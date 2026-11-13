@@ -1,0 +1,724 @@
+module engine where
+
+-- =========================================================================
+-- theory-combine — Nelson-Oppen combination of EUF (Phase 5) + an ORDER theory
+-- over the shared `Tri` currency (decide-substrate Phase 6; brief:
+-- `workstreams/decide-substrate/briefs/phase-6-equality-ground-truth-nelson-oppen.md`;
+-- design: `design/deciding.md` §8, Rung 3 of the ambition axis).
+--
+-- THREE theories combine (Phase 6 shipped two; Phase 6D added the third): EUF
+-- (`euf.fenel` — congruence over `Expr` term-singletons), ORDER/arithmetic
+-- (built HERE over the comparison atoms the EUF collector DROPS), and DATATYPE
+-- (ctor distinctness + injectivity over tag-preserving constructors — the
+-- `dt*` block below). The combination is entailed-EQUALITY exchange: the order
+-- theory derives equalities from nonstrict cycles, the datatype theory from
+-- constructor injectivity; EUF's congruence + lit-conflict + the datatype
+-- distinctness refute; the loop runs to a fixpoint.
+--
+-- ─── THE STEP-1 DEPENDENCY (load-bearing). This whole phase is GATED on
+-- decide-substrate Phase 6 Step 1 (the `eq`/order family made type-honest —
+-- `structuralEq` + same-type ordering). Under the pre-Step-1 COERCING `lte`
+-- (`lte("5",5)` was `true` with `"5" ≠ 5`), the R3 nonstrict-cycle equality
+-- derivation is UNSOUND: `lte("5",5) ∧ lte(5,"5")` are both true yet `"5" ≠ 5`,
+-- so a cycle would derive a false equality. Step 1 makes every asserted-true
+-- `≤`/`<` edge hold within ONE type's total order (cross-type comparisons are
+-- `false`), which is exactly what makes R1/R2/R3 sound. Do NOT reintroduce
+-- coercing comparisons.
+--
+-- ─── THE ORDER THEORY (§3) operates over the SAME deduped indexed universe as
+-- EUF (`eufUniverse` — REUSED; the order edges' endpoints resolve via
+-- `eufIndexOf`). Edges `{a: ix, b: ix, strict: Bool}` from the collected
+-- ltes/lts; all reasoning is over the CURRENT union-find ROOTS (re-projected
+-- each exchange round via `eufFind`). Three rules, each SOUND over every
+-- interpretation of the Step-1 runtime semantics:
+--   • (R1) strict-cycle ⇒ unsat. A cycle of asserted `≤`/`<` edges containing
+--     ≥1 strict edge is unsatisfiable (no total order admits a ≤ … < … ≤ a).
+--     Detected as: some strict edge {a→b} whose head `a` is reachable FROM `b`
+--     (b ⇝ a) ⇒ the cycle a→b→⇝a carries a strict edge.
+--   • (R2) numeric-lit path conflict ⇒ unsat. If numeric lit L1 REACHES numeric
+--     lit L2 through asserted edges, transitivity forces `L1 ≤ L2`; so `L1 > L2`
+--     ⇒ unsat. (The `L1 == L2` with a strict path case DEGENERATES to R1: equal-
+--     valued lits are deduped to ONE universe node, so the strict path is a
+--     self-strict-cycle — hence R2 needs only the nonstrict `>` form.) Numeric is
+--     the required floor; string-lit paths would be sound too (lexical order,
+--     post-Step-1) but are not built (numeric covers the headline rows).
+--   • (R3) nonstrict-cycle ⇒ entailed EQUALITY. Two distinct roots that are
+--     MUTUALLY reachable (a ⇝ b ∧ b ⇝ a) are equal: after R1 has passed there is
+--     no strict edge on any cycle, so all edges around the cycle are `≤`, and
+--     antisymmetry (same-type, post-Step-1) forces equality. Emit `{lhs, rhs}`
+--     equalities between the representatives — THE exchange payload feeding EUF.
+--
+-- ─── THE EXCHANGE LOOP (§4) `satCombined`: seed EUF with the eq atoms → close →
+-- project the order edges onto roots → R1/R2 (unsat ⇒ `Just false`) → R3
+-- equalities → append the fresh ones to the equation set → re-close EUF (lit-
+-- conflict / neq-collapse ⇒ `Just false`) → repeat to fixpoint. Monotone in
+-- merged classes ⇒ fuel = |universe| + 1 (the euf pattern; each productive round
+-- merges ≥1 class). No conflict at fixpoint ⇒ **`Nothing`** — NEVER `Just true`
+-- (a combined-sat certificate needs stable-infiniteness / convexity reasoning we
+-- do not claim; the Phase-5 honesty verbatim). Every `Just false` is sound over
+-- every interpretation of the Step-1 runtime semantics.
+--
+-- ─── THE OPAQUE-NUMBER LANDMINE (Phase-5 surprise, honored here): the order
+-- theory NEVER stringifies a lit value for keying — union-find + reachability are
+-- INDEX-only (raw Numbers via eufIndexOf / eufFind, compared with the working
+-- `eq`), and the ONE value comparison (R2's `gt` over numeric lits) rides the
+-- numeric natives that unwrap correctly. Under the decider ctx a numeric lit that
+-- arrives opaque-wrapped fails `isNumber` ⇒ R2 skips it (sound degradation to
+-- Nothing); R1/R3 are index-only and unaffected.
+--
+-- NO ENTITY DECLS (the law-freeze / cheap-gate rule — the euf.fenel entity-free
+-- precedent): atoms + edges + verdicts are plain records / `Maybe Boolean`.
+-- FENCED in the parse-cache (TS-parsed, byte-identical) — the named-field
+-- `case`-over-Expr idiom of its euf sibling, whose grammar exceeds the Fenel
+-- parser's caps.
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Step 2 (D1) — the mixed-atom collector. Walk the `and`-spine collecting
+-- { eqs, neqs, ltes, lts }: eq/neq/not(eq) verbatim from the euf shape (REUSE
+-- eufTwoArgs); lte/lt as { lhs, rhs }; gte/gt flipped to swapped lte/lt.
+-- Everything else DROPPED (subset-drop: unsat of a subset ⇒ unsat of the
+-- conjunction — sound). eufWhereAtoms (euf.fenel) is NOT modified.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "NO whereAtoms"
+@description "decide-substrate Phase 6 — walk a predicate Expr's `and`-spine collecting mixed atoms { eqs, neqs, ltes, lts }: `eq` ⇒ eqs; `neq`/`not(eq …)` ⇒ neqs; `lte`/`lt` ⇒ ltes/lts as { lhs, rhs }; `gte`/`gt` ⇒ swapped ltes/lts (a ≥ b ≡ b ≤ a); every other head DROPPED (sound subset-drop). The Nelson-Oppen collector — a widening of euf's eq/neq-only eufWhereAtoms (which is left untouched)."
+@tags "engine" "theory-combine" "solve" "prover" "decide-substrate" "phase-6"
+noWhereAtoms : (e: (Expr Any)) -> a
+noWhereAtoms e = noWhereFold e { eqs = [], neqs = [], ltes = [], lts = [] }
+
+@label "NO whereFold"
+@description "decide-substrate Phase 6 — the and-spine collector for noWhereAtoms: `and` ⇒ recurse each arg; `eq` ⇒ add eq; `neq` ⇒ add neq; `not(eq …)` ⇒ add neq; `lte` ⇒ add lte; `lt` ⇒ add lt; `gte`/`gt` ⇒ add the swapped lte/lt; every other head ⇒ drop. Threads the { eqs, neqs, ltes, lts } accumulator. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noWhereFold : (e: (Expr Any)) -> (acc: a) -> a
+noWhereFold e acc =
+  case e of
+    ECall { fnId = f, args = a } ->
+      if eq f "and" then noWhereFoldList a acc
+      else if eq f "eq" then noAddEq a acc
+      else if eq f "neq" then noAddNeq a acc
+      else if eq f "not" then noWhereNot a acc
+      else if eq f "lte" then noAddLte a acc
+      else if eq f "lt" then noAddLt a acc
+      else if eq f "gte" then noAddGteFlip a acc
+      else if eq f "gt" then noAddGtFlip a acc
+      else acc
+    _ -> acc
+
+@label "NO whereFoldList"
+@description "decide-substrate Phase 6 — fold noWhereFold over an `and`'s operand list, threading the { eqs, neqs, ltes, lts } accumulator. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noWhereFoldList : (args: a) -> (acc: b) -> b
+noWhereFoldList args acc =
+  case head args of
+    Nothing -> acc
+    Just a ->
+      let acc1 = noWhereFold a acc
+      case tail args of
+        Nothing -> acc1
+        Just rest -> noWhereFoldList rest acc1
+
+@label "NO addEq"
+@description "decide-substrate Phase 6 — add an `eq` atom (two args, via eufTwoArgs) to the accumulator's eqs; non-2-arg dropped. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noAddEq : (a: b) -> (acc: c) -> c
+noAddEq a acc =
+  case eufTwoArgs a of
+    Just pr -> { eqs = concat acc.eqs (appendItem { lhs = pr.lhs, rhs = pr.rhs } []), neqs = acc.neqs, ltes = acc.ltes, lts = acc.lts }
+    Nothing -> acc
+
+@label "NO addNeq"
+@description "decide-substrate Phase 6 — add a `neq` atom (two args, via eufTwoArgs) to the accumulator's neqs; non-2-arg dropped. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noAddNeq : (a: b) -> (acc: c) -> c
+noAddNeq a acc =
+  case eufTwoArgs a of
+    Just pr -> { eqs = acc.eqs, neqs = concat acc.neqs (appendItem { lhs = pr.lhs, rhs = pr.rhs } []), ltes = acc.ltes, lts = acc.lts }
+    Nothing -> acc
+
+@label "NO whereNot"
+@description "decide-substrate Phase 6 — the `not` arm: `not(eq x y)` ⇒ a neq atom; any other negated head dropped (no De Morgan over the and-spine in v1). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noWhereNot : (a: b) -> (acc: c) -> c
+noWhereNot a acc =
+  case head a of
+    Nothing -> acc
+    Just inner ->
+      case inner of
+        ECall { fnId = g, args = ia } -> if eq g "eq" then noAddNeq ia acc else acc
+        _ -> acc
+
+@label "NO addLte"
+@description "decide-substrate Phase 6 — add an `lte` atom (lhs ≤ rhs, via eufTwoArgs) to the accumulator's ltes; non-2-arg dropped. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noAddLte : (a: b) -> (acc: c) -> c
+noAddLte a acc =
+  case eufTwoArgs a of
+    Just pr -> { eqs = acc.eqs, neqs = acc.neqs, ltes = concat acc.ltes (appendItem { lhs = pr.lhs, rhs = pr.rhs } []), lts = acc.lts }
+    Nothing -> acc
+
+@label "NO addLt"
+@description "decide-substrate Phase 6 — add an `lt` atom (lhs < rhs, via eufTwoArgs) to the accumulator's lts; non-2-arg dropped. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noAddLt : (a: b) -> (acc: c) -> c
+noAddLt a acc =
+  case eufTwoArgs a of
+    Just pr -> { eqs = acc.eqs, neqs = acc.neqs, ltes = acc.ltes, lts = concat acc.lts (appendItem { lhs = pr.lhs, rhs = pr.rhs } []) }
+    Nothing -> acc
+
+@label "NO addGteFlip"
+@description "decide-substrate Phase 6 — a `gte lhs rhs` (lhs ≥ rhs) atom flips to the swapped `lte` edge { lhs = rhs, rhs = lhs } (rhs ≤ lhs); non-2-arg dropped. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noAddGteFlip : (a: b) -> (acc: c) -> c
+noAddGteFlip a acc =
+  case eufTwoArgs a of
+    Just pr -> { eqs = acc.eqs, neqs = acc.neqs, ltes = concat acc.ltes (appendItem { lhs = pr.rhs, rhs = pr.lhs } []), lts = acc.lts }
+    Nothing -> acc
+
+@label "NO addGtFlip"
+@description "decide-substrate Phase 6 — a `gt lhs rhs` (lhs > rhs) atom flips to the swapped `lt` edge { lhs = rhs, rhs = lhs } (rhs < lhs); non-2-arg dropped. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noAddGtFlip : (a: b) -> (acc: c) -> c
+noAddGtFlip a acc =
+  case eufTwoArgs a of
+    Just pr -> { eqs = acc.eqs, neqs = acc.neqs, ltes = acc.ltes, lts = concat acc.lts (appendItem { lhs = pr.rhs, rhs = pr.lhs } []) }
+    Nothing -> acc
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Step 3 (D2) — the order theory over universe root-indices. Universe extras =
+-- the neq terms ++ the order-atom terms; edges resolve endpoints via eufIndexOf.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "NO orderTerms"
+@description "decide-substrate Phase 6 — the lhs ++ rhs terms of every lte + lt atom (the order-theory universe contributors). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noOrderTerms : (ltes: a) -> (lts: b) -> c
+noOrderTerms ltes lts = concat (noPairTerms ltes) (noPairTerms lts)
+
+@label "NO pairTerms"
+@description "decide-substrate Phase 6 — the lhs ++ rhs terms of a { lhs, rhs } pair list (concatenated; deduped later by eufUniverse). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noPairTerms : (pairs: a) -> b
+noPairTerms pairs =
+  case head pairs of
+    Nothing -> []
+    Just p ->
+      let rest = eufRest pairs
+      concat (concat (appendItem p.lhs []) (appendItem p.rhs [])) (noPairTerms rest)
+
+@label "NO edges"
+@description "decide-substrate Phase 6 — the directed order edges { a, b, strict } over universe indices: each lte ⇒ { a = ix lhs, b = ix rhs, strict = false }, each lt ⇒ same with strict = true. `a ≤ b` (or `a < b`) is a directed edge a → b. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noEdges : (uni: a) -> (ltes: b) -> (lts: c) -> d
+noEdges uni ltes lts = concat (noEdgesFrom uni ltes false) (noEdgesFrom uni lts true)
+
+@label "NO edgesFrom"
+@description "decide-substrate Phase 6 — build order edges { a = ix lhs, b = ix rhs, strict } (endpoints resolved via eufIndexOf) from a { lhs, rhs } pair list at a fixed strictness. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noEdgesFrom : (uni: a) -> (pairs: b) -> (strict: Boolean) -> c
+noEdgesFrom uni pairs strict =
+  case head pairs of
+    Nothing -> []
+    Just p ->
+      let e = { a = eufIndexOf uni p.lhs, b = eufIndexOf uni p.rhs, strict = strict }
+      let rest = eufRest pairs
+      concat (appendItem e []) (noEdgesFrom uni rest strict)
+
+@label "NO projectEdges"
+@description "decide-substrate Phase 6 — re-project every order edge's endpoints onto the CURRENT union-find roots (eufFind under the closed parent map): { a = find a, b = find b, strict }. Re-run each exchange round so the order graph tracks the merged EUF classes. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noProjectEdges : (parents: a) -> (edges: b) -> c
+noProjectEdges parents edges =
+  case head edges of
+    Nothing -> []
+    Just e ->
+      let re = { a = eufFind parents e.a, b = eufFind parents e.b, strict = e.strict }
+      let rest = eufRest edges
+      concat (appendItem re []) (noProjectEdges parents rest)
+
+@label "NO elemIx"
+@description "decide-substrate Phase 6 — numeric membership of an index in an index list (compared with the working `eq` over raw Numbers — the opaque-Number-safe path, never a string key). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noElemIx : (n: Number) -> (xs: a) -> Boolean
+noElemIx n xs =
+  case head xs of
+    Nothing -> false
+    Just x -> if eq x n then true else noElemIx n (eufRest xs)
+
+@label "NO reachSet"
+@description "decide-substrate Phase 6 — the set of root indices reachable from `src` following the projected order edges (reflexive + transitive; fixpoint-closed, fuel-bounded by |edges| + 1 — cycles converge). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noReachSet : (rootEdges: a) -> (src: Number) -> b
+noReachSet rootEdges src = noReachClose rootEdges (appendItem src []) (add (length rootEdges) 1)
+
+@label "NO reachClose"
+@description "decide-substrate Phase 6 — the reachability fixpoint: grow the reached-set by one edge-relaxation pass (noReachExpand) until it stabilizes or fuel runs out. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noReachClose : (rootEdges: a) -> (reached: b) -> (fuel: Number) -> b
+noReachClose rootEdges reached fuel =
+  if lte fuel 0 then reached
+  else
+    let expanded = noReachExpand rootEdges reached
+    if eq (length expanded) (length reached) then reached
+    else noReachClose rootEdges expanded (sub fuel 1)
+
+@label "NO reachExpand"
+@description "decide-substrate Phase 6 — one relaxation pass: for each edge { a, b }, if `a` is already reached and `b` is not, append `b` (monotone in the growing accumulator). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noReachExpand : (edges: a) -> (acc: b) -> b
+noReachExpand edges acc =
+  case head edges of
+    Nothing -> acc
+    Just e ->
+      let acc2 = if and (noElemIx e.a acc) (not (noElemIx e.b acc)) then appendItem e.b acc else acc
+      case tail edges of
+        Nothing -> acc2
+        Just rest -> noReachExpand rest acc2
+
+-- (R1) strict-cycle ⇒ unsat.
+@label "NO strictCycle"
+@description "decide-substrate Phase 6 (R1) — true when the projected order graph has a strict cycle: some strict edge { a → b } whose head `a` is reachable FROM `b` (b ⇝ a), forming a → b → ⇝ a with a strict edge. Sound unsat (no total order admits a < … ≤ a). A strict self-loop { a → a } is caught too (reachSet is reflexive). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noStrictCycle : (rootEdges: a) -> Boolean
+noStrictCycle rootEdges = noStrictCycleScan rootEdges rootEdges
+
+@label "NO strictCycleScan"
+@description "decide-substrate Phase 6 (R1) — scan the edges for a strict one whose head is reachable from its tail (the back-edge closing a strict cycle). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noStrictCycleScan : (allEdges: a) -> (rem: b) -> Boolean
+noStrictCycleScan allEdges rem =
+  case head rem of
+    Nothing -> false
+    Just e ->
+      if and e.strict (noElemIx e.a (noReachSet allEdges e.b)) then true
+      else case tail rem of
+             Nothing -> false
+             Just rest -> noStrictCycleScan allEdges rest
+
+-- (R2) numeric-lit path conflict ⇒ unsat.
+@label "NO numLits"
+@description "decide-substrate Phase 6 (R2) — the universe entries whose `.expr` is a numeric ELit (annotated { ix, expr, … }). Under the opaque-Number decider ctx a wrapped number fails isNumber ⇒ it is skipped (R2 degrades to Nothing — sound). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noNumLits : (uni: a) -> b
+noNumLits uni =
+  case head uni of
+    Nothing -> []
+    Just u ->
+      let isNumLit = case u.expr of
+                       ELit { value = v } -> isNumber v
+                       _ -> false
+      let rest = eufRest uni
+      if isNumLit then concat (appendItem u []) (noNumLits rest) else noNumLits rest
+
+@label "NO litPathConflict"
+@description "decide-substrate Phase 6 (R2) — true when some numeric lit L1 reaches a numeric lit L2 (under the current roots + projected edges) with value(L1) > value(L2): transitivity forces L1 ≤ L2, so L1 > L2 is unsat. Excludes L1, L2 sharing a root (that is a lit-conflict eufConflict already refutes). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noLitPathConflict : (parents: a) -> (rootEdges: b) -> (numLits: c) -> Boolean
+noLitPathConflict parents rootEdges numLits = noLitPairScan parents rootEdges numLits numLits
+
+@label "NO litPairScan"
+@description "decide-substrate Phase 6 (R2) — outer loop over numeric lits L1, testing each against the whole numeric-lit list (noLitVsRest). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noLitPairScan : (parents: a) -> (rootEdges: b) -> (lits1: c) -> (lits2: d) -> Boolean
+noLitPairScan parents rootEdges lits1 lits2 =
+  case head lits1 of
+    Nothing -> false
+    Just n1 ->
+      if noLitVsRest parents rootEdges n1 lits2 then true
+      else case tail lits1 of
+             Nothing -> false
+             Just rest -> noLitPairScan parents rootEdges rest lits2
+
+@label "NO litVsRest"
+@description "decide-substrate Phase 6 (R2) — true when numeric lit n1 reaches some numeric lit n2 (distinct roots) with value(n1) > value(n2). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noLitVsRest : (parents: a) -> (rootEdges: b) -> (n1: c) -> (lits2: d) -> Boolean
+noLitVsRest parents rootEdges n1 lits2 =
+  case head lits2 of
+    Nothing -> false
+    Just n2 ->
+      let r1 = eufFind parents n1.ix
+      let r2 = eufFind parents n2.ix
+      let v1 = eufLitValue n1.expr
+      let v2 = eufLitValue n2.expr
+      let conflict = and (not (eq r1 r2)) (and (noElemIx r2 (noReachSet rootEdges r1)) (gt v1 v2))
+      if conflict then true
+      else case tail lits2 of
+             Nothing -> false
+             Just rest -> noLitVsRest parents rootEdges n1 rest
+
+-- (R3) nonstrict-cycle ⇒ entailed EQUALITY (the exchange payload).
+@label "NO derivedEqs"
+@description "decide-substrate Phase 6 (R3) — the equalities entailed by nonstrict cycles: every unordered pair of universe terms with DISTINCT current roots that are MUTUALLY reachable (each in the other's reachSet) is emitted as { lhs, rhs } (representatives). After R1 has passed, a mutual-reach cycle has no strict edge ⇒ antisymmetry (same-type, post-Step-1) forces equality — these feed EUF. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noDerivedEqs : (uni: a) -> (parents: b) -> (rootEdges: c) -> d
+noDerivedEqs uni parents rootEdges = noDerivedOuter uni parents rootEdges
+
+@label "NO derivedOuter"
+@description "decide-substrate Phase 6 (R3) — outer loop over universe terms, pairing each against the terms AFTER it (noDerivedInner) so each unordered pair is tested once. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noDerivedOuter : (rem: a) -> (parents: b) -> (rootEdges: c) -> d
+noDerivedOuter rem parents rootEdges =
+  case head rem of
+    Nothing -> []
+    Just u ->
+      let here = noDerivedInner u (eufRest rem) parents rootEdges
+      case tail rem of
+        Nothing -> here
+        Just rest -> concat here (noDerivedOuter rest parents rootEdges)
+
+@label "NO derivedInner"
+@description "decide-substrate Phase 6 (R3) — pair one universe term u against the remaining terms v: distinct roots + mutual reachability ⇒ emit { lhs = u.expr, rhs = v.expr }. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noDerivedInner : (u: a) -> (others: b) -> (parents: c) -> (rootEdges: d) -> e
+noDerivedInner u others parents rootEdges =
+  case head others of
+    Nothing -> []
+    Just v ->
+      let ru = eufFind parents u.ix
+      let rv = eufFind parents v.ix
+      let mutual = and (not (eq ru rv)) (and (noElemIx rv (noReachSet rootEdges ru)) (noElemIx ru (noReachSet rootEdges rv)))
+      let here = if mutual then appendItem { lhs = u.expr, rhs = v.expr } [] else []
+      case tail others of
+        Nothing -> here
+        Just rest -> concat here (noDerivedInner u rest parents rootEdges)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Phase 6D — the DATATYPE theory (the third member): constructor DISTINCTNESS
+-- + INJECTIVITY over tag-preserving constructors.
+--
+-- THE SOUNDNESS GROUND (verified at HEAD 2026-07-04): the `construct` op
+-- coerces ONLY `True`/`False` (json-logic.ts:1358, the PERMANENT ledger-B5
+-- Bool arm — Nat/Int build pure spines, List ctors build tagged spines,
+-- unregistered ctors get the `{$tag: name, …}` fallback). So EVERY other
+-- constructor is TAG-PRESERVING: its runtime value carries `$tag = <ctor>`.
+-- The exclusion set {True, False} is a language-fact constant (the same class
+-- as euf's "$effect:" prefix) — no facts table, no ctx-native seam, the
+-- decider arm keeps its safe-under-any-ctx property.
+--
+--   • (D1) DISTINCTNESS: two tag-preserving EConstructs with DIFFERENT ctor
+--     NAMES forced into one class ⇒ unsat — their values carry different
+--     `$tag`s and the Step-1 structural `eq` compares `$tag` like any key, so
+--     they can NEVER be equal. Keys on the ctor NAME only (positional `Just x`
+--     vs named `Just {value = x}` are same-ctor different-SIG — not a
+--     distinctness case; they are also genuinely different runtime shapes, so
+--     no rule may merge them either).
+--   • (D2) INJECTIVITY: two tag-preserving EConstructs with the SAME full
+--     signature (eufSig — ctor + field-name list) and same arity forced into
+--     one class ⇒ their children are pairwise EQUAL (same-shape tagged records
+--     are structurally equal iff their fields are — sound ONLY under the
+--     Step-1 structural eq; loose reference-eq would break it). Emitted as
+--     {lhs, rhs} child-term equalities, the SAME exchange payload as R3 —
+--     filtered to NOT-already-same-root pairs (the fixpoint-termination
+--     guard: an unfiltered emit re-derives every round and burns the fuel).
+--   • (D3) LIT-vs-CTOR distinctness: an ELit whose value is a non-array
+--     record carrying a `$tag` entry (read via `entries` — no `$`-key
+--     authoring) same-rooted with a tag-preserving EConstruct of a DIFFERENT
+--     ctor ⇒ unsat. Lit arrays / scalars / tagless records ⇒ no rule (a lit
+--     array vs a Cons-spine construct is repr-vs-pure territory — honest).
+--
+-- Coercing ctors (True/False) are excluded from ALL rules: `x == True ∧
+-- x == False` abstains (the boolean-LITERAL spelling already refutes via the
+-- euf lit-conflict).
+--
+-- THE THEORY INTERFACE (documented, not yet instance-ized): each theory is
+-- (atoms: what it collects from the and-spine) + (check: roots → conflict?) +
+-- (derive: roots → entailed equalities). EUF = {eq/neq, lit-conflict +
+-- neq-collapse, congruence-inside-close}; ORDER = {lte/lt, R1+R2, R3};
+-- DATATYPE = {∅ — it reads the universe the others build, dtConflict,
+-- dtDerive}. The third member has ARRIVED (the Phase-6 instance-ization
+-- trigger), but the flip to a `Theory` class is BLOCKED on fn-by-ref calls
+-- from engine bodies (an engine body cannot call a fn whose id is data — the
+-- structuralPropose closed-case precedent); typed-fn-refs owns the unblock.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "dt: coercingCtor"
+@description "decide-substrate Phase 6D — true for a constructor name whose `construct` COERCES to a native rep instead of a `$tag`-tagged record: exactly True/False (the permanent ledger-B5 Bool arm; verified the only coercion at HEAD). Coercing ctors are excluded from every datatype rule (distinctness/injectivity key on the preserved `$tag`). A language-fact constant (the euf `$effect:`-prefix class). Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtCoercingCtor : (c: String) -> Boolean
+dtCoercingCtor c = or (eq c "True") (eq c "False")
+
+@label "dt: ctorName"
+@description "decide-substrate Phase 6D — the constructor name of an EConstruct term, or \"\" for every other Expr shape (the datatype-theory term view). Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtCtorName : (e: (Expr Any)) -> String
+dtCtorName e =
+  case e of
+    EConstruct { ctor = c } -> c
+    _ -> ""
+
+@label "dt: litTag"
+@description "decide-substrate Phase 6D — the `$tag` of an ELit whose value is a non-array, non-scalar record carrying an own `$tag` property (read through the dynamic-key `mapGet` boundary — no `$`-key authoring), or \"\" otherwise. The D3 lit-vs-ctor view. Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtLitTag : (e: (Expr Any)) -> String
+dtLitTag e =
+  case e of
+    ELit { value = v } ->
+      if isArray v then ""
+      else if isNull v then ""
+      else if isNumber v then ""
+      else if isString v then ""
+      else if isBoolean v then ""
+      else
+        case mapGet v "$tag" of
+          Just tag -> if isString tag then toString tag else ""
+          Nothing -> ""
+    _ -> ""
+
+@label "dt: tagOf"
+@description "decide-substrate Phase 6D — the datatype tag of a universe term under the rules: a tag-preserving EConstruct's ctor name, or a `$tag`-carrying ELit record's tag (D3); \"\" when neither (or when the ctor is coercing). The one string every dt rule keys on. Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtTagOf : (e: (Expr Any)) -> String
+dtTagOf e =
+  let c = dtCtorName e
+  if not (eq c "") then (if dtCoercingCtor c then "" else c)
+  else
+    let t = dtLitTag e
+    if dtCoercingCtor t then "" else t
+
+@label "dt: taggedEntries"
+@description "decide-substrate Phase 6D — the universe entries carrying a non-empty datatype tag (dtTagOf) — the distinctness-scan candidates, annotated { ix, expr, app, sig, childIxs }. Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtTaggedEntries : (uni: a) -> b
+dtTaggedEntries uni =
+  case head uni of
+    Nothing -> []
+    Just u ->
+      let rest = eufRest uni
+      if eq (dtTagOf u.expr) "" then dtTaggedEntries rest
+      else concat (appendItem u []) (dtTaggedEntries rest)
+
+@label "dt: conflict"
+@description "decide-substrate Phase 6D (D1 + D3) — true when two universe terms with DIFFERENT non-empty datatype tags (tag-preserving EConstruct ctors, or `$tag`-carrying lit records) share a union-find root: distinct `$tag`s can never be structurally equal (Step-1 eq compares `$tag` like any key) ⇒ the forcing equalities are unsat. Pairwise scan over the tagged entries. Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtConflict : (uni: a) -> (parents: b) -> Boolean
+dtConflict uni parents = dtConflictScan (dtTaggedEntries uni) parents
+
+@label "dt: conflictScan"
+@description "decide-substrate Phase 6D — the pairwise outer loop of dtConflict: each tagged entry against the entries after it (each unordered pair tested once). Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtConflictScan : (tagged: a) -> (parents: b) -> Boolean
+dtConflictScan tagged parents =
+  case head tagged of
+    Nothing -> false
+    Just u ->
+      let rest = eufRest tagged
+      if dtConflictWith u rest parents then true else dtConflictScan rest parents
+
+@label "dt: conflictWith"
+@description "decide-substrate Phase 6D — true when a tagged entry shares a root with some later tagged entry whose datatype tag DIFFERS (the D1/D3 conflict witness). Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtConflictWith : (u: a) -> (others: b) -> (parents: c) -> Boolean
+dtConflictWith u others parents =
+  case head others of
+    Nothing -> false
+    Just v ->
+      let same = eq (eufFind parents u.ix) (eufFind parents v.ix)
+      let distinct = not (eq (dtTagOf u.expr) (dtTagOf v.expr))
+      if and same distinct then true
+      else dtConflictWith u (eufRest others) parents
+
+@label "dt: termAtIx"
+@description "decide-substrate Phase 6D — the Expr of the universe entry at a given index (Just / Nothing) — recovers child TERMS from the precomputed childIxs for the injectivity payload. Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtTermAtIx : (uni: a) -> (ix: Number) -> Maybe (Expr Any)
+dtTermAtIx uni ix =
+  case head uni of
+    Nothing -> Nothing
+    Just u ->
+      if eq u.ix ix then Just u.expr
+      else dtTermAtIx (eufRest uni) ix
+
+@label "dt: derive"
+@description "decide-substrate Phase 6D (D2 injectivity) — the equalities entailed by same-class same-shape constructs: every pair of tag-preserving (non-coercing) EConstruct entries with the SAME full signature (eufSig — ctor + field names) + same arity sharing a root emits pairwise child equalities for child pairs NOT already same-root (the fixpoint-termination guard). Same-shape tagged records are structurally equal iff their fields are (sound under Step-1 structural eq). The exchange payload feeding EUF, beside R3's. Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtDerive : (uni: a) -> (parents: b) -> c
+dtDerive uni parents = dtDeriveOuter uni (dtCtorApps uni) parents
+
+@label "dt: ctorApps"
+@description "decide-substrate Phase 6D — the universe entries that are NON-COERCING EConstruct applications (ctor name non-empty, not True/False) — the injectivity-scan candidates. Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtCtorApps : (uni: a) -> b
+dtCtorApps uni =
+  case head uni of
+    Nothing -> []
+    Just u ->
+      let c = dtCtorName u.expr
+      let rest = eufRest uni
+      if or (eq c "") (dtCoercingCtor c) then dtCtorApps rest
+      else concat (appendItem u []) (dtCtorApps rest)
+
+@label "dt: deriveOuter"
+@description "decide-substrate Phase 6D — the pairwise outer loop of dtDerive: each ctor-app entry against the entries after it. Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtDeriveOuter : (uni: a) -> (apps: b) -> (parents: c) -> d
+dtDeriveOuter uni apps parents =
+  case head apps of
+    Nothing -> []
+    Just u ->
+      let rest = eufRest apps
+      concat (dtDeriveWith uni u rest parents) (dtDeriveOuter uni rest parents)
+
+@label "dt: deriveWith"
+@description "decide-substrate Phase 6D — pair one ctor-app entry u against the later entries v: same root + same eufSig + same arity ⇒ emit the not-yet-same-root child-pair equalities (dtChildEqs). Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtDeriveWith : (uni: a) -> (u: b) -> (others: c) -> (parents: d) -> e
+dtDeriveWith uni u others parents =
+  case head others of
+    Nothing -> []
+    Just v ->
+      let sameRoot = eq (eufFind parents u.ix) (eufFind parents v.ix)
+      let sameShape = and (eq u.sig v.sig) (eq (length u.childIxs) (length v.childIxs))
+      let here = if and sameRoot sameShape then dtChildEqs uni u.childIxs v.childIxs parents else []
+      concat here (dtDeriveWith uni u (eufRest others) parents)
+
+@label "dt: childEqs"
+@description "decide-substrate Phase 6D — zip two equal-length child-index lists into { lhs, rhs } term equalities, SKIPPING pairs already same-root (the fixpoint-termination guard — an already-merged pair must not re-derive). Terms recovered via dtTermAtIx. Internal helper."
+@tags "engine" "internal" "theory-combine" "datatype" "decide-substrate" "phase-6d"
+@category "engine-internal"
+dtChildEqs : (uni: a) -> (xs: b) -> (ys: c) -> (parents: d) -> e
+dtChildEqs uni xs ys parents =
+  case head xs of
+    Nothing -> []
+    Just x ->
+      case head ys of
+        Nothing -> []
+        Just y ->
+          let restPairs = dtChildEqs uni (eufRest xs) (eufRest ys) parents
+          if eq (eufFind parents x) (eufFind parents y) then restPairs
+          else
+            case dtTermAtIx uni x of
+              Nothing -> restPairs
+              Just tx ->
+                case dtTermAtIx uni y of
+                  Nothing -> restPairs
+                  Just ty -> concat (appendItem { lhs = tx, rhs = ty } []) restPairs
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Step 4 (D3) — the exchange loop + verdict. `Just false` (unsat, sound over
+-- every interpretation of the Step-1 semantics) | `Nothing` (never `Just true`).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Sat combined"
+@description "decide-substrate Phase 6 (+6D) — the Nelson-Oppen combined satisfiability verdict over mixed atoms { eqs, neqs, ltes, lts }, THREE theories: EUF (congruence + lit-conflict + neq-collapse) ⊕ ORDER (R1 strict cycle / R2 numeric-lit path / R3 nonstrict-cycle ⇒ equalities) ⊕ DATATYPE (ctor distinctness ⇒ conflict / ctor injectivity ⇒ child equalities). Seed EUF with the eqs, close, project the order edges onto roots; any theory's conflict ⇒ Just false; else pool the derived equalities (R3 + injectivity), append the fresh ones and re-close; repeat to a fixpoint (fuel = |universe| + 1). No conflict at fixpoint ⇒ Nothing — NEVER Just true (no combined-sat certificate; the Phase-5 honesty). The textbook `x ≤ y ∧ y ≤ x ∧ f x ≠ f y` ⇒ Just false; `x == Just 1 ∧ x == Nothing` ⇒ Just false (distinctness); `x == Just a ∧ x == Just b ∧ f a ≠ f b` ⇒ Just false (injectivity → congruence)."
+@tags "engine" "theory-combine" "euf" "datatype" "solve" "prover" "decide-substrate" "phase-6"
+satCombined : (eqs: a) -> (neqs: b) -> (ltes: c) -> (lts: d) -> Maybe Boolean
+satCombined eqs neqs ltes lts =
+  let extras = concat (eufNeqTerms neqs) (noOrderTerms ltes lts)
+  let uni = eufUniverse eqs extras
+  let edges = noEdges uni ltes lts
+  let numLits = noNumLits uni
+  noSatLoop uni eqs neqs edges numLits (add (length uni) 1)
+
+@label "NO satLoop"
+@description "decide-substrate Phase 6 (+6D) — the exchange fixpoint behind satCombined: close EUF over the current eqs; eufConflict / eufNeqViolated ⇒ Just false; else project edges onto roots, R1/R2 ⇒ Just false; dtConflict (ctor/lit-tag distinctness) ⇒ Just false; else pool the derived equalities (R3 nonstrict-cycles + dtDerive injectivity, both not-same-root-filtered) — none ⇒ Nothing (fixpoint), some ⇒ append + recurse with one less fuel. Internal helper."
+@tags "engine" "internal" "theory-combine" "euf" "datatype" "decide-substrate" "phase-6"
+@category "engine-internal"
+noSatLoop : (uni: a) -> (eqs: b) -> (neqs: c) -> (edges: d) -> (numLits: e) -> (fuel: Number) -> Maybe Boolean
+noSatLoop uni eqs neqs edges numLits fuel =
+  if lte fuel 0 then Nothing
+  else
+    let parents = eufClose uni eqs
+    if eufConflict uni parents then Just false
+    else if eufNeqViolated uni neqs parents then Just false
+    else
+      let rootEdges = noProjectEdges parents edges
+      if noStrictCycle rootEdges then Just false
+      else if noLitPathConflict parents rootEdges numLits then Just false
+      else if dtConflict uni parents then Just false
+      else
+        let derived = concat (noDerivedEqs uni parents rootEdges) (dtDerive uni parents)
+        if eq (length derived) 0 then Nothing
+        else noSatLoop uni (concat eqs derived) neqs edges numLits (sub fuel 1)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Step 5 (D4) — the decider face. `noDecideWhere` is the widened SeWhere arm
+-- body: extract the mixed atoms, defensively fence `$effect:` heads, zero atoms
+-- ⇒ Nothing, else satCombined — unsat ⇒ Just true (EMPTY), else Nothing (never
+-- Just false — the finite-domain honesty). satSymbolic (symbolize.fenel) widens
+-- through satCombined directly under its own lawful memory-model gate.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "NO decideWhere"
+@description "decide-substrate Phase 6 — the widened emptiness arm over a SeWhere predicate Expr (replaces euf's eufDecideWhere in setAlgebraDecideEmptyEufArm): extract the and-spine's mixed atoms (noWhereAtoms; non-extractable conjuncts DROPPED — sound subset-drop); DEFENSIVELY fence any atom whose term tree carries an `$effect:` head (⇒ Nothing); zero atoms ⇒ Nothing. Then satCombined: unsat ⇒ Just true (empty over every domain + ambient env), else Nothing (never Just false — combined-sat does not certify nonempty for a typed domain). The gain: `{v | v ≥ 5 ∧ v ≤ 5 ∧ f v ≠ f 5}` ⇒ Just true (order derives v = 5, EUF refutes)."
+@tags "engine" "theory-combine" "euf" "set-algebra" "decideEmpty" "decide-substrate" "phase-6"
+noDecideWhere : (pred: (Expr Any)) -> Maybe Boolean
+noDecideWhere pred =
+  let atoms = noWhereAtoms pred
+  if noAtomsEffectful atoms then Nothing
+  else if noAtomsEmpty atoms then Nothing
+  else
+    case satCombined atoms.eqs atoms.neqs atoms.ltes atoms.lts of
+      Just false -> Just true
+      _ -> Nothing
+
+@label "NO atomsEffectful"
+@description "decide-substrate Phase 6 — true when any extracted atom (eq/neq/lte/lt) carries an `$effect:`-prefixed ECall head in either side's term tree (the defensive decider fence: effectful sites must never be congruence-merged / ordered by the ambient decider without a memory model). Reuses eufTermHasEffect. Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noAtomsEffectful : (atoms: a) -> Boolean
+noAtomsEffectful atoms =
+  if noPairListEffect atoms.eqs then true
+  else if noPairListEffect atoms.neqs then true
+  else if noPairListEffect atoms.ltes then true
+  else noPairListEffect atoms.lts
+
+@label "NO pairListEffect"
+@description "decide-substrate Phase 6 — true when some { lhs, rhs } atom in the list has an `$effect:` head anywhere in either side's term tree (eufTermHasEffect). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noPairListEffect : (atoms: a) -> Boolean
+noPairListEffect atoms =
+  case head atoms of
+    Nothing -> false
+    Just at ->
+      if or (eufTermHasEffect at.lhs) (eufTermHasEffect at.rhs) then true
+      else noPairListEffect (eufRest atoms)
+
+@label "NO atomsEmpty"
+@description "decide-substrate Phase 6 — true when all four atom lists (eqs, neqs, ltes, lts) are empty (no verdict possible ⇒ Nothing). Internal helper."
+@tags "engine" "internal" "theory-combine" "decide-substrate" "phase-6"
+@category "engine-internal"
+noAtomsEmpty : (atoms: a) -> Boolean
+noAtomsEmpty atoms =
+  and (and (eq (length atoms.eqs) 0) (eq (length atoms.neqs) 0)) (and (eq (length atoms.ltes) 0) (eq (length atoms.lts) 0))

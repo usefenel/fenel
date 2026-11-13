@@ -1,0 +1,1213 @@
+module engine where
+
+-- =========================================================================
+-- syntaxToJsonLogic / programToFrames — the LOADER-SEAM lowering (the Fenel
+-- side of the ONE ledgered `$`-key marshal). parser-substrate Phase 5a (brief:
+-- `workstreams/parser-substrate/briefs/phase-5a-syntax-to-jsonlogic-marshal.md`).
+--
+-- The Fenel parser (Phases 1–4) emits `Syntax` for bodies + plain-record
+-- `{mk}` markers for types (`decl-grammar.fenel`); the loader
+-- (`fenel-module.ts`) consumes the `flattenProgram(parse src)` shape: a frame
+-- list (`{type_sig|def|type_def|module_decl: …}`) with bodies as JSON-Logic +
+-- types as `$`-keyed FenelType. This file is the inverse of `jsonLogicToSyntax`
+-- (`json-logic-to-syntax.fenel`) — arm-for-arm — PLUS the program-frame
+-- envelope assembly. It is Fenel-bodied because JSON-Logic's op keys (`var` /
+-- `call` / `fn` / `construct` / `if` / `let` / `do` / `match`) are NOT
+-- `$`-prefixed — a Fenel record literal authors them. The ONLY `$`-keys in a
+-- parsed module are (a) the FenelType keys (`$record`/`$arrow`/`$ref`/…), left
+-- as `{mk}` markers for the TS marshal, and (b) match-pattern `$tag`/`$bind`,
+-- left as raw `Pattern` ADT values for the TS marshal. The ONE ledgered TS
+-- `$`-key boundary (`marshalParsedFrames`, engine-bodies-dispatch.ts) authors
+-- exactly those. See the brief's family table.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE INVERSE FORM TABLE (pinned by RUNNING `parse(src)`, 2026-06-13 — the
+-- throwaway `_probe_p5a*.ts`, deleted; inverse of `jsonLogicToSyntax`):
+--   SLit v            ⇒ v (raw scalar / [] / pre-eval tagged value pass-through)
+--   SVar n            ⇒ {var: n}
+--   SCall f args      ⇒ {call: [f, …args]}   — EXCEPT an `appendItem` chain
+--                       bottoming at `SLit []` ⇒ the ARRAY literal [a, b, …]
+--                       (the list-literal desugar inverse; see collectList)
+--   SConstruct c args ⇒ {construct: [c, …args]}  (parser emits positional only)
+--   SRecord fields    ⇒ {name: value, …}  (empty ⇒ {})
+--   SIf c t e         ⇒ {if: [c, t, e]}
+--   SLet binds body   ⇒ {do: [{let: bindsObj}, …bodyExprs]}  (the do re-flatten,
+--                       inverse of jlsDoOp/collectLeadingLets)
+--   SDo exprs         ⇒ {do: [e, …]}
+--   SLambda ps body   ⇒ {fn: [p0, …, body]}   (flat form)
+--   SMatch sc arms    ⇒ {match: [sc, pat0, body0, …]}  (pat = RAW Pattern value
+--                       for the TS marshal to author into {$tag,…}/{$bind}; a
+--                       GUARDED arm `{pattern, guard, body}` emits a raw
+--                       `PatGuard {pat, cond}` marker in the pattern slot ⇒ the
+--                       marshal authors `{$guard:[pat, cond]}` — Phase 3)
+--   SWhere body binds ⇒ {where: [bodyJl, bindingsObj]}  (fenel-surface-extensions
+--                       Phase 4 — a function-level `where`; `where` is a PLAIN op
+--                       key, NO `$`-key marshal; bindingsObj folds the [{name,
+--                       value}] list → {name: valueJl} via sRecordToJl)
+--   SMethod c m args  ⇒ {method: [c, m, ...argsJl]}  (fenel-surface-extensions
+--                       Phase 6 — a module-qualified-method head `Foldable.foldr`;
+--                       `method` is a PLAIN op key, NO `$`-key marshal; cls+method
+--                       raw strings PREPENDED, args spread)
+--   SAnn e t          ⇒ {ann: [eJl, t]}  (modules-as-values Phase 2d — the type
+--                       annotation `(e : T)`; `ann` is a PLAIN op key; the type
+--                       rides OPAQUELY: a grammar `{mk}` marker has its value-
+--                       expression args lowered here (lowerValExprs, the sigFrame
+--                       order) and the TS marshal's ann arm authors the FenelType)
+--   SOp op operands   ⇒ {op: [...operands]}  (the OPERATOR-KEY form, e.g.
+--                       `{cat:[…]}` — REACHABLE as of Phase 7e Sn=3: the parser
+--                       emits `SOp "cat"` ONLY for backtick TEMPLATES (the
+--                       interleaved chunk/interp `{cat}` the TS oracle targets);
+--                       fixity-resolves everything else to SCall, so this arm is
+--                       template-only. Distinct from explicit `cat x y` ⇒ SCall
+--                       ⇒ {call:["cat",…]} — the application form.)
+--
+-- THE TWO NON-INJECTIVITIES (surfaced by the loader direction — recorded as
+-- findings, NOT bugs): `jsonLogicToSyntax` is NOT injective, so a perfect
+-- byte round-trip is impossible for two source forms whose Syntax collides:
+--   • single-field records `{a = 1}` parse to `SCall "a" [1]` (same as the call
+--     `a 1`) ⇒ lower to `{call: ["a", 1]}`, NOT the record `{a: 1}` TS-parse
+--     emits. The Fenel parser ALREADY lost the distinction (the differential
+--     compares in Syntax space, where both are SCall). FENCED from the 5a
+--     sample; a 5d/parser-level triage item.
+--   • list literals `[1, 2, x]` and the call `appendItem x [1, 2]` USED TO
+--     produce identical Syntax. RESOLVED (parser-substrate Phase 7k Class A): the
+--     grammar's `buildList` + the oracle's `jlsArrayItems` now MARK list-literal
+--     `appendItem` chains with `lit = true`, so collectList flattens ONLY those
+--     and a genuine `appendItem` application stays `{call:["appendItem",…]}` —
+--     byte-matching the TS oracle (which kept `{call}` and `[…]` distinct all
+--     along). The marker rides the transient Syntax only; it is STRIPPED here at
+--     marshal, so the JSON-Logic IR + everything downstream are unchanged. Before
+--     7k the round-trip silently lowered the call form to an array (semantically
+--     equal — appendItem IS how arrays build — but byte-divergent from the SPEC
+--     TS parser, which fenced `engine/widget-hint.fenel`).
+--
+-- TYPE markers (`{mk}`) + match patterns (`{$tag:Pat*}`) PASS THROUGH untouched
+-- — the TS `marshalParsedFrames` authors their `$`-keys (walkType mirrors the
+-- parser's `liftJuxApp`: List/Maybe/Result/Verified/Map/Tagged special-cased,
+-- else `$el`; NO general registry resolution — the parser does none either).
+--
+-- NO new entities (markers + frames are plain records). NO laws. NOT a parser
+-- entry ⇒ NOT in the compiled-parser closure (interpreted at the loader seam).
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- syntaxToJsonLogic — the Syntax → JSON-Logic value lowering (arm-for-arm
+-- inverse of jsonLogicToSyntax). Total over the 14 Syntax cases. Match-arm
+-- patterns are PASSED THROUGH as raw Pattern ADT values (the TS marshal
+-- authors their `$tag`/`$bind`). parser-substrate Phase 5a.
+-- -------------------------------------------------------------------------
+
+@label "Syntax to JSON Logic"
+@description "Lower a Syntax value to its JSON-Logic value tree — the arm-for-arm inverse of jsonLogicToSyntax (the loader-seam lowering direction). Authors the `$`-FREE JSON-Logic (var/call/construct/if/let/do/fn/match + records + arrays); an appendItem chain bottoming at `SLit []` flattens back to a list literal. Match-arm patterns pass through as raw Pattern ADT values for the ONE ledgered TS `$`-key marshal to author. parser-substrate Phase 5a."
+@tags "engine" "ir" "parser" "loader" "parser-substrate" "phase-5a"
+syntaxToJsonLogic : (s: a) -> a
+syntaxToJsonLogic s =
+  case s of
+    SLit { value = v } -> v
+    SVar { name = n } -> if eq s.identity true then s else mapSet {} "var" n
+    SCall { fnId = f, args = a } -> sCallToJl s f a
+    SConstruct { ctor = c, args = a } -> mapSet {} "construct" (concat (appendItem c []) (map syntaxToJsonLogic a))
+    SRecord { fields = fs } -> sRecordToJl fs {}
+    SIf { cond = c, then = t, else = e } -> mapSet {} "if" (appendItem (syntaxToJsonLogic e) (appendItem (syntaxToJsonLogic t) (appendItem (syntaxToJsonLogic c) [])))
+    SLet { bindings = b, body = bd } -> mapSet {} "do" (sLetToDo b bd)
+    SDo { exprs = xs } -> mapSet {} "do" (map syntaxToJsonLogic xs)
+    SLambda { params = ps, body = bd } -> mapSet {} "fn" (concat ps (appendItem (syntaxToJsonLogic bd) []))
+    SMatch { scrutinee = sc, arms = ar } -> mapSet {} "match" (sMatchArgs sc ar)
+    SOp { op = o, operands = os } -> mapSet {} o (map syntaxToJsonLogic os)
+    -- SWhere (fenel-surface-extensions Phase 4): a function-level `where` lowers
+    -- to the oracle's `{where:[bodyJl, bindingsObj]}`. `where` is a PLAIN op key
+    -- (like `if`/`do`) ⇒ authored by `mapSet` — NO `$`-key, NO TS marshal touch
+    -- (the clean contrast with Phase 3's `$guard`). `bindings` is the LIST
+    -- `[{name, value}]` (SLet's shape); the wire bindingsObj `{name: valueJl, …}`
+    -- folds it via `sRecordToJl` (the SRecord field→object helper — same shape),
+    -- the inverse of jlsWhere's bindings-object→list lift.
+    SWhere { body = bd, bindings = bs } ->
+      mapSet {} "where" (concat (appendItem (syntaxToJsonLogic bd) []) (appendItem (sRecordToJl bs {}) []))
+    -- SMethod (fenel-surface-extensions Phase 6): a module-qualified-method head
+    -- lowers to the oracle's `{method:[cls, method, …argsJl]}` — the flat arg list
+    -- with `cls` + `method` (raw strings) PREPENDED then the lowered args spread.
+    -- `method` is a PLAIN op key (like `where`/`if`/`do`) ⇒ authored by `mapSet` —
+    -- ZERO `$`-key, ZERO TS marshal touch (the generic marshalPatterns deep-walk
+    -- passes `{method:[…]}` through untouched). The runtime evaluates `{method}`
+    -- reflectively (json-logic.ts methodOp), so the interpreted production path
+    -- works the moment the parser emits this shape.
+    SMethod { cls = c, method = m, args = a } ->
+      let projection = mapSet {} "method" (concat [c, m] (map syntaxToJsonLogic a))
+      -- Explicit unit application invokes the projected value. Missing
+      -- metadata retains the existing bare-method and nonempty-call forms.
+      if eq s.applied true then mapSet {} "call" (appendItem projection []) else projection
+    -- SAnn (modules-as-values Phase 2d): the type annotation lowers to the
+    -- oracle's `{ann:[eJl, T]}` — `ann` is a PLAIN op key (mapSet). The type is
+    -- OPAQUE here: a grammar `{mk}` marker gets its value-expression args
+    -- lowered to `$`-free JSON-Logic first (lowerValExprs — the sigFrame order;
+    -- anything that is not a marker passes through it unchanged), then the ONE
+    -- ledgered TS marshal (marshalPatterns' ann arm) authors the `$`-keyed
+    -- FenelType the TS parser emits (or unmarshals the adapter's JsonLogic image).
+    SAnn { expr = e, type = t } ->
+      mapSet {} "ann" (appendItem (lowerValExprs t) (appendItem (syntaxToJsonLogic e) []))
+
+-- sCallToJl — an SCall lowers to `{call: [fnId, …args]}`, EXCEPT a LIST-LITERAL
+-- `appendItem` chain (every node `lit`-marked, bottoming at `SLit []`) ⇒ the
+-- array literal. parser-substrate Phase 7k Class A: a genuine `appendItem`
+-- application (`appendItem entry []` / `appendItem x [1]`) is NOT lit-marked, so
+-- collectList returns Nothing for it and it stays `{call:["appendItem",…]}` —
+-- byte-matching the TS oracle. Before the marker, list-literal Syntax and
+-- appendItem-call Syntax were IDENTICAL (the parser emits the same
+-- `SCall appendItem [item, acc]` for both), so the marshal could not distinguish
+-- them and flattened the call to an array too. The marker is the disambiguator;
+-- `s` (the original SCall, carrying `lit`) is threaded so collectList can read it.
+@label "SCall to JSON Logic"
+@description "Lower an SCall: `{call: [fnId, …args]}` normally, but a `lit`-marked `appendItem` chain bottoming at `SLit []` (a list-literal desugar) flattens to the array literal it desugared from (collectList). A genuine `appendItem` application is unmarked ⇒ stays a call (parser-substrate Phase 7k Class A). parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+sCallToJl : (s: a) -> (f: String) -> (args: a) -> a
+sCallToJl s f args =
+  if eq s.identityHead.identity true
+  then mapSet {} "call" (concat (appendItem (syntaxToJsonLogic s.identityHead) []) (map syntaxToJsonLogic args))
+  else if and (elem f ["if", "?:", "and", "or"]) (eq (lookup s "structural") (Just true))
+  then mapSet {} f (map syntaxToJsonLogic args)
+  else if eq f "appendItem"
+  then
+    case collectList s of
+      Just lst -> lst
+      Nothing -> mapSet {} "call" (concat (appendItem f []) (map syntaxToJsonLogic args))
+  else mapSet {} "call" (concat (appendItem f []) (map syntaxToJsonLogic args))
+
+-- collectList — recognise a LIST-LITERAL `appendItem` chain (each node
+-- `lit`-marked, bottoming at `SLit []`) and rebuild the source array (items in
+-- source order). Returns `Just [items]` or `Nothing` (NOT a list-literal chain —
+-- e.g. a genuine `appendItem` call, whose nodes carry NO `lit` marker, or whose
+-- rest is a var). `appendItem item rest` puts `item` LAST, so the collected rest
+-- is the earlier items in order; append the marshalled item ⇒ source order
+-- preserved. The chain bottom from the parser is always `SLit []`. parser-
+-- substrate Phase 7k Class A added the `lit`-marker guard (`eq s.lit true` — an
+-- absent marker reads as `null`, `eq null true` ⇒ false ⇒ a genuine call).
+@label "Collect list chain"
+@description "Recognise a LIST-LITERAL appendItem chain (every node `lit`-marked, bottoming at `SLit []`) and rebuild the source array literal (items in order). Returns Just [items] for a list-literal chain, Nothing otherwise — a genuine appendItem call (unmarked nodes) or a non-list rest stays a call. parser-substrate Phase 5a / Phase 7k Class A."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a" "phase-7k"
+@category "engine-internal"
+collectList : (s: a) -> a
+collectList s =
+  case s of
+    SLit { value = v } -> if eq (length v) 0 then Just [] else Nothing
+    SCall { fnId = f, args = a } ->
+      if and (and (eq f "appendItem") (eq s.lit true)) (eq (length a) 2)
+      then
+        case collectList (at a 1) of
+          Just rest -> Just (appendItem (syntaxToJsonLogic (at a 0)) rest)
+          Nothing -> Nothing
+      else Nothing
+    other -> Nothing
+
+-- sRecordToJl — fold SRecord fields into a plain JSON object (mapSet per field;
+-- empty ⇒ {}). Authored via mapSet (dynamic keys; the single-key `{k=v}`
+-- compile-collapse is avoided — see decl-grammar's opaque-arm note).
+@label "SRecord to JSON Logic"
+@description "Fold SRecord fields `[{name, value}]` into a plain JSON object via mapSet (empty ⇒ {}). parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+sRecordToJl : (fields: a) -> (acc: a) -> a
+sRecordToJl fields acc =
+  case head fields of
+    Nothing -> acc
+    Just f -> sRecordToJl (tailOr fields) (mapSet acc f.name (syntaxToJsonLogic f.value))
+
+-- sLetToDo — lower SLet to the `{do: [{let: bindsObj}, …bodyExprs]}` re-flatten
+-- (inverse of jlsDoOp's collectLeadingLets re-nest). bodyExprs = the SDo exprs
+-- when body is SDo, else the single marshalled body.
+@label "SLet to do-list"
+@description "Lower SLet to the JSON-Logic do-frame list `[{let: bindingsObj}, …bodyExprs]` (inverse of jlsDoOp's leading-let re-nest). Body=SDo spreads its exprs; any other body is a single trailing expr. parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+sLetToDo : (bindings: a) -> (body: a) -> a
+sLetToDo bindings body =
+  let letItems = map bindingToLetItem bindings
+  let bodyExprs =
+        case body of
+          SDo { exprs = xs } -> map syntaxToJsonLogic xs
+          other -> appendItem (syntaxToJsonLogic body) []
+  concat letItems bodyExprs
+
+-- bindingToLetItem — one let binding `{name, value}` ⇒ a SEPARATE `{let:
+-- {name: value}}` do-item. The TS parser emits one single-binding `{let}` per
+-- SOURCE `let` statement (NOT a merged multi-binding object), and the Fenel
+-- parser folds consecutive lets into ONE SLet with multiple bindings (the
+-- collectLeadingLets mirror) — so the inverse must re-split them one-per-item.
+@label "Binding to let item"
+@description "Lower one SLet binding `{name, value}` to a separate `{let: {name: value}}` do-item (the TS parser emits one single-binding `{let}` per source `let` statement; the Fenel parser merges consecutive lets into one SLet, so the inverse re-splits). parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+bindingToLetItem : (b: a) -> a
+bindingToLetItem b = mapSet {} "let" (mapSet {} b.name (syntaxToJsonLogic b.value))
+
+-- sMatchArgs — flatten SMatch into the `{match: [scrut, pat0, body0, …]}` arg
+-- list. Each arm contributes [pattern (RAW Pattern value), marshalled body].
+@label "SMatch args"
+@description "Flatten SMatch into the JSON-Logic match arg list `[scrutinee, pattern0, body0, …]`. Patterns are RAW Pattern ADT values (the TS marshal authors their `$tag`/`$bind`); bodies are lowered. parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+sMatchArgs : (scrut: a) -> (arms: a) -> a
+sMatchArgs scrut arms = concat (appendItem (syntaxToJsonLogic scrut) []) (matchArmsFlat arms)
+
+@label "Match arms flatten"
+@description "Walk SMatch arms `[{pattern, body}]` into the flat `[pattern0, body0, pattern1, body1, …]` tail (pattern normalized for the existing marshal, body lowered). Canonical PatWildcard lowers recursively to operational PatLit \"_\". A trailing unguarded wildcard drops its pattern and emits the bare default body; guarded, nested and nontrailing wildcards keep their pattern. parser-substrate Phase 5a (the `_`-arm drop: Phase 4h)."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a" "phase-4h"
+@category "engine-internal"
+matchArmsFlat : (arms: a) -> a
+matchArmsFlat arms =
+  case head arms of
+    Nothing -> []
+    Just arm ->
+      let rest = matchArmsFlat (tailOr arms)
+      let bodyJl = syntaxToJsonLogic arm.body
+      let pattern = matchPatternForJsonLogic arm.pattern
+      case lookup arm "guard" of
+        Just g -> concat (appendItem bodyJl (appendItem (guardMarker pattern (syntaxToJsonLogic g)) [])) rest
+        Nothing ->
+          if and (eq (length arms) 1) (isWildcardPat pattern)
+          then concat (appendItem bodyJl []) rest
+          else concat (appendItem bodyJl (appendItem pattern [])) rest
+
+@label "Match pattern for JSON Logic"
+@description "Lower canonical PatWildcard to operational PatLit \"_\" recursively at the match-pattern boundary. Constructor arguments recurse while all other constructor fields, including resolved field identity metadata, are preserved for the existing marshal."
+@tags "engine" "internal" "parser" "loader"
+@category "engine-internal"
+matchPatternForJsonLogic : (pattern: a) -> a
+matchPatternForJsonLogic pattern =
+  case pattern of
+    PatWildcard -> PatLit { value = "_" }
+    PatConstruct { args = args } -> mapSet pattern "args" (map matchPatternForJsonLogic args)
+    other -> other
+
+-- guardMarker — a GUARDED arm (fenel-surface-extensions Phase 3) occupies the
+-- pattern position with the oracle's `{$guard:[pat,cond]}`. `$guard` is a
+-- `$`-key a Fenel body cannot author, so this emits a RAW `PatGuard` marker
+-- (the SAME discipline as the raw Pattern values left for the TS marshal) that
+-- the ONE ledgered match-pattern marshal (`marshalPatterns`, engine-bodies-
+-- dispatch.ts) authors into `{$guard:[<marshalled pat>, cond]}`. `pat` rides as
+-- a raw Pattern ADT value (marshalled to `$tag`/`$bind`/`"_"`); `cond` is the
+-- already-lowered guard JSON-Logic (passes through the marshal — nested match
+-- patterns inside it, if any, marshal too).
+@label "Guard marker"
+@description "Emit the raw `PatGuard { pat, cond }` marker for a guarded match arm — the pattern-position carrier the ledgered match-pattern marshal authors into `{$guard:[pat,cond]}`. `pat` is a raw Pattern ADT value; `cond` is the lowered guard JSON-Logic. fenel-surface-extensions Phase 3."
+@tags "engine" "internal" "parser" "loader" "fenel-surface-extensions" "phase-3"
+@category "engine-internal"
+guardMarker : (pat: a) -> (cond: a) -> a
+guardMarker pat cond = PatGuard { pat = pat, cond = cond }
+
+-- isWildcardPat — recognise the `_` catch-all pattern (`buildConPat` lowers the
+-- bare ident `_` ⇒ `PatLit { value = "_" }` — same shape a string-literal `"_"`
+-- pattern takes, and what TS authors as the bare string `"_"` in sub-positions;
+-- TS DROPS it as a trailing ARM). Total. NB a (never-occurring) trailing
+-- string-literal `"_"` arm would also drop — a documented theoretical fence.
+@label "Is wildcard pattern"
+@description "True when a match-arm pattern is the `_` catch-all (`PatLit { value = \"_\" }`) — the trailing such arm drops its pattern to match TS-parse. parser-substrate Phase 4h."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-4h"
+@category "engine-internal"
+isWildcardPat : (p: a) -> Boolean
+isWildcardPat p =
+  case p of
+    PatLit { value = v } -> eq v "_"
+    other -> false
+
+
+-- =========================================================================
+-- Signature-substrate Phase 2 — declaration-scoped source type binding.
+--
+-- Type grammar markers are intentionally spelling-only. This Fenel-owned pass
+-- assigns declaration-local binders, infers their simple arrow kinds from use,
+-- distinguishes scheme applications from value-dependent applications, and
+-- retains structured diagnostics for lowercase identifiers outside a valid
+-- binder scope. The TS parser contains the one sanctioned byte-equivalent
+-- performance mirror; the loader marshal only authors `$` keys/tags.
+-- =========================================================================
+
+@category "engine-internal"
+sourceTypeLowerName : (name: String) -> Boolean
+sourceTypeLowerName name = and (isLowerInitName name) (not (contains name "."))
+
+@category "engine-internal"
+sourceTypePath : (path: a) -> (segment: String) -> a
+sourceTypePath path segment = appendItem segment path
+
+@category "engine-internal"
+sourceTypeAddName : (name: String) -> (names: a) -> a
+sourceTypeAddName name names = if elem name names then names else appendItem name names
+
+@category "engine-internal"
+sourceTypeKind : (arity: Number) -> a
+sourceTypeKind arity =
+  if eq arity 0
+  then { tag = "KType" }
+  else { tag = "KArrow", input = { tag = "KType" }, output = sourceTypeKind (sub arity 1) }
+
+@category "engine-internal"
+sourceTypeDiagnostic : (code: String) -> (declaration: String) -> (path: a) -> (spelling: String) -> (message: String) -> a
+sourceTypeDiagnostic code declaration path spelling message =
+  { code = code, declaration = declaration, path = path, spelling = spelling, message = message }
+
+@category "engine-internal"
+sourceTypeAddUse : (state: a) -> (name: String) -> (arity: Number) -> (path: a) -> a
+sourceTypeAddUse state name arity path =
+  { names = sourceTypeAddName name state.names,
+    uses = appendItem { name = name, arity = arity, path = path } state.uses,
+    diagnostics = state.diagnostics,
+    applications = state.applications }
+
+@category "engine-internal"
+sourceTypeAddDiagnostic : (state: a) -> (diagnostic: a) -> a
+sourceTypeAddDiagnostic state diagnostic =
+  { names = state.names,
+    uses = state.uses,
+    diagnostics = appendItem diagnostic state.diagnostics,
+    applications = state.applications }
+
+@category "engine-internal"
+sourceTypeAddApplication : (state: a) -> (application: a) -> a
+sourceTypeAddApplication state application =
+  { names = state.names,
+    uses = state.uses,
+    diagnostics = state.diagnostics,
+    applications = appendItem application state.applications }
+
+@category "engine-internal"
+sourceTypeMarkerKind : (value: a) -> String
+sourceTypeMarkerKind value =
+  case lookup value "mk" of
+    Nothing -> ""
+    Just kind -> kind
+
+@category "engine-internal"
+sourceTypeArgIsValue : (arg: a) -> (valueNames: a) -> Boolean
+sourceTypeArgIsValue arg valueNames =
+  let kind = sourceTypeMarkerKind arg
+  if eq kind ""
+  then true
+  else if eq kind "valexpr"
+  then true
+  else if eq kind "value"
+  then true
+  else if eq kind "ref"
+  then elem arg.name valueNames
+  else false
+
+@category "engine-internal"
+sourceTypeArgIsType : (arg: a) -> (valueNames: a) -> Boolean
+sourceTypeArgIsType arg valueNames =
+  let kind = sourceTypeMarkerKind arg
+  if eq kind ""
+  then false
+  else if eq kind "valexpr"
+  then false
+  else if eq kind "value"
+  then false
+  else if eq kind "ref"
+  then not (elem arg.name valueNames)
+  else true
+
+@category "engine-internal"
+sourceTypeArgsHaveValue : (args: a) -> (valueNames: a) -> Boolean
+sourceTypeArgsHaveValue args valueNames =
+  case head args of
+    Nothing -> false
+    Just arg ->
+      if sourceTypeArgIsValue arg valueNames
+      then true
+      else sourceTypeArgsHaveValue (tailOr args) valueNames
+
+@category "engine-internal"
+sourceTypeArgsHaveType : (args: a) -> (valueNames: a) -> Boolean
+sourceTypeArgsHaveType args valueNames =
+  case head args of
+    Nothing -> false
+    Just arg ->
+      if sourceTypeArgIsType arg valueNames
+      then true
+      else sourceTypeArgsHaveType (tailOr args) valueNames
+
+@category "engine-internal"
+sourceTypeKnownExpandedHead : (name: String) -> (arity: Number) -> Boolean
+sourceTypeKnownExpandedHead name arity =
+  if or (eq name "List") (or (eq name "Maybe") (eq name "Verified"))
+  then eq arity 1
+  else if or (eq name "Result") (or (eq name "Map") (eq name "Tagged"))
+  then eq arity 2
+  else false
+
+-- The source binder runs before the TS marshal expands the seven canonical
+-- container markers. Application and diagnostic paths nevertheless target the
+-- final compatibility type, so explicit arguments must enter the exact slot
+-- that walkType/liftGenericApp will author. Map's key argument is intentionally
+-- absent from that compatibility shape (the parser's historical String-key
+-- heuristic); every other canonical argument remains visible.
+@category "engine-internal"
+sourceTypePathMany : (path: a) -> (segments: a) -> a
+sourceTypePathMany path segments =
+  case head segments of
+    Nothing -> path
+    Just segment -> sourceTypePathMany (sourceTypePath path segment) (tailOr segments)
+
+@category "engine-internal"
+sourceTypeExpandedArgVisible : (name: String) -> (index: Number) -> Boolean
+sourceTypeExpandedArgVisible name index =
+  if eq name "Map" then eq index 1
+  else not (eq name "EntityRef")
+
+@category "engine-internal"
+sourceTypeApplicationArgPath : (name: String) -> (index: Number) -> (path: a) -> a
+sourceTypeApplicationArgPath name index path =
+  if eq name "List"
+  then sourceTypePathMany path ["$opaque", "pure", "$variant", "cases", "1", "fields", "0", "type"]
+  else if eq name "Maybe"
+  then sourceTypePathMany path ["$variant", "cases", "1", "fields", "0", "type"]
+  else if eq name "Result"
+  then sourceTypePathMany path ["$variant", "cases", toString index, "fields", "0", "type"]
+  else if eq name "Verified"
+  then sourceTypePathMany path ["$variant", "cases", "0", "fields", "0", "type"]
+  else if eq name "Map"
+  then sourceTypePathMany path ["$map", "values"]
+  else if eq name "Tagged"
+  then if eq index 0
+       then sourceTypePathMany path ["$tagged", "value"]
+       else sourceTypePathMany path ["$tagged", "phantom"]
+  else sourceTypePathMany path ["$el", "call", toString (add index 1)]
+
+@category "engine-internal"
+sourceTypeValueNames : (marker: a) -> a
+sourceTypeValueNames marker = sourceTypeValueNamesGo marker []
+
+@category "engine-internal"
+sourceTypeValueNamesGo : (marker: a) -> (names: a) -> a
+sourceTypeValueNamesGo marker names =
+  let kind = sourceTypeMarkerKind marker
+  if eq kind "arrow"
+  then
+    let afterParams = sourceTypeValueNamesParams marker.params names
+    sourceTypeValueNamesGo marker.ret afterParams
+  else if eq kind "app"
+  then sourceTypeValueNamesList marker.args names
+  else if eq kind "tuple"
+  then sourceTypeValueNamesList marker.items names
+  else if eq kind "record"
+  then sourceTypeValueNamesFields marker.fields names
+  else if eq kind "refined"
+  then sourceTypeValueNamesPredicate (sourceTypePredicate marker.set) (sourceTypeValueNamesGo marker.base names)
+  else names
+
+-- Predicate expressions carry ordinary annotations too. Walk their lowered
+-- JSON Logic only for embedded type markers, using the final expression paths.
+@category "engine-internal"
+sourceTypePredicate : (set: a) -> a
+sourceTypePredicate set =
+  if eq set.mk "where"
+  then
+    let lowered = lowerRefinedSet set
+    if eq lowered.mk "identity-expression-refused" then lowered else lowered.jl
+  else false
+
+@category "engine-internal"
+sourceTypePredicateScalar : (value: a) -> Boolean
+sourceTypePredicateScalar value =
+  or (isNull value) (or (isBoolean value) (or (isNumber value) (isString value)))
+
+@category "engine-internal"
+sourceTypePredicateAnnotation : (value: a) -> Maybe a
+sourceTypePredicateAnnotation value =
+  if eq (length (entries value)) 1
+  then
+    case lookup value "ann" of
+      Just pair -> if and (isArray pair) (eq (length pair) 2) then Just pair else Nothing
+      Nothing -> Nothing
+  else Nothing
+
+@category "engine-internal"
+sourceTypeValueNamesPredicate : (value: a) -> (names: a) -> a
+sourceTypeValueNamesPredicate value names =
+  if sourceTypePredicateScalar value then names
+  else if isArray value then fold (\acc item -> sourceTypeValueNamesPredicate item acc) names value
+  else
+    case sourceTypePredicateAnnotation value of
+      Just pair -> sourceTypeValueNamesPredicate (at pair 0) (sourceTypeValueNamesGo (at pair 1) names)
+      Nothing -> fold (\acc pair -> sourceTypeValueNamesPredicate pair.value acc) names (entries value)
+
+@category "engine-internal"
+sourceTypeValueNamesParams : (params: a) -> (names: a) -> a
+sourceTypeValueNamesParams params names =
+  case head params of
+    Nothing -> names
+    Just param ->
+      let nextNames = if param.named then sourceTypeAddName param.name names else names
+      sourceTypeValueNamesParams (tailOr params) (sourceTypeValueNamesGo param.type nextNames)
+
+@category "engine-internal"
+sourceTypeValueNamesList : (items: a) -> (names: a) -> a
+sourceTypeValueNamesList items names =
+  case head items of
+    Nothing -> names
+    Just item -> sourceTypeValueNamesList (tailOr items) (sourceTypeValueNamesGo item names)
+
+@category "engine-internal"
+sourceTypeValueNamesFields : (fields: a) -> (names: a) -> a
+sourceTypeValueNamesFields fields names =
+  case head fields of
+    Nothing -> names
+    Just field -> sourceTypeValueNamesFields (tailOr fields) (sourceTypeValueNamesGo field.type names)
+
+@category "engine-internal"
+sourceTypeCollect : (marker: a) -> (path: a) -> (valueNames: a) -> (binderNames: a) -> (declaration: String) -> (selfName: String) -> (state: a) -> a
+sourceTypeCollect marker path valueNames binderNames declaration selfName state =
+  let kind = sourceTypeMarkerKind marker
+  if eq kind "ref"
+  then
+    if or (sourceTypeLowerName marker.name) (elem marker.name binderNames)
+    then sourceTypeAddUse state marker.name 0 path
+    else state
+  else if eq kind "var"
+  then sourceTypeAddUse state marker.name 0 path
+  else if eq kind "app"
+  then
+    if and (not (eq selfName "")) (eq marker.head selfName)
+    then state
+    else
+      let hasValue = sourceTypeArgsHaveValue marker.args valueNames
+      let hasType = sourceTypeArgsHaveType marker.args valueNames
+      let entityRefArg =
+            case head marker.args of
+              Nothing -> false
+              Just arg -> or (isString arg) (eq (sourceTypeMarkerKind arg) "strlit")
+      let expanded =
+            if eq marker.head "EntityRef"
+            then and (eq (length marker.args) 1) entityRefArg
+            else sourceTypeKnownExpandedHead marker.head (length marker.args)
+      -- Canonical containers always remain type applications. A same-spelled
+      -- named arrow parameter must not turn `List a` into a dependent value app.
+      let isScheme = or expanded (not hasValue)
+      let state1 =
+            if and (sourceTypeLowerName marker.head) (and hasValue hasType)
+            then sourceTypeAddDiagnostic state (sourceTypeDiagnostic "AmbiguousDependentApplication" declaration path marker.head (concat "lowercase application " (concat marker.head " mixes type and value arguments")))
+            else state
+      let state2 =
+            if and isScheme (or (sourceTypeLowerName marker.head) (elem marker.head binderNames))
+            then sourceTypeAddUse state1 marker.head (length marker.args) path
+            else state1
+      let state3 =
+            if and isScheme (not expanded)
+            then sourceTypeAddApplication state2 { path = path, headName = marker.head, args = marker.args, arity = length marker.args }
+            else state2
+      sourceTypeCollectArgs marker.args 0 marker.head path valueNames binderNames declaration selfName state3 isScheme expanded
+  else if eq kind "arrow"
+  then
+    let afterParams = sourceTypeCollectParams marker.params 0 path valueNames binderNames declaration selfName state
+    sourceTypeCollect marker.ret (sourceTypePath (sourceTypePath path "$arrow") "returns") valueNames binderNames declaration selfName afterParams
+  else if eq kind "tuple"
+  then sourceTypeCollectList marker.items 0 (sourceTypePath path "$tuple") valueNames binderNames declaration selfName state
+  else if eq kind "record"
+  then sourceTypeCollectFields marker.fields 0 (sourceTypePath (sourceTypePath path "$record") "fields") valueNames binderNames declaration selfName state
+  else if eq kind "refined"
+  then
+    let afterBase = sourceTypeCollect marker.base (sourceTypePathMany path ["$refined", "base"]) valueNames binderNames declaration selfName state
+    sourceTypeCollectPredicate (sourceTypePredicate marker.set) (sourceTypePathMany path ["$refined", "set", "pred"]) valueNames binderNames declaration selfName afterBase
+  else state
+
+@category "engine-internal"
+sourceTypeCollectPredicate : (value: a) -> (path: a) -> (valueNames: a) -> (binderNames: a) -> (declaration: String) -> (selfName: String) -> (state: a) -> a
+sourceTypeCollectPredicate value path valueNames binderNames declaration selfName state =
+  if sourceTypePredicateScalar value then state
+  else if isArray value then sourceTypeCollectPredicateList value 0 path valueNames binderNames declaration selfName state
+  else
+    case sourceTypePredicateAnnotation value of
+      Just pair ->
+        let afterExpr = sourceTypeCollectPredicate (at pair 0) (sourceTypePathMany path ["ann", "0"]) valueNames binderNames declaration selfName state
+        sourceTypeCollect (at pair 1) (sourceTypePathMany path ["ann", "1"]) valueNames binderNames declaration selfName afterExpr
+      Nothing -> fold (\acc pair -> sourceTypeCollectPredicate pair.value (sourceTypePath path pair.key) valueNames binderNames declaration selfName acc) state (entries value)
+
+@category "engine-internal"
+sourceTypeCollectPredicateList : (items: a) -> (index: Number) -> (path: a) -> (valueNames: a) -> (binderNames: a) -> (declaration: String) -> (selfName: String) -> (state: a) -> a
+sourceTypeCollectPredicateList items index path valueNames binderNames declaration selfName state =
+  case head items of
+    Nothing -> state
+    Just item ->
+      let next = sourceTypeCollectPredicate item (sourceTypePath path (toString index)) valueNames binderNames declaration selfName state
+      sourceTypeCollectPredicateList (tailOr items) (add index 1) path valueNames binderNames declaration selfName next
+
+@category "engine-internal"
+sourceTypeCollectArgs : (args: a) -> (index: Number) -> (name: String) -> (path: a) -> (valueNames: a) -> (binderNames: a) -> (declaration: String) -> (selfName: String) -> (state: a) -> (scheme: Boolean) -> (expanded: Boolean) -> a
+sourceTypeCollectArgs args index name path valueNames binderNames declaration selfName state scheme expanded =
+  case head args of
+    Nothing -> state
+    Just arg ->
+      let visible = if expanded then sourceTypeExpandedArgVisible name index else true
+      let next =
+            if and visible (or scheme (sourceTypeArgIsType arg valueNames))
+            then sourceTypeCollect arg (if expanded then sourceTypeApplicationArgPath name index path else sourceTypePathMany path ["$el", "call", toString (add index 1)]) valueNames binderNames declaration selfName state
+            else state
+      sourceTypeCollectArgs (tailOr args) (add index 1) name path valueNames binderNames declaration selfName next scheme expanded
+
+@category "engine-internal"
+sourceTypeCollectParams : (params: a) -> (index: Number) -> (path: a) -> (valueNames: a) -> (binderNames: a) -> (declaration: String) -> (selfName: String) -> (state: a) -> a
+sourceTypeCollectParams params index path valueNames binderNames declaration selfName state =
+  case head params of
+    Nothing -> state
+    Just param ->
+      let paramPath = sourceTypePath (sourceTypePath (sourceTypePath (sourceTypePath path "$arrow") "params") (toString index)) "type"
+      let next = sourceTypeCollect param.type paramPath valueNames binderNames declaration selfName state
+      sourceTypeCollectParams (tailOr params) (add index 1) path valueNames binderNames declaration selfName next
+
+@category "engine-internal"
+sourceTypeCollectList : (items: a) -> (index: Number) -> (path: a) -> (valueNames: a) -> (binderNames: a) -> (declaration: String) -> (selfName: String) -> (state: a) -> a
+sourceTypeCollectList items index path valueNames binderNames declaration selfName state =
+  case head items of
+    Nothing -> state
+    Just item ->
+      let next = sourceTypeCollect item (sourceTypePath path (toString index)) valueNames binderNames declaration selfName state
+      sourceTypeCollectList (tailOr items) (add index 1) path valueNames binderNames declaration selfName next
+
+@category "engine-internal"
+sourceTypeCollectFields : (fields: a) -> (index: Number) -> (path: a) -> (valueNames: a) -> (binderNames: a) -> (declaration: String) -> (selfName: String) -> (state: a) -> a
+sourceTypeCollectFields fields index path valueNames binderNames declaration selfName state =
+  case head fields of
+    Nothing -> state
+    Just field ->
+      let fieldPath = sourceTypePath (sourceTypePath path (toString index)) "type"
+      let next = sourceTypeCollect field.type fieldPath valueNames binderNames declaration selfName state
+      sourceTypeCollectFields (tailOr fields) (add index 1) path valueNames binderNames declaration selfName next
+
+@category "engine-internal"
+sourceTypeUsesFor : (name: String) -> (uses: a) -> a
+sourceTypeUsesFor name uses = filter (\use -> eq use.name name) uses
+
+@category "engine-internal"
+sourceTypeFirstArity : (name: String) -> (uses: a) -> Number
+sourceTypeFirstArity name uses =
+  case head (sourceTypeUsesFor name uses) of
+    Nothing -> 0
+    Just use -> use.arity
+
+@category "engine-internal"
+sourceTypeKindMismatch : (name: String) -> (arity: Number) -> (uses: a) -> a
+sourceTypeKindMismatch name arity uses =
+  filter (\use -> and (eq use.name name) (not (eq use.arity arity))) uses
+
+@category "engine-internal"
+sourceTypeQuantifiers : (names: a) -> (uses: a) -> (declaration: String) -> a
+sourceTypeQuantifiers names uses declaration = sourceTypeQuantifiersGo names uses declaration 0 [] []
+
+@category "engine-internal"
+sourceTypeQuantifiersGo : (names: a) -> (uses: a) -> (declaration: String) -> (index: Number) -> (quantified: a) -> (diagnostics: a) -> a
+sourceTypeQuantifiersGo names uses declaration index quantified diagnostics =
+  case head names of
+    Nothing -> { quantified = quantified, diagnostics = diagnostics }
+    Just name ->
+      let arity = sourceTypeFirstArity name uses
+      let variable = { id = concat "q" (toString index), sourceName = name, kind = sourceTypeKind arity }
+      let mismatches = sourceTypeKindMismatch name arity uses
+      let currentDiagnostics = map (\mismatch -> sourceTypeDiagnostic "KindMismatch" declaration mismatch.path name (concat "type variable " (concat name (concat " is used at incompatible kind arities " (concat (toString arity) (concat " and " (toString mismatch.arity))))))) mismatches
+      let nextDiagnostics = concat diagnostics currentDiagnostics
+      sourceTypeQuantifiersGo (tailOr names) uses declaration (add index 1) (appendItem variable quantified) nextDiagnostics
+
+@category "engine-internal"
+sourceTypeUnboundDiagnostics : (names: a) -> (bound: a) -> (uses: a) -> (declaration: String) -> a
+sourceTypeUnboundDiagnostics names bound uses declaration =
+  case head names of
+    Nothing -> []
+    Just name ->
+      let rest = sourceTypeUnboundDiagnostics (tailOr names) bound uses declaration
+      let current =
+            if elem name bound
+            then []
+            else map (\use -> sourceTypeDiagnostic "UnboundTypeIdentifier" declaration use.path name (concat "unbound lowercase type identifier " (concat name (concat " in declaration " declaration)))) (sourceTypeUsesFor name uses)
+      concat current rest
+
+@category "engine-internal"
+sourceTypeBinderNames : (quantified: a) -> a
+sourceTypeBinderNames quantified = map (\variable -> variable.sourceName) quantified
+
+@category "engine-internal"
+sourceTypeApplication : (application: a) -> (quantified: a) -> (bound: a) -> a
+sourceTypeApplication application quantified bound =
+  let args = sourceTypeRewriteArgs application.args bound [] "" true
+  case find (\variable -> eq variable.sourceName application.headName) quantified of
+    Nothing ->
+      { path = application.path,
+        headRef = application.headName,
+        args = args,
+        kind = sourceTypeKind application.arity }
+    Just variable ->
+      { path = application.path,
+        headVarId = variable.id,
+        args = args,
+        kind = variable.kind }
+
+@category "engine-internal"
+sourceTypeApplications : (applications: a) -> (quantified: a) -> (bound: a) -> a
+sourceTypeApplications applications quantified bound =
+  map (\application -> sourceTypeApplication application quantified bound) applications
+
+@category "engine-internal"
+sourceTypeRewrite : (marker: a) -> (bound: a) -> (valueNames: a) -> (selfName: String) -> a
+sourceTypeRewrite marker bound valueNames selfName =
+  let kind = sourceTypeMarkerKind marker
+  if eq kind "ref"
+  then if elem marker.name bound then { mk = "var", name = marker.name } else marker
+  else if eq kind "var"
+  then marker
+  else if eq kind "app"
+  then
+    if and (not (eq selfName "")) (eq marker.head selfName)
+    then marker
+    else
+      let entityRefArg =
+            case head marker.args of
+              Nothing -> false
+              Just arg -> or (isString arg) (eq (sourceTypeMarkerKind arg) "strlit")
+      let expanded =
+            if eq marker.head "EntityRef"
+            then and (eq (length marker.args) 1) entityRefArg
+            else sourceTypeKnownExpandedHead marker.head (length marker.args)
+      let scheme = or expanded (not (sourceTypeArgsHaveValue marker.args valueNames))
+      let args = sourceTypeRewriteArgs marker.args bound valueNames selfName scheme
+      mapSet (mapSet marker "args" args) "role" (if scheme then "scheme" else "dependent")
+  else if eq kind "arrow"
+  then mapSet (mapSet marker "params" (map (\param -> mapSet param "type" (sourceTypeRewrite param.type bound valueNames selfName)) marker.params)) "ret" (sourceTypeRewrite marker.ret bound valueNames selfName)
+  else if eq kind "tuple"
+  then mapSet marker "items" (map (\item -> sourceTypeRewrite item bound valueNames selfName) marker.items)
+  else if eq kind "record"
+  then mapSet marker "fields" (map (\field -> mapSet field "type" (sourceTypeRewrite field.type bound valueNames selfName)) marker.fields)
+  else if eq kind "refined"
+  then
+    let set = marker.set
+    let rewrittenSet = if eq set.mk "where" then { mk = "where", jl = sourceTypeRewritePredicate (sourceTypePredicate set) bound valueNames selfName } else set
+    mapSet (mapSet marker "base" (sourceTypeRewrite marker.base bound valueNames selfName)) "set" rewrittenSet
+  else marker
+
+@category "engine-internal"
+sourceTypeRewritePredicate : (value: a) -> (bound: a) -> (valueNames: a) -> (selfName: String) -> a
+sourceTypeRewritePredicate value bound valueNames selfName =
+  if sourceTypePredicateScalar value then value
+  else if isArray value then map (\item -> sourceTypeRewritePredicate item bound valueNames selfName) value
+  else
+    case sourceTypePredicateAnnotation value of
+      Just pair -> mapSet {} "ann" [sourceTypeRewritePredicate (at pair 0) bound valueNames selfName, sourceTypeRewrite (at pair 1) bound valueNames selfName]
+      Nothing -> fold (\acc pair -> mapSet acc pair.key (sourceTypeRewritePredicate pair.value bound valueNames selfName)) {} (entries value)
+
+@category "engine-internal"
+sourceTypeRewriteArgs : (args: a) -> (bound: a) -> (valueNames: a) -> (selfName: String) -> (scheme: Boolean) -> a
+sourceTypeRewriteArgs args bound valueNames selfName scheme =
+  case head args of
+    Nothing -> []
+    Just arg ->
+      let rewritten =
+            if and (not scheme) (and (eq (sourceTypeMarkerKind arg) "ref") (elem arg.name valueNames))
+            then { mk = "value", name = arg.name }
+            else if or scheme (sourceTypeArgIsType arg valueNames)
+            then sourceTypeRewrite arg bound valueNames selfName
+            else arg
+      concat (appendItem rewritten []) (sourceTypeRewriteArgs (tailOr args) bound valueNames selfName scheme)
+
+@category "engine-internal"
+sourceBindSignature : (declaration: String) -> (marker: a) -> a
+sourceBindSignature declaration marker =
+  let valueNames = sourceTypeValueNames marker
+  let initial = { names = [], uses = [], diagnostics = [], applications = [] }
+  let collected = sourceTypeCollect marker [] valueNames [] declaration "" initial
+  let built = sourceTypeQuantifiers collected.names collected.uses declaration
+  let diagnostics = concat collected.diagnostics built.diagnostics
+  let boundNames = sourceTypeBinderNames built.quantified
+  let body = sourceTypeRewrite marker boundNames valueNames ""
+  { type = body,
+    scheme = { quantified = built.quantified, body = body, applications = sourceTypeApplications collected.applications built.quantified boundNames, diagnostics = diagnostics } }
+
+@category "engine-internal"
+sourceTypeCollectCtorFields : (fields: a) -> (ctorIndex: Number) -> (fieldIndex: Number) -> (valueNames: a) -> (binderNames: a) -> (declaration: String) -> (selfName: String) -> (state: a) -> a
+sourceTypeCollectCtorFields fields ctorIndex fieldIndex valueNames binderNames declaration selfName state =
+  case head fields of
+    Nothing -> state
+    Just field ->
+      let path = ["constructors", toString ctorIndex, "fields", toString fieldIndex, "type"]
+      let next = sourceTypeCollect field.type path valueNames binderNames declaration selfName state
+      sourceTypeCollectCtorFields (tailOr fields) ctorIndex (add fieldIndex 1) valueNames binderNames declaration selfName next
+
+@category "engine-internal"
+sourceTypeCollectCtors : (ctors: a) -> (ctorIndex: Number) -> (binderNames: a) -> (declaration: String) -> (selfName: String) -> (state: a) -> a
+sourceTypeCollectCtors ctors ctorIndex binderNames declaration selfName state =
+  case head ctors of
+    Nothing -> state
+    Just ctor ->
+      let valueNames = map (\field -> field.name) ctor.fields
+      let withType =
+            case lookup ctor "type" of
+              Nothing -> state
+              Just ty -> sourceTypeCollect ty ["constructors", toString ctorIndex, "type"] valueNames binderNames declaration selfName state
+      let withFields = sourceTypeCollectCtorFields ctor.fields ctorIndex 0 valueNames binderNames declaration selfName withType
+      sourceTypeCollectCtors (tailOr ctors) (add ctorIndex 1) binderNames declaration selfName withFields
+
+@category "engine-internal"
+sourceTypeRewriteCtor : (ctor: a) -> (bound: a) -> (selfName: String) -> a
+sourceTypeRewriteCtor ctor bound selfName =
+  let valueNames = map (\field -> field.name) ctor.fields
+  let withType =
+        case lookup ctor "type" of
+          Nothing -> ctor
+          Just ty -> mapSet ctor "type" (sourceTypeRewrite ty bound valueNames selfName)
+  mapSet withType "fields" (map (\field -> mapSet field "type" (sourceTypeRewrite field.type bound valueNames selfName)) ctor.fields)
+
+@category "engine-internal"
+sourceBindTypeDefinition : (frame: a) -> a
+sourceBindTypeDefinition frame =
+  let initial = { names = [], uses = [], diagnostics = [], applications = [] }
+  let explicit =
+        case lookup frame "params" of
+          Nothing -> []
+          Just params -> params
+  let withCtors =
+        case lookup frame "ctors" of
+          Nothing -> initial
+          Just ctors -> sourceTypeCollectCtors ctors 0 explicit frame.name frame.name initial
+  let withAlias =
+        case lookup frame "alias" of
+          Nothing -> withCtors
+          Just alias -> sourceTypeCollect alias ["alias"] [] explicit frame.name frame.name withCtors
+  let withRefined =
+        case lookup frame "refined" of
+          Nothing -> withAlias
+          Just refined -> sourceTypeCollect refined.base ["refined", "base"] [] explicit frame.name frame.name withAlias
+  let collected =
+        case lookup frame "kindSig" of
+          Nothing -> withRefined
+          Just kindSig -> sourceTypeCollect kindSig ["kindSig"] [] explicit frame.name frame.name withRefined
+  let built = sourceTypeQuantifiers explicit collected.uses frame.name
+  let unbound = sourceTypeUnboundDiagnostics collected.names explicit collected.uses frame.name
+  let diagnostics = concat collected.diagnostics (concat unbound built.diagnostics)
+  let bound = sourceTypeBinderNames built.quantified
+  let withBoundCtors =
+        case lookup frame "ctors" of
+          Nothing -> frame
+          Just ctors -> mapSet frame "ctors" (map (\ctor -> sourceTypeRewriteCtor ctor bound frame.name) ctors)
+  let withBoundAlias =
+        case lookup frame "alias" of
+          Nothing -> withBoundCtors
+          Just alias -> mapSet withBoundCtors "alias" (sourceTypeRewrite alias bound [] frame.name)
+  let withBoundRefined =
+        case lookup frame "refined" of
+          Nothing -> withBoundAlias
+          Just refined -> mapSet withBoundAlias "refined" (mapSet refined "base" (sourceTypeRewrite refined.base bound [] frame.name))
+  let rewritten =
+        case lookup frame "kindSig" of
+          Nothing -> withBoundRefined
+          Just kindSig -> mapSet withBoundRefined "kindSig" (sourceTypeRewrite kindSig bound [] frame.name)
+  { frame = rewritten,
+    binding = { quantified = built.quantified, applications = sourceTypeApplications collected.applications built.quantified bound, diagnostics = diagnostics } }
+
+-- =========================================================================
+-- programToFrames — the program-frame envelope assembly. Map the parser's
+-- `[{frame, directives}]` (parseProgToks output) into the loader's frame list
+-- (`flattenProgram(parse src)` shape): `{type_sig|def|type_def|module_decl:…}`.
+-- Bodies via syntaxToJsonLogic; types left as `{mk}` markers (TS walkType);
+-- the `@discriminator` directive lifts to the type_def `discriminator` slot;
+-- optional keys (directives / params) omitted when empty (TS-parse parity).
+-- All `$`-FREE ⇒ Fenel-bodied. parser-substrate Phase 5a.
+-- =========================================================================
+
+@label "Program to frames"
+@description "Map the Fenel parser's program output `[{frame, directives}]` into the loader's frame list (the flattenProgram(parse src) shape): {type_sig|def|type_def|module_decl: …}. Bodies lowered via syntaxToJsonLogic; type slots kept as `{mk}` markers for the TS marshal; @discriminator lifted to the type_def slot; directives/params omitted when empty (TS-parse byte-parity). parser-substrate Phase 5a."
+@tags "engine" "parser" "loader" "parser-substrate" "phase-5a"
+programToFrames : (elements: a) -> a
+programToFrames elements = map elementToFrame elements
+
+@label "Element to frame"
+@description "Map one `{frame, directives}` program element to its loader frame: def ⇒ {def:…}, sig ⇒ {type_sig:…}, module ⇒ {module_decl:…}, typedef ⇒ {type_def:…}, import ⇒ {import_decl:{module,names}} (signature-substrate Phase 4-prep; key order module-then-names matches the TS oracle; a directive-carrying import emits the empty frame the loader marshal REJECTS — mirroring the TS parser's directives-on-import throw). parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+elementToFrame : (el: a) -> a
+elementToFrame el =
+  let f = el.frame
+  let dirs = el.directives
+  if eq f.kind "def"
+  then defFrame f dirs
+  else if eq f.kind "sig"
+  then sigFrame f dirs
+  else if eq f.kind "module"
+  then mapSet {} "module_decl" (mapSet {} "name" f.name)
+  else if eq f.kind "typedef"
+  then typedefFrame f dirs
+  else if eq f.kind "import"
+  then importFrame f dirs
+  else if eq f.kind "fixity"
+  then if eq (length dirs) 0 then { fixity = { op = f.op, assoc = f.assoc, prec = f.prec } } else {}
+  else {}
+
+-- importFrame — signature-substrate Phase 4-prep (D0b). The oracle's
+-- `{import_decl: {module, names}}` with the exact TS key order. Directives do
+-- not attach to imports: the TS parser THROWS ("Directives only apply to
+-- type-decls or function decls"), so a directive-carrying import element
+-- emits the EMPTY frame here and the loader marshal's one-discriminator
+-- check rejects the program — parity of rejection, never silent drop.
+@label "Import frame"
+@description "Assemble the `{import_decl: {module, names}}` loader frame for a structured selective import (key order module-then-names, byte-matching fenel-parser.ts:parseImportDecl). A directive-carrying import emits {} — the loader marshal rejects it, mirroring the TS parser's directives-on-import throw. signature-substrate Phase 4-prep (D0b)."
+@tags "engine" "internal" "parser" "loader" "signature-substrate" "phase-4-prep"
+@category "engine-internal"
+importFrame : (f: a) -> (dirs: a) -> a
+importFrame f dirs =
+  if eq (length dirs) 0
+  then
+    let payload = { module = f.module }
+    let selected = case lookup f "names" of
+      Just names -> mapSet payload "names" names
+      Nothing -> case lookup f "as" of
+        Just alias -> mapSet payload "as" alias
+        Nothing -> case lookup f "hiding" of
+          Just names -> mapSet payload "hiding" names
+          Nothing -> mapSet payload "qualified" true
+    mapSet {} "import_decl" selected
+  else {}
+
+-- addDirs — append the `directives` key only when non-empty (TS-parse parity:
+-- a frame with no directives has NO directives key).
+@label "Add directives key"
+@description "Append a `directives` key to a frame object only when the directive list is non-empty (TS-parse omits the key otherwise). parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+addDirs : (obj: a) -> (dirs: a) -> a
+addDirs obj dirs = if eq (length dirs) 0 then obj else mapSet obj "directives" dirs
+
+@label "Def frame"
+@description "Assemble a `{def: {name, params, body, directives?}}` frame; body lowered via syntaxToJsonLogic. parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+defFrame : (f: a) -> (dirs: a) -> a
+defFrame f dirs =
+  let base = mapSet (mapSet (mapSet {} "name" f.name) "params" f.params) "body" (syntaxToJsonLogic f.body)
+  let sites = syntaxIdentitySites f.body
+  let marked = if eq (length sites) 0 then base else mapSet base "identitySites" sites
+  mapSet {} "def" (addDirs marked dirs)
+
+@label "Syntax identity sites"
+@description "Collect only parser-owned identity SVar sites from expression slots. SLit payloads are opaque data; matching records inside them never become references."
+syntaxIdentitySites : a -> List a
+syntaxIdentitySites s =
+  case s of
+    SLit { value = _ } -> []
+    SVar { name = _ } -> if eq s.identity true then [s] else []
+    SCall { args = args } ->
+      let sites = syntaxIdentityList args
+      if eq s.identityHead.identity true then appendItem s.identityHead sites else sites
+    SConstruct { args = args } -> syntaxIdentityList args
+    SRecord { fields = fields } -> syntaxIdentityFields fields
+    SLambda { body = body } -> syntaxIdentitySites body
+    SMatch { scrutinee = value, arms = arms } -> concat (syntaxIdentitySites value) (syntaxIdentityArms arms)
+    SIf { cond = cond, then = yes, else = no } -> concat (syntaxIdentitySites cond) (concat (syntaxIdentitySites yes) (syntaxIdentitySites no))
+    SLet { bindings = fields, body = body } -> concat (syntaxIdentityFields fields) (syntaxIdentitySites body)
+    SWhere { bindings = fields, body = body } -> concat (syntaxIdentityFields fields) (syntaxIdentitySites body)
+    SDo { exprs = values } -> syntaxIdentityList values
+    SOp { operands = values } -> syntaxIdentityList values
+    SMethod { args = args } -> syntaxIdentityList args
+    SAnn { expr = expr } -> syntaxIdentitySites expr
+    other -> []
+
+@label "Syntax identity list"
+@description "Collect source identity sites across an expression list."
+syntaxIdentityList : List a -> List a
+syntaxIdentityList values = fold (\sites value -> concat sites (syntaxIdentitySites value)) [] values
+
+@label "Syntax identity fields"
+@description "Collect source identity sites from record and binding expression slots."
+syntaxIdentityFields : List a -> List a
+syntaxIdentityFields fields = fold (\sites field -> concat sites (syntaxIdentitySites field.value)) [] fields
+
+@label "Syntax identity arms"
+@description "Collect identity sites from match bodies and guards, leaving pattern data opaque."
+syntaxIdentityArms : List a -> List a
+syntaxIdentityArms arms =
+  fold syntaxIdentityArm [] arms
+
+@label "Syntax identity arm"
+@description "Collect a match arm's expression sites without entering its pattern data."
+syntaxIdentityArm : List a -> b -> List a
+syntaxIdentityArm sites arm =
+  let bodySites = concat sites (syntaxIdentitySites arm.body)
+  case lookup arm "guard" of
+    Nothing -> bodySites
+    Just guard -> concat bodySites (syntaxIdentitySites guard)
+
+@label "Syntax to JSON Logic with identity sites"
+@description "Return the existing Syntax lowering with its explicit identity-site manifest for the dollar-key host marshal. The manifest is parser provenance, never value-shape recognition."
+syntaxToJsonLogicWithIdentitySites : Syntax Any -> { logic: Any, identitySites: List Any }
+syntaxToJsonLogicWithIdentitySites syntax = { logic = syntaxToJsonLogic syntax, identitySites = syntaxIdentitySites syntax }
+
+@label "Source identity application plan"
+@description "Choose the existing call or constructor codec from an exact visible entry. Named constructor fields require named declared slots and their real wire names; one positional record payload stays positional."
+sourceIdentityApplicationPlan : String -> String -> String -> List ({ name: String, positional: Boolean }) -> Maybe (List String) -> { kind: String, named: Boolean }
+sourceIdentityApplicationPlan handle target kind params recordKeys =
+  if not (eq handle target) then { kind = "missing", named = false }
+  else if eq kind "constructor" then
+    let named = case recordKeys of
+      Nothing -> false
+      Just keys -> and (or (gt (length keys) 0) (eq (length params) 0)) (not (std.some keys (\key -> not (std.some params (\p -> eq p.name key)))))
+    { kind = "construct", named = named }
+  else if or (eq kind "function") (eq kind "method") then { kind = "call", named = false }
+  else { kind = "missing", named = false }
+
+@label "Sig frame"
+@description "Assemble a `{type_sig: {name, type, directives?}}` frame; type kept as the `{mk}` marker for the TS walkType marshal. parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+sigFrame : (f: a) -> (dirs: a) -> a
+sigFrame f dirs =
+  -- Phase 8 — lower any VALUE-level dependent type-arg (`f : Vec a (n + 1)`)
+  -- buried inside the sig's type marker BEFORE the TS walkType marshal (a raw
+  -- numeric arg `Vec a 0` is a non-marker leaf that rides through walkType
+  -- untouched; only the `(expr)` valexpr marker needs lowering here).
+  let bound =
+        case lookup f "scheme" of
+          Just scheme -> { type = f.ty, scheme = scheme }
+          Nothing -> sourceBindSignature f.name f.ty
+  let body = lowerValExprs bound.type
+  let scheme = mapSet bound.scheme "body" body
+  let base = mapSet (mapSet (mapSet {} "name" f.name) "type" body) "scheme" scheme
+  mapSet {} "type_sig" (addDirs base dirs)
+
+@label "Typedef frame"
+@description "Assemble a `{type_def: {name, constructors?, alias?, opaque?, refined?, params?, discriminator?, directives?}}` frame: constructors get label=Nothing + fields {name,label,type-marker}; alias kept as a marker; a refinement `refined` marker passes through (base + enum/interval set kept as markers for the TS `$`-key marshal; a predicate set's Syntax lowered Fenel-side); @discriminator lifted from directives; params/directives omitted when empty (TS-parse parity). parser-substrate Phase 5a (refined: Phase 4h batch 3)."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+typedefFrame : (f: a) -> (dirs: a) -> a
+typedefFrame f dirs =
+  let sourceBound = sourceBindTypeDefinition f
+  let sf = sourceBound.frame
+  let withName = mapSet {} "name" sf.name
+  -- Constructors pass through RAW (`[{name, fields:[{name, type-marker}]}]`):
+  -- the TS marshal adds each ctor + field `label = Nothing` ({$tag:"Nothing"}
+  -- is a `$`-key a Fenel body cannot author — `Nothing` coerces to native null
+  -- here) and walkType's the field type markers.
+  -- Phase 8 — lower any VALUE-level dependent type-arg inside each ctor's `type`
+  -- sig (the dependent RETURN index, `Cons : … -> Vec a (n + 1)`) + its decomposed
+  -- field types. A raw numeric index (`Nil : Vec a 0`) is a non-marker leaf the TS
+  -- walkType carries through; only the `(expr)` valexpr marker needs lowering here.
+  -- Identity-preserving on non-valexpr ctors (deep-equal — the gate is authoritative).
+  let withCtors =
+        case lookup sf "ctors" of
+          Just cs -> mapSet withName "constructors" (map lowerCtorVal cs)
+          Nothing -> withName
+  let withAlias =
+        case lookup sf "alias" of
+          Just al -> mapSet withCtors "alias" al
+          Nothing -> withCtors
+  -- parser-substrate Phase 7j — KEY-ORDER fix for the opaque cases. The TS
+  -- oracle emits `opaque` LAST among the type_def body keys: `parseTypeDef`
+  -- produces `{name, (constructors|refined), params?}` and `parseOpaqueDecl`
+  -- then does `td.opaque = {repr}` (fenel-parser.ts:1261) ⇒ variant/refined
+  -- order is `name, body, params, opaque`. So `params` + `refined` must be set
+  -- BEFORE `opaque` (formerly opaque was set right after alias). The ALIAS path
+  -- (`opaque "string" String = List Char`) keeps `name, alias, opaque` because
+  -- it has no params/refined (a parametric opaque ALIAS — `name, alias, opaque,
+  -- params` in the oracle — is corpus-absent; not modeled). Closes the foundation
+  -- List/Char order divergence (the only diff left after the self-ref collapse).
+  let withParams =
+        case lookup sf "params" of
+          Just ps -> if eq (length ps) 0 then withAlias else mapSet withAlias "params" ps
+          Nothing -> withAlias
+  -- Batch 3 — a refinement type-def carries a `refined` marker
+  -- (`{mk=refined, base, set}`). The `base` + the enum/interval set keep their
+  -- `{mk}` form for the TS marshal (`$refined`/`$enum`/`$interval` are `$`-keys);
+  -- a predicate set's Syntax is lowered HERE (Fenel-side) to `$`-free JSON-Logic
+  -- via syntaxToJsonLogic, so the TS marshal only authors the `$where` wrapper.
+  -- (7j) Set BEFORE `opaque` so an opaque refinement (`Char`) reads `name,
+  -- refined, opaque` (the oracle's opaque-last order).
+  let withRefined =
+        case lookup sf "refined" of
+          Just r -> mapSet withParams "refined" { mk = "refined", base = r.base, set = lowerRefinedSet r.set }
+          Nothing -> withParams
+  let withDisc =
+        case findDirective dirs "discriminator" of
+          Just d -> mapSet withRefined "discriminator" (at d.args 0)
+          Nothing -> withRefined
+  -- (7j) `opaque` applied LAST (after ctors/alias/params/refined) — the oracle's
+  -- `td.opaque = {repr}` post-parseTypeDef placement.
+  let withOpaque =
+        case lookup sf "opaque" of
+          Just op -> mapSet withDisc "opaque" op
+          Nothing -> withDisc
+  -- fenel-surface-extensions Phase 7 (D-G) — the dependent-ADT `data … where`
+  -- kindSig (`: <Kind>` arrow FenelType) rides through as the `{mk=arrow}`
+  -- marker for the TS `walkType` marshal (`$arrow` is a `$`-key). Each ctor's
+  -- full `type` sig already rides raw inside `constructors` (the ctors pass
+  -- through unchanged above); only `kindSig` is a frame-level new carry.
+  let withKindSig =
+        case lookup sf "kindSig" of
+          Just ks -> mapSet withOpaque "kindSig" (lowerValExprs ks)
+          Nothing -> withOpaque
+  let withBinding = mapSet withKindSig "binding" sourceBound.binding
+  mapSet {} "type_def" (addDirs withBinding dirs)
+
+@label "Lower refined set marker"
+@description "Lower a refinement SetExpr marker for the TS `$`-key marshal: a `where` predicate set has its Syntax lowered Fenel-side to `$`-free JSON-Logic (`{mk=where, jl}`, the TS marshal wraps it `{$where: jl}`); enum/interval sets pass through unchanged (their `$enum`/`$interval` keys are authored TS-side). parser-substrate Phase 4h batch 3."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-4h"
+@category "engine-internal"
+lowerRefinedSet : (set: a) -> a
+lowerRefinedSet set =
+  if eq set.mk "where"
+  then
+    case lookup set "jl" of
+      Just jl -> set
+      Nothing ->
+        if gt (length (syntaxIdentitySites set.syntax)) 0 then { mk = "identity-expression-refused" }
+        else mapSet (mapSet {} "mk" "where") "jl" (syntaxToJsonLogic set.syntax)
+  else set
+
+@label "Lower value-expr type-args"
+@description "Deep-walk a type `{mk}` marker tree rewriting every `{mk=valexpr, syntax}` (a parenthesised VALUE-level dependent type-arg, `Vec a (n + 1)`) ⇒ `syntaxToJsonLogic syntax` (the `$`-free JSON-Logic the oracle's parseExpr produces, e.g. `{call:[\"add\",{var:\"n\"},1]}`); every other marker (app/arrow/tuple/record recursed; ref/strlit/numlit + raw-number args passed through). Keeps the lowerer OUT of the parser closure (the predicateBody precedent). Run over each frame's type markers BEFORE the TS walkType marshal, which then carries the lowered `$`-free expr verbatim into the authored `$el`. fenel-surface-extensions Phase 8 (D-G follow-up)."
+@tags "engine" "internal" "parser" "loader" "fenel-surface-extensions" "phase-8"
+@category "engine-internal"
+lowerValExprs : (m: a) -> a
+lowerValExprs m =
+  case lookup m "mk" of
+    Nothing -> m
+    Just k ->
+      if eq k "valexpr" then
+        if gt (length (syntaxIdentitySites m.syntax)) 0 then { mk = "identity-expression-refused" }
+        else syntaxToJsonLogic m.syntax
+      else if eq k "app" then mapSet m "args" (map lowerValExprs m.args)
+      else if eq k "tuple" then mapSet m "items" (map lowerValExprs m.items)
+      else if eq k "arrow" then mapSet (mapSet m "params" (map lowerParamVal m.params)) "ret" (lowerValExprs m.ret)
+      else if eq k "record" then mapSet m "fields" (map lowerFieldVal m.fields)
+      else if eq k "refined" then mapSet (mapSet m "base" (lowerValExprs m.base)) "set" (lowerRefinedSet m.set)
+      else m
+
+@label "Lower value-expr (arrow param)"
+@description "Lower value-expr type-args inside one arrow-param marker's `type` slot. fenel-surface-extensions Phase 8 (D-G follow-up)."
+@tags "engine" "internal" "parser" "loader" "fenel-surface-extensions" "phase-8"
+@category "engine-internal"
+lowerParamVal : (p: a) -> a
+lowerParamVal p = mapSet p "type" (lowerValExprs p.type)
+
+@label "Lower value-expr (record/ctor field)"
+@description "Lower value-expr type-args inside one record-/ctor-field marker's `type` slot. fenel-surface-extensions Phase 8 (D-G follow-up)."
+@tags "engine" "internal" "parser" "loader" "fenel-surface-extensions" "phase-8"
+@category "engine-internal"
+lowerFieldVal : (fl: a) -> a
+lowerFieldVal fl = mapSet fl "type" (lowerValExprs fl.type)
+
+@label "Lower value-expr (data ctor)"
+@description "Lower value-expr type-args inside one `data` constructor: its full `type` sig marker (the dependent RETURN index, `Vec a (n + 1)`) AND each decomposed `fields[].type`. A normal (non-data) ctor has no `type` key (left unchanged); fields without value-args round-trip deep-equal. fenel-surface-extensions Phase 8 (D-G follow-up)."
+@tags "engine" "internal" "parser" "loader" "fenel-surface-extensions" "phase-8"
+@category "engine-internal"
+lowerCtorVal : (c: a) -> a
+lowerCtorVal c =
+  let c1 =
+        case lookup c "type" of
+          Just t -> mapSet c "type" (lowerValExprs t)
+          Nothing -> c
+  case lookup c1 "fields" of
+    Just fs -> mapSet c1 "fields" (map lowerFieldVal fs)
+    Nothing -> c1
+
+@label "Find directive"
+@description "Find the first directive with the given name in a directive list; Just it or Nothing. parser-substrate Phase 5a."
+@tags "engine" "internal" "parser" "loader" "parser-substrate" "phase-5a"
+@category "engine-internal"
+findDirective : (dirs: a) -> (name: String) -> a
+findDirective dirs name =
+  case head dirs of
+    Nothing -> Nothing
+    Just d -> if eq d.name name then Just d else findDirective (tailOr dirs) name

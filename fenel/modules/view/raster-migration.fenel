@@ -1,0 +1,100 @@
+module RasterMigration where
+
+using std (find, filter, length, map, numberIsFinite, floor)
+using codec (JsonValue, JsonObjectEntry)
+
+RasterNameRole = RasterRowType | RasterCodeName | RasterTypeReference | RasterConstructorReference | RasterIdPhantomMember
+
+RasterNamePatch = RasterNamePatch role: RasterNameRole before: String after: String
+
+-- These are selected name slots, not a recursive string replacer. A tool
+-- extracts them through its existing typed-codec/traversal and captures the
+-- exact resolved owner of each occurrence before applying this pure plan.
+-- Missing source/phantom binding must stay unresolved in that tool's inventory.
+-- The patch never interprets arbitrary text, classifies storage, or grants IO.
+
+rasterMigrationBareName : (name: String) -> Result String String
+rasterMigrationBareName name =
+  if name == "Color" || name == "RgbaPixel" then Ok "RgbaPixel"
+  else Err "This bound raster name slot must contain Color or RgbaPixel."
+
+rasterMigrationTypeName : (name: String) -> Result String String
+rasterMigrationTypeName name =
+  if name == "6a7477db-06cd-430c-ba13-7c6b3e23ccd6" then Ok name
+  else if name == "std.Color" || name == "std:Color" || name == "std.RgbaPixel" then Ok "std.RgbaPixel"
+  else rasterMigrationBareName name
+
+rasterMigrationConstructorName : (name: String) -> Result String String
+rasterMigrationConstructorName name =
+  if name == "3edbe01c-76f4-4d44-93a1-145c042b078d" then Ok name
+  else if name == "std.Color.Color" || name == "std.RgbaPixel.RgbaPixel" then Ok "std.RgbaPixel.RgbaPixel"
+  else rasterMigrationBareName name
+
+@label "Plan an owned legacy raster name patch"
+@description "Offline migration for a name occurrence whose captured resolved owner is the preserved old std raster type UUID. Explicit roles cover entity row type, Codeable name, type reference, constructor reference and one Id phantom enum member. Preserve canonical type/constructor UUIDs, rename old raster names to RgbaPixel, and refuse unknown ownership or unexpected names. Applying an Id phantom member patch must retain its surrounding type and every other enum member through the existing typed traversal. Unbound source/phantom occurrences remain an unresolved inventory; never run a global Color text replacement."
+planOwnedRasterName : (typeIdentity: String) -> (role: RasterNameRole) -> (name: String) -> Result String RasterNamePatch
+planOwnedRasterName typeIdentity role name =
+  if typeIdentity != "6a7477db-06cd-430c-ba13-7c6b3e23ccd6" then Err "A raster name patch requires the captured preserved old std type identity; unresolved source/phantom bindings must be inventoried."
+  else
+    let planned = case role of
+      RasterRowType -> rasterMigrationBareName name
+      RasterCodeName -> rasterMigrationBareName name
+      RasterTypeReference -> rasterMigrationTypeName name
+      RasterConstructorReference -> rasterMigrationConstructorName name
+      RasterIdPhantomMember -> rasterMigrationBareName name
+    case planned of
+      Err problem -> Err problem
+      Ok renamed -> Ok (RasterNamePatch { role = role, before = name, after = renamed })
+
+-- Offline value migration only. The caller supplies the preserved old std
+-- raster type identity from its captured declaration/slot binding. A bare
+-- name "Color", a new spectral Color identity, or a shape guess is not enough.
+-- Existing UUID references and untagged Image/pixel bytes need no rewrite.
+-- Legacy named type/source references require their own captured bindings;
+-- this helper deliberately handles only one already-owned raster value.
+
+rasterMigrationByte : (value: JsonValue) -> Bool
+rasterMigrationByte value = case value of
+  JsonNumber { value = channel } -> numberIsFinite channel && channel >= 0 && channel <= 255 && floor channel == channel
+  _ -> false
+
+rasterMigrationChannel : (name: String) -> (pairs: List JsonObjectEntry) -> Bool
+rasterMigrationChannel name pairs =
+  let matches = filter (\entry -> entry.key == name) pairs
+  if length matches == 1 then
+    case find (\entry -> entry.key == name) pairs of
+      Just entry -> rasterMigrationByte entry.value
+      Nothing -> false
+  else false
+
+rasterMigrationTag : (pairs: List JsonObjectEntry) -> Bool
+rasterMigrationTag pairs =
+  let matches = filter (\entry -> entry.key == "$tag") pairs
+  if length matches == 0 then true
+  else if length matches == 1 then
+    case find (\entry -> entry.key == "$tag") pairs of
+      Just entry -> case entry.value of
+        JsonString { value = tag } -> tag == "Color" || tag == "RgbaPixel"
+        _ -> false
+      Nothing -> false
+  else false
+
+rasterMigrationEntry : (entry: JsonObjectEntry) -> JsonObjectEntry
+rasterMigrationEntry entry =
+  if entry.key == "$tag" then
+    case entry.value of
+      JsonString { value = "Color" } -> JsonObjectEntry { key = entry.key, value = JsonString { value = "RgbaPixel" } }
+      _ -> entry
+  else entry
+
+@label "Migrate an owned legacy RGBA pixel"
+@description "Offline migration for the preserved old std raster type UUID only. Keep every r/g/b/a byte and every other entry, and rename an optional top-level legacy Color tag to RgbaPixel. Untagged and already renamed pixels stay unchanged. Unknown owner identities, malformed or duplicate byte channels, and other tags return Err. This does not migrate arbitrary Color names, user ADTs, type descriptors, source text or storage."
+migrateOwnedRasterValue : (typeIdentity: String) -> (value: JsonValue) -> Result String JsonValue
+migrateOwnedRasterValue typeIdentity value =
+  if typeIdentity != "6a7477db-06cd-430c-ba13-7c6b3e23ccd6" then Err "The value must be bound to the preserved old std raster type UUID; a Color name or shape guess is insufficient."
+  else case value of
+    JsonObject { pairs = pairs } ->
+      if rasterMigrationChannel "r" pairs && rasterMigrationChannel "g" pairs && rasterMigrationChannel "b" pairs && rasterMigrationChannel "a" pairs && rasterMigrationTag pairs then
+        Ok (JsonObject { pairs = map rasterMigrationEntry pairs })
+      else Err "The owned raster value needs unique whole r/g/b/a bytes and no tag or a Color/RgbaPixel tag."
+    _ -> Err "An owned raster pixel must be JSON object data."

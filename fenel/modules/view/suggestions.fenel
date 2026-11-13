@@ -1,0 +1,1145 @@
+module view where
+
+import std (join, split, capitalize, toString, length, concat, map, filter, flatMap, fold, sort, sortLex, groupBy, lookup, fromMaybe, unique, find, appendItem, head, tail, take, max, floor, eq, not, all, elem, sum, trim, contains, endsWith, sub, mul, and, or, lt, gt, Image, RepresentationValueSnapshot, representationValueSnapshot)
+import engine (fieldRecordSlotPlan, ppNameIsIdent, spokenTypeName)
+
+-- Pure planning and ranking over an admitted, bounded reader snapshot.
+-- Payloads retain the actual callable/expression, complete schemes, identities
+-- and binding context. Keys, labels and printed types are presentation data.
+-- Every proposed expression and fixed input still needs canonical checking.
+-- A checked draft may need arguments; no plan here executes a target or grants
+-- authority. Reader/source revisions and cancellation remain with acquisition.
+
+SuggestionOperation a = SuggestionOperation key: String label: String paramNames: List String payload: a
+
+SuggestionOperationSnapshot a = SuggestionOperationSnapshot operations: List (SuggestionOperation a) totalSubmitted: Number omittedCount: Number
+
+-- fit carries the reader's existing selected-slot judgment for this data
+-- (2026-11-06): 0 a concretely typed input admits it, 1 only a bare type
+-- variable does, 2 unresolved, 3 every input definitely refuses it.
+-- internal (2026-11-08, Rom's decision (b)) is `suggestionInternal` of the
+-- function's own Categorizable/Taggable facts: such entries rank after every
+-- other entry, so the default bounded check leaves them out while a wider
+-- budget ("More operations") still reaches them.
+-- pinned (2026-11-09, Rom: "pin some suggestions at the top for common types;
+-- for the rest it must work automatically") is `suggestionPinnedAction` of the
+-- function's own Taggable facts: a pinned action whose input does not refuse
+-- the data ranks in a first band, before every other entry.
+SuggestionCatalogueEntry a = SuggestionCatalogueEntry operation: SuggestionOperation a callable: Bool moduleName: String fit: Number internal: Bool pinned: Bool
+
+-- A function its own source marks as an implementation helper: a category
+-- named "...-internal" (engine-internal, document-internal, runtime-internal)
+-- or the tag "internal". Read from the function's representations; no
+-- function name or type is inspected.
+suggestionInternal : (category: String) -> (tags: List String) -> Bool
+suggestionInternal category tags =
+  or (endsWith category "-internal") (elem "internal" tags)
+
+-- A pinned action: its source tags it "pin". The pin is per function, so it
+-- reaches exactly the types its input admits (Uppercase pins for text, Double
+-- for numbers, Reverse for lists and text); the set is edited in the source.
+suggestionPinnedAction : (tags: List String) -> Bool
+suggestionPinnedAction tags = elem "pin" tags
+
+-- A representation bridge (2026-11-11, Rom: "Aren't array and list the same in
+-- Fenel?!"): a crossing between a type's definition and its running
+-- representation, or between two representations of the same value (the List
+-- cons-spine and its array, String and List Char, the numeric tower's rung
+-- crossings and refinement isos). Its source tags it "bridge" or "iso" together
+-- with the representation it crosses: "repr" (the List and String spines) or
+-- "numeric" (the numeric tower). "bridge" or "iso" alone is not enough: codec
+-- encode/decode pairs are isos and the FRP, game and query bridges are real
+-- operations. Suggestions on data never offer such a function; Browse, search,
+-- code and the function picker keep it. No function name or module is read.
+suggestionRepresentationBridge : (tags: List String) -> Bool
+suggestionRepresentationBridge tags =
+  and (or (elem "bridge" tags) (elem "iso" tags)) (or (elem "repr" tags) (elem "numeric" tags))
+
+-- rejectedCount: eligible operations outside the prefix whose every input
+-- definitely refused the data; they count as checked (and rejected).
+SuggestionCatalogueSnapshot a = SuggestionCatalogueSnapshot operations: List (SuggestionOperation a) totalSubmitted: Number eligibleCount: Number excludedCount: Number omittedCount: Number rejectedCount: Number
+
+-- Navigation constructors are catalogue entries but lack an ordinary callable
+-- route. Acquisition reflects that distinction without filtering unresolved
+-- signatures. An empty moduleName marks captured reader-local callable data.
+suggestionCatalogueTier : SuggestionCatalogueEntry a -> Number
+suggestionCatalogueTier entry =
+  if eq entry.moduleName "std" then 0
+  else if eq entry.moduleName "" then 1
+  else 2
+
+-- The bounded prefix follows input fit first, then module tier: data meets
+-- the operations that take it as a typed input before generic or unresolved
+-- ones, whatever their module. Rank = band + fit * 3 + tier: a pinned action
+-- whose input does not refuse the data in the first band (0..11), every other
+-- entry in the second (12..23), an internal helper in the last (24..35).
+suggestionCatalogueRank : SuggestionCatalogueEntry a -> Number
+suggestionCatalogueRank entry =
+  let fit = if entry.fit >= 0 && entry.fit <= 3 then floor entry.fit else 2
+  let band = if entry.internal then 24 else if entry.pinned && fit < 3 then 0 else 12
+  band + mul fit 3 + suggestionCatalogueTier entry
+
+-- The last rank still needed to fill the budget; only those ranks are sorted.
+suggestionCatalogueCutoff : Number -> Number -> Number -> List Number -> Number
+suggestionCatalogueCutoff budget seen rank counts =
+  case head counts of
+    Nothing -> rank - 1
+    Just count -> if seen + count >= budget then rank else suggestionCatalogueCutoff budget (seen + count) (rank + 1) (fromMaybe [] (tail counts))
+
+suggestionCatalogueSnapshot : Number -> List (SuggestionCatalogueEntry a) -> SuggestionCatalogueSnapshot a
+suggestionCatalogueSnapshot maxOperations entries =
+  let eligible = filter (\entry -> entry.callable) entries
+  let budget = max 0 (floor maxOperations)
+  -- Rank 0..35 (a list literal: a nullary declaration would pass as a reference).
+  let ranks = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+        24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
+  let ranked = map (\entry -> { inputIndex = suggestionCatalogueRank entry, payload = entry }) eligible
+  let counts = map (\rank -> length (filter (\item -> eq item.inputIndex rank) ranked)) ranks
+  let cutoff = suggestionCatalogueCutoff budget 0 0 counts
+  let active =
+        if eq budget 0 then []
+        else map (\item -> item.payload) (filter (\item -> item.inputIndex <= cutoff) ranked)
+  -- Cache nested projections once. A common prefix preserves UTF-16 lexical
+  -- order while keeping dynamic group keys away from prototype/index names.
+  -- Buckets retain encounter order, so both string passes remain stable.
+  let keyed = map (\entry -> {
+        key = join ["suggestion/", entry.operation.key] "",
+        label = join ["suggestion/", entry.operation.label] "",
+        inputIndex = suggestionCatalogueRank entry,
+        refused = entry.fit >= 3,
+        payload = entry.operation
+      }) active
+  let identityGroups = groupBy (\entry -> entry.key) keyed
+  let identityKeys = sortLex (unique (map (\entry -> entry.key) keyed))
+  let byIdentity = flatMap (\key -> fromMaybe [] (lookup identityGroups key)) identityKeys
+  let labelGroups = groupBy (\entry -> entry.label) byIdentity
+  let labelKeys = sortLex (unique (map (\entry -> entry.label) byIdentity))
+  let byLabel = flatMap (\key -> fromMaybe [] (lookup labelGroups key)) labelKeys
+  -- Within a rank, one-input operations come first: they are complete actions
+  -- whose result can be previewed; more inputs need arguments first. Arity
+  -- order 1, 0, 2, 3, ... (a zero-input operation never takes the data).
+  let arities = [1, 0, 2, 3, 4, 5, 6, 7]
+  let arityOf = \entry -> if length entry.payload.paramNames > 7 then 7 else length entry.payload.paramNames
+  let byArity = \inRank -> flatMap (\arity -> filter (\entry -> eq (arityOf entry) arity) inRank) arities
+  let byTier = flatMap (\rank -> byArity (filter (\entry -> eq entry.inputIndex rank) byLabel)) ranks
+  let retained = take budget byTier
+  let refused = length (filter (\entry -> entry.fit >= 3) eligible)
+  let refusedRetained = length (filter (\entry -> entry.refused) retained)
+  SuggestionCatalogueSnapshot {
+    operations = map (\entry -> entry.payload) retained,
+    totalSubmitted = length entries,
+    eligibleCount = length eligible,
+    excludedCount = length entries - length eligible,
+    omittedCount = length eligible - length retained,
+    rejectedCount = refused - refusedRetained
+  }
+
+-- Acquisition supplies only admitted visible entries. Stable callable keys,
+-- never type-name filters, choose the bounded prefix; omitted entries remain
+-- visible as coverage so an empty result cannot claim a complete catalogue.
+suggestionOperationSnapshot : Number -> List (SuggestionOperation a) -> SuggestionOperationSnapshot a
+suggestionOperationSnapshot maxOperations operations =
+  let retained = take (max 0 (floor maxOperations)) (sort (\operation -> operation.key) operations)
+  SuggestionOperationSnapshot {
+    operations = retained,
+    totalSubmitted = length operations,
+    omittedCount = length operations - length retained
+  }
+
+SuggestionPlan a = SuggestionPlan operation: SuggestionOperation a inputIndex: Number bindingNames: List String missingNames: List String
+
+SuggestionPlanBatch a = SuggestionPlanBatch plans: List (SuggestionPlan a) skippedOperations: List String
+
+suggestionArgumentName : Number -> String
+suggestionArgumentName index = join ["argument", toString index] ""
+
+suggestionParameterName : Number -> List String -> Maybe String
+suggestionParameterName index names =
+  if index <= 0 then head names
+  else case tail names of
+    Nothing -> Nothing
+    Just rest -> suggestionParameterName (index - 1) rest
+
+-- All-position offers remain distinguishable even when their function labels
+-- match. Names are presentation only; the slot index still owns the binding.
+suggestionPlanLabel : SuggestionPlan a -> String
+suggestionPlanLabel plan =
+  if length plan.operation.paramNames <= 1 then plan.operation.label
+  else
+    let slot = case suggestionParameterName plan.inputIndex plan.operation.paramNames of
+          Just name -> if eq name "" || eq name "_" || elem name ["_0", "_1", "_2", "_3", "_4"] then join ["argument ", toString (plan.inputIndex + 1)] "" else name
+          Nothing -> join ["argument ", toString (plan.inputIndex + 1)] ""
+    join [plan.operation.label, " (", slot, ")"] ""
+
+suggestionBindings : Number -> Number -> Number -> List String
+suggestionBindings selected count index =
+  if index >= count then []
+  else concat [if eq selected index then "selectedData" else suggestionArgumentName index] (suggestionBindings selected count (index + 1))
+
+suggestionMissingBindings : Number -> Number -> Number -> List String
+suggestionMissingBindings selected count index =
+  if index >= count then []
+  else
+    let rest = suggestionMissingBindings selected count (index + 1)
+    if eq selected index then rest else concat [suggestionArgumentName index] rest
+
+suggestionOperationPlans : SuggestionOperation a -> Number -> List (SuggestionPlan a)
+suggestionOperationPlans operation index =
+  let count = length operation.paramNames
+  if index >= count then []
+  else
+    let plan = SuggestionPlan {
+      operation = operation,
+      inputIndex = index,
+      bindingNames = suggestionBindings index count 0,
+      missingNames = suggestionMissingBindings index count 0
+    }
+    concat [plan] (suggestionOperationPlans operation (index + 1))
+
+suggestionPlans : Number -> List (SuggestionOperation a) -> List (SuggestionPlan a)
+suggestionPlans maxArity operations =
+  flatMap (\operation -> if length operation.paramNames > maxArity then [] else suggestionOperationPlans operation 0) operations
+
+suggestionPlanBatch : Number -> List (SuggestionOperation a) -> SuggestionPlanBatch a
+suggestionPlanBatch maxArity operations =
+  let skipped = filter (\operation -> length operation.paramNames > max 0 (floor maxArity)) operations
+  SuggestionPlanBatch {
+    plans = suggestionPlans (max 0 (floor maxArity)) operations,
+    skippedOperations = map (\operation -> operation.key) skipped
+  }
+
+-- Existing checker observations are transported as data. This is a policy for
+-- combining them, not another type judgment. A solved expression does not turn
+-- an unknown input admission into true; a mismatched fixed input rejects.
+-- Invalid also covers resolver/boundary failures, so it cannot alone establish
+-- incompatibility. Those outcomes stay unknown until the checker distinguishes
+-- a genuine mismatch from unavailable evidence.
+suggestionAdmission : String -> String -> Maybe Bool
+suggestionAdmission expressionOutcome inputCompatibility =
+  if eq inputCompatibility "incompatible" then Just false
+  else if eq expressionOutcome "Solved" && eq inputCompatibility "compatible" then Just true
+  else Nothing
+
+suggestionAdmissionReason : String -> String -> String
+suggestionAdmissionReason expressionOutcome inputCompatibility =
+  case suggestionAdmission expressionOutcome inputCompatibility of
+    Just true -> "The whole expression and selected input were checked."
+    Just false -> "The selected input or complete expression is incompatible."
+    _ -> "Existing inference or containment could not establish this application."
+
+-- A destination is independent from the observed source type. A present but
+-- unreadable requirement cannot be treated as a free query. The full consumer
+-- expression checks every shared variable together with the ordinary holes.
+suggestionDestinationAdmission : String -> String -> Bool -> String -> Bool -> Bool -> String -> Maybe Bool
+suggestionDestinationAdmission outcome inputCompatibility hasDestination targetOutcome targetAvailable namesAvailable targetCompatibility =
+  let ordinary = suggestionAdmission outcome inputCompatibility
+  if not namesAvailable then Nothing
+  else if not hasDestination then ordinary
+  else if eq targetCompatibility "incompatible" then Just false
+  else case ordinary of
+    Just false -> Just false
+    Just true -> if targetAvailable && eq targetOutcome "Solved" then Just true else Nothing
+    Nothing -> Nothing
+
+suggestionDestinationReason : Bool -> Bool -> String -> String
+suggestionDestinationReason hasDestination rigidContext targetOutcome =
+  if rigidContext then "This requirement needs the complete function declaration context; the repair remains unresolved."
+  else if not hasDestination then ""
+  else if eq targetOutcome "Solved" then "The complete replacement was checked against the required type."
+  else "The required type could not be established for this complete replacement."
+
+-- Canonical surface reference analysis supplies free spellings. Only their
+-- lexical roots participate in binder allocation; saved references keep IDs.
+suggestionReservedNames : List String -> List String -> List String
+suggestionReservedNames references lexicalNames =
+  unique (concat lexicalNames (map (\name -> fromMaybe name (head (split name "."))) references))
+
+suggestionFreshName : String -> Number -> List String -> String
+suggestionFreshName base suffix reserved =
+  let name = if eq suffix 1 then base else concat base (toString suffix)
+  if elem name reserved then suggestionFreshName base (suffix + 1) reserved else name
+
+suggestionFreshNames : List String -> List String -> List String
+suggestionFreshNames reserved proposed =
+  case head proposed of
+    Nothing -> []
+    Just base ->
+      let name = suggestionFreshName base 1 reserved
+      concat [name] (suggestionFreshNames (appendItem name reserved) (fromMaybe [] (tail proposed)))
+
+-- A computed child keeps its producer. Each step is ordinary source with an
+-- explicit missing branch; the observed child is never captured as a fallback.
+-- Canonical scheme projection and whole-expression checking remain mandatory.
+SuggestionSourceSlot = SuggestionSourceSlot kind: String name: String index: Number
+
+suggestionSourceSlots : List Anything -> Maybe (List SuggestionSourceSlot)
+suggestionSourceSlots path = case representationValueSnapshot path of
+  SnapshotArray items -> case head path of
+    Nothing -> Just []
+    Just segment ->
+      let slot = case representationValueSnapshot segment of
+            SnapshotNumber index -> if index >= 0 && eq index (floor index) && eq (index - index) 0 then Just (SuggestionSourceSlot { kind = "list-element", name = "", index = index }) else Nothing
+            SnapshotString name -> if eq name "" || contains name "." || contains name "$" || not (ppNameIsIdent (join ["suggestionSource", name] ".")) then Nothing else Just (SuggestionSourceSlot { kind = "record-field", name = name, index = 0 })
+            _ -> Nothing
+      case slot of
+        Nothing -> Nothing
+        Just own -> case suggestionSourceSlots (fromMaybe [] (tail path)) of
+          Nothing -> Nothing
+          Just rest -> Just (concat [own] rest)
+  _ -> Nothing
+
+suggestionSourceNames : List String -> List SuggestionSourceSlot -> List String
+suggestionSourceNames reserved slots =
+  let proposed = fold (\state slot -> { current = concat state.current "Child", names = appendItem (concat state.current "Child") state.names }) { current = "suggestionSource", names = ["suggestionSource"] } slots
+  suggestionFreshNames reserved proposed.names
+
+-- The renderer's existing semantic-slot reader handles named/positional wire
+-- aliases and refuses ambiguous or unreadable records. This checks presence
+-- only: the admitted typed dot projection below supplies the actual child.
+suggestionSourceFieldPresent : a -> Maybe (List String) -> String -> Boolean
+suggestionSourceFieldPresent value declared name =
+  case fieldRecordSlotPlan (representationValueSnapshot value) declared name of
+    Err message -> false
+    Ok slot -> case slot.value of
+      Just child -> true
+      Nothing -> false
+
+-- B3 codec packet only: exact current-reader ExprNode.fnId operands, never
+-- callable values. No labels, source-name lookup or persisted route registry.
+-- Ordinary Fenel function data elsewhere remains a reference/closure/partial.
+SuggestionSourceRoutes = SuggestionSourceRoutes head: String drop: String present: String snapshot: String just: String find: String bind: String fmap: String
+SuggestionSourceStep = SuggestionSourceStep slot: SuggestionSourceSlot declared: Maybe (List String)
+
+-- ExprNode is the browser's existing plain-record transport. Binding and
+-- constructor patterns come from the canonical codec constructors; this module
+-- never authors a dollar-key wire object.
+suggestionSourceParam : String -> Anything
+suggestionSourceParam name = { kind = "param", name = name }
+
+suggestionSourceLiteral : a -> Anything
+suggestionSourceLiteral value = { kind = "literal", value = value }
+
+suggestionSourceCall : String -> List Anything -> Anything
+suggestionSourceCall target args = { kind = "call", fnId = target, args = args }
+
+suggestionSourceConstruct : String -> List Anything -> Anything
+suggestionSourceConstruct target args = { kind = "call", fnId = target, args = args, callSyntax = "construct" }
+
+suggestionSourceLambda : String -> Anything -> Anything
+suggestionSourceLambda name body =
+  suggestionSourceLiteral { __lambda = { params = [name], arrayParams = true, body = body } }
+
+suggestionSourceBind : String -> Anything -> Anything -> Anything
+suggestionSourceBind name source body =
+  suggestionSourceLiteral { __do = [suggestionSourceLiteral { __let = { bindings = [{ name = name, expr = source }] } }, body] }
+
+suggestionSourceWalk : SuggestionSourceRoutes -> List SuggestionSourceStep -> List String -> List Anything -> Anything -> Anything
+suggestionSourceWalk routes steps names patterns body =
+  let current = fromMaybe "" (head names)
+  let restNames = fromMaybe [] (tail names)
+  let currentPattern = fromMaybe { array = "_" } (head patterns)
+  case head steps of
+    Nothing -> body
+    Just step ->
+      -- find over ONE original parent preserves its type. Its predicate only
+      -- says whether this parent can be read; no untyped child becomes evidence.
+      let predicate =
+          if eq step.slot.kind "list-element" then
+            suggestionSourceLiteral { __match = { scrutinee = suggestionSourceCall routes.snapshot [suggestionSourceParam current], arms = [
+              { pattern = currentPattern.array, body = suggestionSourceLiteral true },
+              { pattern = "_", body = suggestionSourceLiteral false }
+            ] } }
+          else suggestionSourceCall routes.present [suggestionSourceParam current, suggestionSourceLiteral step.declared, suggestionSourceLiteral step.slot.name]
+      let singleton = suggestionSourceLiteral { __list = [suggestionSourceParam current] }
+      let guarded = suggestionSourceCall routes.find [suggestionSourceLambda current predicate, singleton]
+      let selected =
+          if eq step.slot.kind "list-element" then
+            suggestionSourceCall routes.bind [guarded, suggestionSourceLambda current (suggestionSourceCall routes.head [suggestionSourceCall routes.drop [suggestionSourceLiteral step.slot.index, suggestionSourceParam current]])]
+          else suggestionSourceCall routes.fmap [suggestionSourceLambda current (suggestionSourceParam (join [current, step.slot.name] ".")), guarded]
+      let next = suggestionSourceCall routes.bind [body, suggestionSourceLambda current selected]
+      suggestionSourceWalk routes (fromMaybe [] (tail steps)) restNames (fromMaybe [] (tail patterns)) next
+
+suggestionSourceExpression : SuggestionSourceRoutes -> List SuggestionSourceStep -> List String -> List Anything -> Anything -> Anything -> Anything
+suggestionSourceExpression routes steps names patterns source body =
+  let current = fromMaybe "" (head names)
+  let selected = suggestionSourceWalk routes steps names patterns (suggestionSourceConstruct routes.just [suggestionSourceParam current])
+  let leaf = fromMaybe current (head (fold (\rest name -> [name]) [] names))
+  suggestionSourceBind current source (suggestionSourceCall routes.fmap [suggestionSourceLambda leaf body, selected])
+
+suggestionHolesExcept : Number -> Number -> List String -> List String
+suggestionHolesExcept selected index names =
+  case head names of
+    Nothing -> []
+    Just name ->
+      let rest = suggestionHolesExcept selected (index + 1) (fromMaybe [] (tail names))
+      if eq selected index then rest else concat [name] rest
+
+suggestionHygienicPlan : List String -> SuggestionPlan a -> SuggestionPlan a
+suggestionHygienicPlan reserved plan =
+  let names = suggestionFreshNames reserved plan.bindingNames
+  SuggestionPlan { operation = plan.operation, inputIndex = plan.inputIndex, bindingNames = names, missingNames = suggestionHolesExcept plan.inputIndex 0 names }
+
+suggestionInputsCompatibility : List String -> String
+suggestionInputsCompatibility compatibilities =
+  if eq (length compatibilities) 0 then "unknown"
+  else if elem "incompatible" compatibilities then "incompatible"
+  else if all compatibilities (\compatibility -> eq compatibility "compatible") then "compatible"
+  else "unknown"
+
+suggestionContextAdmission : String -> List String -> Maybe Bool
+suggestionContextAdmission outcome compatibilities =
+  suggestionAdmission outcome (suggestionInputsCompatibility compatibilities)
+
+-- User preferences are separate from provider nominations. Exact keys here are
+-- recipe identities supplied by the snapshot, not labels or function names.
+SuggestionPin = SuggestionPin identity: String order: Number
+
+suggestionPinnedOrder : String -> List SuggestionPin -> Maybe Number
+suggestionPinnedOrder identity pins =
+  case head pins of
+    Nothing -> Nothing
+    Just pin ->
+      if eq pin.identity identity then Just pin.order
+      else case tail pins of
+        Nothing -> Nothing
+        Just rest -> suggestionPinnedOrder identity rest
+
+suggestionIsHidden : String -> List String -> Bool
+suggestionIsHidden identity hidden = elem identity hidden
+
+-- Curated context metadata gives relevance hints; it never changes admission.
+-- These rules do not inspect type-name spellings or duplicate the decider.
+SuggestionContextRule = SuggestionContextRule family: String intent: String bonus: Number
+
+suggestionContextBonus : String -> String -> List SuggestionContextRule -> Number
+suggestionContextBonus family intent rules =
+  let matching = filter (\rule -> eq rule.family family && eq rule.intent intent) rules
+  sum (map (\rule -> rule.bonus) matching)
+
+suggestionRelevance : Number -> Number -> Number -> Number
+suggestionRelevance base factBonus contextBonus = base + factBonus + contextBonus
+
+-- Type-fact relevance for a direct application (2026-11-06, actions panel).
+-- The facts come from the reader's existing judgments: slot is the selected
+-- input's verdict ("exact" for a concretely typed input that admits the data,
+-- "generic" for a bare type variable, else "unknown"); sameType says the
+-- checked result type and the data's type contain each other (Negate,
+-- Reverse, Blur); constructs marks a constructor that only wraps the data;
+-- moduleName is the catalogue module ("catalogue" for reader-local callables).
+-- Most useful first: same-type transformations of an exact input, then
+-- conversions of an exact input, then generic operations, then wrappers.
+-- Other modules (internal or demo definitions) follow the standard library.
+suggestionFitRelevance : (base: Number) -> (slot: String) -> (sameType: Bool) -> (constructs: Bool) -> (moduleName: String) -> Number
+suggestionFitRelevance base slot sameType constructs moduleName =
+  let fit = if eq slot "exact" then 30 else if eq slot "generic" then 0 else 10
+  let same = if sameType && eq slot "exact" then 20 else 0
+  let wraps = if constructs then sub 0 45 else 0
+  let home = if eq moduleName "std" || eq moduleName "catalogue" || eq moduleName "" then 0 else if eq moduleName "publicdemo" then sub 0 40 else sub 0 15
+  base + fit + same + wraps + home
+
+-- (2026-11-08, lane D) The catalogue's standing inside one fit: an operation
+-- that also carries the language's own operator notation (Prefixable/Infixable:
+-- Negate is unary minus) is an elementary operation of the type and comes first
+-- among equally fitting ones; an internal helper (`suggestionInternal`) comes
+-- after every user-facing operation. Ties keep the stable identity order.
+suggestionCatalogueRelevance : (base: Number) -> (slot: String) -> (sameType: Bool) -> (constructs: Bool) -> (moduleName: String) -> (operator: Bool) -> (internal: Bool) -> Number
+suggestionCatalogueRelevance base slot sameType constructs moduleName operator internal =
+  let notation = if operator && eq slot "exact" then 5 else 0
+  let helper = if internal then sub 0 60 else 0
+  suggestionFitRelevance base slot sameType constructs moduleName + notation + helper
+
+-- Family diversity keeps a few other modules visible without letting a less
+-- relevant module overtake the standard library's best matches.
+suggestionFamilyQuota : (maxDisplayed: Number) -> Number
+suggestionFamilyQuota maxDisplayed = max 4 (sub maxDisplayed (floor (mul maxDisplayed 0.25)))
+
+-- A second generic generator fills ONE remaining slot from an explicitly
+-- supplied context snapshot. Context values may themselves be callable values,
+-- so the same generator can propose map upper xs and join strings separator.
+-- The existing checker must admit the whole resulting expression; compatible
+-- type alone does not decide that the contextual value has the intended role.
+-- The original plan and each context payload are retained for inspection.
+
+SuggestionContextValue b = SuggestionContextValue key: String label: String payload: b
+
+SuggestionContextPlan a b = SuggestionContextPlan plan: SuggestionPlan a boundName: String contextValue: SuggestionContextValue b missingNames: List String
+
+suggestionContextChoices : SuggestionPlan a -> String -> List (SuggestionContextValue b) -> List (SuggestionContextPlan a b)
+suggestionContextChoices plan name values =
+  map (\value -> SuggestionContextPlan {
+    plan = plan,
+    boundName = name,
+    contextValue = value,
+    missingNames = filter (\missing -> not (eq missing name)) plan.missingNames
+  }) values
+
+suggestionContextSlots : SuggestionPlan a -> List String -> List (SuggestionContextValue b) -> List (SuggestionContextPlan a b)
+suggestionContextSlots plan names values =
+  case head names of
+    Nothing -> []
+    Just name ->
+      let own = suggestionContextChoices plan name values
+      case tail names of
+        Nothing -> own
+        Just rest -> concat own (suggestionContextSlots plan rest values)
+
+suggestionContextPlans : Number -> SuggestionPlan a -> List (SuggestionContextValue b) -> List (SuggestionContextPlan a b)
+suggestionContextPlans maxValues plan values =
+  suggestionContextSlots plan plan.missingNames (take (max 0 (floor maxValues)) values)
+
+-- An ordinary lambda adapter keeps a declaration's named parameter identities
+-- at its call site while exposing the usual positional callable arguments.
+-- This constructs a plan for \argument0 ... -> original argument0 ...;
+-- the canonical inference owner must check it. No arrow fields are rewritten.
+SuggestionEtaPlan a = SuggestionEtaPlan operation: SuggestionOperation a bindingNames: List String
+
+suggestionEtaPlan : SuggestionOperation a -> SuggestionEtaPlan a
+suggestionEtaPlan operation =
+  SuggestionEtaPlan { operation = operation, bindingNames = suggestionMissingBindings (sub 0 1) (length operation.paramNames) 0 }
+
+-- Ordinary, bounded observations for authored value-sensitive ranking. A fact
+-- influences relevance only; it never replaces type or expression admission.
+-- The caller supplies already-admitted String/List data and a finite fact input.
+
+SuggestionTextFacts = SuggestionTextFacts hasOuterWhitespace: Bool hasComma: Bool hasLineBreak: Bool isEmpty: Bool
+
+suggestionTextFacts : String -> SuggestionTextFacts
+suggestionTextFacts text =
+  SuggestionTextFacts {
+    hasOuterWhitespace = not (eq text (trim text)),
+    hasComma = contains text ",",
+    hasLineBreak = contains text "\n",
+    isEmpty = eq text ""
+  }
+
+SuggestionListFacts = SuggestionListFacts count: Number duplicateCount: Number isEmpty: Bool
+
+suggestionListFacts : List a -> SuggestionListFacts
+suggestionListFacts items =
+  SuggestionListFacts {
+    count = length items,
+    duplicateCount = length items - length (unique items),
+    isEmpty = eq (length items) 0
+  }
+
+SuggestionFactRule = SuggestionFactRule fact: String family: String bonus: Number
+
+suggestionFactBonus : List String -> String -> List SuggestionFactRule -> Number
+suggestionFactBonus facts family rules =
+  let matching = filter (\rule -> eq rule.family family && elem rule.fact facts) rules
+  sum (map (\rule -> rule.bonus) matching)
+
+suggestionTextFactNames : SuggestionTextFacts -> List String
+suggestionTextFactNames facts =
+  let whitespace = if facts.hasOuterWhitespace then ["outer-whitespace"] else []
+  let comma = if facts.hasComma then ["comma"] else []
+  let lines = if facts.hasLineBreak then ["line-break"] else []
+  let empty = if facts.isEmpty then ["empty"] else []
+  concat whitespace (concat comma (concat lines empty))
+
+suggestionListFactNames : SuggestionListFacts -> List String
+suggestionListFactNames facts =
+  let duplicates = if facts.duplicateCount > 0 then ["duplicates"] else []
+  concat duplicates (if facts.isEmpty then ["empty"] else [])
+
+-- Applicability is supplied by the existing checker, never invented by ranking.
+-- The payload is retained unchanged; expression/resultType are display text only.
+-- Finite ranking keys and already-admitted candidate lists are input requirements.
+-- Exact identity buckets merge duplicates; bounded family counting remains quadratic.
+-- identity is an upstream normalized recipe fingerprint, not a callable name.
+
+SuggestionCandidate a = SuggestionCandidate identity: String family: String label: String expression: String resultType: String inputIndex: Number missingArguments: Number applicability: Maybe Bool relevance: Number compositionCost: Number pin: Maybe Number lenses: List String reasons: List String plan: a
+
+RankedSuggestions a = RankedSuggestions suggestions: List (SuggestionCandidate a) undecided: List (SuggestionCandidate a) omittedConfirmed: Number omittedUndecided: Number duplicateCount: Number rejectedCount: Number diversityDeferred: Number totalSubmitted: Number
+
+-- A compact ordinary data projection of the same checked candidates used by
+-- the menu. The captured codec payload retains the complete editable recipe;
+-- opening a row uses that original candidate and rechecks it, never this display.
+@label "Suggestion"
+SuggestionPresentation = SuggestionPresentation identity: String label: String resultType: Maybe Type remainingArguments: Number detail: String reasons: List String confirmed: Bool
+
+-- The source never interprets the candidate's arbitrary recipe payload as a
+-- Type. The canonical checker transports its typed result in this explicit
+-- sibling; a malformed/foreign payload cannot supply display-type evidence.
+-- sentence: what the action computes, in words (suggestionSentence), or "".
+SuggestionPresentationInput a = SuggestionPresentationInput candidate: SuggestionCandidate a resultType: Maybe Type sentence: String
+
+SuggestionPresentationBatch a = SuggestionPresentationBatch suggestions: List (SuggestionPresentationInput a) undecided: List (SuggestionPresentationInput a)
+
+suggestionPresentation : SuggestionPresentationInput a -> SuggestionPresentation
+suggestionPresentation input =
+  let candidate = input.candidate
+  let confirmed = suggestionConfirmed candidate
+  let detail =
+        if not confirmed then "The type check could not confirm this operation."
+        else input.sentence
+  SuggestionPresentation { identity = candidate.identity, label = candidate.label, resultType = input.resultType, remainingArguments = candidate.missingArguments, detail = detail, reasons = candidate.reasons, confirmed = confirmed }
+
+@label "Suggestions as data"
+@description "Present the existing ranked candidates as an ordinary typed list. The result's type and reasons remain inspectable; selection retains and rechecks the original recipe in the same reader."
+suggestionPanelRows : SuggestionPresentationBatch a -> List SuggestionPresentation
+suggestionPanelRows batch = map suggestionPresentation (concat batch.suggestions batch.undecided)
+
+SuggestionDiversity a = SuggestionDiversity selected: List (SuggestionCandidate a) deferred: List (SuggestionCandidate a)
+
+SuggestionTemplateTraits = SuggestionTemplateTraits relevance: Number compositionCost: Number icon: String
+
+-- Default recipe effort/relevance belongs to the source policy, not its codec.
+-- (2026-11-07, demo 1) Field-derived recipes rank above every generic standard
+-- operation (a same-type exact one reaches 110 in suggestionFitRelevance):
+-- grouping by a field, then its aggregations per key, then getting the field.
+-- A list of records otherwise showed fifteen generic list functions first.
+suggestionTemplateTraits : String -> SuggestionTemplateTraits
+suggestionTemplateTraits template =
+  if eq template "SuggestionProjection" || eq template "SuggestionMappedProjection"
+  then SuggestionTemplateTraits { relevance = 100, compositionCost = 1, icon = "corner-down-right" }
+  else if eq template "SuggestionGroupedProjection"
+  then SuggestionTemplateTraits { relevance = 125, compositionCost = 1, icon = "layers" }
+  else if eq template "SuggestionCountProjection"
+  then SuggestionTemplateTraits { relevance = 122, compositionCost = 1, icon = "hash" }
+  else if eq template "SuggestionSumProjection"
+  then SuggestionTemplateTraits { relevance = 122, compositionCost = 1, icon = "calculator" }
+  else SuggestionTemplateTraits { relevance = 60, compositionCost = 0, icon = "function" }
+
+-- The default click of an action (2026-11-07, demo 1; design/suggestions.md,
+-- "Apply here" and "New data from this"). A result that the selected data's own
+-- type admits replaces that data in place (Reverse, Sort: Rom, Nov 7). A result
+-- of another type (a grouping, a count per key, a field) or an undecided check
+-- makes new data from this one instead; the other choice stays one click away.
+-- `replaceable` is the reader's check of the result against the data's type.
+@label "Default action destination"
+@description "Apply here when the action's result fits the selected data's own type; otherwise new data from this one."
+suggestionDisposition : (replaceable: Maybe Bool) -> LensShortcutDisposition
+suggestionDisposition replaceable =
+  case replaceable of
+    Just admitted -> if admitted then ApplyToDraft else CreateDerivedData
+    Nothing -> CreateDerivedData
+    _ -> CreateDerivedData
+
+suggestionConfirmed : (candidate: SuggestionCandidate a) -> Bool
+suggestionConfirmed candidate = case candidate.applicability of
+  Just admitted -> admitted
+  Nothing -> false
+
+suggestionUndecided : (candidate: SuggestionCandidate a) -> Bool
+suggestionUndecided candidate = case candidate.applicability of
+  Just admitted -> false
+  Nothing -> true
+
+suggestionNotRejected : (candidate: SuggestionCandidate a) -> Bool
+suggestionNotRejected candidate = case candidate.applicability of
+  Just admitted -> admitted
+  Nothing -> true
+
+suggestionPinned : (candidate: SuggestionCandidate a) -> Bool
+suggestionPinned candidate = case candidate.pin of
+  Just position -> true
+  Nothing -> false
+
+suggestionPinPosition : (candidate: SuggestionCandidate a) -> Number
+suggestionPinPosition candidate = case candidate.pin of
+  Just position -> position
+  Nothing -> 0
+
+-- Stable scalar-key passes implement a genuine lexicographic order; array keys
+-- would depend on host coercion and pairwise specificity guesses can cycle.
+-- Priority: confirmed, personal pin/order, relevance minus completion effort,
+-- missing slots, cost, id. Effort is ordinary policy data; zero disables it.
+-- (2026-10-31) Completion effort is missing slots times the penalty, and no
+-- effort when either is zero (or -0, NaN), so an infinite penalty never yields
+-- 0 * Infinity = NaN. Each Number pass ranks a key std `lt` cannot order
+-- (NaN, for instance Infinity minus Infinity) after every number, in
+-- encounter order: std `sort` alone treats such a key as a tie with
+-- everything, which leaves the entries around it partly unsorted. The
+-- helpers are local lambdas (every real is below 1 or above 0).
+suggestionSortWithEffort : (penalty: Number) -> (candidates: List (SuggestionCandidate a)) -> List (SuggestionCandidate a)
+suggestionSortWithEffort penalty candidates =
+  let nonZero = \value -> or (gt value 0) (lt value 0)
+  let orderable = \value -> or (lt value 1) (gt value 0)
+  let effort = \missing -> if and (nonZero penalty) (nonZero missing) then mul missing penalty else 0
+  let sortNumbers = \numberKey -> \entries -> concat (sort numberKey (filter (\entry -> orderable (numberKey entry)) entries)) (filter (\entry -> not (orderable (numberKey entry))) entries)
+  let keyed = map (\candidate -> {
+          identity = candidate.identity,
+          compositionCost = candidate.compositionCost,
+          missingArguments = candidate.missingArguments,
+          relevance = sub 0 (sub candidate.relevance (effort candidate.missingArguments)),
+          pin = suggestionPinPosition candidate,
+          inputIndex = if suggestionPinned candidate then 0 else 1,
+          applicability = if suggestionConfirmed candidate then 0 else 1,
+          payload = candidate
+        }) candidates
+  let byIdentity = sort (\entry -> entry.identity) keyed
+  let byCost = sortNumbers (\entry -> entry.compositionCost) byIdentity
+  let byEffort = sortNumbers (\entry -> entry.missingArguments) byCost
+  let byRelevance = sortNumbers (\entry -> entry.relevance) byEffort
+  let byPinOrder = sortNumbers (\entry -> entry.pin) byRelevance
+  let byPinned = concat (filter (\entry -> eq entry.inputIndex 0) byPinOrder) (filter (\entry -> eq entry.inputIndex 1) byPinOrder)
+  let byConfirmed = concat (filter (\entry -> eq entry.applicability 0) byPinned) (filter (\entry -> eq entry.applicability 1) byPinned)
+  map (\entry -> entry.payload) byConfirmed
+
+suggestionSort : (candidates: List (SuggestionCandidate a)) -> List (SuggestionCandidate a)
+suggestionSort candidates = suggestionSortWithEffort 12 candidates
+
+-- Exact duplicates keep the best-ranked plan, verdict, pin and lens choices.
+-- Diagnostic reasons can merge without claiming that an unknown duplicate's
+-- lens choices were checked or replacing the retained callable/binding payload.
+suggestionMergeReasons : SuggestionCandidate a -> SuggestionCandidate a -> SuggestionCandidate a
+suggestionMergeReasons retained duplicate =
+  SuggestionCandidate {
+    identity = retained.identity,
+    family = retained.family,
+    label = retained.label,
+    expression = retained.expression,
+    resultType = retained.resultType,
+    inputIndex = retained.inputIndex,
+    missingArguments = retained.missingArguments,
+    applicability = retained.applicability,
+    relevance = retained.relevance,
+    compositionCost = retained.compositionCost,
+    pin = retained.pin,
+    lenses = retained.lenses,
+    reasons = unique (concat retained.reasons duplicate.reasons),
+    plan = retained.plan
+  }
+
+-- Ranking happens before exact deduplication, so a checked occurrence wins over
+-- an undecided duplicate. Distinct saved pins need distinct upstream identities.
+suggestionDeduplicateStep : (selected: List (SuggestionCandidate a)) -> (candidate: SuggestionCandidate a) -> List (SuggestionCandidate a)
+suggestionDeduplicateStep selected candidate =
+  let duplicate = find (\previous -> eq previous.identity candidate.identity) selected
+  case duplicate of
+    Just previous -> map (\entry -> if eq entry.identity candidate.identity then suggestionMergeReasons entry candidate else entry) selected
+    Nothing -> appendItem candidate selected
+
+suggestionDeduplicate : (candidates: List (SuggestionCandidate a)) -> List (SuggestionCandidate a)
+suggestionDeduplicate candidates =
+  let groups = groupBy (\candidate -> join ["suggestion/", candidate.identity] "") candidates
+  let identities = unique (map (\candidate -> join ["suggestion/", candidate.identity] "") candidates)
+  let mergeGroup = \group ->
+        case head group of
+          Nothing -> []
+          Just retained -> [fold suggestionMergeReasons retained (fromMaybe [] (tail group))]
+  flatMap (\identity -> mergeGroup (fromMaybe [] (lookup groups identity))) identities
+
+suggestionFamilyCount : (family: String) -> (selected: List (SuggestionCandidate a)) -> Number
+suggestionFamilyCount family selected =
+  -- Field-derived recipes (Get, Group by, Count / Sum per) share one quota, so
+  -- a record with many fields still leaves room for other operations.
+  let quotaFamily = \name -> if eq name "grouping" || eq name "aggregate" || eq name "projection" then "record fields" else name
+  length (filter (\candidate -> and (eq (quotaFamily candidate.family) (quotaFamily family)) (not (suggestionPinned candidate))) selected)
+
+suggestionDiversityStep : (quota: Number) -> (state: SuggestionDiversity a) -> (candidate: SuggestionCandidate a) -> SuggestionDiversity a
+suggestionDiversityStep quota state candidate =
+  let admitted = or (suggestionPinned candidate) (lt (suggestionFamilyCount candidate.family state.selected) quota)
+  if admitted
+    then SuggestionDiversity { selected = appendItem candidate state.selected, deferred = state.deferred }
+    else SuggestionDiversity { selected = state.selected, deferred = appendItem candidate state.deferred }
+
+-- Overflow is deferred behind the first diverse pass, never silently discarded.
+-- Pins are exempt from the quota and do not consume other rows' family slots.
+suggestionDiversify : (maxPerFamily: Number) -> (candidates: List (SuggestionCandidate a)) -> SuggestionDiversity a
+suggestionDiversify maxPerFamily candidates =
+  let quota = if lt maxPerFamily 1 then 1 else floor maxPerFamily
+  fold (suggestionDiversityStep quota) (SuggestionDiversity { selected = [], deferred = [] }) candidates
+
+suggestionStatus : (candidate: SuggestionCandidate a) -> String
+suggestionStatus candidate = case candidate.applicability of
+  Nothing -> "Check unresolved"
+  Just admitted ->
+    if not admitted then "Not applicable"
+    else if gt candidate.missingArguments 0 then "Needs arguments"
+    else "Inputs checked"
+
+-- Both groups share one display budget. Visible counts distinguish truncation
+-- from no candidates. An input check never grants execution authority.
+rankSuggestionsWithEffort : (maxDisplayed: Number) -> (maxPerFamily: Number) -> (penalty: Number) -> (candidates: List (SuggestionCandidate a)) -> RankedSuggestions a
+rankSuggestionsWithEffort maxDisplayed maxPerFamily penalty candidates =
+  let budget = if lt maxDisplayed 0 then 0 else floor maxDisplayed
+  let eligible = filter suggestionNotRejected candidates
+  let unique = suggestionDeduplicate (suggestionSortWithEffort penalty eligible)
+  let confirmed = filter suggestionConfirmed unique
+  let unknown = filter suggestionUndecided unique
+  let diverse = suggestionDiversify maxPerFamily confirmed
+  let ordered = concat diverse.selected diverse.deferred
+  let shown = take budget ordered
+  let shownUnknown = take (sub budget (length shown)) unknown
+  RankedSuggestions { suggestions = shown, undecided = shownUnknown, omittedConfirmed = sub (length confirmed) (length shown), omittedUndecided = sub (length unknown) (length shownUnknown), duplicateCount = sub (length eligible) (length unique), rejectedCount = sub (length candidates) (length eligible), diversityDeferred = length diverse.deferred, totalSubmitted = length candidates }
+
+rankSuggestions : (maxDisplayed: Number) -> (maxPerFamily: Number) -> (candidates: List (SuggestionCandidate a)) -> RankedSuggestions a
+rankSuggestions maxDisplayed maxPerFamily candidates = rankSuggestionsWithEffort maxDisplayed maxPerFamily 12 candidates
+
+-- Selecting a callable adds one generic proposal: apply that selected value.
+-- This is a finite binding plan, not a callable/type recognizer. Its operation
+-- payload retains the actually inferred expression and scheme. The reader adapter
+-- must check the resulting ordinary application and every supplied argument.
+-- No function name, domain type, callback effect or result shape is hard-coded.
+
+SuggestionApplicationPlan a = SuggestionApplicationPlan operation: SuggestionOperation a callableBinding: String bindingNames: List String missingNames: List String
+
+suggestionApplicationPlan : Number -> SuggestionOperation a -> Maybe (SuggestionApplicationPlan a)
+suggestionApplicationPlan maxArity operation =
+  let count = length operation.paramNames
+  if count > max 0 (floor maxArity) then Nothing
+  else
+    let names = suggestionMissingBindings (sub 0 1) count 0
+    Just (SuggestionApplicationPlan { operation = operation, callableBinding = "selectedFunction", bindingNames = names, missingNames = names })
+
+suggestionHygienicApplication : List String -> SuggestionApplicationPlan a -> SuggestionApplicationPlan a
+suggestionHygienicApplication reserved plan =
+  let allocated = suggestionFreshNames reserved (concat [plan.callableBinding] plan.bindingNames)
+  let names = fromMaybe [] (tail allocated)
+  SuggestionApplicationPlan { operation = plan.operation, callableBinding = fromMaybe plan.callableBinding (head allocated), bindingNames = names, missingNames = names }
+
+SuggestionApplicationContextPlan a b = SuggestionApplicationContextPlan plan: SuggestionApplicationPlan a boundName: String contextValue: SuggestionContextValue b missingNames: List String returnsFunction: Bool
+
+suggestionApplicationContextChoices : SuggestionApplicationPlan a -> String -> List (SuggestionContextValue b) -> List (SuggestionApplicationContextPlan a b)
+suggestionApplicationContextChoices plan name values =
+  let remaining = filter (\missing -> not (eq missing name)) plan.missingNames
+  map (\value -> SuggestionApplicationContextPlan {
+    plan = plan,
+    boundName = name,
+    contextValue = value,
+    missingNames = remaining,
+    returnsFunction = length remaining > 0
+  }) values
+
+suggestionApplicationContextSlots : SuggestionApplicationPlan a -> List String -> List (SuggestionContextValue b) -> List (SuggestionApplicationContextPlan a b)
+suggestionApplicationContextSlots plan names values =
+  case head names of
+    Nothing -> []
+    Just name ->
+      let own = suggestionApplicationContextChoices plan name values
+      case tail names of
+        Nothing -> own
+        Just rest -> concat own (suggestionApplicationContextSlots plan rest values)
+
+suggestionApplicationContextPlans : Number -> SuggestionApplicationPlan a -> List (SuggestionContextValue b) -> List (SuggestionApplicationContextPlan a b)
+suggestionApplicationContextPlans maxValues plan values =
+  suggestionApplicationContextSlots plan plan.missingNames (take (max 0 (floor maxValues)) values)
+
+-- Two finite composition directions. These plans describe ordinary lambdas;
+-- the checker must validate the complete expression with both actual inputs.
+-- In particular a predicate composed AFTER text cleanup may work when the
+-- reverse direction does not. Direction is never guessed from a type name.
+SuggestionCompositionPlan a b = SuggestionCompositionPlan operation: SuggestionOperation a contextValue: SuggestionContextValue b selectedInputIndex: Number callableBinding: String contextBinding: String argumentBinding: String outerBinding: String innerBinding: String
+
+suggestionCompositionChoice : SuggestionOperation a -> SuggestionContextValue b -> Bool -> SuggestionCompositionPlan a b
+suggestionCompositionChoice operation value selectedOuter =
+  SuggestionCompositionPlan {
+    operation = operation,
+    contextValue = value,
+    selectedInputIndex = if selectedOuter then 0 else 1,
+    callableBinding = "selectedFunction",
+    contextBinding = "contextFunction",
+    argumentBinding = "argument0",
+    outerBinding = if selectedOuter then "selectedFunction" else "contextFunction",
+    innerBinding = if selectedOuter then "contextFunction" else "selectedFunction"
+  }
+
+suggestionCompositionChoices : SuggestionOperation a -> List (SuggestionContextValue b) -> List (SuggestionCompositionPlan a b)
+suggestionCompositionChoices operation values =
+  case head values of
+    Nothing -> []
+    Just value ->
+      let own = [suggestionCompositionChoice operation value true, suggestionCompositionChoice operation value false]
+      case tail values of
+        Nothing -> own
+        Just rest -> concat own (suggestionCompositionChoices operation rest)
+
+suggestionCompositionPlans : Number -> SuggestionOperation a -> List (SuggestionContextValue b) -> List (SuggestionCompositionPlan a b)
+suggestionCompositionPlans maxValues operation values =
+  suggestionCompositionChoices operation (take (max 0 (floor maxValues)) values)
+
+-- The bounded two-slot permutation is another ordinary lambda plan. Return
+-- the inferred callable itself, so its result type is not taken from an
+-- unrelated free result variable in a catalogue combinator's declaration.
+SuggestionSwapPlan a = SuggestionSwapPlan operation: SuggestionOperation a callableBinding: String bindingNames: List String argumentOrder: List String
+
+suggestionSwapPlan : SuggestionOperation a -> Maybe (SuggestionSwapPlan a)
+suggestionSwapPlan operation =
+  if not (eq (length operation.paramNames) 2) then Nothing
+  else Just (SuggestionSwapPlan {
+    operation = operation,
+    callableBinding = "selectedFunction",
+    bindingNames = ["argument0", "argument1"],
+    argumentOrder = ["argument1", "argument0"]
+  })
+
+-- Fields come from an admitted reflection snapshot. The payload retains their
+-- actual FieldKey and scheme; label/path are current presentation projections.
+-- All extraction and composed expressions are checked by canonical inference.
+SuggestionField a = SuggestionField identity: String label: String path: List String payload: a
+SuggestionProjection a = SuggestionProjection field: SuggestionField a sourceBinding: String
+SuggestionProjectedOperation a b = SuggestionProjectedOperation projection: SuggestionProjection a operationPlan: SuggestionPlan b
+
+suggestionProjectionPlans : Number -> List (SuggestionField a) -> List (SuggestionProjection a)
+suggestionProjectionPlans budget fields =
+  map (\field -> SuggestionProjection { field = field, sourceBinding = "selectedData" }) (take (max 0 (floor budget)) fields)
+
+suggestionHygienicProjection : List String -> SuggestionProjection a -> SuggestionProjection a
+suggestionHygienicProjection reserved plan =
+  SuggestionProjection { field = plan.field, sourceBinding = suggestionFreshName plan.sourceBinding 1 reserved }
+
+SuggestionMappedProjection a b = SuggestionMappedProjection field: SuggestionField a operation: SuggestionOperation b rowBinding: String
+
+-- The reflection snapshot retains an actual admitted map callable. These are
+-- ordinary applications of that callable, never a new collection operation.
+suggestionMappedProjectionPlans : Number -> List String -> Maybe (SuggestionOperation b) -> List (SuggestionField a) -> List (SuggestionMappedProjection a b)
+suggestionMappedProjectionPlans budget reserved mapper fields =
+  case mapper of
+    Nothing -> []
+    Just operation -> map (\field -> SuggestionMappedProjection { field = field, operation = operation, rowBinding = suggestionFreshName "row" 1 reserved }) (take (max 0 (floor budget)) fields)
+
+suggestionHygienicMappedProjection : List String -> SuggestionMappedProjection a b -> SuggestionMappedProjection a b
+suggestionHygienicMappedProjection reserved plan =
+  SuggestionMappedProjection { field = plan.field, operation = plan.operation, rowBinding = suggestionFreshName plan.rowBinding 1 reserved }
+
+SuggestionGroupedProjection a b = SuggestionGroupedProjection field: SuggestionField a operation: SuggestionOperation b rowBinding: String
+
+-- The reflection snapshot retains the actual admitted typed-grouping callable.
+-- These are ordinary applications of it to a field-projection callback.
+suggestionGroupedProjectionPlans : Number -> List String -> Maybe (SuggestionOperation b) -> List (SuggestionField a) -> List (SuggestionGroupedProjection a b)
+suggestionGroupedProjectionPlans budget reserved grouper fields =
+  case grouper of
+    Nothing -> []
+    Just operation -> map (\field -> SuggestionGroupedProjection { field = field, operation = operation, rowBinding = suggestionFreshName "row" 1 reserved }) (take (max 0 (floor budget)) fields)
+    _ -> []
+
+suggestionHygienicGroupedProjection : List String -> SuggestionGroupedProjection a b -> SuggestionGroupedProjection a b
+suggestionHygienicGroupedProjection reserved plan =
+  SuggestionGroupedProjection { field = plan.field, operation = plan.operation, rowBinding = suggestionFreshName plan.rowBinding 1 reserved }
+
+-- Polish lane B item 6 (Rom, Nov 7): a short sentence under each field-derived
+-- action, saying what it computes, so a row reads as its result rather than as
+-- a type phrase. The element is the list's element type's name (its spoken
+-- plural, as the type formatter says it), empty for anonymous records.
+@label "Sentence of a suggestion"
+@description "What a field-derived suggestion computes, in words: 'Transactions grouped by date', 'Number of transactions per person', 'Total amount per person', 'The date of each of the transactions'. The plan kind is the suggestion plan's constructor name; the element is the type name of the list's elements (empty for anonymous records, read as items); field and amount are the fields' labels. Empty for every other plan."
+suggestionSentence : (kind: String) -> (element: String) -> (field: String) -> (amount: String) -> String
+suggestionSentence kind element field amount =
+  let spoken = spokenTypeName element
+  let items = if eq element "" then "items" else spoken.plural
+  if eq kind "SuggestionGroupedProjection" then join [capitalize items, " grouped by ", field] ""
+  else if eq kind "SuggestionCountProjection" then join ["Number of ", items, " per ", field] ""
+  else if eq kind "SuggestionSumProjection" then join ["Total ", amount, " per ", field] ""
+  else if eq kind "SuggestionMappedProjection" then join ["The ", field, " of each of the ", items] ""
+  else ""
+
+suggestionGroupingLabel : SuggestionField a -> String
+suggestionGroupingLabel field = join ["Group by ", field.label] ""
+
+-- Aggregations per key (M9): ordinary applications of the admitted
+-- std.countByKey / std.sumByKey callables to field-projection callbacks.
+SuggestionCountProjection a b = SuggestionCountProjection field: SuggestionField a operation: SuggestionOperation b rowBinding: String
+SuggestionSumProjection a b = SuggestionSumProjection field: SuggestionField a amount: SuggestionField a operation: SuggestionOperation b rowBinding: String
+
+suggestionCountProjectionPlans : Number -> List String -> Maybe (SuggestionOperation b) -> List (SuggestionField a) -> List (SuggestionCountProjection a b)
+suggestionCountProjectionPlans budget reserved counter fields =
+  case counter of
+    Nothing -> []
+    Just operation -> map (\field -> SuggestionCountProjection { field = field, operation = operation, rowBinding = suggestionFreshName "row" 1 reserved }) (take (max 0 (floor budget)) fields)
+    _ -> []
+
+-- Every (amount, key) pair of distinct fields is planned; the checker admits
+-- only amounts that are numbers, so no field type is judged here.
+suggestionSumProjectionPlans : Number -> List String -> Maybe (SuggestionOperation b) -> List (SuggestionField a) -> List (SuggestionSumProjection a b)
+suggestionSumProjectionPlans budget reserved summer fields =
+  case summer of
+    Nothing -> []
+    Just operation -> take (max 0 (floor budget)) (flatMap (\amount -> map (\field -> SuggestionSumProjection { field = field, amount = amount, operation = operation, rowBinding = suggestionFreshName "row" 1 reserved }) (filter (\candidate -> not (eq candidate.identity amount.identity)) fields)) fields)
+    _ -> []
+
+suggestionHygienicCountProjection : List String -> SuggestionCountProjection a b -> SuggestionCountProjection a b
+suggestionHygienicCountProjection reserved plan =
+  SuggestionCountProjection { field = plan.field, operation = plan.operation, rowBinding = suggestionFreshName plan.rowBinding 1 reserved }
+
+suggestionHygienicSumProjection : List String -> SuggestionSumProjection a b -> SuggestionSumProjection a b
+suggestionHygienicSumProjection reserved plan =
+  SuggestionSumProjection { field = plan.field, amount = plan.amount, operation = plan.operation, rowBinding = suggestionFreshName plan.rowBinding 1 reserved }
+
+suggestionCountLabel : SuggestionField a -> String
+suggestionCountLabel field = join ["Count per ", field.label] ""
+
+suggestionSumLabel : SuggestionField a -> SuggestionField a -> String
+suggestionSumLabel amount field = join ["Sum of ", amount.label, " per ", field.label] ""
+
+suggestionProjectionLabel : Bool -> SuggestionField a -> String
+suggestionProjectionLabel mapped field =
+  join ["Get ", field.label, if mapped then " from each item" else ""] ""
+
+suggestionProjectedOperations : Number -> SuggestionProjection a -> List (SuggestionOperation b) -> List (SuggestionProjectedOperation a b)
+suggestionProjectedOperations maxArity projection operations =
+  map (\plan -> SuggestionProjectedOperation { projection = projection, operationPlan = plan }) (suggestionPlans maxArity operations)
+
+-- A rename updates path/label through the reflection owner; the FieldKey-derived
+-- identity and containing source identity remain the recipe identity inputs.
+suggestionProjectionPath : SuggestionProjection a -> String
+suggestionProjectionPath projection = join (concat [projection.sourceBinding] projection.field.path) "."
+
+-- A generic composition template: put selected data in a singleton collection,
+-- or pair it with one supplied context value, then supply that collection to
+-- any argument position. This is useful for typeUnion [Number, String] but is
+-- deliberately independent of Type, list element types and callable names.
+-- Both the collection and the complete expression require canonical checking.
+
+SuggestionCollectionPlan a b = SuggestionCollectionPlan plan: SuggestionPlan a memberNames: List String contextValue: Maybe (SuggestionContextValue b)
+
+suggestionCollectionChoices : SuggestionPlan a -> List (SuggestionContextValue b) -> List (SuggestionCollectionPlan a b)
+suggestionCollectionChoices plan values =
+  let single = SuggestionCollectionPlan { plan = plan, memberNames = ["selectedData"], contextValue = Nothing }
+  let pairs = map (\value -> SuggestionCollectionPlan { plan = plan, memberNames = ["selectedData", "contextData"], contextValue = Just value }) values
+  concat [single] pairs
+
+suggestionCollectionPlansFor : List (SuggestionPlan a) -> List (SuggestionContextValue b) -> List (SuggestionCollectionPlan a b)
+suggestionCollectionPlansFor plans values =
+  case head plans of
+    Nothing -> []
+    Just plan ->
+      let own = suggestionCollectionChoices plan values
+      case tail plans of
+        Nothing -> own
+        Just rest -> concat own (suggestionCollectionPlansFor rest values)
+
+suggestionCollectionPlans : Number -> Number -> List (SuggestionOperation a) -> List (SuggestionContextValue b) -> List (SuggestionCollectionPlan a b)
+suggestionCollectionPlans maxValues maxArity operations values =
+  suggestionCollectionPlansFor (suggestionPlans (max 0 (floor maxArity)) operations) (take (max 0 (floor maxValues)) values)
+
+suggestionCollectionAdmission : String -> String -> String -> Maybe Bool
+suggestionCollectionAdmission collectionOutcome expressionOutcome inputCompatibility =
+  if eq inputCompatibility "incompatible" then Just false
+  else if eq collectionOutcome "Solved" then suggestionAdmission expressionOutcome inputCompatibility
+  else Nothing
+
+-- Optional bounded observations for admitted raster data. These are ranking
+-- facts, never membership decisions. A sampled transparent/chromatic pixel is
+-- positive evidence; absence in a bounded prefix makes no whole-image claim.
+SuggestionRasterFacts = SuggestionRasterFacts width: Number height: Number pixelCount: Number inspectedPixels: Number complete: Bool sampledTransparency: Bool sampledChromaticity: Bool
+
+suggestionRasterFacts : Image -> Number -> SuggestionRasterFacts
+suggestionRasterFacts image budget =
+  let sampled = take (max 0 (floor budget)) image.pixels
+  SuggestionRasterFacts {
+    width = image.width,
+    height = image.height,
+    pixelCount = length image.pixels,
+    inspectedPixels = length sampled,
+    complete = length sampled == length image.pixels,
+    sampledTransparency = not (all sampled (\pixel -> pixel.a >= 255)),
+    sampledChromaticity = not (all sampled (\pixel -> pixel.r == pixel.g && pixel.g == pixel.b))
+  }
+
+suggestionRasterFactNames : SuggestionRasterFacts -> List String
+suggestionRasterFactNames facts =
+  let shape = if facts.width > facts.height then ["landscape"] else if facts.height > facts.width then ["portrait"] else ["square"]
+  let transparency = if facts.sampledTransparency then ["sampled-transparency"] else []
+  let chromaticity = if facts.sampledChromaticity then ["sampled-chromaticity"] else []
+  concat shape (concat transparency chromaticity)
+
+-- Constructor recipes are ordinary authored data. The same finite template
+-- can wrap any selected data in any constructor; it has no SetExpr recognizer.
+-- A template's argument slots need not equal constructor fields: for example,
+-- union packs two independently checked set arguments into one branches field.
+-- The host transports these addresses to the existing expression codec, then
+-- checks the complete constructor expression and every fixed input. Merely
+-- naming SeUnion (or any other constructor) never establishes applicability.
+
+SuggestionConstructionField = SuggestionConstructionField name: String indices: List Number packed: Bool
+
+SuggestionConstructionRecipe a = SuggestionConstructionRecipe operation: SuggestionOperation a fields: List SuggestionConstructionField
+
+SuggestionConstructionPlan a = SuggestionConstructionPlan recipe: SuggestionConstructionRecipe a plan: SuggestionPlan a
+
+suggestionConstructionFieldValid : Number -> SuggestionConstructionField -> Bool
+suggestionConstructionFieldValid arity field =
+  let sizeValid = if field.packed then true else eq (length field.indices) 1
+  let indicesValid = all field.indices (\index -> index >= 0 && index < arity && eq index (floor index))
+  sizeValid && indicesValid
+
+suggestionConstructionRecipeValid : SuggestionConstructionRecipe a -> Bool
+suggestionConstructionRecipeValid recipe =
+  let names = map (\field -> field.name) recipe.fields
+  let arity = length recipe.operation.paramNames
+  let used = unique (flatMap (\field -> field.indices) recipe.fields)
+  eq (length names) (length (unique names)) && eq (length used) arity && all recipe.fields (suggestionConstructionFieldValid arity)
+
+suggestionConstructionRecipePlans : Number -> SuggestionConstructionRecipe a -> List (SuggestionConstructionPlan a)
+suggestionConstructionRecipePlans maxArity recipe =
+  if not (suggestionConstructionRecipeValid recipe) then []
+  else map (\plan -> SuggestionConstructionPlan { recipe = recipe, plan = plan }) (suggestionPlans maxArity [recipe.operation])
+
+suggestionConstructionPlans : Number -> List (SuggestionConstructionRecipe a) -> List (SuggestionConstructionPlan a)
+suggestionConstructionPlans maxArity recipes =
+  flatMap (suggestionConstructionRecipePlans (max 0 (floor maxArity))) recipes
+
+-- Argument choice, preparation holes and context limits stay shared with
+-- ordinary calls. A contextual Number may fill a membership value slot, but
+-- may not become a SetExpr argument merely because a constructor packs it.
+SuggestionConstructionContextPlan a b = SuggestionConstructionContextPlan construction: SuggestionConstructionPlan a contextPlan: SuggestionContextPlan a b
+
+suggestionConstructionContextPlans : Number -> SuggestionConstructionPlan a -> List (SuggestionContextValue b) -> List (SuggestionConstructionContextPlan a b)
+suggestionConstructionContextPlans maxValues construction values =
+  map (\contextPlan -> SuggestionConstructionContextPlan { construction = construction, contextPlan = contextPlan }) (suggestionContextPlans maxValues construction.plan values)
+
+-- Explicit captured-data recipes may use the existing reader's whole-value
+-- membership judgment. These are immutable snapshots, never a scheme change
+-- for a live reference. Unknown membership cannot admit a fixed argument.
+suggestionSnapshotMembershipCompatibility : String -> String
+suggestionSnapshotMembershipCompatibility verdict =
+  if eq verdict "yes" then "compatible"
+  else if eq verdict "no" then "incompatible"
+  else "unknown"
+
+suggestionSnapshotInputsCompatibility : List String -> String
+suggestionSnapshotInputsCompatibility verdicts =
+  suggestionInputsCompatibility (map suggestionSnapshotMembershipCompatibility verdicts)
+
+-- Preparation only: solver discovery must never call solve, inhabit, a selected
+-- function, or its captures. The selected payload retains its actual expression,
+-- inferred scheme and owner. A type alone is not a reifiable function body.
+-- These are bounded unary recipes; fixing arguments first handles wider arity.
+SuggestionSolveMode = SatisfySelectedPredicate | ReachSelectedOutput
+
+SuggestionSolvePlan a b = SuggestionSolvePlan selected: SuggestionOperation a mode: SuggestionSolveMode target: Maybe (SuggestionContextValue b) missingNames: List String
+
+suggestionSolveTargetPlans : SuggestionOperation a -> List (SuggestionContextValue b) -> List (SuggestionSolvePlan a b)
+suggestionSolveTargetPlans selected targets =
+  map (\target -> SuggestionSolvePlan {
+    selected = selected,
+    mode = ReachSelectedOutput,
+    target = Just target,
+    missingNames = []
+  }) targets
+
+suggestionSolvePlans : Number -> SuggestionOperation a -> List (SuggestionContextValue b) -> List (SuggestionSolvePlan a b)
+suggestionSolvePlans maxTargets selected targets =
+  if not (eq (length selected.paramNames) 1) then []
+  else concat [
+    SuggestionSolvePlan { selected = selected, mode = SatisfySelectedPredicate, target = Nothing, missingNames = [] },
+    SuggestionSolvePlan { selected = selected, mode = ReachSelectedOutput, target = Nothing, missingNames = ["target"] }
+  ] (suggestionSolveTargetPlans selected (take (max 0 (floor maxTargets)) targets))
+
+-- Whole-expression type admission and reification are separate observations.
+-- Reification failure is not proof of an incompatible function type. Neither
+-- successful preparation nor a pin proves the predicate is solvable.
+-- An open target stays a typed argument of the recipe. It need not be filled
+-- to admit that recipe; no executable predicate Expr exists until it is filled.
+suggestionSolveAdmission : Maybe Bool -> Maybe Bool -> Bool -> Maybe Bool
+suggestionSolveAdmission checked bridgeChecked reifiable =
+  case checked of
+    Just false -> Just false
+    Just true -> case bridgeChecked of
+      Just false -> Just false
+      Just true -> if reifiable then Just true else Nothing
+      Nothing -> Nothing
+    Nothing -> Nothing
+
+-- A malformed owner declaration cannot refute an otherwise valid question.
+-- Keep that bridge unavailable until the existing owner has an admitted type.
+suggestionSolveBridgeAdmission : String -> String -> Bool -> Maybe Bool
+suggestionSolveBridgeAdmission outcome compatibility declarationResolved =
+  if declarationResolved then suggestionAdmission outcome compatibility else Nothing
+
+suggestionSolveResultMeaning : Maybe a -> String
+suggestionSolveResultMeaning result = case result of
+  Just witness -> "A witness was returned; validate it in the actual execution context before using it."
+  Nothing -> "No witness was returned. This does not establish that no solution exists."

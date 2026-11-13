@@ -1,0 +1,306 @@
+-- =========================================================================
+-- Types — public-slug → type RESOLUTION + the form VIEW (storage-as-effect
+-- Phase 4e, 2026-06-19).
+--
+-- The thesis forms-collapse closes (Rom 2026-06-19): there is NO "form"
+-- concept — a form is the auto-derived input VIEW over a type. A public form
+-- decomposes with no residue into (1) the type (its $record ⇒ the fields,
+-- auto-rendered by FieldRenderer), (2) the type's Codeable codeName (= the
+-- public URL slug), (3) the type's representations (the submit-button CTA = a
+-- Submittable representation), and (4) the type's function (the dissolved
+-- onSubmit). The `entity_type='form'` rows are RETIRED (migration 0084); their
+-- type is now resolved by the type's Codeable codeName.
+--
+-- 4d renamed the live capture type cf_application → CFApplication, which BROKE
+-- the public slug→type lookup (the slug `cf_application` no longer names a type
+-- row). The fix: resolve the slug by name FIRST (a direct type-name match), and
+-- on a miss fall back to the Codeable codeName projection (which still names the
+-- public slug). This fixes BOTH the GET-schema path (formView) and the
+-- submit path (submit.fenel resolves here before account-aware validation).
+--
+-- parseApp doesn't continue arg lists across newlines ⇒ multi-line case bodies
+-- → top-level helpers (the items/submit recipe). `find`/`eq` are std; getType /
+-- getTypeById / listInstancesByName are state IO leaves; listSystemEntities is the
+-- dispatch:* compile-time-catalog leaf (HasStateIO supplied by createRegistry's
+-- attachInferredRequires, transitive from the state:*/dispatch:* calls).
+--
+-- storage-as-effect Phase 4f (2026-06-19) — resolveType gains a THIRD fallback
+-- arm (resolveTypeBySystemEntity, via dispatch:listSystemEntities) so the shared
+-- public resolver covers SYSTEM entities (the page lane's `profile` typeRef). This
+-- is the D-RESOLVE fix placed in the shared resolver (not the `state:getType`
+-- storage leaf) — see resolveTypeByCodeNameOrSystem's note for why.
+-- =========================================================================
+
+module types where
+
+-- resolveType — the name-then-Codeable-codeName slug→type fallback. Resolve the
+-- slug as a direct type name FIRST (state:getType); on a miss, invert the
+-- Codeable projection (storage-as-effect Phase 4e: the public slug is the type's
+-- Codeable codeName, post-4d's CFApplication rename). Returns the FULL type row
+-- (id / name / type) so callers thread the canonical name + the schema + the id.
+resolveType : String -> Maybe ({  })
+@label "Resolve type by slug"
+@description "storage-as-effect Phase 4e/4f / field-identity Phase 2b — the name-then-Codeable-codeName-then-system-entity public-slug→type fallback. state:getType slug (a direct type-name match) FIRST; Nothing → resolveTypeByCodeName (consider every matching Codeable, join its target against the account/system type roster, and require one distinct type); Nothing → resolveTypeBySystemEntity. Field Codeables and unrelated instance Codeables therefore cannot strand a public type by list order, and two real type projections fail closed instead of first-match routing. Returns the full type row (id/name/type)."
+@tags "type" "resolve" "forms-collapse"
+resolveType slug =
+  case getType slug of
+    Just row -> Just row
+    Nothing -> resolveTypeByCodeNameOrSystem slug
+
+-- resolveTypeByCodeNameOrSystem — the second fallback chain: invert the Codeable
+-- projection FIRST, then (on a miss) the compile-time system-entity catalog.
+-- storage-as-effect Phase 4f (2026-06-19): the page lane's live typeRef `profile`
+-- is a SYSTEM entity — NOT a DB `types` row and NOT a Codeable codeName — so the
+-- two pre-4f arms (getType / Codeable) both miss it and the public PAGE 404s once
+-- it resolves via this shared body. The fix: a THIRD arm over `dispatch:listSystemEntities`
+-- (the compile-time `systemEntities` catalog, account-agnostic). This widens
+-- `resolveType` (the forms/pages public resolver) — NOT `state:getType` (the storage
+-- leaf), which stays Nothing-for-system-entities so dashboard `getTypeDetail`'s
+-- legacy /types/:name semantics are untouched (D-RESOLVE: neither brief Option A's
+-- leaf change nor a new TS leaf — the gate on `getType` callers tripped on
+-- getTypeDetail, so the system arm lives in the shared resolver, via an EXISTING
+-- leaf). Both public lanes (forms + pages) now share ONE resolution path that
+-- covers system entities.
+resolveTypeByCodeNameOrSystem : String -> Maybe ({  })
+resolveTypeByCodeNameOrSystem slug =
+  case resolveTypeByCodeName slug of
+    Just row -> Just row
+    Nothing -> resolveTypeBySystemEntity slug
+
+-- resolveTypeByCodeName — the fallback arm. A single global Codeable list also
+-- contains Field facets and projections for ordinary entity instances. List
+-- order is not authority: resolve every matching target through getTypeById,
+-- ignore non-type targets, dedupe repeated projections of the same type, and
+-- fail closed when the slug names two distinct type rows.
+resolveTypeByCodeName : String -> Maybe ({  })
+resolveTypeByCodeName slug =
+  let cods = listInstancesByName "Codeable"
+  let types = listTypes
+  let matches = filter (\c -> eq c.methods.codeName slug) cods
+  selectResolvedTypeCodeables (map (resolveTypeCodeableRow types) matches)
+
+-- Pure join of one Codeable target against the account/system type roster.
+-- Canonical Phase-2b Field Codeables carry targetEntityType="Field" and
+-- ordinary value Codeables target non-type row ids, so both become Nothing.
+resolveTypeCodeableRow : List ({}) -> {} -> Maybe ({  })
+resolveTypeCodeableRow types candidate =
+  find (\row -> eq row.id candidate.targetEntityType) types
+
+-- Pure exact-one selection over already-resolved candidate rows. Repeated
+-- Codeables for the same type id are idempotent; two distinct type ids make the
+-- public slug ambiguous and therefore unresolved.
+selectResolvedTypeCodeableStep : {} -> Maybe ({  }) -> {}
+selectResolvedTypeCodeableStep state candidate =
+  if state.ambiguous
+  then state
+  else case candidate of
+    Nothing -> state
+    Just row ->
+      case state.row of
+        Nothing -> { row = Just row, ambiguous = false }
+        Just prior ->
+          if eq prior.id row.id
+          then state
+          else { row = state.row, ambiguous = true }
+
+selectResolvedTypeCodeables : List (Maybe ({})) -> Maybe ({  })
+selectResolvedTypeCodeables candidates =
+  let selected = fold selectResolvedTypeCodeableStep { row = Nothing, ambiguous = false } candidates
+  if selected.ambiguous then Nothing else selected.row
+
+-- resolveTypeBySystemEntity — the compile-time system-entity arm. `dispatch:listSystemEntities`
+-- returns every engine `systemEntities` row ({id, type?, module="system"}); find the
+-- one whose id == slug and normalise it to the {id, name, type} row shape the callers
+-- thread (name = id — a system entity's id IS its canonical name, e.g. `profile`).
+-- This is the page lane's profile-capture resolution (storage-as-effect Phase 4f).
+resolveTypeBySystemEntity : String -> Maybe ({  })
+resolveTypeBySystemEntity slug =
+  let sysEnts = listSystemEntities
+  let match = find (\e -> eq e.id slug) sysEnts
+  case match of
+    Nothing -> Nothing
+    Just e -> Just { id = e.id, name = e.id, type = e.type, isSystem = true }
+
+-- ---- The embed lane's publication gate (rights Phase C3) -----------------
+--
+-- `resolveType` above answers "which type does this public slug name?". It
+-- deliberately does NOT answer "may an anonymous caller on the internet
+-- instantiate that type?", and until now nothing did: `/api/embed/forms/:slug`
+-- picks its account from a caller-supplied `X-Account-Id` header, resolves ANY
+-- registered name in that account (or any compile-time system entity, via the
+-- third arm), and creates an instance of it. GET leaked the `$record` of
+-- private types the same way. The route carried a `forms-collapse: open until
+-- the rights arc gates anonymous capture` marker; this is that gate.
+--
+-- The predicate is PUBLICATION, and it is POSITIVE: a type is reachable through
+-- the embed lane iff its owner published it there. Absence of a publication is
+-- a denial, so a newly-created type is private by default and no future
+-- resolver arm can widen the lane by accident.
+--
+-- Why a dedicated `EmbedPublication` and not the existing `Submittable`
+-- representation (which, empirically, the one live embed type already carries):
+-- `Submittable` means "here is my submit-button label". Reusing it would make a
+-- PRESENTATION edit a PUBLICATION act — an author who sets a CTA label silently
+-- exposes the type's schema and capture to anonymous callers, and an author who
+-- removes the label silently unpublishes a live funnel. That is the
+-- confused-deputy shape Cornerstone 4 rejects in one line: values describe,
+-- frames empower. A description must not be a grant. Keeping them separate also
+-- means the eventual conversion to a real sealed grant (Landing 4) converts one
+-- publication row into one grant, instead of mass-converting every CTA label
+-- into an envelope.
+--
+-- This is deliberately NOT the rights kernel. It is one account-scoped,
+-- type-id-keyed, owner-authored row that one lane consults — no envelope, no
+-- frame, no perform gate, nothing for Landing 4 to unpick. Its successor is a
+-- first-class publication object carrying `{slug, origins, …}` addressed by the
+-- URL, which would retire the caller-supplied account header and the whole
+-- three-arm name resolution on this lane; that changes the deployed widget
+-- contract, so it belongs with the sealed grants, not here.
+-- HISTORICAL — this module used to be one declaration from a boot crash. The
+-- defect is REPAIRED (module-substrate M1,
+-- `workstreams/module-substrate/briefs/phase-m1-module-growth-must-not-crash-boot.md`).
+-- Kept because the shape is worth knowing, and because the note it replaces
+-- told you the crash was your fault when it was not.
+--
+-- What used to happen: `engine/src/modules/types.ts` calls `loadFenelModule` at
+-- MODULE SCOPE, inside the `registry.ts -> system-entities.ts -> modules/*`
+-- import cycle. Growing this module made the file MISS the content-addressed
+-- parse cache; the live Fenel parser needs the interpreted harness; building it
+-- host-required `registry`, which reached `system-entities.ts` and read the
+-- still-TDZ `typesModule` binding of the very module in flight. The
+-- ReferenceError propagated out of `require`, was swallowed by the parser's
+-- broad catch (so the load "succeeded" via the TypeScript parser), and left
+-- Bun's module graph half-evaluated — hoisted functions callable, `const`s in
+-- TDZ forever. The crash then surfaced somewhere unrelated, most often
+-- `Cannot access 'fieldModuleIdentity' before initialization` (registry.ts:1305)
+-- or `MODULE_MANIFEST` (module-manifest.ts:179), with nothing pointing back here.
+--
+-- Measured triggers, both while landing rights C3: adding `@entity` to the
+-- declaration below, AND (separately, with no `@entity` anywhere) adding one
+-- more ordinary function to `submit.fenel`. So the trigger was GROWING THIS
+-- MODULE, not the directive.
+--
+-- Now: `getHarness` refuses to build during module-graph initialization instead
+-- of host-requiring an in-flight module, the TypeScript parser (the ledgered B1
+-- performance branch) serves such a miss, and the deficit is logged and fails
+-- the audit until `generate-parse-cache.ts --incremental` is run. Growing this
+-- module is ordinary work again; regenerate the artifact chain as usual.
+@label "Embed publication"
+@description "rights Phase C3 — an owner's declaration that ONE type is instantiable through the anonymous embed lane (/api/embed/forms/:slug). Account-scoped (the instance row's account) and keyed by the canonical `types` row UUID, never by a slug or a name, so re-aliasing a slug or renaming a type cannot re-point a publication at a different type. Presence IS the grant; there is no field to mis-set. Publishing a type exposes its $record schema to GET, its capture to POST, and — because submitValidated routes a same-name function when one exists — its authored submit behavior as well. It publishes the row's LIVE definition as the owner evolves it: publication is NOT a definition-version pin, and an owner editing a published type acts within the grant, not against it (see the C3 notes on why the roadmap's sha256(definition) bind was escalated rather than built). Successor: a publication object carrying slug + allowed origins (rights Landing 4)."
+@tags "type" "embed" "publication" "rights"
+EmbedPublication = EmbedPublication typeId: String
+
+-- embedResolve — the ONE entry the embed lane resolves through. Composes the
+-- public slug resolution with the two fences the lane needs:
+--   1. BIND BY ID. Re-read the resolved row by its canonical UUID through the
+--      account-scoped `getTypeById`. This is what "resolve once, bind the
+--      canonical type id" buys, and it also excludes the system-entity arm for
+--      free: `resolveTypeBySystemEntity` synthesises `id = name` from the
+--      compile-time catalog (`profile`, …), which is not a `types` row UUID and
+--      so cannot survive the re-read. The pages lane still needs that arm, which
+--      is exactly why this gate sits here and not inside `resolveType`.
+--   2. REQUIRE PUBLICATION for the bound id.
+-- Nothing on any failure — the caller maps every Nothing to one indistinguishable
+-- 404. Distinguishing "no such type" from "private type" would turn this into an
+-- existence oracle for an account's private schema roster.
+-- ⚠ THE PARAMETER IS NAMED, and that is a REPAIR (rights R4a C1a). It read
+-- `embedResolve : String -> Maybe ({  })` — an ANONYMOUS parameter — so the key
+-- a caller had to use was inferred from the body's binder rather than stated by
+-- the signature. `api/src/routes/forms.ts` passed `{ name: slug }`, the argument
+-- bound to nothing, and EVERY `/forms/:slug` request answered Nothing and
+-- therefore 404 — silently, because the gate renders every miss as one
+-- indistinguishable "Form not found". Measured against staging with a real
+-- published type: `{"slug":"CFApplication"}` resolves, `{"name":"CFApplication"}`
+-- does not. Naming the parameter makes the contract a declaration instead of an
+-- inference.
+embedResolve : (slug: String) -> Maybe ({  })
+@label "Resolve an embed-published type by slug"
+@description "rights Phase C3 — the embed lane's gated resolver. resolveType slug → getTypeById row.id (account-scoped, UUID-keyed: rejects the system-entity arm) → require an EmbedPublication row in this account targeting that id. Returns the freshly re-read canonical type row (id/name/type) so callers thread the BOUND identity rather than the caller-supplied slug. Nothing means unresolved, unpublished, or not an account type row — the caller must not tell those apart."
+@tags "type" "resolve" "embed" "rights"
+@ioAction "types.embed_resolve"
+embedResolve slug =
+  case resolveType slug of
+    Nothing -> Nothing
+    Just row -> embedBindById row
+
+-- embedBindById — the bind step. Re-reads by canonical UUID so everything
+-- downstream is threaded from a row this account actually owns, not from the
+-- shape the (three-arm, alias-tolerant) slug resolution happened to produce.
+embedBindById : {  } -> Maybe ({  })
+embedBindById row =
+  case getTypeById row.id of
+    Nothing -> Nothing
+    Just canonical -> embedRefuseGrantStore canonical
+
+-- embedRefuseGrantStore — THE GRANT STORE IS NOT REACHABLE THROUGH THE GRANTED
+-- LANE. `EmbedPublication` rows live in `entity_instances` under
+-- `entity_type='EmbedPublication'`, which is exactly what
+-- `embedRequirePublication` reads — and the generic capture arm of `submit`
+-- persists whatever type it was handed under that same column. `resolveType`
+-- prefers a DB `types` row over the module entity, so an account holding a row
+-- NAMED `EmbedPublication` that someone then published would let anonymous
+-- POSTs MINT publications for arbitrary type ids in that account: a data-race
+-- becomes anonymous grant-minting. Two owner missteps are required, which is
+-- precisely why this is a defense-in-depth invariant and not a comment.
+-- Reserved at the bind, so it covers GET and POST together.
+embedRefuseGrantStore : {  } -> Maybe ({  })
+embedRefuseGrantStore canonical =
+  if eq canonical.name "EmbedPublication"
+  then Nothing
+  else embedRequirePublication canonical
+
+-- embedRequirePublication — the positive check. `listInstancesByName` is
+-- account-scoped by the handler, so a publication in another account cannot
+-- authorise a type here; matching on the canonical row id (not the name)
+-- means a rename cannot silently carry a publication onto a different type.
+embedRequirePublication : {  } -> Maybe ({  })
+embedRequirePublication canonical =
+  let pubs = listInstancesByName "EmbedPublication"
+  case find (\p -> eq p.typeId canonical.id) pubs of
+    Nothing -> Nothing
+    Just _pub -> Just canonical
+
+-- formView — what GET /forms/:slug serves: the registered type's $record schema
+-- (so the widget renders the fields via FieldRenderer) + the public config. PORTS
+-- the route's former TS `{slug, type, config}` assembly into Fenel (Fenel-first;
+-- the route becomes a thin invoke passthrough). config carries the submit-CTA
+-- when the type has a Submittable representation, else {} (the widget reads
+-- config?.submitLabel).
+-- rights Phase C3 — takes the BOUND canonical type id, not the caller's slug.
+-- It used to re-run the full three-arm `resolveType` on whatever string the
+-- route passed, which meant the gate's bind died at the route boundary and the
+-- served schema was re-selected by the alias-tolerant resolver. `getTypeById` is
+-- account-scoped and UUID-keyed, so what GET serves is exactly the row
+-- `embedResolve` authorised.
+formView : (typeId: String) -> Maybe ({ slug: String, typeName: String, type: Type, config: Map String Any, rootBinding: { origin: String, id: String, name: String } })
+@label "Form view"
+@description "storage-as-effect Phase 4e / field-identity Phase 2b / rights Phase C3 — GET /embed/forms/:slug's response, ported from TS into Fenel. Takes the BOUND canonical type-row UUID (from types:embedResolve), NOT a public slug: getTypeById typeId → Nothing (404) | Just row → Just { slug = row.name, typeName = row.name, type = row.type, config }. The route echoes the caller's slug back over `slug`, so the widget's wire contract is unchanged. typeName lets the browser select the registry-local identified definition; raw row.type remains the public wire definition. config = { submitLabel } when the type has a Submittable representation, else {}."
+@tags "type" "form-view" "forms-collapse" "rights"
+@ioAction "types.form_view"
+formView typeId =
+  case getTypeById typeId of
+    Nothing -> Nothing
+    Just row -> Just (formViewOf row.name row)
+
+-- formViewOf — assemble the served record from the resolved type row.
+formViewOf : (slug: String) -> (row: { id: String, name: String, type: Type }) -> { slug: String, typeName: String, type: Type, config: Map String Any, rootBinding: { origin: String, id: String, name: String } }
+formViewOf slug row =
+  { slug = slug, typeName = row.name, type = row.type, config = formViewConfig row, rootBinding = publicTypeRootBinding row }
+
+-- Internal read provenance travels to the Field graph check, then the HTTP
+-- projection removes it. A name alone must never replace an account identity.
+publicTypeRootBinding : (row: { id: String, name: String }) -> { origin: String, id: String, name: String }
+publicTypeRootBinding row =
+  { origin = if eq row.isSystem true then "repository" else "account", id = row.id, name = row.name }
+
+-- formViewConfig — read the type's submit-CTA (Submittable representation) into
+-- the public config. Two-arm: found ⇒ { submitLabel = <bare string> } (the
+-- widget reads config?.submitLabel directly), absent ⇒ {} (no CTA override).
+-- The value MUST be a plain string / omitted, NOT a Maybe.
+formViewConfig : (row: { id: String }) -> Map String Any
+formViewConfig row =
+  let subs = listInstancesByName "Submittable"
+  let match = find (\s -> eq s.targetEntityType row.id) subs
+  case match of
+    Nothing -> {  }
+    Just s -> { submitLabel = s.methods.submitLabel }

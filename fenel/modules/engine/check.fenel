@@ -1,0 +1,1815 @@
+module engine where
+
+-- =========================================================================
+-- check.fenel — `checkExpr`, the BIDIRECTIONAL term-membership judgment over
+-- the core `Expr` (decide-substrate Phase 8λ.2; brief:
+-- `workstreams/decide-substrate/briefs/phase-8lambda-2-check-judgment.md`;
+-- design: `design/arrow-synthesis.md` §4, the D-C v2 CHECK shape).
+--
+-- CROSS-REFERENCE — THE SIGNATURE-VALIDATION CHECKER RULES DO NOT LIVE HERE
+-- (signature-substrate slice 3h). P4-D3 asks for "the rules and side conditions
+-- documented in `check.fenel`"; that sentence is from 2026-07-23, before the
+-- occurrence carrier existed. Those rules walk `VcaNode` — the annotated carrier
+-- over the RAW stored body — and this file walks `Expr`, which is produced by
+-- the provenance-free re-lift the whole S1 finding exists to keep OUT of
+-- validation. So the sentence is honoured by REINTERPRETATION: the rules live in
+-- `fenel/modules/engine/validation-check.fenel` (prefix `vch*`), their trusted
+-- statements are the `vch.*` rows of `design/tcb-ledger.md` § 3h, and their
+-- narrative is `design/signatures-and-contracts.md` § "The checker rules".
+--
+-- WHAT THAT MEANS FOR THIS FILE: NOTHING. The general judgment is UNTOUCHED by
+-- that slice — `checkExpr` / `checkExprFix` keep their signatures and their
+-- behaviour for every non-validation consumer, and the decider corpus is
+-- required to come back with zero deltas. The validation rules are
+-- validation-only, keyed by an occurrence identity only the trusted entry can
+-- supply, and they REUSE this file's exported primitives bare-name (both are
+-- `module engine`) in the direction `arrowSigAligned` already uses. They do not
+-- extend it and nothing here may reach them.
+--
+-- THE ONE CAPABILITY: `checkExpr e env goal : Maybe Bool` decides whether the
+-- OPEN TERM `e` (a value of the 7-case core `Expr`), under a variable→set
+-- environment `env`, is a member of the set `goal`. It is the CHECK half of
+-- bidirectional type-checking — the goal set is GIVEN (never inferred) — and it
+-- is what makes TYPE-CHECKING A LAMBDA kernel-reachable: `setAlgebraArrowContains`
+-- (set-algebra-deciders.fenel) lifts a closure's body via the `bodyToExpr`
+-- marshal seam and calls `checkExpr` to decide `{closure} ⊆ SeArrow`, so the
+-- kernel's `verifyWitnessMembership` re-certifies a proposed lambda through the
+-- ordinary `decideSubset → contains → SeArrow-closure` route with ZERO kernel
+-- edits (design/arrow-synthesis.md §4; the 8λ.1 const-witness GAP closes here).
+--
+-- NOT A FOURTH ABSTRACT EVALUATOR (the Addendum's named risk): checkExpr
+-- delegates ALL transfer math to the `propagate` leaves (the interval/enum math
+-- that `inferExprType` uses — ONE implementation) and ALL set-membership to the
+-- shipped `decideSubset` decider arms. It grows NO interval math of its own; if
+-- it ever does, that is the regression signal. `inferExprType` (fenel-check.fenel)
+-- STAYS the editor's FORWARD inference branch (a different consumer, a different
+-- input currency — an `ExprMarker` walk, not this `Expr` walk); it is NOT
+-- kernel-reachable, and this file does NOT copy it.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE SOUNDNESS INVARIANT + PROPAGATION TABLE (the §3 header — LOAD-BEARING):
+--
+--   checkExpr e env goal = Just true  ⇒  ⟦e⟧env ⊆ goal   (a SOUND sufficient
+--     condition for membership — every accept requires its sub-obligations to
+--     decide `Just true`, and every synth-mode set OVER-APPROXIMATES the true
+--     image, so an accept can never be a false accept).
+--   checkExpr e env goal = Just false ⇒ ⟦e⟧env ∩ goal = ∅   (a definite refutation,
+--     emitted ONLY from an EXACT derivation — enumerated below).
+--   checkExpr e env goal = Nothing   ⇒ UNDECIDED (the honest fence — out of the
+--     v1 fragment; never wrong).
+--
+-- The EXACT-refutation sites (the ONLY arms that may return `Just false`), each
+-- enumerated because `Just false` feeds the kernel's PropSubset/witness faces:
+--   • ELit v        — `decideSubset (SeEnum [v]) goal` is EXACT (a singleton is
+--                     the value itself); BOTH verdicts propagate.
+--   • ELambda arity — ONLY the curry-irreducible direction (8λ.2-r): MORE params
+--                     than the goal AND a non-arrow codomain provably CALLABLE-
+--                     FREE (the under-applied value is a partial — a callable —
+--                     definitely ∉ a callable-free codomain), gated on every goal
+--                     param domain decidably NONEMPTY. A flat param-count
+--                     mismatch is NOT a refutation — currying/partial-application
+--                     bridges arities (the 8λ.2-r probe-confirmed fix).
+--   • EConstruct ctor-tag mismatch — a non-coercing ctor value carries `$tag`,
+--                     never structurally equal to a different-ctor set (the 8μ.1a
+--                     distinctness rule lifted to open terms); the empty SeUnion.
+--   • EConstruct/ERecord fieldwise — propagates a field's `Just false` (which is
+--                     itself only ever exact, by this same discipline) OR the
+--                     all-branches-false union verdict.
+--   • ELambda body   — propagates the body's `Just false` ONLY when the body
+--                     derivation is EXACT (v1: an `ELit` body) AND every goal
+--                     param domain is decidably NONEMPTY (the vacuous gate);
+--                     else softens.
+--   • ECall "if" both-branches — a 3-arg if's value is ALWAYS one of the two
+--                     branch values, so both branches refuted-EXACTLY ⇒ the term
+--                     is refuted (8λ.2-r).
+--   • True/False EConstruct — the B5 coercion makes the value EXACTLY the JS
+--                     boolean ⇒ the ELit singleton face's verdicts (8λ.2-r; the
+--                     Opus pass's blanket Nothing threw exactness away).
+--   • EMatch all-covered-all-refuted (8λ.4) — the checkIfArm both-branches
+--                     precedent widened to n arms: every branch of the
+--                     scrutinee's ctor decomposition is COVERED by an unguarded
+--                     always-match arm (⇒ the runtime null path is impossible —
+--                     probe-verified: an uncovered value yields host-null,
+--                     json-logic.ts matchOp) AND every could-fire arm body is
+--                     refuted EXACTLY (each body refutation is itself exact by
+--                     this same discipline) ⇒ whichever arm fires, the value is
+--                     refuted. Arm-ordering is respected (the walk stops at the
+--                     first unguarded always-match arm — later arms are
+--                     unreachable for that branch and impose NO obligation);
+--                     guarded / might-match arms contribute obligations but
+--                     never coverage (a guard can dodge at runtime —
+--                     probe-verified: falsy guard ⇒ continue to later arms).
+--
+-- Every OTHER arm is ACCEPT-ONLY (`Just false ⇒ Nothing`):
+--   • EVar          — the env set may OVER-approximate the var's runtime values.
+--   • ECall synth   — the synth set OVER-approximates the call's true image (a
+--                     declared return is exact as a SET, but the call's image only
+--                     ⊆-approximates it), so a `Just false` against the goal is
+--                     NOT a term refutation.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE CALLING-CONVENTION SEMANTICS (8λ.2-r — probe-verified against
+-- json-logic.ts invokeFunction, the operational ground truth):
+--   • UNDER-application yields a `{__fenelPartial}` (json-logic.ts:1871) — so an
+--     N-param closure IS a member of a curried goal `(A)→((B)→C)` when its
+--     uncurried check passes: checkLambda RE-ASSOCIATES an arrow-shaped codomain
+--     (params ++ returns.params) when the closure has MORE params than the goal.
+--   • OVER-application SPILLS leftover args onto a CALLABLE result
+--     (json-logic.ts:1887) — so a closure with FEWER params than the goal checks
+--     its BODY against the remainder arrow `SeArrow(aps[N:], returns)` under the
+--     first-N bindings (ACCEPT-ONLY: a non-callable result silently DROPS
+--     leftovers, so `f(a,b) = f(a)` when `f(a)` is a scalar — a body refuted
+--     against the remainder arrow could still be a member via the drop path).
+--   • VACUOUS membership: `∀x∈∅. …` holds for ANY closure — a goal param with a
+--     decidably-EMPTY domain ⇒ `Just true` REGARDLESS of arity or body (the
+--     exponential law's witness side; refuting inhabit's own vacuous witness was
+--     the 8λ.2-r probe-confirmed false refutation — the ∅-class 8λ.1-r fixed on
+--     the subset face, applied here to membership).
+--   • REFUTATION GATES: every lambda refutation (arity / exact-body) rides the
+--     ∀ being NON-vacuous ⇒ requires EVERY goal param domain decidably NONEMPTY.
+--
+-- THE FENCES (each an honest `Nothing`, NOT a silent gap):
+--   • EMatch (8λ.4 — the v1 blanket fence NARROWED to a real fragment): the
+--     check arm decides matches whose SCRUTINEE SYNTH SET decomposes to
+--     SeCtor / SeUnion-of-SeCtor branches (non-coercing, non-`""` — genuine
+--     `$tag`-carrying ctors). Per branch, arms walk IN ORDER: a PatConstruct
+--     whose ctor mismatches the branch is an EXACT never-match (matchPattern
+--     keys on `$tag` equality — probe-verified); a PatVar / PatLit-`"_"` /
+--     matching-ctor pattern with all-PatVar/`"_"` sub-patterns is an
+--     always-match whose body (under the NARROWED env — scrutinee var ↦ the
+--     branch, PatVar binders ↦ the branch field sets, PREPENDED newest-first)
+--     is an obligation; the first UNGUARDED always-match arm covers the branch
+--     and stops the walk. Guarded arms + scalar-sub-PatLit (might-match) arms
+--     contribute obligations but continue (they can dodge — the runtime falls
+--     through to later arms / host-null). STILL fenced inside the arm:
+--     a non-decomposable scrutinee synth (SeAll / SeRef / SeInterval / … —
+--     SeMu now DECOMPOSES by one face-ok-gated equi-recursive unfold, 8λ.5
+--     `checkMatchBranchesMu`; a non-positive/unguarded/μ-of-μ stays fenced),
+--     coercing (True/False) or `""` branch ctors, canonical PatWildcard (this
+--     checker conservatively fences it even though egress now normalizes it
+--     to operational `PatLit "_"`, the wire `"_"`), positional ctor patterns
+--     with args but no fields metadata, nested PatConstruct sub-patterns, non-scalar PatLits,
+--     an uncovered branch (⇒ the runtime null path), and the empty
+--     decomposition. The fork driver's `armAssume` currency was RE-VERIFIED
+--     (8λ.4 probe 4) as fork PATH-ATOMS (`eq scrutinee (EConstruct C [?fork:
+--     fresh])` + capture substitution) — NOT reusable as set narrowing, so the
+--     arm keeps its own `{name, set}` re-binding currency.
+--   • under/over-applied / unknown call heads, registered args not decidably
+--     inside their domains, `pipe`/`apply` raw forms — synth Nothing.
+--     `$dyn:<name>` / `$`-vehicle DYNAMIC heads are NO LONGER blanket-fenced
+--     (8λ.4 Γ-apply v2): an env-bound SeArrow head with exact arity + every
+--     arg's synth set decidably ⊆ its param set synths the arrow's RETURN set
+--     (synthDynName / synthDollar — both spellings of one semantics, probe 1);
+--     anything less degrades to SeAll (accept-only, never a refutation).
+--   • effectful referents          — `fnTypeMarker`'s `pure=false` (the effect
+--                                     fence, inherited from 8λ.1).
+--   • advisory/untrusted referents — `fnTypeMarker`'s `trusted=false`; useful
+--                                     inference is not a floor fact (signature P2).
+--   • non-exact signatures         — `seHasAll` on the projected signature (a free
+--                                     type var / `$el` / open map ⇒ SeAll ⇒ the
+--                                     8λ.1-r exactness lesson; instantiation is
+--                                     8λ.3+); the synth set softens to SeAll.
+--   • ELambda vs a non-SeArrow goal, EConstruct (non-coercing) vs a
+--     non-SeCtor/SeUnion/SeAll goal, closure CAPTURES (free vars in the body
+--     that live in `closure` are NOT bound — env misses ⇒ Nothing, never a
+--     false accept; binding ELit-able captures is a cheap v2 widening),
+--     2-arg `if` (the missing else-branch value is host-null) — all Nothing.
+--   • True/False constructs are NOT fenced (8λ.2-r): the B5 coercion makes the
+--     value EXACTLY the boolean ⇒ they route through the ELit singleton face.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- CTX-SAFETY (probe #4, the 8λ.1-r flag — ANSWERED): the closure-membership arm
+-- (and this file's synth-mode `fnTypeMarker`) reaches the decider ctx-natives.
+-- That is SAFE under the kernel witness re-check: the kernel's in-body
+-- `decideSubset` resolves to the `set:decideSubset` NATIVE, which re-enters
+-- `dispatchSetAlgebraDecider` — and that ALWAYS injects `setAlgebraDeciderNativesCtx()`
+-- (fnTypeMarker / bodyToExpr / namedMember / whereMember). Empirically proven by
+-- the 8μ.4 mu-forall e2e (the Park premise re-check reaches the `fnBody` ctx-native
+-- in-kernel and produces SolverChecked). So NO kernel-ctx widening is needed —
+-- the closure-check path rides the same route as 8μ.4.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- NO ENTITY DECLS (the engine-fns law-freeze rule — entity +0, law +0, lock +0):
+-- Env lookup remains lexical by source binding name, but entries created from
+-- resolved fields/params also retain `{semanticKey, wirePath}`. `semanticKey`
+-- is `Just FieldKey` for a field-derived binding and `Nothing` for a plain
+-- lexical binder; `wirePath` is diagnostics/runtime projection only. Existing
+-- external `{name,set}` entries are normalized at the engine dispatch boundary
+-- before these exact structural signatures are checked.
+-- =========================================================================
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- checkExpr — the public entry. Dispatch on the Expr shape (positional patterns).
+-- Check-mode arms (goal known): ELit / EVar / ELambda / EConstruct / ERecord /
+-- EMatch (8λ.4 — per-arm SeCtor narrowing over the scrutinee's ctor
+-- decomposition). Synth-mode: ECall (a sub-term needs a set) delegates to
+-- synthExpr, then accept-only against the goal. Anything else ⇒ Nothing.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Check expr membership"
+@description "The bidirectional CHECK judgment (decide-substrate Phase 8λ.2 / 8λ.4): decide whether an open term `e` (the 7-case core Expr), under a variable→set env, is a member of a GIVEN goal set. `Just true ⇒ ⟦e⟧env ⊆ goal` (sound sufficient membership); `Just false` only from EXACT derivations (ELit / ELambda arity / EConstruct ctor-tag / EMatch all-covered-all-refuted); `Nothing` = out of the fragment. Check-mode: ELit (the singleton {v}⊆goal face), EVar (env lookup, accept-only), ELambda-against-SeArrow (the intro rule — arity + bind params + check the body against the codomain), EConstruct-against-SeCtor/SeUnion (ctor match + FieldKey-aligned fieldwise reasoning), ERecord-against-SeCtor \"\" (key-bearing goal slots projected once through current wire names), EMatch (8λ.4 — the scrutinee synth's SeCtor decomposition, per-branch first-match arm walk under the narrowed env, coverage-gated). Synth-mode: ECall delegates to the propagate transfer leaves (op fragment) + fnTypeMarker return signatures (registered calls), accept-only. Makes type-checking a lambda kernel-reachable: setAlgebraArrowContains calls this to decide {closure} ⊆ SeArrow, so verifyWitnessMembership re-certifies a proposed lambda with zero kernel edits."
+@tags "engine" "check" "membership" "arrow" "decide-substrate" "phase-8lambda"
+checkExpr : (e: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkExpr e env goal =
+  case e of
+    ELit { value = v } -> checkLit v goal
+    EVar { name = x } -> checkVar x env goal
+    ELambda { params = ps, body = b } -> checkLambda ps b env goal
+    EConstruct { ctor = c, args = cargs } -> checkConstruct c cargs (checkCtorTermFields e) env goal
+    ERecord { fields = fs } -> checkRecord fs env goal
+    ECall { fnId = f, args = cargs } ->
+      if and (elem f ["if", "?:"]) (eq (lookup e "structural") (Just false)) then Nothing
+      else if and (elem f ["if", "?:"]) (eq (lookup e "structural") (Just true)) then checkIfArm cargs env goal
+      else checkCall f cargs env goal
+    EMatch { scrutinee = sc, arms = arms } -> checkMatch sc arms env goal
+    _ -> Nothing
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- ELit — the EXISTING singleton membership face `{v} ⊆ goal`, EXACT ⇒ both
+-- verdicts propagate (the kernel's verifyWitnessMembership rule at the term level).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "check: ELit"
+@description "decide-substrate Phase 8λ.2 — a literal term checks by the singleton subset face: decideSubset (SeEnum [v]) goal. EXACT (a singleton IS the value) ⇒ both Just true and Just false propagate. Internal helper."
+@tags "engine" "internal" "check" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkLit : (v: Any) -> (goal: SetExpr) -> Maybe Boolean
+checkLit v goal =
+  let vs = appendItem v []
+  let s = SeEnum { values = vs }
+  decideSubset s goal
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- EVar — env lookup, ACCEPT-ONLY (the env set may over-approximate the var's
+-- runtime values through a synth-mode flow ⇒ a Just false is NOT a refutation).
+-- Unbound ⇒ Nothing.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "check: EVar"
+@description "decide-substrate Phase 8λ.2 — a variable term checks by env lookup, ACCEPT-ONLY: the bound set decideSubset-ed against the goal, softening Just false to Nothing (the env set may over-approximate the var's true values). Unbound ⇒ Nothing. Uses the check-local exact Env lookup. Internal helper."
+@tags "engine" "internal" "check" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkVar : (x: String) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkVar x env goal =
+  case checkEnvLookup x env of
+    Just s -> checkAcceptOnly (decideSubset s goal)
+    Nothing -> Nothing
+
+@label "check: env lookup"
+@description "Exact check-local lexical lookup over normalized Env rows. Scans head-first so newly prepended lambda and match bindings shadow older entries. Internal helper."
+@tags "engine" "internal" "check" "environment" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkEnvLookup : (name: String) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Maybe SetExpr
+checkEnvLookup name env =
+  case head env of
+    Nothing -> Nothing
+    Just entry ->
+      if eq entry.name name then Just entry.set
+      else
+        case tail env of
+          Nothing -> Nothing
+          Just rest -> checkEnvLookup name rest
+
+@label "check: acceptOnly"
+@description "decide-substrate Phase 8λ.2 — soften a decideSubset verdict to accept-only: Just true stays; Just false and Nothing both become Nothing (the over-approximation rule — an over-approximating set's Just false is not a term refutation). Internal helper."
+@tags "engine" "internal" "check" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkAcceptOnly : (d: Maybe Boolean) -> Maybe Boolean
+checkAcceptOnly d =
+  case d of
+    Just b -> if b then Just true else Nothing
+    Nothing -> Nothing
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- ELambda — the INTRO rule. Against a SeArrow goal: arity-match the params
+-- (intrinsic ⇒ mismatch is an EXACT Just false), bind each param to its goal
+-- param domain, check the body against the codomain. The body's Just false
+-- propagates ONLY when the body derivation is EXACT (v1: an ELit body — a const
+-- lambda whose constant escapes the codomain is definitely ∉); else soften.
+-- Non-SeArrow goal ⇒ Nothing.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "check: ELambda"
+@description "decide-substrate Phase 8λ.2 / 8λ.2-r — the lambda INTRO rule against a SeArrow goal, CURRY-AWARE + VACUOUS-GATED (the calling-convention semantics in the file header): (1) any goal param domain decidably EMPTY ⇒ Just true (vacuous ∀ — regardless of arity or body; refuting inhabit's own vacuous witness was the probe-confirmed 8λ.2-r false refutation); (2) closure arity N == goal arity M ⇒ bind + check the body against the codomain (refutations gated by checkLambdaBody); (3) N > M ⇒ an arrow-shaped codomain RE-ASSOCIATES into the params (under-application yields a partial — currying) and retries, a non-arrow codomain refutes ONLY when provably callable-free + all params decidably nonempty (the under-applied value is a partial, a callable), else Nothing; (4) N < M ⇒ bind the first N and check the body against the remainder arrow ACCEPT-ONLY (over-application SPILLS onto callable results but DROPS onto non-callables — the drop path makes refutation unsound). A non-SeArrow goal ⇒ Nothing. THIS is the arm that makes type-checking a lambda kernel-reachable. Internal helper."
+@tags "engine" "internal" "check" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkLambda : (ps: List String) -> (b: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkLambda ps b env goal =
+  if not (eq (seTag goal) "SeArrow") then Nothing
+  else if arrowSomeParamEmpty goal.params then Just true
+  else
+    let aps = goal.params
+    let n = length ps
+    let m = length aps
+    if eq n m then
+      let env2 = checkBindParams ps aps env
+      let bodyV = checkExpr b env2 goal.returns
+      checkLambdaBody bodyV b aps
+    else if gt n m then checkLambdaWide ps b env goal
+    else checkLambdaNarrow ps b env goal
+
+@label "check: lambda wide (N > M)"
+@description "decide-substrate Phase 8λ.2-r — a closure with MORE params than the goal: an arrow-shaped goal codomain RE-ASSOCIATES (goal params ++ codomain params → codomain returns — sound via under-application/partials: f(a) behaves as the residual lambda) and retries checkLambda (terminates — the codomain arrow depth strictly decreases); a non-arrow codomain: the goal-applied value is a PARTIAL (a callable), so a provably CALLABLE-FREE codomain refutes (Just false, gated on all goal params decidably nonempty — the ∀ must be non-vacuous), else Nothing. Internal helper."
+@tags "engine" "internal" "check" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkLambdaWide : (ps: List String) -> (b: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkLambdaWide ps b env goal =
+  let r = goal.returns
+  if eq (seTag r) "SeArrow" then
+    let ps2 = concat goal.params r.params
+    let goal2 = SeArrow { params = ps2, returns = r.returns }
+    checkLambda ps b env goal2
+  else
+    if checkAllParamsNonempty goal.params then
+      if checkCallableFree r then Just false else Nothing
+    else Nothing
+
+@label "check: lambda narrow (N < M)"
+@description "decide-substrate Phase 8λ.2-r — a closure with FEWER params than the goal: bind the first N goal domains (checkBindParams stops at the shorter list) and check the body against the REMAINDER arrow SeArrow(aps[N:], returns) — sound via over-application SPILL (a callable body-value absorbs the leftover args). ACCEPT-ONLY: a NON-callable body-value silently DROPS leftovers (json-logic.ts:1894 returns the result unchanged), so a body refuted against the remainder arrow could still be a member via the drop path ⇒ Just false softens to Nothing. Internal helper."
+@tags "engine" "internal" "check" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkLambdaNarrow : (ps: List String) -> (b: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkLambdaNarrow ps b env goal =
+  let rest = arrowDropList goal.params (length ps)
+  let goal2 = SeArrow { params = rest, returns = goal.returns }
+  let env2 = checkBindParams ps goal.params env
+  checkAcceptOnly (checkExpr b env2 goal2)
+
+@label "check: lambda body verdict"
+@description "decide-substrate Phase 8λ.2 / 8λ.2-r — combine a lambda body's check verdict with the refutation discipline: Just true ⇒ Just true; Just false propagates ONLY when the body is an ELit (an exact const-lambda refutation) AND every goal param domain is decidably NONEMPTY (the vacuous gate — a maybe-empty domain could make the ∀ vacuous ⇒ member), else Nothing; Nothing ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "check" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkLambdaBody : (bodyV: Maybe Boolean) -> (b: (Expr Any)) -> (aps: List SetArrowParam) -> Maybe Boolean
+checkLambdaBody bodyV b aps =
+  case bodyV of
+    Just true -> Just true
+    Just false ->
+      if checkIsELit b then
+        if checkAllParamsNonempty aps then Just false else Nothing
+      else Nothing
+    Nothing -> Nothing
+
+@label "check: all params nonempty?"
+@description "decide-substrate Phase 8λ.2-r — every goal param domain decidably NONEMPTY (setAlgebraDecideEmpty = Just false)? The lambda-refutation gate: a refutation of `∀x∈P. …` needs a witness binding, so every P must be decidably inhabited; any Just true / Nothing ⇒ false (the refutation softens). Internal helper."
+@tags "engine" "internal" "check" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkAllParamsNonempty : (aps: List SetArrowParam) -> Boolean
+checkAllParamsNonempty aps =
+  case head aps of
+    Nothing -> true
+    Just p ->
+      case setAlgebraDecideEmpty p.set of
+        Just b -> if b then false else checkAllParamsNonempty (eufRest aps)
+        Nothing -> false
+
+@label "check: callable-free set?"
+@description "decide-substrate Phase 8λ.2-r — is a SetExpr PROVABLY free of callable values (no `{$ref}` / `{__fenelFn}` / `{__fenelPartial}` member possible)? The N>M arity-refutation gate: the under-applied value is a partial (a callable), so it is definitely ∉ a callable-free codomain. v1 shapes: SeInterval / SeNone (empty) ⇒ true; a KNOWN atom-tower SeRef (seNamedEmpty = Just false — numbers/strings/chars/bools are never callable) ⇒ true; SeEnum with every value a scalar (checkEnumScalarsOnly) ⇒ true; everything else (SeCtor could degenerately carry callable-shaped fields, SeAll/SeWhere/… unknown) ⇒ false (the refutation softens). Internal helper."
+@tags "engine" "internal" "check" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkCallableFree : (s: SetExpr) -> Boolean
+checkCallableFree s =
+  case s of
+    SeInterval {} -> true
+    SeNone -> true
+    SeRef { handle = h } ->
+      case seNamedEmpty h of
+        Just b -> not b
+        Nothing -> false
+    SeEnum { values = vs } -> checkEnumScalarsOnly vs
+    _ -> false
+
+@label "check: enum all scalars?"
+@description "decide-substrate Phase 8λ.2-r — every enum value a scalar (number / string / boolean — never a record, so never callable-shaped)? Internal helper to checkCallableFree."
+@tags "engine" "internal" "check" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkEnumScalarsOnly : (vs: List Any) -> Boolean
+checkEnumScalarsOnly vs =
+  case head vs of
+    Nothing -> true
+    Just v ->
+      if isNumber v then checkEnumScalarsOnly (eufRest vs)
+      else if isString v then checkEnumScalarsOnly (eufRest vs)
+      else if isBoolean v then checkEnumScalarsOnly (eufRest vs)
+      else false
+
+@label "check: bind params"
+@description "decide-substrate Phase 8λ.2 / 8λ.2-r — bind a lambda's param names (a list of strings) to the goal SeArrow's per-param domains (SetArrowParam.set) for the body check. PREPENDS each {name, set} entry (cons — envLookup scans HEAD-FIRST, so the NEWEST binding must sit in front: appending gave reverse-lexical scoping where an OUTER binding shadowed the inner param — the 8λ.2-r probe-confirmed KERNEL-REACHABLE FALSE ACCEPT via nested same-name lambdas `\\x -> \\x -> x`; prepend order also matches the runtime's last-param-wins data binding for duplicate names). Positional pairing; stops at the shorter list (the N<M narrow arm binds exactly the closure's params). Internal helper."
+@tags "engine" "internal" "check" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkBindParams : (ps: List String) -> (aps: List SetArrowParam) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })
+checkBindParams ps aps env =
+  case head ps of
+    Nothing -> env
+    Just p ->
+      case head aps of
+        Nothing -> env
+        Just ap ->
+          let entry = { name = p, semanticKey = Just ap.key, wirePath = ap.wireName, set = ap.set }
+          let one = appendItem entry []
+          let env2 = concat one env
+          checkBindParams (eufRest ps) (eufRest aps) env2
+
+@label "check: is ELit?"
+@description "decide-substrate Phase 8λ.2 — true when an Expr is an ELit (the body-exactness gate for the lambda refutation propagation). Internal helper."
+@tags "engine" "internal" "check" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkIsELit : (e: (Expr Any)) -> Boolean
+checkIsELit e =
+  case e of
+    ELit {} -> true
+    _ -> false
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- EConstruct — the 8μ.1a membership rule lifted to OPEN TERMS, judged against
+-- the value the RUNTIME `construct` op actually WRITES (type-substrate
+-- P1(a.12), chk.ctor.pair). The old reading RECONSTRUCTED the argument axes
+-- from the ctor tag (a declared-semantic-key lookup over the PROCESS registry)
+-- and paired them to the goal by key identity; that is not the write model, and
+-- it minted a definite ACCEPT for `Pair 5 9` against a NAMED `Pair{a,b}` goal
+-- while the runtime wrote `_0`/`_1` and membership refuted.
+--
+-- The write model, verbatim from json-logic.ts's `construct` arm:
+--   name = _constructorWireNames[source] ?? source; ""/`@ctor/` ⇒ THROW;
+--   nullary True/False ⇒ the native boolean; else `{$tag: name}` plus
+--   useNamed = (exactly ONE payload arg ∧ its RAW JSON-Logic node is a plain
+--              non-array object ∧ (unregistered ? true
+--                                 : its keys are non-empty and all DECLARED)),
+--   named ⇒ the raw object's own keys carry the evaluated sub-nodes;
+--   otherwise ⇒ the positional axes `_0 … _(n-1)`.
+-- Every axis is therefore a PHYSICAL WIRE, and the goal side is read through
+-- `seCtorFieldReadWire` — membership's OWN primitive, so the two faces cannot
+-- disagree where both decide.
+--
+-- The write model is IR-SHAPE-dependent (it inspects the raw node's keys), and
+-- the Expr the judgment sees has already lost the raw node. `checkCtorSourceWires`
+-- is a TOTAL decoder over that residual ambiguity: n≥2 and n==0 are positional
+-- unconditionally; a sole argument is positional only when NO preimage of its
+-- Expr shape can take the named branch. An unregistered ctor makes every plain
+-- object named, so a sole argument there always abstains (chk.ctor.sole-object).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "check: EConstruct term fields"
+@description "type-substrate P1(a.12) — read an EConstruct's `fields` provenance slot TOLERANTLY (the desugar without-fields arm omits the key; the kernel-side bodyToExpr lift passes no ctorDefs, so lifted terms never carry it). Missing ⇒ []. Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorTermFields : (e: (Expr Any)) -> List ({ key: FieldKey, wireName: String })
+checkCtorTermFields e =
+  case lookup e "fields" of
+    Just fs -> fs
+    Nothing -> []
+
+@label "check: EConstruct"
+@description "decide-substrate Phase 8λ.2 / 8λ.2-r / type-substrate P1(a.12) — a constructor term checks against a SeCtor / SeUnion-of-SeCtor goal (the 8μ.1a membership rule on open terms). A COERCING ctor (True/False) routes through the ELit singleton face ONLY at arity 0 (chk.ctor.bool-arity): the B5 coercion arm fires exactly when the construct call has no payload arg, so `True 5` is the ordinary tagged record `{$tag:\"True\",_0:5}` and the blanket literal route was a false accept against `{true}`. A source ctor name that is empty or in the reserved `@ctor/` namespace ⇒ Nothing (chk.ctor.reserved-name): the runtime THROWS there, so no value exists and NEITHER polarity is entitled — and the compiler's short-tag projection is not available at this face. Everything else takes the physical-wire ctor path. Internal helper."
+@tags "engine" "internal" "check" "ctor" "decide-substrate" "phase-8lambda" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkConstruct : (c: String) -> (args: List (Expr Any)) -> (srcFields: List ({ key: FieldKey, wireName: String })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkConstruct c args srcFields env goal =
+  if checkCtorNameFenced c then Nothing
+  else if and (eq c "True") (eq (length args) 0) then checkLit true goal
+  else if and (eq c "False") (eq (length args) 0) then checkLit false goal
+  else checkCtorAgainst c args srcFields env goal
+
+@label "check: ctor name fenced?"
+@description "type-substrate P1(a.12) — true for a source constructor name the runtime construct op REFUSES: the empty name and any name inside the reserved `@ctor/` exact-target namespace (json-logic.ts throws on both AFTER applying `_constructorWireNames`). `_constructorWireNames` is keyed by `@ctor/…` target ids ONLY (registryConstructorTargetId), so an ordinary short tag projects to itself and this predicate is exactly the throwing set that survives projection. Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorNameFenced : (c: String) -> Boolean
+checkCtorNameFenced c = or (eq c "") (startsWith c "@ctor/")
+
+@label "check: ctor against goal"
+@description "decide-substrate Phase 8λ.2 / 8λ.2-r / 8λ.5 — dispatch a (non-coercing) constructor term against the goal shape: SeCtor ⇒ direct physical-wire fieldwise; SeUnion ⇒ member iff a member of SOME branch (all branches refute ⇒ Just false); SeMu ⇒ ONE face-ok-gated equi-recursive unfold then the same two arms (chk.ctor.mu — checkCtorMu); any other goal ⇒ the accept-only ⊤-fallback (`decideSubset SeAll goal`, softened — a constructed value is a value, so ⟦e⟧ ⊆ ⊤ ⊆ goal). Internal helper."
+@tags "engine" "internal" "check" "ctor" "mu" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkCtorAgainst : (c: String) -> (args: List (Expr Any)) -> (srcFields: List ({ key: FieldKey, wireName: String })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkCtorAgainst c args srcFields env goal =
+  if eq (seTag goal) "SeCtor" then checkCtorSeCtor c args srcFields env goal
+  else if eq (seTag goal) "SeUnion" then checkCtorUnion c args srcFields env goal.branches
+  else if eq (seTag goal) "SeMu" then checkCtorMu c args srcFields env goal
+  else checkAcceptOnly (decideSubset SeAll goal)
+
+@label "check: ctor vs SeMu (chk.ctor.mu)"
+@description "decide-substrate Phase 8λ.5 — a constructor term vs a μ goal: gate positivity + support + guardedness (seMuFaceOk ∧ seMuGuarded — the mem.mu/chk.match.mu condition set), unfold ONCE (`μv.F = F[v:=μv.F]` — substSet, the arms-only identity exposure), and dispatch to exactly the two base arms (SeCtor / SeUnion); a μ-headed or other unfold shape (or a gate failure) ⇒ the accept-only ⊤-fallback (never a guess, no unfold loop — the checkMatchBranchesMu no-re-entry discipline). Both verdicts propagate: equi-recursion makes the μ's members EXACTLY the unfold's, so a fieldwise/all-branch refutation against the unfold is a refutation against the μ. This is the arm that lets a lifted recursor witness (`case n of Z -> {Z-value} | S -> S (f n._0)`) kernel-re-certify: the tagged-literal arm body lifts back as an EConstruct, whose goal is the μ. Internal helper."
+@tags "engine" "internal" "check" "ctor" "mu" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkCtorMu : (c: String) -> (args: List (Expr Any)) -> (srcFields: List ({ key: FieldKey, wireName: String })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkCtorMu c args srcFields env goal =
+  if and (seMuFaceOk goal.var goal.body) (seMuGuarded goal.var goal.body)
+  then checkCtorMuGo c args srcFields env (substSet goal.var goal goal.body) goal
+  else checkAcceptOnly (decideSubset SeAll goal)
+
+@label "check: ctor vs SeMu (unrolled)"
+@description "decide-substrate Phase 8λ.5 — dispatch the one-level μ unfold: SeCtor ⇒ checkCtorSeCtor; SeUnion ⇒ checkCtorUnion; anything else ⇒ the accept-only ⊤-fallback against the ORIGINAL μ goal. Internal helper to checkCtorMu."
+@tags "engine" "internal" "check" "ctor" "mu" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkCtorMuGo : (c: String) -> (args: List (Expr Any)) -> (srcFields: List ({ key: FieldKey, wireName: String })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (unrolled: SetExpr) -> (goal: SetExpr) -> Maybe Boolean
+checkCtorMuGo c args srcFields env unrolled goal =
+  if eq (seTag unrolled) "SeCtor" then checkCtorSeCtor c args srcFields env unrolled
+  else if eq (seTag unrolled) "SeUnion" then checkCtorUnion c args srcFields env unrolled.branches
+  else checkAcceptOnly (decideSubset SeAll goal)
+
+@label "check: ctor vs SeCtor"
+@description "decide-substrate Phase 8λ.2 / field-identity Phase 4 / type-substrate P1(a.12) (chk.ctor.pair) — a constructor term vs a SeCtor, judged by EFFECTIVE PHYSICAL WIRE. ORDER IS LOAD-BEARING and mirrors membership's (setAlgebraCtorContains): (1) the goal outside the judgment fence (seCtorFieldsFenceOk — slot validity ∧ no RESOLVED reserved wire ∧ resolved-wire injectivity) ⇒ Nothing; (2) a COERCING goal ctor ⇒ Nothing (the ledger-B5 exclusion, membership's own arm); (3) the SOURCE write plan (checkCtorSourceWires) — computed BEFORE the tag leg because the legacy named branch can OVERWRITE `$tag` from the payload, so a tag mismatch is not a refutation until the plan is known; (4) the tag leg, which a `\"\"` goal ctor SKIPS entirely (the anonymous-record former — membership is \"\"-agnostic, and P1(a) already retired \"\"-as-a-distinct-tag in the subset and disjointness legs); (5) fieldwise by wire. A goal wire absent from the (total) source plan ⇒ Just false, membership's own unconditional shape-mismatch rule. Declared ARITY is NOT consulted: it is not part of the write model. Internal helper."
+@tags "engine" "internal" "check" "ctor" "decide-substrate" "phase-8lambda" "field-identity" "phase-4" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorSeCtor : (c: String) -> (args: List (Expr Any)) -> (srcFields: List ({ key: FieldKey, wireName: String })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkCtorSeCtor c args srcFields env goal =
+  if not (seCtorFieldsFenceOk goal.fields) then Nothing
+  else if seCtorCoercing goal.ctor then Nothing
+  else case checkCtorSourceWires c args srcFields of
+    Nothing -> Nothing
+    Just ws ->
+      if and (not (eq goal.ctor "")) (not (eq c goal.ctor)) then Just false
+      else checkCtorPairFold goal.fields ws env
+
+@label "check: ctor source wires"
+@description "type-substrate P1(a.12) — the TOTAL decoder for the runtime construct op's write plan: `Just [{wire, expr}]` when the physical axes the value will carry are determined by the term alone, `Nothing` when the write is IR-shape dependent. Arity 0 ⇒ no axes. A NON-EMPTY `fields` provenance slot ⇒ Nothing (chk.ctor.src-fields): the slot's own egress reading is decided by the KEY (positional keys re-emit positionally), so the metadata alone does not pin the wires — an empty slot is the established POSITIONAL sentinel (synCtor emits `fields = []`; partial-evaluate's egress reads it that way) and falls through. Arity ≥ 2 ⇒ positional `_0 … _(n-1)` UNCONDITIONALLY (`useNamed` requires exactly one payload arg). Arity 1 ⇒ checkCtorSoleArgWires. Finally the source axes must themselves be sane: no RESERVED wire ($tag/$ref/__fenelPartial/__fenelFn — the axis would collide with the tag/callable coordinate the faces read out of band) and no two axes on one host property. Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorSourceWires : (c: String) -> (args: List (Expr Any)) -> (srcFields: List ({ key: FieldKey, wireName: String })) -> Maybe (List ({ wire: String, expr: (Expr Any) }))
+checkCtorSourceWires c args srcFields =
+  if gt (length srcFields) 0 then Nothing
+  else if eq (length args) 0 then Just []
+  else if gt (length args) 1 then checkCtorSrcWiresGate (checkCtorPositionalWires args 0)
+  else case head args of
+    Just a0 ->
+      case checkCtorSoleArgWires a0 (checkCtorDeclaredWires c) of
+        Just ws -> checkCtorSrcWiresGate ws
+        other -> Nothing
+    other -> Nothing
+
+@label "check: ctor source wires gate"
+@description "type-substrate P1(a.12) — admit a computed source write plan only when its axes are sane: checkCtorSrcWiresOk. Internal helper to checkCtorSourceWires."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorSrcWiresGate : (ws: List ({ wire: String, expr: (Expr Any) })) -> Maybe (List ({ wire: String, expr: (Expr Any) }))
+checkCtorSrcWiresGate ws = if checkCtorSrcWiresOk ws [] then Just ws else Nothing
+
+@label "check: ctor positional wires"
+@description "type-substrate P1(a.12) — the positional write plan `[{wire = \"_i\", expr = arg_i}]`, the axes the construct op's else-branch binds. Ordinal rendering reuses fieldNaturalDecimal (digit recursion — never toString, which boxes under the decider ctx). Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorPositionalWires : (args: List (Expr Any)) -> (i: Number) -> List ({ wire: String, expr: (Expr Any) })
+checkCtorPositionalWires args i =
+  case head args of
+    Nothing -> []
+    Just a ->
+      let entry = { wire = concat "_" (fieldNaturalDecimal i), expr = a }
+      concat (appendItem entry []) (checkCtorPositionalWires (eufRest args) (add i 1))
+
+@label "check: ctor sole-arg wires"
+@description "type-substrate P1(a.12) — the ONE genuinely ambiguous cell of the write model. With exactly one payload argument the construct op takes the NAMED branch iff the argument's RAW JSON-Logic node is a plain non-array object whose keys are all DECLARED (an UNREGISTERED ctor makes ANY plain object named — the legacy heuristic). The judgment sees the lifted Expr, not the raw node, so this decides by the lift's CLOSED preimage schema. Unregistered ⇒ ALWAYS Nothing: every Expr shape has at least one plain-object preimage (a `{do:[…]}` wrapper if nothing else). Registered ⇒ positional is entitled only when NO preimage key can be declared: every raw key of every preimage is a RESERVED IR KEY (jlsSingleKey's closed cascade plus `$tag`/`$bind`/`$guard`), an operator NOTATION (opNotationToCodeName's closed table), the callee fnId (checked for ECall), or a record field name (checked for ERecord). Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorSoleArgWires : (a: (Expr Any)) -> (ds: Maybe (List String)) -> Maybe (List ({ wire: String, expr: (Expr Any) }))
+checkCtorSoleArgWires a ds =
+  case ds of
+    Just names ->
+      if not (checkCtorDsGuardOk names) then Nothing
+      else
+        let positional = Just (appendItem { wire = "_0", expr = a } [])
+        case a of
+          ERecord { fields = rfs } ->
+            if and (gt (length rfs) 0) (checkCtorRecordNamesIn rfs names) then Nothing else positional
+          ECall { fnId = f } -> if elem f names then Nothing else positional
+          other -> positional
+    other -> Nothing
+
+@label "check: ctor declared-name guard"
+@description "type-substrate P1(a.12) — a constructor's declared field names may not collide with any key a lifted Expr's raw JSON-Logic preimage can carry, or the sole-argument write becomes IR-shape dependent. The guarded set is jlsSingleKey's CLOSED op cascade (var/if/?:/let/do/fn/call/construct/match/and/or/where/method/ann; `ann` since modules-as-values Phase 2d) plus the tagged and pattern meta keys ($tag/$bind/$guard) plus every operator NOTATION (opNotationToCodeName's closed table — `{+:[…]}` lifts to ECall \"add\", so the raw key is the notation, not the code name). Any declared name inside that set ⇒ the plan abstains. Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorDsGuardOk : (names: List String) -> Boolean
+checkCtorDsGuardOk names =
+  case head names of
+    Nothing -> true
+    Just n ->
+      if checkCtorIrKeyReserved n then false
+      else case opNotationToCodeName n of
+        Just code -> false
+        Nothing -> checkCtorDsGuardOk (eufRest names)
+
+@label "check: ctor IR key reserved?"
+@description "type-substrate P1(a.12) — membership of jlsSingleKey's closed recognised-op cascade plus the tagged/pattern meta keys. A census pin (check-face-differential) asserts this list still covers that cascade, so a future adapter arm fails loudly instead of silently reopening the sole-argument hole. Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorIrKeyReserved : (n: String) -> Boolean
+checkCtorIrKeyReserved n =
+  elem n (appendItem "var" (appendItem "if" (appendItem "?:" (appendItem "let" (appendItem "do" (appendItem "fn" (appendItem "call" (appendItem "construct" (appendItem "match" (appendItem "and" (appendItem "or" (appendItem "where" (appendItem "method" (appendItem "ann" (appendItem "$tag" (appendItem "$bind" (appendItem "$guard" [])))))))))))))))))
+
+@label "check: ctor record names declared?"
+@description "type-substrate P1(a.12) — every field name of a record-shaped sole argument is a declared constructor field name (the construct op's `keys(arg) ⊆ ctorDef` named-branch test). True ⇒ the named branch fires and the plan abstains, because the record's own preimage may equally be a `{do:[…]}`-wrapped object whose only key is `do`. Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorRecordNamesIn : (rfs: List ({ name: String, value: (Expr Any) })) -> (names: List String) -> Boolean
+checkCtorRecordNamesIn rfs names =
+  case head rfs of
+    Nothing -> true
+    Just rf -> if elem rf.name names then checkCtorRecordNamesIn (eufRest rfs) names else false
+
+@label "check: ctor source wires ok?"
+@description "type-substrate P1(a.12) — the SOURCE-side mirror of seCtorWiresOk: no planned axis lands on a RESERVED host property ($tag/$ref/__fenelPartial/__fenelFn) and no two axes land on the same one (a later write would silently overwrite an earlier). Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorSrcWiresOk : (ws: List ({ wire: String, expr: (Expr Any) })) -> (seen: List String) -> Boolean
+checkCtorSrcWiresOk ws seen =
+  case head ws of
+    Nothing -> true
+    Just w ->
+      if seWireReserved w.wire then false
+      else if elem w.wire seen then false
+      else checkCtorSrcWiresOk (eufRest ws) (appendItem w.wire seen)
+
+@label "check: ctor pair by wire"
+@description "decide-substrate Phase 8λ.2 / type-substrate P1(a.12) — fold the GOAL's fields against the source write plan by EFFECTIVE PHYSICAL WIRE: each goal field projects through seCtorFieldReadWire (membership's OWN primitive — key→CURRENT wire when the process registry knows the key, the embedded persisted wireName as the codec-hint fallback), and the plan is looked up at that wire. A goal wire the plan does not write ⇒ Just false: the plan is TOTAL (it enumerates exactly the axes the construct op binds) and membership's own rule for a missing host property is the same unconditional Just false. A wire the plan writes ⇒ the sub-expression checkExpr-ed against the field's set. Any Just false ⇒ Just false; all Just true ⇒ Just true; any Nothing (none false) ⇒ Nothing. EXTRA source axes are irrelevant — ctor membership is open-width. Internal helper."
+@tags "engine" "internal" "check" "ctor" "decide-substrate" "phase-8lambda" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorPairFold : (gfields: List SetCtorField) -> (ws: List ({ wire: String, expr: (Expr Any) })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Maybe Boolean
+checkCtorPairFold gfields ws env =
+  case head gfields of
+    Nothing -> Just true
+    Just gf ->
+      case checkCtorFindWire ws (seCtorFieldReadWire gf) of
+        Nothing -> Just false
+        Just e ->
+          let v = checkExpr e env gf.set
+          case v of
+            Just false -> Just false
+            _ ->
+              let rest = checkCtorPairFold (eufRest gfields) ws env
+              checkCombineField v rest
+
+@label "check: ctor find wire"
+@description "type-substrate P1(a.12) — look one physical wire up in the source write plan, returning Just its expression or Nothing when the plan does not bind that axis. Internal helper."
+@tags "engine" "internal" "check" "ctor" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkCtorFindWire : (ws: List ({ wire: String, expr: (Expr Any) })) -> (w: String) -> Maybe (Expr Any)
+checkCtorFindWire ws w =
+  case head ws of
+    Nothing -> Nothing
+    Just x -> if eq x.wire w then Just x.expr else checkCtorFindWire (eufRest ws) w
+
+@label "check: combine field"
+@description "decide-substrate Phase 8λ.2 — combine a non-false field verdict v (Just true or Nothing) with the folded rest of the fields: rest Just false ⇒ Just false; rest Nothing ⇒ Nothing; rest Just true ⇒ (v Just true ⇒ Just true, else Nothing). Internal helper (shared by EConstruct + ERecord folds)."
+@tags "engine" "internal" "check" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkCombineField : (v: Maybe Boolean) -> (rest: Maybe Boolean) -> Maybe Boolean
+checkCombineField v rest =
+  case rest of
+    Just false -> Just false
+    Nothing -> Nothing
+    Just true ->
+      case v of
+        Just true -> Just true
+        _ -> Nothing
+
+@label "check: ctor vs SeUnion"
+@description "decide-substrate Phase 8λ.2 — a constructor term vs a SeUnion of branches: member iff a member of SOME branch. Any branch Just true ⇒ Just true; ALL branches Just false ⇒ Just false (definitely not in any, EXACT); else Nothing. Empty union ⇒ Just false (∅ membership). Internal helper."
+@tags "engine" "internal" "check" "ctor" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkCtorUnion : (c: String) -> (args: List (Expr Any)) -> (srcFields: List ({ key: FieldKey, wireName: String })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (branches: List SetExpr) -> Maybe Boolean
+checkCtorUnion c args srcFields env branches =
+  case head branches of
+    Nothing -> Just false
+    Just br ->
+      let v = checkCtorAgainst c args srcFields env br
+      case v of
+        Just true -> Just true
+        _ ->
+          let rest = checkCtorUnion c args srcFields env (eufRest branches)
+          checkCombineUnion v rest
+
+@label "check: combine union"
+@description "decide-substrate Phase 8λ.2 — combine a non-true branch verdict v (Just false or Nothing) with the folded rest of the union branches: rest Just true ⇒ Just true; rest Just false ⇒ (v Just false ⇒ Just false [all refute], else Nothing); rest Nothing ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "check" "ctor" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkCombineUnion : (v: Maybe Boolean) -> (rest: Maybe Boolean) -> Maybe Boolean
+checkCombineUnion v rest =
+  case rest of
+    Just true -> Just true
+    Nothing -> Nothing
+    Just false ->
+      case v of
+        Just false -> Just false
+        _ -> Nothing
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- ERecord — the anonymous-record rule: against a `SeCtor ""` (the synthetic
+-- record ctor the type-to-set `$record` projection emits). The goal's semantic
+-- slots are validated first; each field then projects through its current
+-- wireName to find the source record property and check its
+-- value. A missing field ⇒ Nothing (soft). Non-`SeCtor ""` goal ⇒ Nothing.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "check: ERecord"
+@description "decide-substrate Phase 8λ.2 / 8λ.2-r — a record term checks against a validated SeCtor \"\" goal (the type-to-set $record projection's synthetic record ctor): each semantic field projects through wireName to find the source record property (missing ⇒ Nothing, soft) and checkExpr its value against the field set, combined by the shared field-fold discipline (WIDTH subtyping: extra record fields are fine). A malformed slot plan fences. A non-SeCtor/non-\"\" goal uses the conservative accept-only top route because an unresolved source record has no authority to mint semantic field identities. Internal helper."
+@tags "engine" "internal" "check" "record" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkRecord : (fs: List ({ name: String, value: (Expr Any) })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkRecord fs env goal =
+  if not (eq (seTag goal) "SeCtor") then checkAcceptOnly (decideSubset SeAll goal)
+  else if not (seCtorFieldsFenceOk goal.fields) then Nothing
+  else if not (eq goal.ctor "") then Nothing
+  else checkRecFieldsFold goal.fields fs env
+
+@label "check: record fields fold"
+@description "decide-substrate Phase 8λ.2 / field-identity Phase 4 (D4) — fold validated SeCtor \"\" fields against a record term: for each semantic slot, project through seCtorFieldReadWire (key→CURRENT wire when the registry knows the key; the embedded persisted wireName as the fallback codec hint — never key equality by spelling), look up that source property, and checkExpr its value against the set. Any field Just false ⇒ Just false; all Just true ⇒ Just true; any Nothing ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "check" "record" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkRecFieldsFold : (sfields: List SetCtorField) -> (rfs: List ({ name: String, value: (Expr Any) })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Maybe Boolean
+checkRecFieldsFold sfields rfs env =
+  case head sfields of
+    Nothing -> Just true
+    Just sf ->
+      case checkRecFindField (seCtorFieldReadWire sf) rfs of
+        Nothing -> Nothing
+        Just rv ->
+          let v = checkExpr rv env sf.set
+          case v of
+            Just false -> Just false
+            _ ->
+              let rest = checkRecFieldsFold (eufRest sfields) rfs env
+              checkCombineField v rest
+
+@label "check: record find field"
+@description "decide-substrate Phase 8λ.2 / field-identity Phase 3 — read a source record term through the already-selected semantic slot's current wire projection, returning Just its value Expr or Nothing. This source lookup never establishes field identity. Internal helper."
+@tags "engine" "internal" "check" "record" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkRecFindField : (name: String) -> (rfs: List ({ name: String, value: (Expr Any) })) -> Maybe (Expr Any)
+checkRecFindField name rfs =
+  case head rfs of
+    Nothing -> Nothing
+    Just rf -> if eq rf.name name then Just rf.value else checkRecFindField name (eufRest rfs)
+
+
+-- =========================================================================
+-- EMatch — the per-arm SeCtor-narrowing CHECK arm (8λ.4; was the v1 blanket
+-- fence). The scrutinee SYNTHS to a set; a SeCtor / SeUnion-of-SeCtor
+-- decomposition gives the branches; each branch walks the arms in order
+-- (respecting first-match), folding the could-fire arm-body verdicts under the
+-- NARROWED env. Coverage of every branch by an UNGUARDED always-match arm is
+-- required for BOTH verdicts (an uncovered value ⇒ the runtime host-null path,
+-- probe-verified). Branch verdicts combine by the checkIfArm discipline widened
+-- to n branches: all-true ⇒ Just true, all-false ⇒ Just false (EXACT — see the
+-- header enumeration), else Nothing.
+-- =========================================================================
+
+@label "check: EMatch"
+@description "decide-substrate Phase 8λ.4 — the match CHECK arm: synth the scrutinee's set, decompose it into SeCtor branches (checkMatchBranches — SeCtor / SeUnion-of-SeCtor only, non-coercing, non-empty ctor names), then per branch walk the arms in first-match order (checkMatchWalk) and combine the branch verdicts by the n-ary checkIfArm discipline (all-true ⇒ true, all-false ⇒ false, else Nothing — checkMatchFold). A non-decomposable scrutinee synth or an empty decomposition ⇒ Nothing (the honest fence). Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatch : (sc: (Expr Any)) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkMatch sc arms env goal =
+  let sSet = synthExpr sc env
+  case checkMatchBranches sSet of
+    Nothing -> Nothing
+    Just bs ->
+      case head bs of
+        Nothing -> Nothing
+        Just b0 -> checkMatchFold bs sc arms env goal
+
+@label "check: match branches"
+@description "decide-substrate Phase 8λ.4 / 8λ.5 — decompose a scrutinee synth set into its ctor branches: a usable SeCtor ⇒ the singleton list; a SeUnion whose branches are ALL usable SeCtors ⇒ the branch list; a SeMu ⇒ ONE face-ok-gated equi-recursive unfold (8λ.5 — checkMatchBranchesMu; the arms-only μ-identity exposure, the b-side-unroll precedent) then the same two base shapes; anything else ⇒ Nothing (the fence — SeAll / SeRef / SeInterval scrutinees are out of the fragment). Usable = a genuine `$tag`-carrying ctor set: tag SeCtor, ctor name non-empty (the `\"\"` record ctor's values carry NO $tag), non-coercing (True/False values are JS booleans, not records). Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchBranches : (s: SetExpr) -> Maybe (List SetExpr)
+checkMatchBranches s =
+  if eq (seTag s) "SeCtor" then
+    if checkMatchBranchOk s then Just (appendItem s []) else Nothing
+  else if eq (seTag s) "SeUnion" then checkMatchBranchList s.branches
+  else if eq (seTag s) "SeMu" then checkMatchBranchesMu s
+  else Nothing
+
+@label "check: match branches (μ unfold)"
+@description "decide-substrate Phase 8λ.5 — decompose a SeMu scrutinee by ONE equi-recursive unfold: gate positivity + support + guardedness (seMuFaceOk ∧ seMuGuarded — the mem.mu condition set; a non-positive μ NEVER decomposes, which is what keeps fix-intro/chk.fix off negative recursion), substSet the μ into its own body (`μv.F = F[v:=μv.F]` — the arms-only identity exposure, the Park-b-side-unroll precedent: NOT a normalize rewrite), then accept exactly the two base shapes (a usable SeCtor / a SeUnion of usable SeCtors). NO re-entry into checkMatchBranches — a μ-headed unfold (μ-of-μ) ⇒ Nothing, so there is no unfold loop. This is what makes a μ-typed param case-splittable: the Cons branch's tail field carries the WHOLE μ back (substSet), so the narrowed `x.tail` path bind is exactly the recursive component chk.fix's descent rule credits. Internal helper."
+@tags "engine" "internal" "check" "match" "mu" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchBranchesMu : (s: SetExpr) -> Maybe (List SetExpr)
+checkMatchBranchesMu s =
+  if and (seMuFaceOk s.var s.body) (seMuGuarded s.var s.body)
+  then checkMatchBranchesMuGo (substSet s.var s s.body)
+  else Nothing
+
+@label "check: match branches (μ unfold, unrolled)"
+@description "decide-substrate Phase 8λ.5 — validate the ONE-level μ unfold as a decomposition: exactly the checkMatchBranches base shapes (a usable SeCtor / a SeUnion of usable SeCtors); a μ-headed or any other unfold shape ⇒ Nothing (no re-entry — no unfold loop). Internal helper to checkMatchBranchesMu."
+@tags "engine" "internal" "check" "match" "mu" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchBranchesMuGo : (unrolled: SetExpr) -> Maybe (List SetExpr)
+checkMatchBranchesMuGo unrolled =
+  if eq (seTag unrolled) "SeCtor" then
+    if checkMatchBranchOk unrolled then Just (appendItem unrolled []) else Nothing
+  else if eq (seTag unrolled) "SeUnion" then checkMatchBranchList unrolled.branches
+  else Nothing
+
+@label "check: match branch usable?"
+@description "decide-substrate Phase 8λ.4 / type-substrate P1(a.12) — is a decomposition branch a usable ctor set (SeCtor, INSIDE the judgment fence, non-empty ctor name, non-coercing)? The fence (seCtorFieldsFenceOk) runs BEFORE any arm classification or wildcard/PatVar narrowing: an operand whose resolved wires are reserved or alias onto ONE host property breaks the field independence every per-arm narrowing assumes, and membership already abstains for it. Internal helper to checkMatchBranches."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchBranchOk : (b: SetExpr) -> Boolean
+checkMatchBranchOk b =
+  if not (eq (seTag b) "SeCtor") then false
+  else if not (seCtorFieldsFenceOk b.fields) then false
+  else if eq b.ctor "" then false
+  else not (seCtorCoercing b.ctor)
+
+@label "check: match branch list"
+@description "decide-substrate Phase 8λ.4 — validate a SeUnion's branches as usable SeCtors, returning Just the list (any unusable branch ⇒ Nothing — the whole decomposition fences). Internal helper to checkMatchBranches."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchBranchList : (bs: List SetExpr) -> Maybe (List SetExpr)
+checkMatchBranchList bs =
+  case head bs of
+    Nothing -> Just []
+    Just b ->
+      if checkMatchBranchOk b then
+        case checkMatchBranchList (eufRest bs) of
+          Just rest -> Just (concat (appendItem b []) rest)
+          Nothing -> Nothing
+      else Nothing
+
+@label "check: match fold branches"
+@description "decide-substrate Phase 8λ.4 — fold the per-branch verdicts across the scrutinee decomposition: each branch walks the arms (checkMatchWalk, acc seeded \"none\"); verdicts combine by checkIfCombine (all Just true ⇒ Just true; all Just false ⇒ Just false — the n-ary checkIfArm widening, EXACT per the header enumeration; else Nothing). Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchFold : (bs: List SetExpr) -> (sc: (Expr Any)) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkMatchFold bs sc arms env goal =
+  case head bs of
+    Nothing -> Nothing
+    Just b ->
+      let v = checkMatchWalk b sc arms env goal "none"
+      let rest = eufRest bs
+      case head rest of
+        Nothing -> v
+        Just b2 ->
+          let restV = checkMatchFold rest sc arms env goal
+          checkIfCombine v restV
+
+@label "check: match arm walk"
+@description "decide-substrate Phase 8λ.4 — walk the arms in order for ONE branch, threading the obligation accumulator (\"none\" | \"true\" | \"false\" | \"bot\"): a never-match arm skips; a fence classification ⇒ Nothing; an always/might arm's body checkExpr (under the classify-narrowed env) folds into the acc (any disagreement / Nothing ⇒ \"bot\" ⇒ the walk short-circuits to Nothing); the first UNGUARDED always-match arm COVERS the branch and emits the folded verdict (later arms are unreachable for this branch — first-match order); running out of arms without unguarded coverage ⇒ Nothing (the runtime null path — probe-verified: an uncovered value / an all-guards-dodge run yields host-null). Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchWalk : (b: SetExpr) -> (sc: (Expr Any)) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> (acc: String) -> Maybe Boolean
+checkMatchWalk b sc arms env goal acc =
+  case head arms of
+    Nothing -> Nothing
+    Just arm ->
+      let cls = checkArmClassify sc arm.pattern b env
+      if eq cls.kind "fence" then Nothing
+      else if eq cls.kind "never" then checkMatchWalk b sc (eufRest arms) env goal acc
+      else
+        let ov = checkExpr arm.body cls.env goal
+        let acc2 = checkMatchAcc acc ov
+        if eq acc2 "bot" then Nothing
+        else if eq cls.kind "always" then
+          if checkArmUnguarded arm then checkMatchAccOut acc2
+          else checkMatchWalk b sc (eufRest arms) env goal acc2
+        else checkMatchWalk b sc (eufRest arms) env goal acc2
+
+@label "check: match arm unguarded?"
+@description "decide-substrate Phase 8λ.4 — true when a match arm carries NO guard field. A guarded arm can DODGE at runtime (falsy guard ⇒ continue to later arms — probe-verified against json-logic.ts matchOp), so only unguarded always-match arms count for branch COVERAGE. Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkArmUnguarded : (arm: { pattern: (Pattern Any), body: (Expr Any) }) -> Boolean
+checkArmUnguarded arm =
+  case lookup arm "guard" of
+    Just g -> false
+    Nothing -> true
+
+@label "check: match obligation acc"
+@description "decide-substrate Phase 8λ.4 — fold ONE arm-body verdict into the branch obligation accumulator: Just true keeps/enters \"true\", Just false keeps/enters \"false\", any Nothing or true/false disagreement ⇒ \"bot\" (the branch verdict can only be Nothing). \"none\" = no obligations yet. Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchAcc : (acc: String) -> (ov: Maybe Boolean) -> String
+checkMatchAcc acc ov =
+  case ov of
+    Nothing -> "bot"
+    Just bv ->
+      if bv then
+        if eq acc "none" then "true"
+        else if eq acc "true" then "true"
+        else "bot"
+      else
+        if eq acc "none" then "false"
+        else if eq acc "false" then "false"
+        else "bot"
+
+@label "check: match acc out"
+@description "decide-substrate Phase 8λ.4 — project the branch obligation accumulator onto the branch verdict at coverage: \"true\" ⇒ Just true, \"false\" ⇒ Just false (EXACT — every folded refutation is itself exact), anything else ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchAccOut : (acc: String) -> Maybe Boolean
+checkMatchAccOut acc =
+  if eq acc "true" then Just true
+  else if eq acc "false" then Just false
+  else Nothing
+
+@label "check: match arm classify"
+@description "decide-substrate Phase 8λ.4 — classify ONE arm pattern against ONE branch and build its narrowed env in the same pass: returns `{ kind, env }` with kind ∈ \"always\" (fires whenever a branch value reaches it) | \"never\" (EXACT non-match — ctor-tag mismatch / scalar lit vs a $tag record) | \"might\" (could dodge structurally — scalar sub-PatLits) | \"fence\" (out of fragment: canonical PatWildcard [conservatively fenced here; egress normalizes it to operational PatLit \"_\"], non-scalar lits, nested ctor sub-patterns, positional args without fields metadata, unknown field names). The env narrows: an EVar scrutinee re-binds to the branch (checkMatchScrutNarrow), a top-level PatVar binds the whole branch, PatConstruct PatVar sub-binders bind their field sets (checkArmCtorArgs) — all PREPENDED newest-first (the checkBindParams/runtime-spread convention: later bindings win). Internal helper — ALSO the narrowing convention Commit-B synthesis (synCase) reuses, so the synthesis env and the re-check env agree BY CONSTRUCTION."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkArmClassify : (sc: (Expr Any)) -> (pat: (Pattern Any)) -> (b: SetExpr) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> { kind: String, env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) }
+checkArmClassify sc pat b env =
+  let envN = checkMatchScrutNarrow sc b env
+  case pat of
+    PatVar { name = n } ->
+      let entry = { name = n, semanticKey = Nothing, wirePath = n, set = b }
+      { kind = "always", env = concat (appendItem entry []) envN }
+    PatLit { value = v } -> checkArmLit v envN
+    -- fields read TOLERANTLY (checkArmPatFields, not a 3-key named-field
+    -- pattern): the jlsTaggedPattern lift OMITS the `fields` slot for
+    -- unregistered ctors (shouldUseNamedFields ⇒ false; the kernel-side
+    -- bodyToExpr lift passes NO ctorDefs), and a pattern requiring the key
+    -- would MISS the lifted shape entirely.
+    PatConstruct { ctor = c, args = as } ->
+      let fs = checkArmPatFields pat
+      checkArmCtor c as fs b envN
+    other -> { kind = "fence", env = envN }
+
+@label "check: match pattern fields (tolerant)"
+@description "decide-substrate Phase 8λ.4 — read a PatConstruct's `fields` metadata tolerantly: the authored shape carries the slot (possibly []); the jlsTaggedPattern lift OMITS the key for unregistered ctors (its no-named arm constructs without it). Missing ⇒ []. Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkArmPatFields : (pat: (Pattern Any)) -> List ({ key: FieldKey, wireName: String })
+checkArmPatFields pat =
+  case lookup pat "fields" of
+    Just fs -> fs
+    Nothing -> []
+
+@label "check: match scrutinee narrow"
+@description "decide-substrate Phase 8λ.4 — when the scrutinee is an EVar, PREPEND its branch re-binding ({name = x, set = branch}) AND one FIELD-PATH binding per branch field ({name = \"x.<field>\", set = the field's set} — the runtime's dotted var-path resolution reads exactly that projection, so `EVar \"x._0\"` in an arm body is the payload). Matching a branch's pattern PROVES the value carries that branch's $tag ⇒ both bindings over-approximate the true path values (sound for accept and exact-refute). The path bindings are what case-split SYNTHESIS emits bodies against (tag-only patterns + path vars — the shape that round-trips the jlsTaggedPattern lift byte-identically; binder metadata does NOT survive the lift for unregistered ctors). A non-var scrutinee narrows nothing. Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchScrutNarrow : (sc: (Expr Any)) -> (b: SetExpr) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })
+checkMatchScrutNarrow sc b env =
+  case sc of
+    EVar { name = x } ->
+      let entry = { name = x, semanticKey = Nothing, wirePath = x, set = b }
+      let env2 = concat (appendItem entry []) env
+      checkMatchPathBinds x b.fields env2
+    other -> env
+
+@label "check: match field-path binds"
+@description "decide-substrate Phase 8λ.4 / type-substrate P1(a.12) (chk.match.path-wire) — PREPEND a dotted field-path binding per branch field through its EFFECTIVE wire: `{name = x ++ \".\" ++ seCtorFieldReadWire field, set = field.set}`. It reads through the SAME primitive membership uses (key→CURRENT wire when the process registry knows the key, the embedded persisted wireName as the codec-hint fallback); the older embedded-only read minted a path the runtime does not resolve after a field rename, while this very prose already claimed the current one. A field whose effective wire CONTAINS a dot mints NO bind at all: the runtime resolveVar splits dotted names into a property walk, so `x.a.b` would not denote the single property `a.b`, and the use site then misses in the env and abstains. This is a runtime projection path only; the semantic slot identity remains key. Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchPathBinds : (x: String) -> (bfields: List SetCtorField) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })
+checkMatchPathBinds x bfields env =
+  case head bfields of
+    Nothing -> env
+    Just f ->
+      let wire = seCtorFieldReadWire f
+      if fixStrHasDot wire then checkMatchPathBinds x (eufRest bfields) env
+      else
+        let pname = concat x (concat "." wire)
+        let entry = { name = pname, semanticKey = Just f.key, wirePath = pname, set = f.set }
+        let env2 = concat (appendItem entry []) env
+        checkMatchPathBinds x (eufRest bfields) env2
+
+@label "check: match lit arm"
+@description "decide-substrate Phase 8λ.4 — classify a PatLit against a $tag-ctor branch: the string \"_\" is the OPERATIONAL WILDCARD (matchPattern's `pattern === \"_\"` arm — always-match, binds nothing); any other scalar (number / string / boolean) NEVER matches a $tag record (scalar-vs-object: no matchPattern arm applies — EXACT, probe-verified); a non-scalar lit (a record value could structurally match) ⇒ fence. Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkArmLit : (v: Any) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> { kind: String, env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) }
+checkArmLit v env =
+  if isString v then
+    if eq v "_" then { kind = "always", env = env }
+    else { kind = "never", env = env }
+  else if isNumber v then { kind = "never", env = env }
+  else if isBoolean v then { kind = "never", env = env }
+  else { kind = "fence", env = env }
+
+@label "check: match ctor arm"
+@description "decide-substrate Phase 8λ.4 / type-substrate P1(a.12) — classify a PatConstruct against a branch: a branch outside the JUDGMENT FENCE (seCtorFieldsFenceOk — upgraded from the embedded-wire-only fieldSemanticSlotsValid, so this arm abstains exactly where membership does) ⇒ fence; a pattern ctor name that is empty or in the reserved `@ctor/` namespace ⇒ fence, NOT never: matchPattern projects the pattern's own `$tag` through _constructorWireNames (constructorPatternWireName), so an exact-target tag can match a short-tag branch the raw comparison calls distinct, and an unprojectable one yields the invalid-wire sentinel (chk.match.pattern-tag); ctor-tag mismatch ⇒ never (EXACT — matchPattern requires $tag equality); tag match with NO sub-patterns ⇒ always (a tag-only wire pattern `{$tag: C}` matches ANY C-value — pattern keys ⊆ scrutinee keys, probe-verified); args with DUPLICATE or empty slot wires ⇒ fence (marshalPatterns writes one host property per slot, so a duplicate silently drops the earlier binder); args WITHOUT fields metadata ⇒ fence (the positional pairing needs the wire key names; index arithmetic is banned under the decider ctx — the boxed-Number toString landmine); args WITH metadata ⇒ the parallel sub-pattern walk (checkArmCtorArgs). Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkArmCtor : (c: String) -> (as: List (Pattern Any)) -> (fs: List ({ key: FieldKey, wireName: String })) -> (br: SetExpr) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> { kind: String, env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) }
+checkArmCtor c as fs br env =
+  if not (seCtorFieldsFenceOk br.fields) then { kind = "fence", env = env }
+  else if checkCtorNameFenced c then { kind = "fence", env = env }
+  else if not (eq c br.ctor) then { kind = "never", env = env }
+  else
+    case head as of
+      Nothing -> { kind = "always", env = env }
+      Just a0 ->
+        if not (checkArmSlotsOk fs []) then { kind = "fence", env = env }
+        else case head fs of
+          Nothing -> { kind = "fence", env = env }
+          Just f0 -> checkArmCtorArgs as fs br env "always"
+
+@label "check: match ctor sub-patterns"
+@description "decide-substrate Phase 8λ.4 / type-substrate P1(a.12) (chk.match.path-wire) — walk a matching-ctor pattern's sub-patterns in parallel with its resolved CompileFieldSlot metadata (list-parallel — NO index arithmetic): each pattern slot resolves against the branch by FieldKey, never spelling, and then its OWN wire is CONSULTED (checkArmSlotWireOk) because the runtime matcher reads the pattern's spelling, not its key — a slot whose spelling the runtime would read elsewhere, or refuse as stale under _strictPatternFields, fences instead of classifying; each PatVar sub-binder PREPENDS `{name, semanticKey, wirePath, set}` from the matched branch slot, with wirePath the EFFECTIVE (seCtorFieldReadWire) projection rather than the embedded one. A PatLit `\"_\"` binds nothing; a scalar PatLit DEMOTES the arm to might-match (the arm can dodge on the field value — obligations still count, coverage doesn't); more sub-patterns than metadata slots, an unknown semantic key, nested PatConstructs, PatWildcard, or non-scalar lits ⇒ fence. Returns `{ kind, env }`. Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkArmCtorArgs : (as: List (Pattern Any)) -> (fs: List ({ key: FieldKey, wireName: String })) -> (br: SetExpr) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (kind: String) -> { kind: String, env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) }
+checkArmCtorArgs as fs br env kind =
+  case head as of
+    Nothing -> { kind = kind, env = env }
+    Just a ->
+      case head fs of
+        Nothing -> { kind = "fence", env = env }
+        Just patternSlot ->
+          case checkMatchFieldSlot patternSlot.key br.fields of
+            Nothing -> { kind = "fence", env = env }
+            Just matchedField ->
+              if not (checkArmSlotWireOk patternSlot matchedField) then { kind = "fence", env = env }
+              else case a of
+                PatVar { name = n } ->
+                  let entry = { name = n, semanticKey = Just matchedField.key, wirePath = seCtorFieldReadWire matchedField, set = matchedField.set }
+                  let env2 = concat (appendItem entry []) env
+                  checkArmCtorArgs (eufRest as) (eufRest fs) br env2 kind
+                PatLit { value = v } ->
+                  if isString v then
+                    if eq v "_" then checkArmCtorArgs (eufRest as) (eufRest fs) br env kind
+                    else checkArmCtorArgs (eufRest as) (eufRest fs) br env "might"
+                  else if isNumber v then checkArmCtorArgs (eufRest as) (eufRest fs) br env "might"
+                  else if isBoolean v then checkArmCtorArgs (eufRest as) (eufRest fs) br env "might"
+                  else { kind = "fence", env = env }
+                other -> { kind = "fence", env = env }
+
+@label "check: match pattern slots ok?"
+@description "type-substrate P1(a.12) — a constructor pattern's slot metadata must be a FUNCTION from slots to host properties: no empty wire and no two slots on the same wire. marshalPatterns writes one property per slot, so a duplicate wire silently drops every binder but the last, and the classifier would credit bindings the runtime never makes. Internal helper to checkArmCtor."
+@tags "engine" "internal" "check" "match" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkArmSlotsOk : (fs: List ({ key: FieldKey, wireName: String })) -> (seen: List String) -> Boolean
+checkArmSlotsOk fs seen =
+  case head fs of
+    Nothing -> true
+    Just f ->
+      if eq f.wireName "" then false
+      else if elem f.wireName seen then false
+      else checkArmSlotsOk (eufRest fs) (appendItem f.wireName seen)
+
+@label "check: match slot wire ok?"
+@description "type-substrate P1(a.12) (chk.match.path-wire) — may this pattern slot carry a DEFINITE arm classification? The runtime matcher reads the pattern's OWN spelling and, under _strictPatternFields, REFUSES the whole arm when that spelling is not a current wire of the constructor (patternMatchPlan's stale set); in the legacy and raw-plan modes it raw-reads the spelling instead. So the classifier may only stay definite where all three policies provably agree. POSITIONAL spellings are the certified case: isNamedPatternField excludes `_i` from the identity plan entirely, so every context reads the property raw, and the branch fence has already forced the branch's own positional slot onto that same `_i` — hence spelling equality against seCtorFieldReadWire is exactly the agreement condition. A NAMED spelling is policy-dependent: proving it non-stale needs the ctx's _ctorFieldKeys plan and _strictPatternFields, which this face does not read, so it fences. Internal helper to checkArmCtorArgs."
+@tags "engine" "internal" "check" "match" "type-substrate" "phase-1a12"
+@category "engine-internal"
+checkArmSlotWireOk : (patternSlot: { key: FieldKey, wireName: String }) -> (matchedField: SetCtorField) -> Boolean
+checkArmSlotWireOk patternSlot matchedField =
+  case patternSlot.key of
+    PositionalField -> eq patternSlot.wireName (seCtorFieldReadWire matchedField)
+    NamedField -> false
+
+@label "check: match field set"
+@description "decide-substrate Phase 8λ.4 — resolve a pattern's already-identified CompileFieldSlot against a validated branch slot by FieldKey. Renames therefore preserve meaning and equal spellings with distinct UUIDs remain distinct; wireName is retained only as the runtime projection carried into the narrowed binding. Internal helper."
+@tags "engine" "internal" "check" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkMatchFieldSlot : (fname: FieldKey) -> (bfields: List SetCtorField) -> Maybe SetCtorField
+checkMatchFieldSlot fname bfields =
+  case head bfields of
+    Nothing -> Nothing
+    Just f ->
+      if fieldKeyEq fname f.key
+      then Just f
+      else checkMatchFieldSlot fname (eufRest bfields)
+
+
+-- =========================================================================
+-- SYNTH MODE — ECall. A sub-term needs a SET (over-approximating the call's true
+-- image). Two delegates, NO fourth evaluator:
+--   • op-fragment notation ops (+ - * / % > < … cat !) ⇒ the `propagate`
+--     transfer leaves over the args' synth sets (the SAME leaves inferExprType
+--     uses — the interval/enum math exists ONCE);
+--   • floor-admitted registered calls ⇒ `fnTypeMarker` (the 8λ.1 dual-use
+--     native) → the projected RETURN set, with exact arity, decidable argument
+--     fit, and the 8λ.1-r fences (effect / trust / exactness).
+-- Then check-mode: `decideSubset synthset goal`, ACCEPT-ONLY (the synth set only
+-- ⊆-approximates the true image, so its Just false is not a term refutation).
+-- =========================================================================
+
+@label "check: ECall"
+@description "decide-substrate Phase 8λ.2 / 8λ.2-r — a call term checks in SYNTH mode, with ONE check-mode special: `if` (desugar lowers EVERY surface if to `ECall \"if\"` — expr.fenel header) checks BOTH branches against the goal directly (checkIfArm — both-true ⇒ true, both-refuted-EXACTLY ⇒ false: a 3-arg if's value is always one of the two branch values; the Opus pass had no if arm, fencing every conditional body). Everything else: synthCall produces an over-approximating set for the call's image, then decideSubset synthset goal, ACCEPT-ONLY (the synth set only ⊆-approximates the true image ⇒ its Just false is not a term refutation). Internal helper."
+@tags "engine" "internal" "check" "call" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkCall : (f: String) -> (args: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkCall f args env goal =
+  if eq f "if" then checkIfArm args env goal
+  else
+    let s = synthCall f args env
+    checkAcceptOnly (decideSubset s goal)
+
+@label "check: if arm"
+@description "decide-substrate Phase 8λ.2-r — check-mode `if`: a 3-arg if's VALUE is always one of {then-value, else-value} (the condition only selects), so checkExpr BOTH branches against the goal: both Just true ⇒ Just true; both Just false ⇒ Just false (EXACT — each branch refutation is itself exact by the file discipline, and the value is one of the two); else Nothing. A 2-arg if (missing else ⇒ host-null value) or malformed arity ⇒ Nothing (the fence). Internal helper."
+@tags "engine" "internal" "check" "call" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkIfArm : (args: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkIfArm args env goal =
+  if gte (length args) 3 then
+    case nthArg args 1 of
+      Nothing -> Nothing
+      Just t ->
+        case nthArg args 2 of
+          Nothing -> Nothing
+          Just e ->
+            let tv = checkExpr t env goal
+            let ev = checkExpr e env goal
+            checkIfCombine tv ev
+  else Nothing
+
+@label "check: if combine"
+@description "decide-substrate Phase 8λ.2-r — combine the two if-branch verdicts: both Just true ⇒ Just true; both Just false ⇒ Just false; else Nothing. Internal helper to checkIfArm."
+@tags "engine" "internal" "check" "call" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkIfCombine : (tv: Maybe Boolean) -> (ev: Maybe Boolean) -> Maybe Boolean
+checkIfCombine tv ev =
+  case tv of
+    Nothing -> Nothing
+    Just tb ->
+      case ev of
+        Nothing -> Nothing
+        Just eb ->
+          if tb then (if eb then Just true else Nothing)
+          else (if eb then Nothing else Just false)
+
+@label "check: synth expr"
+@description "decide-substrate Phase 8λ.2 / 8λ.2-r — SYNTH mode over a sub-term: produce an OVER-APPROXIMATING set (accept-only downstream). ELit ⇒ its singleton (exact); EVar ⇒ the env set (unbound ⇒ SeAll); ECall ⇒ synthCall; True/False EConstruct ⇒ the exact boolean singleton (B5); unresolved source records ⇒ SeAll because CHECK cannot mint semantic field identities; every other shape ⇒ SeAll. Internal helper."
+@tags "engine" "internal" "check" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthExpr : (e: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> SetExpr
+synthExpr e env =
+  case e of
+    ELit { value = v } ->
+      let vs = appendItem v []
+      SeEnum { values = vs }
+    EVar { name = x } ->
+      case checkEnvLookup x env of
+        Just s -> s
+        Nothing -> SeAll
+    ECall { fnId = f, args = cargs } ->
+      if and (elem f ["if", "?:"]) (eq (lookup e "structural") (Just false)) then SeAll
+      else if and (elem f ["if", "?:"]) (eq (lookup e "structural") (Just true)) then synthIf cargs env
+      else synthCall f cargs env
+    EConstruct { ctor = c } ->
+      if eq c "True" then SeEnum { values = appendItem true [] }
+      else if eq c "False" then SeEnum { values = appendItem false [] }
+      else SeAll
+    ERecord { fields = rfs } -> SeAll
+    _ -> SeAll
+
+-- Fresh IF control provenance is handled at the Expr node entry. This helper
+-- retains ordinary registered-call and absent-marker legacy behavior only.
+@label "check: synth call"
+@description "decide-substrate Phase 8λ.2 / 8λ.2-r / 8λ.4 + signature-substrate Phase 2 — SYNTH a call's image set. Dynamic `$dyn:` and the `$` application vehicle remain language forms. Every other head first consults fnTypeMarker so an actual registered function, including one whose spelling resembles `if` or a notation op, takes the trust/groundness/exact-arity/domain-checked synthRegistered path that matches runtime registry precedence. Only an unregistered `if` or notation head uses synthIf/synthPropOp; other misses degrade to SeAll. Internal helper."
+@tags "engine" "internal" "check" "call" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthCall : (f: String) -> (args: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> SetExpr
+synthCall f args env =
+  if startsWith f "$dyn:" then synthDynName (slice f 5 (length f)) args env
+  else if eq f "$" then synthDollar args env
+  else
+    case fnTypeMarker f of
+      Just r -> synthRegistered r args env
+      Nothing ->
+        if eq f "if" then synthIf args env
+        else if synthIsOpFragment f then synthPropOp f args env
+        else SeAll
+
+@label "check: synth dynamic head"
+@description "decide-substrate Phase 8λ.4 — SYNTH a Γ-bound dynamic call's image set (the Γ-apply v2 arm): the head name resolves through the ENV (not the registry — it is a lambda param / binder); a SeArrow-bound head with EXACT arity whose every arg's synth set decidably ⊆ its param set ⇒ the arrow's RETURN set (f ∈ SeArrow(P→R) maps every p∈P into R — for args within P the image is inside R; for args NOT provably within P a member function's behavior is UNCONSTRAINED, so anything less than Just-true fit degrades to SeAll). Unbound / non-arrow / arity-mismatch (an under-applied partial or the over-application drop-quirk — neither lands in R) ⇒ SeAll. ACCEPT-ONLY downstream like every synth set. Internal helper."
+@tags "engine" "internal" "check" "call" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthDynName : (name: String) -> (args: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> SetExpr
+synthDynName name args env =
+  case checkEnvLookup name env of
+    Nothing -> SeAll
+    Just s ->
+      if not (eq (seTag s) "SeArrow") then SeAll
+      else if not (eq (length args) (length s.params)) then SeAll
+      else if synthArgsFit args s.params env then s.returns
+      else SeAll
+
+@label "check: synth args fit params?"
+@description "decide-substrate Phase 8λ.4 — every arg's SYNTH set decidably ⊆ its arrow param set (parallel walk, arity pre-checked)? Anything but Just true ⇒ false (the soundness gate: an arrow member's behavior outside its domain is unconstrained, so the return set only over-approximates the image when the args provably land in the domain). Internal helper."
+@tags "engine" "internal" "check" "call" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthArgsFit : (args: List (Expr Any)) -> (params: List SetArrowParam) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+synthArgsFit args params env =
+  case head args of
+    Nothing -> true
+    Just a ->
+      case head params of
+        Nothing -> true
+        Just p ->
+          let aS = synthExpr a env
+          case decideSubset aS p.set of
+            Just true -> synthArgsFit (eufRest args) (eufRest params) env
+            _ -> false
+
+@label "check: synth $ vehicle"
+@description "decide-substrate Phase 8λ.4 — SYNTH a `$`-headed application (`ECall \"$\" [callee, …args]` — the egress rendering of a dynamic call): an EVar callee delegates to synthDynName over the REST of the args (one semantics, two spellings — probe 1); any other callee shape (an inline lambda applied, a nested call) ⇒ SeAll (the fence). Internal helper."
+@tags "engine" "internal" "check" "call" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthDollar : (args: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> SetExpr
+synthDollar args env =
+  case head args of
+    Nothing -> SeAll
+    Just h ->
+      case h of
+        EVar { name = n } -> synthDynName n (eufRest args) env
+        other -> SeAll
+
+@label "check: synth if"
+@description "decide-substrate Phase 8λ.2-r — SYNTH an if's image set: ≥3 args ⇒ the normalized UNION of the then/else branch synths (the value is one of the two — the inferIf mirror); anything shorter ⇒ SeAll (the 2-arg if's missing-else value is host-null — not representable, stay ⊤). Internal helper."
+@tags "engine" "internal" "check" "call" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthIf : (args: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> SetExpr
+synthIf args env =
+  if gte (length args) 3 then
+    case nthArg args 1 of
+      Nothing -> SeAll
+      Just t ->
+        case nthArg args 2 of
+          Nothing -> SeAll
+          Just e ->
+            let tS = synthExpr t env
+            let eS = synthExpr e env
+            let bs = appendItem eS (appendItem tS [])
+            setAlgebraNormalize (SeUnion { branches = bs })
+  else SeAll
+
+@label "check: is op-fragment head?"
+@description "decide-substrate Phase 8λ.2 — true when a call head is a NOTATION op propagate recognises (arithmetic / comparison / min / max / cat / boolean-negation). fnIds like `add`/`sub` are NOT notation ops (propagate keys on `+`/`-`) ⇒ they route to the registered-signature arm, matching the brief's `add x 1 via add's registered signature` intent. Internal helper."
+@tags "engine" "internal" "check" "call" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthIsOpFragment : (f: String) -> Boolean
+synthIsOpFragment f =
+  if propIsArith f then true
+  else if propIsCmp f then true
+  else if propIsMinMax f then true
+  else if eq f "cat" then true
+  else if eq f "!" then true
+  else if eq f "not" then true
+  else false
+
+@label "check: synth op-fragment"
+@description "decide-substrate Phase 8λ.2 — SYNTH an op-fragment call: infer each arg's synth set, then propagate the notation op over them and normalize (the SAME propagate leaf + normalize inferExprType uses — the interval/enum transfer math exists ONCE; check adds none). Internal helper."
+@tags "engine" "internal" "check" "call" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthPropOp : (f: String) -> (args: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> SetExpr
+synthPropOp f args env =
+  let inputs = map (\a -> synthExpr a env) args
+  setAlgebraNormalize (propagate f inputs)
+
+@label "check: synth registered"
+@description "decide-substrate Phase 8λ.2 / signature-substrate Phase 2 — SYNTH a registered call's image set from the effective fnTypeMarker row selected by synthCall: effectful (pure=false) or advisory/untrusted (trusted=false) ⇒ SeAll; otherwise require an exact signature projection, exact call arity, and every argument's synth set decidably within its corresponding parameter domain before exposing the RETURN set. Internal helper."
+@tags "engine" "internal" "check" "call" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthRegistered : (f: { marker: TraversalType, pure: Boolean, trusted: Boolean }) -> (args: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> SetExpr
+synthRegistered f args env =
+  if f.pure
+  then if f.trusted then synthFromSig f.marker args env else SeAll
+  else SeAll
+
+@label "check: synth from signature"
+@description "decide-substrate Phase 8λ.2 / signature-substrate Phase 2 — project a floor-admitted registered signature marker to its RETURN synth set through typeToSetProjection; if degraded, carrying SeAll anywhere (the existing seHasAll exactness fence), arity is not exact, or some argument synth set is not decidably within its matching parameter domain, return SeAll. Only an exact, argument-safe call exposes the declared return set. Internal helper."
+@tags "engine" "internal" "check" "call" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synthFromSig : (marker: TraversalType) -> (args: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> SetExpr
+synthFromSig marker args env =
+  let projection = typeToSetProjection marker
+  let sigArrow = if projection.degraded then SeAll else projection.set
+  if seHasAll sigArrow then SeAll
+  else if not (eq (seTag sigArrow) "SeArrow") then SeAll
+  else if not (eq (length args) (length sigArrow.params)) then SeAll
+  else if synthArgsFit args sigArrow.params env then sigArrow.returns
+  else SeAll
+
+
+-- =========================================================================
+-- chk.fix — RECURSIVE-lambda membership (decide-substrate Phase 8λ.5; the ONE
+-- new trusted rule this phase — TCB ledger row `chk.fix`, SIDE-CONDITIONED,
+-- same commit).
+--
+-- THE RULE (the premise + the side condition, two separate obligations):
+--
+--     Γ, f : (P…→R), p̄ : P̄  ⊢  body ⇐ R          (the PREMISE — the ordinary
+--                                                  checkExpr judgment; the f
+--                                                  binding makes every
+--                                                  `$dyn:f`-headed self-call an
+--                                                  assumed member of the goal
+--                                                  arrow via the SHIPPED
+--                                                  synthDynName arm — chk.fix
+--                                                  adds NO transfer math)
+--     + STRUCTURAL DESCENT (the SIDE CONDITION — fixDescentAny): a SYNTACTIC,
+--       arm-aware walk proving every runtime activation of `f` strictly
+--       descends. ∃ ONE param position dp (COMMON to all self-calls — the
+--       fixed-position criterion; per-call-varying positions are the
+--       totality.fenel cross-position UNSOUNDNESS class) such that EVERY
+--       self-call: (a) has exact arity, and (b) passes at dp a VARIABLE that is
+--       a strict structural COMPONENT of the dp param — spelled as the check
+--       arm's dotted FIELD-PATH var (`x.tail`, `x.tail.tail`, …: the ONLY
+--       minters of dotted names are checkMatchScrutNarrow/checkMatchPathBinds,
+--       always rooted at their scrutinee) — AND that variable is ENV-BOUND at
+--       the call site (the load-bearing half: a path bind exists exactly under
+--       an enclosing match arm that PROVED the branch tag, so the runtime
+--       projection can never be the Nil-arm null). Every OTHER occurrence of
+--       `f` (a bare EVar in arg/scrutinee/field position — the value escape
+--       that would defeat the induction measure, e.g. Y-combinator-style
+--       self-passing) ⇒ FAIL.
+--
+-- WHY SOUND (the Park / least-fixpoint citation — design/mu-induction.md
+-- §0.1): the goal's param sets are either non-recursive (finite tagged trees)
+-- or positive μ (⟦μv.F⟧ = the LEAST fixpoint ⇒ finite unfoldings — and the
+-- μ-decomposition that MINTS the descent path binds is seMuFaceOk∧seMuGuarded
+-- gated in checkMatchBranchesMu, so a negative μ never decomposes and fix
+-- never fires over it). All runtime values are finite trees; a strict
+-- structural component strictly decreases the finite tree size ∈ ℕ. Induction
+-- on the dp argument's size: every self-call passes a strict component ⇒
+-- terminates; the body away from self-calls is the already-shipped v1 fragment
+-- ⇒ the closure is a TOTAL function whose outputs the premise proves land in
+-- R ⇒ a genuine member of the signature-space ⟦(P…)→R⟧ (the total-function
+-- model — design/cduce-arrows-soundness.md; ⊥ is NOT a member, which is
+-- exactly why the bare premise alone would false-accept the loop `\x -> f x`
+-- against an SeAll-accepting R and the side condition is load-bearing).
+--
+-- FENCES (each an honest Nothing): non-exact arity (curry/spill gymnastics ×
+-- recursion is out of the v1 fragment); a dotted or ps/fixName-colliding
+-- BINDER anywhere in the body (fixBindersOk — kills path-var aliasing by
+-- construction: with all binders dot-free and non-colliding, an env-bound
+-- dotted `p.…` name can only be a genuine machinery-minted strict component of
+-- the real param p); dotted/duplicate λ-params; a fixName-mentioning subtree
+-- under a non-decomposable match (can't verify which path binds are live);
+-- dotted branch-field wireNames (adversarial SetExpr goals — the scan's
+-- fixWiresOk gate; registered types never carry them); guarded-measure
+-- (`n-1`), permuted/rotating, and mutual descent (the shipped size-change
+-- analysis proves them; this kernel rule deliberately does NOT — totality.fenel
+-- stays the wider PROPOSER-side analysis, the kernel re-derives only this
+-- syntactic fragment — the census note's fragment comparison).
+--
+-- REPRESENTATION (NO new Expr case — the locked 7-case core is untouched): the
+-- fix name rides OUTSIDE the term, in the closure envelope's optional `fix`
+-- slot ({__fenelFn, params, body, closure, fix} — read tolerantly by
+-- arrowClosureContains via eufFindEntry, absent ⇒ the plain 8λ.2 route
+-- byte-preserved), and self-calls inside the body are the SHIPPED dynamic-
+-- callee spellings (`ECall "$dyn:f"` self-check-side / the `$`-vehicle
+-- `ECall "$" [EVar f, …]` kernel-lift-side — the 8λ.4 two-spellings
+-- precedent, both recognized by the descent scan and both deciding through
+-- synthDynName).
+--
+-- The scan REUSES the check arm's own machinery (synthExpr / checkMatchBranches
+-- / checkArmClassify) for its match narrowing, so the path binds it credits are
+-- the SAME binds the premise's walk sees — agreement BY CONSTRUCTION, no fourth
+-- evaluator. Where the scan's env is coarser (nested-lambda params bound SeAll
+-- — the scan has no nested goal), coarseness only REJECTS more ⇒ abstention,
+-- never a false accept.
+-- =========================================================================
+
+@label "Check recursive lambda membership (chk.fix)"
+@description "decide-substrate Phase 8λ.5 — the RECURSIVE-lambda CHECK rule (the ONE new trusted rule; TCB row chk.fix, SIDE-CONDITIONED): `checkExprFix fixName e env goal` decides membership of a fix-marked lambda in a SeArrow goal. Premise: bind fixName ↦ the WHOLE goal arrow in Γ (self-calls become assumed members via the shipped synthDynName arm — no new transfer math) + bind params + checkExpr the body against the codomain, ACCEPT-ONLY. Side condition (fixDescentAny): a syntactic arm-aware descent scan — ∃ one param position, common to ALL self-calls, at which every self-call passes an env-bound dotted strict-component path var (`x.tail` — minted only by the match narrowing under a proven branch tag); any other occurrence of the fix name (value escape, wrong arity, unverifiable subtree) fails. Vacuous ∀ (some param domain decidably empty) ⇒ Just true (the checkLambda mirror). Exact arity only; dotted/colliding binders fence; refutations are NOT emitted (accept-only — the honest v1). Sound by structural induction on the descent argument (finite trees; positive-μ decomposition is seMuFaceOk-gated): descent ⇒ total, premise ⇒ outputs in R ⇒ a member of the signature-space arrow."
+@tags "engine" "check" "membership" "arrow" "fix" "recursion" "decide-substrate" "phase-8lambda"
+checkExprFix : (fixName: String) -> (e: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkExprFix fixName e env goal =
+  case e of
+    ELambda { params = ps, body = b } -> checkFixLambda fixName ps b env goal
+    _ -> Nothing
+
+@label "check: fix lambda"
+@description "decide-substrate Phase 8λ.5 — the chk.fix gate ladder: SeArrow goal only; fixName/params well-formed (checkFixNamesOk — non-empty, dot-free, fixName ∉ params, params pairwise distinct); vacuous ∀ ⇒ Just true; EXACT arity only; the global binder fence (fixBindersOk); then the PREMISE (checkExpr body ⇐ returns under Γ + f + params) and the SIDE CONDITION (fixDescentAny) — BOTH must hold; accept-only. Internal helper."
+@tags "engine" "internal" "check" "arrow" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkFixLambda : (fixName: String) -> (ps: List String) -> (b: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe Boolean
+checkFixLambda fixName ps b env goal =
+  if not (eq (seTag goal) "SeArrow") then Nothing
+  else if not (checkFixNamesOk fixName ps) then Nothing
+  else if arrowSomeParamEmpty goal.params then Just true
+  else if not (eq (length ps) (length goal.params)) then Nothing
+  else if not (fixBindersOk fixName ps b) then Nothing
+  else
+    let fentry = { name = fixName, semanticKey = Nothing, wirePath = fixName, set = goal }
+    let env1 = concat (appendItem fentry []) env
+    let env2 = checkBindParams ps goal.params env1
+    case checkExpr b env2 goal.returns of
+      Just true -> if fixDescentAny fixName ps ps b env2 then Just true else Nothing
+      _ -> Nothing
+
+@label "check: fix names ok?"
+@description "decide-substrate Phase 8λ.5 — well-formedness of the fix name + λ-param names: fixName non-empty, dot-free, ∉ params; every param dot-free; params pairwise distinct. Dots are reserved for the machinery-minted field-path binds — a dotted binder could ALIAS a path var and steal descent credit; a param equal to fixName would shadow the fixpoint. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+checkFixNamesOk : (fixName: String) -> (ps: List String) -> Boolean
+checkFixNamesOk fixName ps =
+  if eq fixName "" then false
+  else if fixStrHasDot fixName then false
+  else if fixNameInList fixName ps then false
+  else fixParamsOk ps []
+
+@label "check: fix params ok?"
+@description "decide-substrate Phase 8λ.5 — every λ-param name dot-free and distinct from the already-seen ones (threaded seen-list). Internal helper to checkFixNamesOk."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixParamsOk : (ps: List String) -> (seen: List String) -> Boolean
+fixParamsOk ps seen =
+  case head ps of
+    Nothing -> true
+    Just p ->
+      if fixStrHasDot p then false
+      else if fixNameInList p seen then false
+      else fixParamsOk (eufRest ps) (appendItem p seen)
+
+@label "check: string has a dot?"
+@description "decide-substrate Phase 8λ.5 — does a string contain the '.' character? (Head-slice recursion — pure string ops, no index arithmetic beyond slice bounds.) Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixStrHasDot : (s: String) -> Boolean
+fixStrHasDot s =
+  if eq (length s) 0 then false
+  else if eq (slice s 0 1) "." then true
+  else fixStrHasDot (slice s 1 (length s))
+
+@label "check: name in string list?"
+@description "decide-substrate Phase 8λ.5 — plain string-list membership (the synCaseSeen shape). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixNameInList : (n: String) -> (xs: List String) -> Boolean
+fixNameInList n xs =
+  case head xs of
+    Nothing -> false
+    Just x -> if eq x n then true else fixNameInList n (eufRest xs)
+
+@label "check: fix binder fence"
+@description "decide-substrate Phase 8λ.5 — the GLOBAL binder fence: every binder in the body (nested ELambda params, PatVar names top-level and nested) must be dot-free AND ≠ fixName AND ∉ the λ-params. This is what makes the descent scan's name-prefix reasoning sound: with all user binders dot-free and non-colliding, an env-bound name `p.…` can only be a machinery-minted field-path bind rooted at the REAL λ-param p (checkMatchScrutNarrow/checkMatchPathBinds are the only dotted-name minters, always rooted at their scrutinee), and fixName always denotes the fixpoint. Any violation ⇒ false (the whole chk.fix abstains — the proposer freshens so it never emits one). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixBindersOk : (fixName: String) -> (ps: List String) -> (e: (Expr Any)) -> Boolean
+fixBindersOk fixName ps e =
+  case e of
+    ELit {} -> true
+    EVar {} -> true
+    ECall { args = as } -> fixBindersOkList fixName ps as
+    ELambda { params = qs, body = bd } ->
+      if fixBinderNamesOk fixName ps qs then fixBindersOk fixName ps bd else false
+    EMatch { scrutinee = sc, arms = arms } ->
+      if fixBindersOk fixName ps sc then fixBindersOkArms fixName ps arms else false
+    EConstruct { args = as } -> fixBindersOkList fixName ps as
+    ERecord { fields = fs } -> fixBindersOkFields fixName ps fs
+    _ -> false
+
+@label "check: fix binder fence (list)"
+@description "decide-substrate Phase 8λ.5 — fold fixBindersOk over an expression list. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixBindersOkList : (fixName: String) -> (ps: List String) -> (es: List (Expr Any)) -> Boolean
+fixBindersOkList fixName ps es =
+  case head es of
+    Nothing -> true
+    Just e0 ->
+      if fixBindersOk fixName ps e0 then fixBindersOkList fixName ps (eufRest es) else false
+
+@label "check: fix binder fence (record fields)"
+@description "decide-substrate Phase 8λ.5 — fold fixBindersOk over record-field values. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixBindersOkFields : (fixName: String) -> (ps: List String) -> (fs: List ({ name: String, value: (Expr Any) })) -> Boolean
+fixBindersOkFields fixName ps fs =
+  case head fs of
+    Nothing -> true
+    Just f0 ->
+      if fixBindersOk fixName ps f0.value then fixBindersOkFields fixName ps (eufRest fs) else false
+
+@label "check: fix binder fence (arms)"
+@description "decide-substrate Phase 8λ.5 — per match arm: the pattern's binders (fixPatBindersOk), the guard when present, and the body. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixBindersOkArms : (fixName: String) -> (ps: List String) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> Boolean
+fixBindersOkArms fixName ps arms =
+  case head arms of
+    Nothing -> true
+    Just arm ->
+      if not (fixPatBindersOk fixName ps arm.pattern) then false
+      else if not (fixBindersOkGuard fixName ps arm) then false
+      else if fixBindersOk fixName ps arm.body then fixBindersOkArms fixName ps (eufRest arms) else false
+
+@label "check: fix binder fence (guard)"
+@description "decide-substrate Phase 8λ.5 — an arm's guard expression, when present, passes the binder fence too (guards EXECUTE). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixBindersOkGuard : (fixName: String) -> (ps: List String) -> (arm: { pattern: (Pattern Any), body: (Expr Any) }) -> Boolean
+fixBindersOkGuard fixName ps arm =
+  case lookup arm "guard" of
+    Just g -> fixBindersOk fixName ps g
+    Nothing -> true
+
+@label "check: fix pattern binders ok?"
+@description "decide-substrate Phase 8λ.5 — a pattern's bound names (PatVar, top-level or nested under PatConstruct) are dot-free and non-colliding; PatLit/PatWildcard bind nothing. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixPatBindersOk : (fixName: String) -> (ps: List String) -> (pat: (Pattern Any)) -> Boolean
+fixPatBindersOk fixName ps pat =
+  case pat of
+    PatVar { name = n } -> fixBinderNameOk fixName ps n
+    PatConstruct { args = subs } -> fixPatBindersOkList fixName ps subs
+    _ -> true
+
+@label "check: fix pattern binders (list)"
+@description "decide-substrate Phase 8λ.5 — fold fixPatBindersOk over sub-patterns. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixPatBindersOkList : (fixName: String) -> (ps: List String) -> (subs: List (Pattern Any)) -> Boolean
+fixPatBindersOkList fixName ps subs =
+  case head subs of
+    Nothing -> true
+    Just sp ->
+      if fixPatBindersOk fixName ps sp then fixPatBindersOkList fixName ps (eufRest subs) else false
+
+@label "check: fix binder name ok?"
+@description "decide-substrate Phase 8λ.5 — ONE binder name: dot-free, ≠ fixName, ∉ λ-params. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixBinderNameOk : (fixName: String) -> (ps: List String) -> (n: String) -> Boolean
+fixBinderNameOk fixName ps n =
+  if fixStrHasDot n then false
+  else if eq n fixName then false
+  else not (fixNameInList n ps)
+
+@label "check: fix binder names ok (list)"
+@description "decide-substrate Phase 8λ.5 — every name in a binder-name list passes fixBinderNameOk. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixBinderNamesOk : (fixName: String) -> (ps: List String) -> (qs: List String) -> Boolean
+fixBinderNamesOk fixName ps qs =
+  case head qs of
+    Nothing -> true
+    Just q ->
+      if fixBinderNameOk fixName ps q then fixBinderNamesOk fixName ps (eufRest qs) else false
+
+@label "check: fix descent (any position)"
+@description "decide-substrate Phase 8λ.5 — the SIDE CONDITION driver: try each λ-param position as THE descent position (the fixed common position — ∃dp ∀self-calls; per-call-varying positions are the cross-position unsoundness class totality.fenel repaired, refused here by construction). First position whose scan passes wins; none ⇒ false. A body with NO self-calls passes vacuously at the first position (a non-recursive fix-marked lambda is a plain member — harmless). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixDescentAny : (fixName: String) -> (ps: List String) -> (tryPs: List String) -> (b: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixDescentAny fixName ps tryPs b env =
+  case head tryPs of
+    Nothing -> false
+    Just dp ->
+      if fixScanExpr fixName ps dp b env then true
+      else fixDescentAny fixName ps (eufRest tryPs) b env
+
+@label "check: fix descent scan"
+@description "decide-substrate Phase 8λ.5 — the arm-aware descent walk for ONE candidate position dp: ELit passes; a bare EVar equal to fixName is the VALUE ESCAPE ⇒ false (any other var passes); ECall — a `$dyn:fixName` head or a `$`-vehicle with EVar-fixName callee is a SELF-CALL (fixSelfCall: exact arity + the dp-arg descent credit + recurse into every arg), any other call recurses its args; ELambda binds its params SeAll (coarser than the premise's env — coarseness only rejects more) and recurses; EMatch scans the scrutinee then the branch×arm table (fixScanMatch); EConstruct/ERecord recurse. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanExpr : (fixName: String) -> (ps: List String) -> (dp: String) -> (e: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixScanExpr fixName ps dp e env =
+  case e of
+    ELit {} -> true
+    EVar { name = n } -> not (eq n fixName)
+    ECall { fnId = f, args = as } -> fixScanCall fixName ps dp f as env
+    ELambda { params = qs, body = bd } ->
+      let env2 = fixBindAll qs env
+      fixScanExpr fixName ps dp bd env2
+    EMatch { scrutinee = sc, arms = arms } ->
+      if fixScanExpr fixName ps dp sc env then fixScanMatch fixName ps dp sc arms env else false
+    EConstruct { args = as } -> fixScanList fixName ps dp as env
+    ERecord { fields = fs } -> fixScanFields fixName ps dp fs env
+    _ -> false
+
+@label "check: fix descent scan (call)"
+@description "decide-substrate Phase 8λ.5 — classify a call head for the descent scan: `$dyn:<fixName>` ⇒ a self-call over the whole arg list; the `$` vehicle whose FIRST arg is EVar fixName ⇒ a self-call over the REST (the kernel-lift spelling — the callee slot is a HEAD, not a value escape); anything else ⇒ recurse all args (an EVar-fixName among them is caught by the EVar escape rule). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanCall : (fixName: String) -> (ps: List String) -> (dp: String) -> (f: String) -> (as: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixScanCall fixName ps dp f as env =
+  if eq f (concat "$dyn:" fixName) then fixSelfCall fixName ps dp as env
+  else if eq f "$" then fixScanDollar fixName ps dp as env
+  else fixScanList fixName ps dp as env
+
+@label "check: fix descent scan ($ vehicle)"
+@description "decide-substrate Phase 8λ.5 — the `$`-vehicle arm of the descent scan: a first-arg EVar equal to fixName is a self-call HEAD (the kernel-lift spelling — obligations over the REST); any other first arg ⇒ the whole arg list scans as ordinary expressions (an EVar-fixName among them is the escape rule's business). Internal helper to fixScanCall."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanDollar : (fixName: String) -> (ps: List String) -> (dp: String) -> (as: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixScanDollar fixName ps dp as env =
+  case head as of
+    Nothing -> true
+    Just h ->
+      case h of
+        EVar { name = n } ->
+          if eq n fixName then fixSelfCall fixName ps dp (eufRest as) env
+          else fixScanList fixName ps dp as env
+        other -> fixScanList fixName ps dp as env
+
+@label "check: fix self-call"
+@description "decide-substrate Phase 8λ.5 — ONE self-call's obligations: exact arity (length args == length λ-params); the arg at the dp position is an env-BOUND dotted strict-component var of dp (fixDescentArgOk — the position located by the parallel args∥params walk, no index arithmetic); and every arg recursively passes the scan (nested self-calls inside args carry their own obligations — sound: each descends, so each terminates by the same induction). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixSelfCall : (fixName: String) -> (ps: List String) -> (dp: String) -> (as: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixSelfCall fixName ps dp as env =
+  if not (eq (length as) (length ps)) then false
+  else if not (fixDescentArgAt fixName ps dp as env) then false
+  else fixScanList fixName ps dp as env
+
+@label "check: fix descent arg at dp"
+@description "decide-substrate Phase 8λ.5 — walk args ∥ λ-params to the dp position and test the descent credit there: the arg must be `EVar v` with v = dp ++ \".\" ++ … (a dotted extension — startsWith the terminated prefix, so a param `x` never falsely matches `xt.foo`) AND v env-bound (envLookup Just — the path bind exists only under a match arm that PROVED the branch tag; an unbound dotted name is the Nil-arm null projection, refused). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixDescentArgAt : (fixName: String) -> (ps: List String) -> (dp: String) -> (as: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixDescentArgAt fixName ps dp as env =
+  case head ps of
+    Nothing -> false
+    Just p ->
+      case head as of
+        Nothing -> false
+        Just a0 ->
+          if eq p dp then fixDescentVarOk dp a0 env
+          else fixDescentArgAt fixName (eufRest ps) dp (eufRest as) env
+
+@label "check: fix descent var ok?"
+@description "decide-substrate Phase 8λ.5 — the descent-credit test on one arg: an EVar whose name starts with `dp.` and is env-bound. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixDescentVarOk : (dp: String) -> (a0: (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixDescentVarOk dp a0 env =
+  case a0 of
+    EVar { name = v } ->
+      if startsWith v (concat dp ".") then
+        case checkEnvLookup v env of
+          Just s -> true
+          Nothing -> false
+      else false
+    _ -> false
+
+@label "check: fix descent scan (list)"
+@description "decide-substrate Phase 8λ.5 — fold fixScanExpr over an expression list. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanList : (fixName: String) -> (ps: List String) -> (dp: String) -> (es: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixScanList fixName ps dp es env =
+  case head es of
+    Nothing -> true
+    Just e0 ->
+      if fixScanExpr fixName ps dp e0 env then fixScanList fixName ps dp (eufRest es) env else false
+
+@label "check: fix descent scan (record fields)"
+@description "decide-substrate Phase 8λ.5 — fold fixScanExpr over record-field values. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanFields : (fixName: String) -> (ps: List String) -> (dp: String) -> (fs: List ({ name: String, value: (Expr Any) })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixScanFields fixName ps dp fs env =
+  case head fs of
+    Nothing -> true
+    Just f0 ->
+      if fixScanExpr fixName ps dp f0.value env then fixScanFields fixName ps dp (eufRest fs) env else false
+
+@label "check: fix bind lambda params (SeAll)"
+@description "decide-substrate Phase 8λ.5 — bind nested-lambda params to SeAll for the descent scan (the scan has no nested goal to project domains from; SeAll is maximally coarse, and a coarser scan env only REJECTS more — descent vars stay verifiable only where genuinely minted). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixBindAll : (qs: List String) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })
+fixBindAll qs env =
+  case head qs of
+    Nothing -> env
+    Just q ->
+      let entry = { name = q, semanticKey = Nothing, wirePath = q, set = SeAll }
+      fixBindAll (eufRest qs) (concat (appendItem entry []) env)
+
+@label "check: fix descent scan (match)"
+@description "decide-substrate Phase 8λ.5 — the branch×arm table for the descent scan, REUSING the check arm's own decomposition + classification (synthExpr / checkMatchBranches / checkArmClassify — so the scan's narrowed envs and path binds are the premise walk's, by construction). A NON-decomposable scrutinee synth ⇒ strict mode: the arms must not MENTION the fix name at all (fixArmsMention — can't verify which path binds are live there); decomposable ⇒ every branch's arm walk passes (fixScanBranch, plus the dot-free branch-field wire gate fixWiresOk against adversarial dotted wireNames). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanMatch : (fixName: String) -> (ps: List String) -> (dp: String) -> (sc: (Expr Any)) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixScanMatch fixName ps dp sc arms env =
+  let sSet = synthExpr sc env
+  case checkMatchBranches sSet of
+    Nothing -> not (fixArmsMention fixName arms)
+    Just bs -> fixScanBranches fixName ps dp sc arms bs env
+
+@label "check: fix descent scan (branches)"
+@description "decide-substrate Phase 8λ.5 — every decomposition branch passes its arm walk; each branch's field wireNames must be dot-free first (fixWiresOk — a dotted wireName would mint a path bind whose name aliases a DEEPER chain than the runtime's path-split projection reads; registered types never carry one, adversarial hand-built goals fence). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanBranches : (fixName: String) -> (ps: List String) -> (dp: String) -> (sc: (Expr Any)) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> (bs: List SetExpr) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixScanBranches fixName ps dp sc arms bs env =
+  case head bs of
+    Nothing -> true
+    Just b0 ->
+      if not (fixWiresOk b0.fields) then false
+      else if fixScanBranchArms fixName ps dp sc arms b0 env
+      then fixScanBranches fixName ps dp sc arms (eufRest bs) env
+      else false
+
+@label "check: fix branch-field wires dot-free?"
+@description "decide-substrate Phase 8λ.5 — every branch field's wireName is dot-free (the path-bind minting concatenates `x.` ++ wireName — a dotted wireName would produce a name the runtime path-splits DIFFERENTLY than the single-field check binding). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixWiresOk : (bfields: List SetCtorField) -> Boolean
+fixWiresOk bfields =
+  case head bfields of
+    Nothing -> true
+    Just f0 ->
+      if fixStrHasDot f0.wireName then false else fixWiresOk (eufRest bfields)
+
+@label "check: fix descent scan (branch arm walk)"
+@description "decide-substrate Phase 8λ.5 — walk the arms in first-match order for ONE branch (the checkMatchWalk mirror): classify via checkArmClassify (the SAME narrowing); \"never\" skips; \"fence\" ⇒ the arm may still FIRE at runtime, so it must not mention the fix name (then continue — later arms stay conservatively scanned; over-scanning only rejects more); \"always\"/\"might\" ⇒ the guard (when present) and the body must pass the scan under the NARROWED env; an UNGUARDED always-match arm ends the branch's walk (later arms unreachable). Running out of arms ⇒ true (an uncovered branch value takes the runtime null path — no self-call fires; the PREMISE separately refuses uncovered matches for the membership claim itself). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanBranchArms : (fixName: String) -> (ps: List String) -> (dp: String) -> (sc: (Expr Any)) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> (br: SetExpr) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixScanBranchArms fixName ps dp sc arms br env =
+  case head arms of
+    Nothing -> true
+    Just arm ->
+      let cls = checkArmClassify sc arm.pattern br env
+      if eq cls.kind "never" then fixScanBranchArms fixName ps dp sc (eufRest arms) br env
+      else if eq cls.kind "fence" then fixScanFenceArm fixName ps dp sc arms br env arm
+      else
+        if not (fixScanGuard fixName ps dp arm cls.env) then false
+        else if not (fixScanExpr fixName ps dp arm.body cls.env) then false
+        else
+          if eq cls.kind "always" then
+            if checkArmUnguarded arm then true
+            else fixScanBranchArms fixName ps dp sc (eufRest arms) br env
+          else fixScanBranchArms fixName ps dp sc (eufRest arms) br env
+
+@label "check: fix descent scan (fence-classified arm)"
+@description "decide-substrate Phase 8λ.5 — a fence-classified arm may still FIRE at runtime, so it must not mention the fix name (false when it does); otherwise the branch walk continues over the remaining arms (over-scanning unreachable arms only rejects more — sound abstention). Internal helper to fixScanBranchArms."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanFenceArm : (fixName: String) -> (ps: List String) -> (dp: String) -> (sc: (Expr Any)) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> (br: SetExpr) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (arm: { pattern: (Pattern Any), body: (Expr Any) }) -> Boolean
+fixScanFenceArm fixName ps dp sc arms br env arm =
+  if fixArmMention fixName arm then false
+  else fixScanBranchArms fixName ps dp sc (eufRest arms) br env
+
+@label "check: fix descent scan (guard)"
+@description "decide-substrate Phase 8λ.5 — an arm's guard expression, when present, passes the descent scan under the arm's narrowed env (guards EXECUTE — a self-call inside one carries the same obligations). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixScanGuard : (fixName: String) -> (ps: List String) -> (dp: String) -> (arm: { pattern: (Pattern Any), body: (Expr Any) }) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+fixScanGuard fixName ps dp arm env =
+  case lookup arm "guard" of
+    Just g -> fixScanExpr fixName ps dp g env
+    Nothing -> true
+
+@label "check: fix arms mention the fix name?"
+@description "decide-substrate Phase 8λ.5 — does ANY arm (guard or body) mention the fix name (fixMentions)? The strict-mode test for non-decomposable / fence-classified arms. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixArmsMention : (fixName: String) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> Boolean
+fixArmsMention fixName arms =
+  case head arms of
+    Nothing -> false
+    Just arm ->
+      if fixArmMention fixName arm then true else fixArmsMention fixName (eufRest arms)
+
+@label "check: fix ONE arm mentions the fix name?"
+@description "decide-substrate Phase 8λ.5 — one arm's guard (when present) or body mentions the fix name. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixArmMention : (fixName: String) -> (arm: { pattern: (Pattern Any), body: (Expr Any) }) -> Boolean
+fixArmMention fixName arm =
+  case lookup arm "guard" of
+    Just g -> if fixMentions fixName g then true else fixMentions fixName arm.body
+    Nothing -> fixMentions fixName arm.body
+
+@label "check: fix name mentioned in an expr?"
+@description "decide-substrate Phase 8λ.5 — pure occurrence scan: an EVar of the name, or a `$dyn:<name>` call head, anywhere in the tree (args / bodies / scrutinee / arm guards+bodies / ctor args / record fields). Patterns cannot carry an occurrence (PatVar names are binders, and the binder fence already excluded the fix name). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixMentions : (fixName: String) -> (e: (Expr Any)) -> Boolean
+fixMentions fixName e =
+  case e of
+    ELit {} -> false
+    EVar { name = n } -> eq n fixName
+    ECall { fnId = f, args = as } ->
+      if eq f (concat "$dyn:" fixName) then true else fixMentionsList fixName as
+    ELambda { body = bd } -> fixMentions fixName bd
+    EMatch { scrutinee = sc, arms = arms } ->
+      if fixMentions fixName sc then true else fixMentionsArms fixName arms
+    EConstruct { args = as } -> fixMentionsList fixName as
+    ERecord { fields = fs } -> fixMentionsFields fixName fs
+    _ -> true
+
+@label "check: fix mention (list)"
+@description "decide-substrate Phase 8λ.5 — any expression in the list mentions the fix name. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixMentionsList : (fixName: String) -> (es: List (Expr Any)) -> Boolean
+fixMentionsList fixName es =
+  case head es of
+    Nothing -> false
+    Just e0 ->
+      if fixMentions fixName e0 then true else fixMentionsList fixName (eufRest es)
+
+@label "check: fix mention (arms)"
+@description "decide-substrate Phase 8λ.5 — any arm mentions the fix name (guard or body). Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixMentionsArms : (fixName: String) -> (arms: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> Boolean
+fixMentionsArms fixName arms =
+  case head arms of
+    Nothing -> false
+    Just arm ->
+      if fixArmMention fixName arm then true else fixMentionsArms fixName (eufRest arms)
+
+@label "check: fix mention (record fields)"
+@description "decide-substrate Phase 8λ.5 — any record-field value mentions the fix name. Internal helper."
+@tags "engine" "internal" "check" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+fixMentionsFields : (fixName: String) -> (fs: List ({ name: String, value: (Expr Any) })) -> Boolean
+fixMentionsFields fixName fs =
+  case head fs of
+    Nothing -> false
+    Just f0 ->
+      if fixMentions fixName f0.value then true else fixMentionsFields fixName (eufRest fs)

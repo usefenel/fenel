@@ -1,0 +1,260 @@
+-- =========================================================================
+-- Entitlements — grant_entitlement + revoke_entitlement + check_access.
+--
+-- ts-elimination-completion Phase 2 (entitlements area, Group 3). Ports the
+-- three `(E)` handlers in core/actions/entitlements.ts from live TS
+-- orchestration (findItemBySlug / checkProfileAccess lookups +
+-- createEntityInstance / getEntityInstance / updateEntityInstance +
+-- appendEvent + ISO-date defaulting) to Fenel bodies over state:*. Each TS
+-- handler reduces to a thin validateActionParams + Maybe-marshalling +
+-- invokeIOAction + actionResultAdtToTs delegator.
+--
+-- NEW module + thin engine seam, registered at the same boot sites as
+-- itemsModule/plansModule + the engine package.json exports. The header
+-- keeps the LEGACY lowercase `entitlements:` id-prefix + the `"entitlement"`
+-- entity-type string byte-identical (Decision 3 — no PascalCase rename).
+--
+-- Two NEW substrate leaves were added for the Group-3 reads (the expected
+-- substrate-leaf bridge — sister of state:findInventoryBySlug):
+--   - state:findItemBySlug slug          → Maybe<Item>  (slug→item resolve)
+--   - state:checkProfileAccess pid slug  → Boolean       (access-validity)
+-- Both read accountId from ctx; the composition lives in the Fenel bodies.
+--
+-- Substrate consumed:
+--   - state:findItemBySlug / state:checkProfileAccess (new this area)
+--   - state:tryCreateInstanceByName "entitlement" data
+--   - state:getInstance "entitlement" id   (revoke existence guard + read)
+--   - state:updateInstance id patch        (patch-merge revoke fields)
+--   - state:appendEvent type payload …     (write-only event log)
+--   - std:mergeRecords / dashboard:defaultTo / time:nowIso
+--
+-- DIVERGENCES (documented): the optional entitlement fields (itemId /
+-- grantedByPurchaseId / grantedByStep / expiresAt / graceEndsAt) are
+-- OMIT-when-absent (Fenel has no null literal; pre-port stored undefined,
+-- which JSON drops). canonIso (= parse+format ISO) replaces the wrapper's
+-- toIsoOrUndefined `new Date(s).toISOString()`; lenient on parse failure.
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line.
+-- =========================================================================
+
+module entitlements where
+
+-- maybeOr — Maybe<a> with a default. @codeName scopes the global codeName
+-- (profiles:maybeOr owns the bare "maybeOr"; sister of payments).
+maybeOr : {} -> {} -> {}
+@codeName "maybeOrEntitlements"
+@label "Maybe or default (entitlements)"
+@description "ts-elimination-completion Phase 2 — Maybe with default: Just<x> → x; Nothing → defaultV. Redeclared in entitlements scope (revoke reason 'manual' default + grant payload {} default)."
+@tags "entitlement" "pure" "maybe" "ts-elimination"
+maybeOr m defaultV =
+  case m of
+    Nothing -> defaultV
+    Just v -> v
+
+-- canonIso — `new Date(s).toISOString()` via time:parseIsoTimestamp +
+-- time:formatIsoTimestamp. Returns input unchanged on parse failure.
+-- Redeclared per-module (@codeName scoped) to keep entitlements decoupled.
+canonIso : String -> String
+@codeName "canonIsoEntitlements"
+@label "Canonicalise ISO timestamp (entitlements)"
+@description "ts-elimination-completion Phase 2 — replicates `new Date(s).toISOString()` via time:parseIsoTimestamp + time:formatIsoTimestamp. Returns input unchanged on parse failure (lenient). Redeclared in entitlements scope."
+@tags "entitlement" "time" "pure" "ts-elimination"
+canonIso s =
+  case parseIsoTimestamp s of
+    Nothing -> s
+    Just t -> formatIsoTimestamp t
+
+-- --- grant_entitlement -------------------------------------------------
+
+-- resolveStartsAt — pre-port `startsAt ? canonIso(startsAt) : now`.
+resolveStartsAt : Maybe String -> String
+@label "Resolve startsAt"
+@description "ts-elimination-completion Phase 2 — pure helper. canonIso(startsAt) when Just, else time:nowIso (pre-port `startsAtMaybe ? new Date(startsAtMaybe).toISOString() : new Date().toISOString()`)."
+@tags "entitlement" "time" "pure" "ts-elimination"
+resolveStartsAt startsAtM =
+  case startsAtM of
+    Nothing -> nowIso
+    Just s -> canonIso s
+
+-- add* — OMIT-when-absent optional entitlement fields.
+addItemId : {} -> Maybe String -> {}
+@label "Add itemId (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {itemId} only when itemIdM is Just (pre-port stored undefined when no itemSlug)."
+@tags "entitlement" "pure" "ts-elimination"
+addItemId base itemIdM =
+  case itemIdM of
+    Nothing -> base
+    Just i -> mergeRecords base { itemId = i }
+
+addPurchaseId : {} -> Maybe String -> {}
+@label "Add grantedByPurchaseId (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {grantedByPurchaseId} only when purchaseIdM is Just."
+@tags "entitlement" "pure" "ts-elimination"
+addPurchaseId base purchaseIdM =
+  case purchaseIdM of
+    Nothing -> base
+    Just p -> mergeRecords base { grantedByPurchaseId = p }
+
+addGrantedByStep : {} -> Maybe String -> {}
+@label "Add grantedByStep (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {grantedByStep} only when grantedByStepM is Just."
+@tags "entitlement" "pure" "ts-elimination"
+addGrantedByStep base grantedByStepM =
+  case grantedByStepM of
+    Nothing -> base
+    Just s -> mergeRecords base { grantedByStep = s }
+
+addExpiresAt : {} -> Maybe String -> {}
+@label "Add expiresAt (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {expiresAt = canonIso v} only when expiresAtM is Just (pre-port `toIsoOrUndefined`)."
+@tags "entitlement" "time" "pure" "ts-elimination"
+addExpiresAt base expiresAtM =
+  case expiresAtM of
+    Nothing -> base
+    Just v -> mergeRecords base { expiresAt = canonIso v }
+
+addGraceEndsAt : {} -> Maybe String -> {}
+@label "Add graceEndsAt (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Sister of addExpiresAt for graceEndsAt."
+@tags "entitlement" "time" "pure" "ts-elimination"
+addGraceEndsAt base graceEndsAtM =
+  case graceEndsAtM of
+    Nothing -> base
+    Just v -> mergeRecords base { graceEndsAt = canonIso v }
+
+-- buildEntitlementData — composes the entitlement entity_instances data.
+-- base: {profileId, entitlementSlug, startsAt, payload (default {})};
+-- optional itemId/grantedByPurchaseId/grantedByStep/expiresAt/graceEndsAt.
+buildEntitlementData : String -> String -> Maybe String -> Maybe String -> Maybe String -> String -> Maybe String -> Maybe String -> Maybe ({}) -> {}
+@label "Build entitlement data"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the entitlement data record: {profileId, entitlementSlug, startsAt, payload = payloadM ?? {}} + optional itemId / grantedByPurchaseId / grantedByStep / expiresAt / graceEndsAt (omit-when-absent, dates canonicalised)."
+@tags "entitlement" "pure" "ts-elimination"
+buildEntitlementData profileId entitlementSlug itemIdM purchaseIdM grantedByStepM startsAt expiresAtM graceEndsAtM payloadM =
+  let base = { profileId = profileId, entitlementSlug = entitlementSlug, startsAt = startsAt, payload = maybeOr payloadM {} }
+  let withItem = addItemId base itemIdM
+  let withPurchase = addPurchaseId withItem purchaseIdM
+  let withStep = addGrantedByStep withPurchase grantedByStepM
+  let withExpires = addExpiresAt withStep expiresAtM
+  addGraceEndsAt withExpires graceEndsAtM
+
+-- buildGrantedPayload — entitlement_granted event payload. {entitlementSlug,
+-- adapter} + optional itemId / purchaseId / grantedByStep.
+buildGrantedPayload : String -> Maybe String -> Maybe String -> Maybe String -> String -> {}
+@label "Build entitlement_granted payload"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the entitlement_granted event payload: {entitlementSlug, adapter} + optional itemId / purchaseId / grantedByStep (omit-when-absent, mirrors pre-port undefined-drop)."
+@tags "entitlement" "pure" "ts-elimination"
+buildGrantedPayload entitlementSlug itemIdM purchaseIdM grantedByStepM adapter =
+  let base = { entitlementSlug = entitlementSlug, adapter = adapter }
+  let withItem = addItemId base itemIdM
+  let withPurchase = addPurchaseId withItem purchaseIdM
+  addGrantedByStep withPurchase grantedByStepM
+
+-- grantEmit — successful-create tail. Writes entitlement_granted, returns Ok.
+grantEmit : String -> String -> String -> Maybe String -> Maybe String -> Maybe String -> String -> ActionResult
+@label "Grant entitlement (emit)"
+@description "ts-elimination-completion Phase 2 — successful-create tail of grantEntitlement. Writes entitlement_granted (buildGrantedPayload) with aggregateType=Just 'entitlement', aggregateId=Just entitlementId, profileId=Just profileId; returns ActionOk { data = {entitlementId, entitlementSlug} }."
+@tags "entitlement" "grant" "ts-elimination"
+grantEmit entitlementId profileId entitlementSlug itemIdM purchaseIdM grantedByStepM adapter =
+  let payload = buildGrantedPayload entitlementSlug itemIdM purchaseIdM grantedByStepM adapter
+  let _e = appendEvent "entitlement_granted" payload (Just "entitlement") (Just entitlementId) (Just profileId)
+  ActionOk { data = { entitlementId = entitlementId, entitlementSlug = entitlementSlug }, aggregateType = Just "entitlement", aggregateId = Just entitlementId, profileId = Just profileId }
+
+-- grantWrite — builds the entitlement data, persists, emits. itemIdM is the
+-- resolved Maybe<itemId> (Nothing when no itemSlug; Just when resolved).
+grantWrite : String -> String -> Maybe String -> Maybe String -> Maybe String -> Maybe String -> Maybe String -> Maybe String -> Maybe ({}) -> String -> ActionResult
+@label "Grant entitlement (write)"
+@description "ts-elimination-completion Phase 2 — resolves startsAt, builds entitlement data (buildEntitlementData), persists via state:tryCreateInstanceByName; success → grantEmit, failure → ActionErr."
+@tags "entitlement" "grant" "ts-elimination"
+grantWrite profileId entitlementSlug itemIdM purchaseIdM grantedByStepM startsAtM expiresAtM graceEndsAtM payloadM adapter =
+  let startsAt = resolveStartsAt startsAtM
+  let data = buildEntitlementData profileId entitlementSlug itemIdM purchaseIdM grantedByStepM startsAt expiresAtM graceEndsAtM payloadM
+  let r = tryCreateInstanceByName "entitlement" data
+  if r.ok
+  then grantEmit r.value profileId entitlementSlug itemIdM purchaseIdM grantedByStepM adapter
+  else ActionErr { message = r.error }
+
+-- grantResolveItem — itemSlug present: resolve via state:findItemBySlug;
+-- Nothing → Err item_not_found; Just item → grantWrite with Just item.id.
+grantResolveItem : String -> String -> String -> Maybe String -> Maybe String -> Maybe String -> Maybe String -> Maybe String -> Maybe ({}) -> String -> ActionResult
+@label "Grant entitlement (resolve item)"
+@description "ts-elimination-completion Phase 2 — case-arm extraction from grantEntitlement (itemSlug Just). Resolves the slug via state:findItemBySlug; Nothing → ActionErr 'Item not found' (pre-port throw); Just item → grantWrite with itemId = Just item.id."
+@tags "entitlement" "grant" "ts-elimination"
+grantResolveItem profileId entitlementSlug slug purchaseIdM grantedByStepM startsAtM expiresAtM graceEndsAtM payloadM adapter =
+  case findItemBySlug slug of
+    Nothing -> ActionErr { message = `Item not found: ${slug}` }
+    Just item -> grantWrite profileId entitlementSlug (Just item.id) purchaseIdM grantedByStepM startsAtM expiresAtM graceEndsAtM payloadM adapter
+
+-- grantEntitlement — main body. Branches on the optional itemSlug.
+-- action-subsumption Phase 3 (2026-06-08) — grantEntitlement IS the public
+-- grant_entitlement action now (D1 COLLAPSE): public field names (drop the `…M`
+-- marshalling) + the refinements grant_entitlement_params mirrored ride the sig
+-- (profileId : Uuid, entitlementSlug : NonEmptyStr, purchaseId : Maybe Uuid). The
+-- startsAt `?? now` residual stays body-side (resolveStartsAt). The TS handler is
+-- deleted; `adapter` stays an explicit param (D4).
+grantEntitlement : Uuid -> NonEmptyStr -> Maybe String -> Maybe Uuid -> Maybe String -> Maybe String -> Maybe String -> Maybe String -> Maybe ({}) -> String -> ActionResult
+@label "Grant entitlement"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 3 — the public grant_entitlement action (no separate TS handler). Params ARE the public contract (profileId, entitlementSlug, itemSlug?, purchaseId?, grantedByStep?, startsAt?, expiresAt?, graceEndsAt?, payload?, adapter). Branches on the optional itemSlug (Nothing → grantWrite with no itemId; Just → grantResolveItem); then builds + persists the entitlement, emits entitlement_granted. startsAt `?? now` default stays body-side (resolveStartsAt)."
+@tags "entitlement" "grant" "ts-elimination" "action"
+@ioAction "entitlements.grant_entitlement"
+grantEntitlement profileId entitlementSlug itemSlug purchaseId grantedByStep startsAt expiresAt graceEndsAt payload adapter =
+  case itemSlug of
+    Nothing -> grantWrite profileId entitlementSlug Nothing purchaseId grantedByStep startsAt expiresAt graceEndsAt payload adapter
+    Just slug -> grantResolveItem profileId entitlementSlug slug purchaseId grantedByStep startsAt expiresAt graceEndsAt payload adapter
+
+-- --- revoke_entitlement ------------------------------------------------
+
+-- revokeKnown — after the existence guard. Patches revokedAt/revokedReason
+-- (patch-merge preserves existing fields), emits entitlement_revoked. The
+-- profileId / entitlementSlug come from the fetched entitlement row
+-- (defaultTo "" — pre-port `?? ""`).
+revokeKnown : String -> {} -> Maybe String -> String -> ActionResult
+@label "Revoke entitlement (known)"
+@description "ts-elimination-completion Phase 2 — case-arm extraction from revokeEntitlement (entitlement exists). Patches {revokedAt = nowIso, revokedReason = reasonM ?? 'manual'} via state:updateInstance; reads profileId / entitlementSlug off the fetched row (defaultTo ''); emits entitlement_revoked; returns ActionOk { data = {entitlementSlug} }."
+@tags "entitlement" "revoke" "ts-elimination"
+revokeKnown entitlementId ent reasonM adapter =
+  let reason = maybeOr reasonM "manual"
+  let _u = updateInstance entitlementId { revokedAt = nowIso, revokedReason = reason }
+  let profileId = defaultTo "" ent.profileId
+  let entitlementSlug = defaultTo "" ent.entitlementSlug
+  let payload = { entitlementSlug = entitlementSlug, reason = reason, adapter = adapter }
+  let _e = appendEvent "entitlement_revoked" payload (Just "entitlement") (Just entitlementId) (Just profileId)
+  ActionOk { data = { entitlementSlug = entitlementSlug }, aggregateType = Just "entitlement", aggregateId = Just entitlementId, profileId = Just profileId }
+
+-- revokeEntitlement — main body. Existence guard (pre-port throws
+-- "Entitlement not found"); known arm patches + emits.
+-- action-subsumption Phase 2 (2026-06-08) — revokeEntitlement IS the public
+-- revoke_entitlement action now (D1 COLLAPSE): public field names (`reason`,
+-- not `reasonM`) + the `format:uuid` refinement revoke_entitlement_params
+-- mirrored, carried via the `Uuid` named type (entitlementId : Uuid). The TS
+-- handler is deleted; `adapter` stays an explicit param (D4).
+revokeEntitlement : Uuid -> Maybe String -> String -> ActionResult
+@label "Revoke entitlement"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 2 — the public revoke_entitlement action (no separate TS handler). Params ARE the public contract (entitlementId, reason?, adapter). Guards on state:getInstance 'entitlement' id (Nothing → ActionErr 'Entitlement not found'); known arm patches revokedAt/revokedReason + emits entitlement_revoked."
+@tags "entitlement" "revoke" "ts-elimination" "action"
+@ioAction "entitlements.revoke_entitlement"
+revokeEntitlement entitlementId reason adapter =
+  case getInstance "entitlement" entitlementId of
+    Nothing -> ActionErr { message = `Entitlement not found: ${entitlementId}` }
+    Just ent -> revokeKnown entitlementId ent reason adapter
+
+-- --- check_access (read-only, no event) --------------------------------
+
+-- checkAccess — read-only access-validity query. Returns ActionOk with the
+-- {hasAccess, profileId, itemSlug} payload via the same Ok arm; no event, no
+-- aggregate provenance (profileId field = Nothing — read-only).
+-- action-subsumption Phase 2 (2026-06-08) — checkAccess IS the public
+-- check_access action now (D1 COLLAPSE; read-only, no marshalling to drop). The
+-- refinements check_access_params mirrored ride the sig: profileId : Uuid
+-- (format:uuid), itemSlug : NonEmptyStr. No adapter param (read-only); the
+-- dispatcher's adapter/accountId injections are harmless extra env keys the
+-- body ignores.
+checkAccess : Uuid -> NonEmptyStr -> ActionResult
+@label "Check access"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 2 — the public check_access action (no separate TS handler; read-only, no event). Calls state:checkProfileAccess; returns ActionOk { data = {hasAccess, profileId, itemSlug}, aggregate* = Nothing }."
+@tags "entitlement" "access" "read-only" "ts-elimination" "action"
+@ioAction "entitlements.check_access"
+checkAccess profileId itemSlug =
+  let hasAccess = checkProfileAccess profileId itemSlug
+  ActionOk { data = { hasAccess = hasAccess, profileId = profileId, itemSlug = itemSlug }, aggregateType = Nothing, aggregateId = Nothing, profileId = Nothing }

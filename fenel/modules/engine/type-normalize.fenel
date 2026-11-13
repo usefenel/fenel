@@ -1,0 +1,566 @@
+module engine where
+
+-- type-normalize — recursive shorthand rewriter that converts legacy
+-- `$maybe` / `$list` / `$result` shorthand encodings of FenelType to
+-- their canonical helper-emitted form:
+--
+--   { $maybe: T }                  →  Maybe(T)   = $variant { Nothing | Just }
+--   { $list: T }                   →  List(T)    = $opaque { repr: "array", … }
+--   { $result: { err: E, ok: A } } →  Result(E, A) = $variant { Err | Ok }
+--
+-- Properties:
+--  - Idempotent. Re-running on already-canonical data is a no-op.
+--  - Conservative. Only sole-key objects with exactly `$maybe` / `$list` /
+--    `$result` are rewritten. Every other key (including value-level
+--    `$tag` / `$named` / `$variant` records) passes through unchanged.
+--  - Total over JSON. Walks arrays + plain objects to any depth.
+--    Non-objects (numbers / strings / booleans / null / undefined) are
+--    returned unchanged.
+--  - Reports a count. Returns NormalizeResult { value, rewrites } so the
+--    migration script can log per-row rewrite counts.
+--
+-- The walk descends BEFORE rewriting so nested shorthand like
+-- `{$maybe: {$list: T}}` resolves in a single pass.
+--
+-- Phase 7a — first port in the type-algebra arc. Mirrors the TS oracle
+-- at implementations/typescript/engine/src/type-normalize.ts (now a thin
+-- shim around dispatchedNormalizeFenelTypeShorthand).
+--
+-- The dispatch wrapper marshals heterogeneous JSON input to the TypeNorm
+-- ADT — same pattern as Phase 21.5's JsonLogic marshalling for
+-- normaliseToCore — so the body pattern-matches on declared variants
+-- rather than reaching for `isObject` / `isArray` / `objectKeys`
+-- introspection primitives. The ADT lacks a tagged variant (no analog
+-- of JlTagged) because the rewriter intentionally treats records like
+-- `{$tag: "Just", value: 42}` as plain objects, NOT as tagged values
+-- (per the boundary contract — see test `type-normalize.test.ts:110`).
+--
+-- For the rewrite output the body emits intent markers (TnMaybeRewrite /
+-- TnListRewrite / TnResultRewrite) rather than constructing the full
+-- structural `$variant`/`$opaque` shapes inline. The TS unmarshaller maps
+-- markers back to the canonical Maybe/List/Result helper output. This
+-- splits responsibilities cleanly: WALK + DETECT in Fenel, structural
+-- SHAPE EMISSION via the existing type-foundation.ts helpers.
+--
+-- All internal helpers are prefixed `typeNorm…` to avoid colliding with
+-- like-named helpers already registered by other engine bodies (notably
+-- normalise-to-core.fenel's `unwrapFirstField`).
+
+-- TypeNorm — typed ADT view of arbitrary JSON. The marshalling layer in
+-- the dispatch wrapper converts each JS shape to its canonical variant
+-- (no JlTagged-style $tag discrimination — see file header).
+TypeNorm =
+  TnNull
+  | TnBool value: a
+  | TnNumber value: a
+  | TnString value: a
+  | TnArray items: a
+  | TnObject fields: a
+  | TnMaybeRewrite inner: a
+  | TnListRewrite elem: a
+  | TnResultRewrite errType: a okType: a
+  | TnVecRewrite elem: a n: a
+  -- signature-substrate Phase 1 — the `$arrow.requires` retirement marker
+  -- (design/signatures-and-contracts.md §6). The slot is deleted from the
+  -- `$arrow` type constructor (types.ts); foreign/persisted data still
+  -- carrying it is stripped HERE — never silently (silent ignore loses a
+  -- capability declaration; Codex review 2's veto). `arrow` is the walked
+  -- inner object WITHOUT the `requires` field; the TS unmarshaller rebuilds
+  -- the `{$arrow: …}` envelope, records the distinct boundary diagnostic,
+  -- and warns.
+  | TnArrowRequiresStripped arrow: a
+
+-- TnField — one entry in a TnObject fields list. Named-record shape
+-- mirroring the parser's `{name, value}` convention so pattern bindings
+-- via field name work uniformly.
+TnField = TnField name: String value: a
+
+-- NormalizeResult — the body's return shape. `value` is the rewritten
+-- TypeNorm subtree; `rewrites` is the cumulative count of shorthand
+-- rewrites performed in this subtree.
+NormalizeResult = NormalizeResult value: a rewrites: a
+
+-- WalkArrayAcc — intermediate accumulator for typeNormWalkArrayInner.
+-- Threads the accumulating items list + rewrite count through tail
+-- recursion.
+WalkArrayAcc = WalkArrayAcc items: a rewrites: a
+
+-- WalkObjectAcc — intermediate accumulator for typeNormWalkObjectFields.
+-- Threads the accumulating field list + rewrite count through tail
+-- recursion.
+WalkObjectAcc = WalkObjectAcc fields: a rewrites: a
+
+-- normalizeFenelTypeShorthand — entry point. `emptyList` is the harness-
+-- supplied empty-list seed (Core IR rejects bare-array literals at
+-- expression position — `appendItem` builds lists by snoc).
+@label "Normalize FenelType shorthand"
+@description "Phase 7a — recursive rewriter that converts legacy `$maybe` / `$list` / `$result` shorthand encodings of FenelType to their canonical helper-emitted form (`Maybe(T)` / `List(T)` / `Result(E, A)`). Boundary adapter; dispatched via `dispatchedNormalizeFenelTypeShorthand` in engine-bodies-dispatch.ts which marshals raw JSON to the TypeNorm ADT and unmarshals rewrite markers via the canonical Maybe/List/Result helpers. Mirrors implementations/typescript/engine/src/type-normalize.ts (now a thin shim). First port of the type-algebra arc."
+@tags "engine" "type" "boundary" "phase-7a"
+normalizeFenelTypeShorthand : (input: TypeNorm) -> (emptyList: List a) -> NormalizeResult
+normalizeFenelTypeShorthand input emptyList = typeNormWalk input emptyList
+
+-- typeNormWalk — main dispatch over a TypeNorm node.
+@label "type-normalize: walk"
+@description "Phase 7a — main dispatch over a TypeNorm node. Helper to normalizeFenelTypeShorthand; tagged engine-internal so the editor catalog hides it from the public picker. Prefixed `typeNorm…` to avoid colliding with similarly-named helpers in normalise-to-core.fenel. See fenel/modules/engine/type-normalize.fenel for the per-function comment block."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormWalk : (node: TypeNorm) -> (emptyList: List a) -> NormalizeResult
+typeNormWalk node emptyList =
+  case node of
+    TnNull -> NormalizeResult { value = TnNull, rewrites = 0 }
+    TnBool { value = b } -> NormalizeResult { value = TnBool { value = b }, rewrites = 0 }
+    TnNumber { value = n } -> NormalizeResult { value = TnNumber { value = n }, rewrites = 0 }
+    TnString { value = s } -> NormalizeResult { value = TnString { value = s }, rewrites = 0 }
+    TnArray { items = xs } -> typeNormWalkArray xs emptyList
+    TnObject { fields = fs } -> typeNormWalkObject fs emptyList
+
+-- typeNormWalkArray — walk each element, returning a TnArray with the
+-- walked elements + accumulated rewrite count.
+@label "type-normalize: walkArray"
+@description "Phase 7a — walk each element of a TnArray, accumulating rewrites. Helper to typeNormWalk; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormWalkArray : (items: List a) -> (emptyList: List a) -> NormalizeResult
+typeNormWalkArray items emptyList =
+  let inner = typeNormWalkArrayInner items emptyList 0 emptyList
+  NormalizeResult { value = TnArray { items = inner.items }, rewrites = inner.rewrites }
+
+-- typeNormWalkArrayInner — accumulator-threaded loop. For each item in
+-- left-to-right order, walk it + append to acc + accumulate rewrites.
+@label "type-normalize: walkArrayInner"
+@description "Phase 7a — accumulator-threaded loop over array items. Helper to typeNormWalkArray; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormWalkArrayInner : (items: List a) -> (emptyList: List a) -> (rewrites: a) -> (acc: List a) -> WalkArrayAcc
+typeNormWalkArrayInner items emptyList rewrites acc =
+  case head items of
+    Nothing -> WalkArrayAcc { items = acc, rewrites = rewrites }
+    Just first ->
+      let walked = typeNormWalk first emptyList
+      let newAcc = appendItem walked.value acc
+      let newRewrites = rewrites + walked.rewrites
+      case tail items of
+        Nothing -> WalkArrayAcc { items = newAcc, rewrites = newRewrites }
+        Just rest ->
+          typeNormWalkArrayInner rest emptyList newRewrites newAcc
+
+-- typeNormWalkObject — detect sole-key shorthand or recurse into fields.
+@label "type-normalize: walkObject"
+@description "Phase 7a — detect sole-key shorthand or recurse into fields. Helper to typeNormWalk; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormWalkObject : (fields: List a) -> (emptyList: List a) -> NormalizeResult
+typeNormWalkObject fields emptyList =
+  let n = length fields
+  if eq n 1
+  then
+    let first = typeNormUnwrapFirstField fields
+    typeNormDetectShorthand first.name first.value fields emptyList
+  else
+    typeNormWalkObjectGeneric fields emptyList
+
+-- typeNormDetectShorthand — dispatch on sole-key name. Emits a rewrite
+-- marker for `$maybe` / `$list` / `$result`; falls through to generic
+-- walk for any other sole key.
+@label "type-normalize: detectShorthand"
+@description "Phase 7a — dispatch on sole-key name; emit rewrite markers for $maybe / $list / $result, or fall through to generic walk. Helper to typeNormWalkObject; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormDetectShorthand : (name: String) -> (value: TypeNorm) -> (originalFields: List a) -> (emptyList: List a) -> NormalizeResult
+typeNormDetectShorthand name value originalFields emptyList =
+  if eq name "$maybe"
+  then
+    let walked = typeNormWalk value emptyList
+    NormalizeResult { value = TnMaybeRewrite { inner = walked.value }, rewrites = walked.rewrites + 1 }
+  else if eq name "$list"
+  then
+    let walked = typeNormWalk value emptyList
+    NormalizeResult { value = TnListRewrite { elem = walked.value }, rewrites = walked.rewrites + 1 }
+  else if eq name "$result"
+  then typeNormTryRewriteResult value originalFields emptyList
+  else if eq name "$refined"
+  then typeNormTryRewriteVec value originalFields emptyList
+  else if eq name "$arrow"
+  then typeNormTryStripArrowRequires value originalFields emptyList
+  else typeNormWalkObjectGeneric originalFields emptyList
+
+-- typeNormTryRewriteResult — the `$result` shorthand requires the inner
+-- value to be a TnObject with BOTH `err` and `ok` fields. If either is
+-- missing (or the value isn't a TnObject), fall back to the generic
+-- walk so malformed shorthand passes through unchanged.
+@label "type-normalize: tryRewriteResult"
+@description "Phase 7a — emit TnResultRewrite when the inner value has both `err` and `ok` fields; otherwise fall back to generic walk. Helper to typeNormDetectShorthand; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormTryRewriteResult : (resultValue: TypeNorm) -> (originalFields: List a) -> (emptyList: List a) -> NormalizeResult
+typeNormTryRewriteResult resultValue originalFields emptyList =
+  case resultValue of
+    TnObject { fields = fs } ->
+      let errMaybe = typeNormFindField fs "err"
+      let okMaybe = typeNormFindField fs "ok"
+      case errMaybe of
+        Nothing -> typeNormWalkObjectGeneric originalFields emptyList
+        Just errValue ->
+          case okMaybe of
+            Nothing -> typeNormWalkObjectGeneric originalFields emptyList
+            Just okValue ->
+              let walkedErr = typeNormWalk errValue emptyList
+              let walkedOk = typeNormWalk okValue emptyList
+              NormalizeResult {
+                value = TnResultRewrite { errType = walkedErr.value, okType = walkedOk.value },
+                rewrites = walkedErr.rewrites + walkedOk.rewrites + 1
+              }
+    _ -> typeNormWalkObjectGeneric originalFields emptyList
+
+-- typeNormWalkObjectGeneric — walk every field's value, accumulating
+-- rewrites.
+@label "type-normalize: walkObjectGeneric"
+@description "Phase 7a — walk every field's value, accumulating rewrites. Helper to typeNormWalkObject / typeNormDetectShorthand / typeNormTryRewriteResult fall-through; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormWalkObjectGeneric : (fields: List a) -> (emptyList: List a) -> NormalizeResult
+typeNormWalkObjectGeneric fields emptyList =
+  let inner = typeNormWalkObjectFields fields emptyList 0 emptyList
+  NormalizeResult { value = TnObject { fields = inner.fields }, rewrites = inner.rewrites }
+
+-- typeNormWalkObjectFields — accumulator-threaded loop over object fields.
+@label "type-normalize: walkObjectFields"
+@description "Phase 7a — accumulator-threaded loop over object fields. Helper to typeNormWalkObjectGeneric; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormWalkObjectFields : (fields: List a) -> (emptyList: List a) -> (rewrites: a) -> (acc: List a) -> WalkObjectAcc
+typeNormWalkObjectFields fields emptyList rewrites acc =
+  case head fields of
+    Nothing -> WalkObjectAcc { fields = acc, rewrites = rewrites }
+    Just first ->
+      let walked = typeNormWalk first.value emptyList
+      let newField = TnField { name = first.name, value = walked.value }
+      let newAcc = appendItem newField acc
+      let newRewrites = rewrites + walked.rewrites
+      case tail fields of
+        Nothing -> WalkObjectAcc { fields = newAcc, rewrites = newRewrites }
+        Just rest ->
+          typeNormWalkObjectFields rest emptyList newRewrites newAcc
+
+-- typeNormUnwrapFirstField — extract the first field of a length>=1 list.
+-- Unreachable on the Nothing branch under `typeNormWalkObject`'s length==1
+-- guard; returns an empty placeholder for total-function safety.
+@label "type-normalize: unwrapFirstField"
+@description "Phase 7a — extract the first field of a length>=1 list. Helper to typeNormWalkObject; tagged engine-internal. Prefixed `typeNorm…` to avoid colliding with normalise-to-core.fenel's `unwrapFirstField` which has the same shape but a different (JlField-typed) input."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormUnwrapFirstField : (fields: List a) -> TnField
+typeNormUnwrapFirstField fields =
+  case head fields of
+    Just f -> f
+    Nothing -> TnField { name = "", value = TnNull }
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- array-substrate Phase 1a.5 — the normalization LAW:
+--   refined(C, length == n) ≡ $map (Fin n) <elem>   (the `==`-only fence)
+--
+-- A `$refined` whose base is List-shaped (`List a`, the `$opaque List` canonical
+-- form / a `$list` shorthand / `String` = `List Char`) and whose `set` is EXACTLY
+-- `length(value) == <literal n>` IS the canonical `Vec n a = $map (Fin n) a`. So
+-- a length-`n` string normalises to `Vec n Char`; `LengthBoundedString n` BECOMES
+-- `Vec n Char` — one insight, two former special-cases collapsed. The `$map` form
+-- carries TOTAL indexing + the Phase-1a algebra, so it is the canonical direction
+-- (refined-List-length → `$map`, NEVER the reverse).
+--
+-- FENCE: only `==` (a FIXED cardinality ⇒ a fixed `Fin n`). Length INEQUALITIES
+-- (`>= n` / `<= n` / a range) are a variable-support map — NOT a single `Fin n` —
+-- and stay refined-List (they look up a `==` field that isn't there ⇒ fall
+-- through). Only a LITERAL `n` (a `TnNumber`) — a symbolic bound is left refined.
+--
+-- The DECISION (recognise the List base + the `length==n` SetExpr + extract elem)
+-- is 100% Fenel here, walking the marshalled TypeNorm view (the `$`-keys arrive
+-- as String field NAMES the body compares with `eq`); the TS unmarshaller only
+-- builds the `$map`/`$refined` envelope from the `TnVecRewrite { elem, n }` marker
+-- (the TnMaybeRewrite/TnListRewrite/TnResultRewrite seam precedent).
+
+-- typeNormTryRewriteVec — emit TnVecRewrite when the `$refined` inner is a
+-- List-shaped base refined by EXACTLY `length(value) == <literal>`; otherwise
+-- fall back to the generic walk (so non-matching / inequality-refined types pass
+-- through, with nested shorthand still normalised).
+@label "type-normalize: tryRewriteVec"
+@description "array-substrate Phase 1a.5 — emit TnVecRewrite (⇒ `$map (Fin n) elem`) when the `$refined` inner is a List-shaped base refined by EXACTLY `length(value) == <literal n>`; else generic walk. The normalization law `refined(C, length==n) ≡ Vec n a`. Helper to typeNormDetectShorthand; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+typeNormTryRewriteVec : (refinedInner: TypeNorm) -> (originalFields: List a) -> (emptyList: List a) -> NormalizeResult
+typeNormTryRewriteVec refinedInner originalFields emptyList =
+  case tnGetField refinedInner "base" of
+    Nothing -> typeNormWalkObjectGeneric originalFields emptyList
+    Just base ->
+      case tnGetField refinedInner "set" of
+        Nothing -> typeNormWalkObjectGeneric originalFields emptyList
+        Just set ->
+          case typeNormLengthEqN set of
+            Nothing -> typeNormWalkObjectGeneric originalFields emptyList
+            Just nNode ->
+              case typeNormListElem base emptyList of
+                Nothing -> typeNormWalkObjectGeneric originalFields emptyList
+                Just elem ->
+                  let walkedElem = typeNormWalk elem emptyList
+                  NormalizeResult {
+                    value = TnVecRewrite { elem = walkedElem.value, n = nNode },
+                    rewrites = walkedElem.rewrites + 1
+                  }
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- signature-substrate Phase 1 — the `$arrow.requires` retirement boundary
+-- (design/signatures-and-contracts.md §6; gate §11.2).
+--
+-- The census found NO producer of `$arrow.requires` — the parser cannot write
+-- it (no `=>` sugar, no `$`-keys from `.fenel`), no TS builder sets it — so
+-- the slot is DELETED from the `$arrow` constructor (types.ts). Foreign or
+-- persisted data still carrying it hits this arm at the unknown-gateway
+-- normalizer: the field is STRIPPED and the strip is REPORTED (marker →
+-- host-side diagnostic + warn). Silent ignore is not acceptable — it loses a
+-- capability declaration (Codex review 2). The DECISION (recognize + strip +
+-- walk the survivors) is Fenel; the TS unmarshaller only rebuilds the
+-- `{$arrow: …}` envelope and emits the diagnostic (the TnVecRewrite seam
+-- precedent).
+
+-- typeNormTryStripArrowRequires — emit TnArrowRequiresStripped when the
+-- sole-key `$arrow` object's inner record carries a `requires` field;
+-- otherwise fall back to the generic walk (well-formed arrows pass through
+-- unchanged, nested shorthand still normalised).
+@label "type-normalize: tryStripArrowRequires"
+@description "signature-substrate Phase 1 — emit TnArrowRequiresStripped (⇒ `{$arrow: …}` minus the retired `requires` slot + a distinct boundary diagnostic) when a foreign `$arrow` envelope still carries `requires`; else generic walk. Capability constraints live on the function spec (judgment 2, design/signatures-and-contracts.md §6), never in the arrow value type. Helper to typeNormDetectShorthand; tagged engine-internal."
+@tags "engine" "internal" "type" "signature-substrate" "phase-1"
+@category "engine-internal"
+typeNormTryStripArrowRequires : (arrowValue: TypeNorm) -> (originalFields: List a) -> (emptyList: List a) -> NormalizeResult
+typeNormTryStripArrowRequires arrowValue originalFields emptyList =
+  case arrowValue of
+    TnObject { fields = fs } ->
+      case typeNormFindField fs "requires" of
+        Nothing -> typeNormWalkObjectGeneric originalFields emptyList
+        Just _ ->
+          let kept = typeNormFieldsWithout fs "requires" emptyList
+          let walked = typeNormWalkObjectGeneric kept emptyList
+          NormalizeResult {
+            value = TnArrowRequiresStripped { arrow = walked.value },
+            rewrites = walked.rewrites + 1
+          }
+    _ -> typeNormWalkObjectGeneric originalFields emptyList
+
+-- typeNormFieldsWithout — order-preserving field-list filter (drop every
+-- field named `name`). Accumulator-threaded snoc fold, the file's list idiom.
+@label "type-normalize: fieldsWithout"
+@description "signature-substrate Phase 1 — order-preserving TnField-list filter dropping every field with the given name. Helper to typeNormTryStripArrowRequires; tagged engine-internal."
+@tags "engine" "internal" "type" "signature-substrate" "phase-1"
+@category "engine-internal"
+typeNormFieldsWithout : (fields: List a) -> (name: String) -> (acc: List a) -> List a
+typeNormFieldsWithout fields name acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      if eq f.name name
+      then typeNormFieldsWithout (tailOr fields) name acc
+      else typeNormFieldsWithout (tailOr fields) name (appendItem f acc)
+
+-- tnGetField — field-by-name lookup over a TnObject node (Nothing for any
+-- non-TnObject or absent field). The TypeNorm analogue of `obj[name]`.
+@label "type-normalize: tnGetField"
+@description "array-substrate Phase 1a.5 — field-by-name lookup over a TnObject node (Nothing for non-TnObject / absent). Helper for the Vec normalization law; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+tnGetField : (node: TypeNorm) -> (name: String) -> Maybe a
+tnGetField node name =
+  case node of
+    TnObject { fields = fs } -> typeNormFindField fs name
+    _ -> Nothing
+
+-- tnStringEq — True iff `node` is a TnString equal to `s`.
+@label "type-normalize: tnStringEq"
+@description "array-substrate Phase 1a.5 — True iff the node is a TnString equal to s. Helper for the Vec normalization law; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+tnStringEq : (node: TypeNorm) -> (s: String) -> Bool
+tnStringEq node s =
+  case node of
+    TnString { value = v } -> eq v s
+    _ -> false
+
+-- tnArrItems — the items list of a TnArray (Nothing for non-TnArray).
+@label "type-normalize: tnArrItems"
+@description "array-substrate Phase 1a.5 — the items list of a TnArray (Nothing for non-TnArray). Helper for the Vec normalization law; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+tnArrItems : (node: TypeNorm) -> Maybe a
+tnArrItems node =
+  case node of
+    TnArray { items = xs } -> Just xs
+    _ -> Nothing
+
+-- tnFindNamed — find the first TnObject in `items` whose `name` field is a
+-- TnString equal to `name` (the `$variant.cases` / `Cons.fields` shape, where
+-- each entry is `{ name: "...", ... }` with `name` a String field, NOT the
+-- parser's TnField convention). Used to navigate to the `Cons` case + its `head`
+-- field when extracting a List's element type.
+@label "type-normalize: tnFindNamed"
+@description "array-substrate Phase 1a.5 — find the first TnObject in items whose `name` field equals `name`. Navigates `$variant.cases` / case `fields`. Helper for the Vec normalization law; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+tnFindNamed : (items: List a) -> (name: String) -> Maybe TypeNorm
+tnFindNamed items name =
+  case head items of
+    Nothing -> Nothing
+    Just it ->
+      let isMatch = case tnGetField it "name" of
+                      Just nm -> tnStringEq nm name
+                      Nothing -> false
+      if isMatch
+      then Just it
+      else
+        case tail items of
+          Nothing -> Nothing
+          Just rest -> tnFindNamed rest name
+
+-- typeNormLengthEqN — recognise a SetExpr that is EXACTLY `length(value) == n`
+-- and return the literal `n` node. The `==`-only fence: an inequality SetExpr
+-- (`>= n` etc.) has no `==` field ⇒ Nothing ⇒ left refined. `n` must be a
+-- literal TnNumber (a symbolic bound ⇒ Nothing).
+@label "type-normalize: lengthEqN"
+@description "array-substrate Phase 1a.5 — recognise a `$where { ==: [length(value), <literal n>] }` SetExpr and return the literal n node (the `==`-only fence; inequalities + symbolic bounds ⇒ Nothing). Helper for the Vec normalization law; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+typeNormLengthEqN : (set: TypeNorm) -> Maybe TypeNorm
+typeNormLengthEqN set =
+  let wherePayload =
+    case tnGetField set "$tag" of
+      Just tag -> if tnStringEq tag "SeWhere" then tnGetField set "pred" else Nothing
+      Nothing -> tnGetField set "$where"
+  case wherePayload of
+    Nothing -> Nothing
+    Just whereVal ->
+      case tnGetField whereVal "==" of
+        Nothing -> Nothing
+        Just eqNode ->
+          case tnArrItems eqNode of
+            Nothing -> Nothing
+            Just eqItems ->
+              case head eqItems of
+                Nothing -> Nothing
+                Just lhs ->
+                  if typeNormIsLengthCall lhs
+                  then
+                    case tail eqItems of
+                      Nothing -> Nothing
+                      Just rest ->
+                        case head rest of
+                          Nothing -> Nothing
+                          Just nNode -> typeNormLiteralNumber nNode
+                  else Nothing
+
+-- typeNormIsLengthCall — True iff the node is `{ call: ["length", ...] }` (the
+-- canonical length-predicate head the legacy Vec / vecOfLength emitted).
+@label "type-normalize: isLengthCall"
+@description "array-substrate Phase 1a.5 — True iff the node is `{ call: [\"length\", …] }`. Helper for the Vec normalization law; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+typeNormIsLengthCall : (node: TypeNorm) -> Bool
+typeNormIsLengthCall node =
+  case tnGetField node "call" of
+    Nothing -> false
+    Just callNode ->
+      case tnArrItems callNode of
+        Nothing -> false
+        Just callItems ->
+          case head callItems of
+            Nothing -> false
+            Just h -> tnStringEq h "length"
+
+-- typeNormLiteralNumber — Just the node iff it is a literal TnNumber (the `n`
+-- fence: a symbolic / expression bound ⇒ Nothing ⇒ left refined).
+@label "type-normalize: literalNumber"
+@description "array-substrate Phase 1a.5 — Just the node iff it is a literal TnNumber (else Nothing — the symbolic-bound fence). Helper for the Vec normalization law; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+typeNormLiteralNumber : (node: TypeNorm) -> Maybe TypeNorm
+typeNormLiteralNumber node =
+  case node of
+    TnNumber { value = n } -> Just (TnNumber { value = n })
+    _ -> Nothing
+
+-- typeNormListElem — extract the ELEMENT type of a List-shaped base, as a
+-- TypeNorm node. Recognises three forms: `String` (`{$ref:"String"}`) ⇒ `Char`
+-- (`{$ref:"Char"}`, the String = List Char law arm); the `$opaque` canonical
+-- List (`{$opaque:{name:"List", pure:$variant{Nil | Cons{head, tail}}}}`) ⇒ the
+-- `Cons.head` type; a `$list` shorthand ⇒ its element. Nothing for any other
+-- base (⇒ not a Vec; left refined).
+@label "type-normalize: listElem"
+@description "array-substrate Phase 1a.5 — extract the element type of a List-shaped base (`String`⇒Char / `$opaque List`⇒Cons.head / `$list`⇒elem). The String=List Char + canonical-List arms of the Vec normalization law. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+typeNormListElem : (base: TypeNorm) -> (emptyList: List a) -> Maybe TypeNorm
+typeNormListElem base emptyList =
+  case tnGetField base "$ref" of
+    Just r ->
+      if tnStringEq r "String"
+      then Just (TnObject { fields = appendItem (TnField { name = "$ref", value = TnString { value = "Char" } }) emptyList })
+      else Nothing
+    Nothing ->
+      case tnGetField base "$opaque" of
+        Just op ->
+          let isList = case tnGetField op "name" of
+                         Just nm -> tnStringEq nm "List"
+                         Nothing -> false
+          if isList then typeNormOpaqueListElem op else Nothing
+        Nothing ->
+          case tnGetField base "$list" of
+            Just elem -> Just elem
+            Nothing -> Nothing
+
+-- typeNormOpaqueListElem — navigate an `$opaque List`'s `pure` $variant to the
+-- `Cons` case's `head` field type (the element). `pure → $variant → cases → Cons
+-- → fields → head → type`.
+@label "type-normalize: opaqueListElem"
+@description "array-substrate Phase 1a.5 — navigate an `$opaque List`'s pure $variant to the Cons.head element type. Helper for typeNormListElem; tagged engine-internal."
+@tags "engine" "internal" "type" "array-substrate"
+@category "engine-internal"
+typeNormOpaqueListElem : (op: TypeNorm) -> Maybe TypeNorm
+typeNormOpaqueListElem op =
+  case tnGetField op "pure" of
+    Nothing -> Nothing
+    Just pure ->
+      case tnGetField pure "$variant" of
+        Nothing -> Nothing
+        Just variant ->
+          case tnGetField variant "cases" of
+            Nothing -> Nothing
+            Just casesNode ->
+              case tnArrItems casesNode of
+                Nothing -> Nothing
+                Just cases ->
+                  case tnFindNamed cases "Cons" of
+                    Nothing -> Nothing
+                    Just consCase ->
+                      case tnGetField consCase "fields" of
+                        Nothing -> Nothing
+                        Just fieldsNode ->
+                          case tnArrItems fieldsNode of
+                            Nothing -> Nothing
+                            Just consFields ->
+                              case tnFindNamed consFields "head" of
+                                Nothing -> Nothing
+                                Just headField -> tnGetField headField "type"
+
+-- typeNormFindField — locate the first field with the given name,
+-- returning its value as a Maybe. Used by typeNormTryRewriteResult to
+-- locate `err` / `ok`.
+@label "type-normalize: findField"
+@description "Phase 7a — locate the first field with the given name, returning its value as a Maybe. Helper to typeNormTryRewriteResult; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeNormFindField : (fields: List a) -> (name: String) -> Maybe a
+typeNormFindField fields name =
+  case head fields of
+    Nothing -> Nothing
+    Just f ->
+      if eq f.name name
+      then Just f.value
+      else
+        case tail fields of
+          Nothing -> Nothing
+          Just rest -> typeNormFindField rest name

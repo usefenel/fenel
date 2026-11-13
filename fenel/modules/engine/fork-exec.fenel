@@ -1,0 +1,1194 @@
+module engine where
+
+-- Recipe-functions uses the same path-sensitive discipline with lexical
+-- symbolic values and independently checked transitions. Keep this separate
+-- entry so the older residual-only fork driver retains its existing fences.
+@label "Fork recipe analysis"
+forkRecipeAnalysis : (snapshot: RecipeAnalysisSnapshot) -> (budget: Nat) -> RecipeExtraction
+forkRecipeAnalysis snapshot budget = proposeRecipeAnalysis snapshot budget
+
+-- =========================================================================
+-- fork-exec — the FORK DRIVER: path-sensitive symbolic execution
+-- (KLEE/DART-style, Fenel-native). partial-evaluator-substrate Phase 3
+-- (brief: `workstreams/partial-evaluator-substrate/briefs/phase-3-fork-driver.md`;
+-- design: `design/partial-evaluation.md` §5 + `design/symbolic-execution.md`).
+--
+-- THE THESIS: a pure pass over the (post-PE, post-mint) residual `Expr` that
+-- at each residual BRANCH POINT forks the world — one successor per branch,
+-- each carrying the branch's assumption appended to a threaded PATH CONDITION.
+-- A path whose condition the theory REFUTES is pruned (infeasible); surviving
+-- paths are the program's feasible behaviors, each with a residual + its atoms.
+-- The composed pipeline is EXACT under memory-model v1 (every effect site is a
+-- declared READ of a Symbolic-in-scope class ⇒ no writes ⇒ minting is
+-- PATH-INSENSITIVE: `PE → symbolizeShared → fork` composes with no loss).
+--
+-- VERDICT HONESTY (the substrate-wide contract): pruning may only KILL paths
+-- PROVEN infeasible; `Just false` fires only when EVERY path is refuted AND the
+-- enumeration is COMPLETE (no budget overflow); everything else ⇒ `Nothing`.
+-- Never `Just true`.
+--
+-- ─── THE PATH CONDITION (§1). Carried in EXACTLY the `satCombined` shape
+-- `{ eqs, neqs, ltes, lts }` PLUS an `opaque` list (conditions that don't
+-- atomize — recorded for the WITNESS residual, contributing NO pruning).
+-- Pruning uses the ATOM SUBSET (unsat-of-a-subset ⇒ unsat-of-the-whole — the
+-- same subset-drop the collectors use). Every atom ADDED is IMPLIED by the real
+-- branch assumption. The NEGATION TABLE (the else-world / arm-mismatch soundness
+-- core):
+--   • `¬(eq a b)` ⇒ `neq a b`      (exact — Step-1 eq is a total complement)
+--   • `¬(neq a b)` ⇒ `eq a b`       (exact)
+--   • `¬(not d)` ⇒ assume `d`       (exact)
+--   • `¬(ORDER atom)` ⇒ OPAQUE       (`¬(a≤b) ⟺ b<a` only SAME-TYPE; cross-type
+--       both `lte`/`gt` are false ⇒ the flip would STRENGTHEN ⇒ UNSOUND. v1
+--       abstains — the same-type certificate is the flagged widening. LANDED
+--       decide-substrate Phase 7: when BOTH operands are certified NUMERIC (a
+--       numeric `ELit` or an eufValEq-member of the face's `numCerts` — reads
+--       whose resolved domain / return type is numeric), the else-world emits
+--       the flipped strict/nonstrict atom; uncertified ⇒ this opaque arm.)
+--   • `¬(and/or/call)` ⇒ OPAQUE      (De-Morgan-into-`or` needs disjunction)
+--
+-- ─── MATCH ARM ASSUMPTIONS (§1). A ctor pattern `C p1…pn` ⇒ the POSITIVE atom
+-- `eq scrutinee (EConstruct C [?f1…?fn])` with FRESH dot-free EVars
+-- (`?fork:<path>:<i>`), the body's captures SUBSTITUTED by those fresh vars —
+-- implied because the arm fires iff the scrutinee IS a C-construct. Datatype
+-- DISTINCTNESS (6D) then refutes a same-scrutinee different-ctor constraint (THE
+-- headline); INJECTIVITY connects the body's constraints through the payload. A
+-- LITERAL pattern ⇒ `eq scrutinee (ELit L)`; a var/wildcard ⇒ no atom (capture
+-- substituted by the scrutinee Expr itself). NEGATIVE arm assumptions (arms j<k
+-- did not match) — CLOSED 8μ.3: they ride a per-scrutinee DOMAIN refinement, NOT
+-- new `satCombined` atom classes. Each prior pattern PROJECTS to its matched-set
+-- over-approximation (wildcard/var ⇒ SeAll, lit ⇒ SeEnum [L], ctor `C` ⇒
+-- SeCtor C []), and arm k's negative domain is `complement(SeUnion ⟦priors⟧)`
+-- (`SeCtor` non-membership — the `tagOf` term set-side, `design/mu-induction.md`
+-- §2.2; the SeCtor faces landed 8μ.1a). Two payoffs (forkArmDead / forkArmUnshadowed):
+--   • DEAD-ARM PRUNING — `decideEmpty(negDom) == Just true` (only when a prior
+--     catch-all makes negDom = SeNone — a union of SeCtors/SeEnums is never
+--     provably the universe ⇒ no false prune) ⇒ the arm contributes NO paths.
+--   • the SHADOWABLE LIFT (see the WITNESS SOUNDNESS block below).
+-- A GUARD, or a nested/record pattern beyond ctor-of-(vars/lits), FENCES the
+-- whole match (it stays an opaque residual leaf on every enclosing path).
+--
+-- ─── WITNESS SOUNDNESS (the `shadowable` flag). A match arm k≥1 could be
+-- SHADOWED by an earlier arm (which fires first at the same scrutinee value); a
+-- witness computed from arm k's residual alone might pick a value the earlier
+-- arm actually matches ⇒ a FALSE witness. So each path carries `shadowable`, and
+-- the WITNESS face SKIPS shadowable paths. WIDENED 8μ.3 (forkArmUnshadowed): the
+-- LIFTED CLASS is a k≥1 arm whose projection is provably DISJOINT from EVERY
+-- prior arm's projection — `case x of Just v -> …; Nothing -> …`, where `Nothing`
+-- (SeCtor "Nothing" []) is distinct from `Just` (SeCtor "Just" []) by SeCtor
+-- distinctness, so no earlier arm can shadow it ⇒ its witness is real. Disjointness
+-- over the over-approximated projections is SOUND (subsets of disjoint sets are
+-- disjoint); an UNPROVABLE pair keeps `shadowable=true` (conservative). `if`-forks
+-- and arm-0 forks stay witness-safe. The REFUTATION face ignores the flag
+-- (positive-only over-approximates feasibility ⇒ sound for `Just false`). A
+-- CTOR-arm-WITH-PAYLOAD witness path STILL abstains via solve's single-unknown
+-- fence (the fresh payload var is a 2nd free var) — so the lift bites on NULLARY
+-- ctor / lit arms (no fresh payload var), belt and suspenders on the rest.
+--
+-- ─── FORK SCOPE (v1). The walker forks at the HEAD `if`/`?:`/forkable `EMatch`
+-- and recurses through the SELECTED sub-expressions (then/else/arm bodies). A
+-- branch buried inside an ARGUMENT (e.g. `f (if c then a else b)`) is NOT lifted
+-- — the whole non-branch-headed node stays a residual leaf, honestly handled by
+-- solve/satCombined downstream (which handle-or-abstain — never a false verdict).
+-- A lambda is a VALUE — its body is NOT forked (a residual leaf). Deep/nested
+-- (branch-in-argument) forking is a flagged v1 widening.
+--
+-- NO ENTITY DECLS (the cheapest gate class — the symbolize/theory-combine
+-- entity-free precedent): the walker is structural over the registered `Expr` /
+-- `Pattern`; it declares NO ADTs, so the entity oracle stays UNTOUCHED and the
+-- law count moves +0. Only the engine fn roster grows. FENCED in the parse-cache
+-- (TS-parsed, byte-identical) — the named-field `case`-over-Expr idiom of its
+-- euf/theory-combine siblings, whose grammar exceeds the Fenel parser's caps.
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- forkPaths — the entry. Seed the empty path condition + the structural path
+-- "0" + shadowable=false, then walk. Returns { paths, complete } where each
+-- path is { atoms, opaque, residual, shadowable }.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Fork paths"
+@description "partial-evaluator-substrate Phase 3 — the FORK DRIVER: walk a (post-PE, post-mint) residual `Expr`, forking the world at each residual branch point (`if`/`?:` per chain link, forkable `EMatch` per arm) and threading a PATH CONDITION (`{ eqs, neqs, ltes, lts }` atoms + an `opaque` list). Prunes EAGERLY — a `satCombined`-refuted prefix kills the subtree before it explodes. Returns `{ paths: List { atoms, opaque, residual, shadowable }, complete }`: each surviving path is a feasible behavior (branch-selected residual + captures substituted); `budget` caps the live path count (overflow ⇒ complete=false ⇒ consumers degrade to Nothing). Guarded/complex matches + lambda bodies + branch-in-argument stay opaque residual leaves (honest v1 fences). The composed satSymbolicPaths / solveSymbolicPaths faces consume it."
+@tags "engine" "fork-exec" "symbolize" "solve" "prover" "partial-evaluator-substrate" "phase-3"
+forkPaths : (effectFnIds: a) -> (budget: Number) -> (expr: (Expr Any)) -> b
+forkPaths effectFnIds budget expr =
+  forkPathsSeeded effectFnIds budget { atoms = { eqs = [], neqs = [], ltes = [], lts = [] }, opaque = [], shadowable = false, certs = [] } expr
+
+@label "fork: paths-seeded"
+@description "decide-substrate Phase 7 — the seeded fork entry: walk a residual `Expr` from an EXPLICIT initial path-condition state `{ atoms, opaque, shadowable, certs }` (path \"0\"). `forkPaths` is the thin empty-seed wrapper (empty atoms/opaque/certs, shadowable=false); the branching faces seed `atoms` with the domains' numeric BOUNDS ATOMS (global, path-independent facts) + `certs` with the numeric-certified read terms (the negated-order certificate source). Public shape + behavior of `forkPaths` UNCHANGED. Internal helper."
+@tags "engine" "internal" "fork-exec" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkPathsSeeded : (effectFnIds: a) -> (budget: Number) -> (state0: b) -> (expr: (Expr Any)) -> c
+forkPathsSeeded effectFnIds budget state0 expr =
+  forkAt effectFnIds budget state0 "0" expr
+
+@label "fork: at"
+@description "partial-evaluator-substrate Phase 3 — the path-threaded fork walker behind forkPaths. `ECall \"if\"|\"?:\"` ⇒ forkIfChain (fork per chain link); a forkable `EMatch` ⇒ forkMatchArms (fork per arm); every other node (incl. a fenced/guarded/complex EMatch, a lambda, a non-branch ECall/EConstruct/ERecord/ELit/EVar) ⇒ a residual LEAF at the current path condition. `state` = { atoms, opaque, shadowable }; `path` names the structural position (for fresh match-var uniqueness). Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkAt : (effectFnIds: a) -> (budget: Number) -> (state: b) -> (path: String) -> (expr: (Expr Any)) -> c
+forkAt effectFnIds budget state path expr =
+  case expr of
+    ECall { fnId = f, args = args } ->
+      if and (or (eq f "if") (eq f "?:")) (not (eq (lookup expr "structural") (Just false)))
+      then forkIfChain effectFnIds budget state path args 0
+      else forkLeaf state expr
+    EMatch { scrutinee = sc, arms = arms } ->
+      if forkableMatch arms
+      then forkMatchArms effectFnIds budget state path sc arms 0 []
+      else forkLeaf state expr
+    other -> forkLeaf state expr
+
+@label "fork: leaf"
+@description "partial-evaluator-substrate Phase 3 — emit a single residual LEAF path at the current path condition: `{ paths = [{ atoms, opaque, residual = expr, shadowable }], complete = true }`. The terminal of every non-branch descent. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkLeaf : (state: a) -> (expr: (Expr Any)) -> b
+forkLeaf state expr =
+  { paths = appendItem { atoms = state.atoms, opaque = state.opaque, residual = expr, shadowable = state.shadowable } [], complete = true }
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- forkIfChain — fork the chained `if` arg list (pairs (cond, then); trailing
+-- else). TRUE world: assume `cond` (splitCondInto), prune, recurse the then.
+-- FALSE world: assume `¬cond` (negateCondInto), prune, recurse the REST of the
+-- chain (index i+2 … the trailing else).
+-- ─────────────────────────────────────────────────────────────────────────
+@label "fork: if-chain"
+@description "partial-evaluator-substrate Phase 3 — fork the chained `if` arg list (walkIf-shaped): at index i, cond=args[i], then=args[i+1]; a trailing else (i == n-1) recurses directly. TRUE world assumes cond (splitCondInto — atoms + opaque), prunes if refuted, recurses the then; FALSE world assumes ¬cond (negateCondInto — the negation table), prunes, recurses the rest of the chain (i+2). combineFork merges the two worlds under the budget. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkIfChain : (effectFnIds: a) -> (budget: Number) -> (state: b) -> (path: String) -> (args: c) -> (i: Number) -> d
+forkIfChain effectFnIds budget state path args i =
+  let n = length args
+  if not (lt i n)
+  then { paths = [], complete = true }
+  else if eq (add i 1) n
+  then forkAt effectFnIds budget state (concat path "/else") (at args i)
+  else
+    let cond = at args i
+    let thenE = at args (add i 1)
+    let trueAcc = splitCondInto cond { atoms = state.atoms, opaque = state.opaque }
+    let stTrue = { atoms = trueAcc.atoms, opaque = trueAcc.opaque, shadowable = state.shadowable, certs = state.certs }
+    let trueRes =
+          if forkRefuted stTrue.atoms
+          then { paths = [], complete = true }
+          else forkAt effectFnIds budget stTrue (concat path "/then") thenE
+    let falseAcc = negateCondInto state.certs cond { atoms = state.atoms, opaque = state.opaque }
+    let stFalse = { atoms = falseAcc.atoms, opaque = falseAcc.opaque, shadowable = state.shadowable, certs = state.certs }
+    let falseRes =
+          if forkRefuted stFalse.atoms
+          then { paths = [], complete = true }
+          else forkIfChain effectFnIds budget stFalse path args (add i 2)
+    combineFork budget trueRes falseRes
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- forkMatchArms — fork a forkable EMatch per arm (positive assumption only).
+-- Arm k≥1 sets shadowable=true (an earlier arm could shadow it — the witness
+-- face skips such paths). Captures substituted into the body before recursion.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "fork: match-arms"
+@description "partial-evaluator-substrate Phase 3 / decide-substrate Phase 8μ.3 — fork a forkable EMatch per arm, threading the PRIOR arm patterns (arms j<k). DEAD-ARM PRUNING (8μ.3): if the per-scrutinee NEGATIVE domain `complement(SeUnion ⟦prior patterns⟧)` decides EMPTY (only fires when a prior wildcard/var covers the universe ⇒ SeNone ⇒ Just true — an arm after a catch-all is unreachable), the arm contributes NO paths. Else build the arm's POSITIVE assumption + captures (armAssume), split into the path atoms, and set shadowable = state.shadowable OR (arm NOT provably-disjoint from every prior arm). The 8μ.3 SHADOWABLE LIFT: when the arm's projection is provably disjoint from ALL prior projections (SeCtor distinctness / distinct-lit) the k≥1 arm is NO LONGER shadowed (its value can never be caught by an earlier arm) ⇒ the witness face may compute it (`case x of Just v -> …; Nothing -> …` arm-2 witness now reachable). Prune if refuted, then recurse forkAt over the CAPTURE-SUBSTITUTED arm body. combineFork accumulates the arms under the budget. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3" "decide-substrate" "phase-8mu"
+@category "engine-internal"
+forkMatchArms : (effectFnIds: a) -> (budget: Number) -> (state: b) -> (path: String) -> (scrutinee: c) -> (rem: d) -> (k: Number) -> (priors: e) -> f
+forkMatchArms effectFnIds budget state path scrutinee rem k priors =
+  case head rem of
+    Nothing -> { paths = [], complete = true }
+    Just arm ->
+      let priors2 = appendItem arm.pattern priors
+      if forkArmDead priors
+      then forkMatchArms effectFnIds budget state path scrutinee (eufRest rem) (add k 1) priors2
+      else
+        let armPath = concat path (concat "/a" (toString k))
+        let av = armAssume scrutinee arm.pattern armPath
+        let baseAcc = { atoms = state.atoms, opaque = state.opaque }
+        let armAcc =
+              case av.assume of
+                Just aexpr -> splitCondInto aexpr baseAcc
+                Nothing -> baseAcc
+        let armShadow = or state.shadowable (not (forkArmUnshadowed arm.pattern priors))
+        let stArm = { atoms = armAcc.atoms, opaque = armAcc.opaque, shadowable = armShadow, certs = state.certs }
+        let armRes =
+              if forkRefuted stArm.atoms
+              then { paths = [], complete = true }
+              else forkAt effectFnIds budget stArm armPath (forkSubst arm.body av.captures)
+        let restRes = forkMatchArms effectFnIds budget state path scrutinee (eufRest rem) (add k 1) priors2
+        combineFork budget armRes restRes
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The 8μ.3 negative-match domain machinery (SeCtor non-membership; the
+-- `fork-exec.fenel` §1 tagOf flag CLOSED). A prior arm pattern PROJECTS to the
+-- SOUND OVER-approximation of its matched set: wildcard/var ⇒ SeAll (EXACT — a
+-- catch-all), lit ⇒ SeEnum [L] (EXACT), ctor `C p…` ⇒ SeCtor C [] (all C-values
+-- — the top over-approx of `C args`). The NEGATIVE domain on arm k's scrutinee
+-- is complement(SeUnion ⟦priors⟧):
+--   • DEAD-ARM: `decideEmpty(negDom) == Just true`. This ONLY fires when a prior
+--     is a catch-all (⇒ negDom = SeNone) — a union of SeCtors/SeEnums is never
+--     provably the universe, so a false prune is impossible; the catch-all
+--     projection is EXACT ⇒ the prune is SOUND.
+--   • SHADOWABLE LIFT: arm k is UNSHADOWED iff its projection is provably DISJOINT
+--     from EVERY prior projection (over-approx is the sound direction for
+--     disjointness — subsets of disjoint sets are disjoint). Unprovable ⇒ stay
+--     shadowed (conservative). The forkable fragment (patForkable) admits only
+--     wildcard/var/lit/ctor-of-simple, so guarded/nested patterns never reach
+--     here (forkableMatch FENCES the whole match) — nothing over-approximated
+--     beyond the sound SeCtor [] top.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "fork: arm-project"
+@description "decide-substrate Phase 8μ.3 — project a forkable arm pattern to its matched-set OVER-approximation as a SetExpr: PatWildcard / PatVar ⇒ SeAll (a catch-all — EXACT); PatLit L ⇒ SeEnum [L] (EXACT); PatConstruct C ⇒ SeCtor C [] (all values tagged C — the sound top over-approx of `C args`). Non-forkable patterns never reach here (forkableMatch fences the match). Internal helper."
+@tags "engine" "internal" "fork-exec" "sector" "decide-substrate" "phase-8mu"
+@category "engine-internal"
+forkArmProject : (pat: a) -> b
+forkArmProject pat =
+  case pat of
+    PatWildcard -> SeAll
+    PatVar { name = n } -> SeAll
+    PatLit { value = v } -> SeEnum { values = appendItem v [] }
+    PatConstruct { ctor = c } -> SeCtor { ctor = c, fields = [] }
+    other -> SeAll
+
+@label "fork: arm-catchall"
+@description "decide-substrate Phase 8μ.3 — true when a pattern matches EVERY value (PatWildcard / PatVar) — the only projection that is the universe, hence the only dead-arm-pruning trigger. Internal helper."
+@tags "engine" "internal" "fork-exec" "decide-substrate" "phase-8mu"
+@category "engine-internal"
+forkArmCatchAll : (pat: a) -> Boolean
+forkArmCatchAll pat =
+  case pat of
+    PatWildcard -> true
+    PatVar { name = n } -> true
+    other -> false
+
+@label "fork: priors-catchall"
+@description "decide-substrate Phase 8μ.3 — true when SOME prior arm pattern is a catch-all (wildcard/var). Internal helper."
+@tags "engine" "internal" "fork-exec" "decide-substrate" "phase-8mu"
+@category "engine-internal"
+forkPriorsCatchAll : (priors: a) -> Boolean
+forkPriorsCatchAll priors =
+  case head priors of
+    Nothing -> false
+    Just p -> if forkArmCatchAll p then true else forkPriorsCatchAll (eufRest priors)
+
+@label "fork: priors-project"
+@description "decide-substrate Phase 8μ.3 — project every prior arm pattern to its SetExpr over-approximation (forkArmProject), accumulating a branch list. Internal helper."
+@tags "engine" "internal" "fork-exec" "decide-substrate" "phase-8mu"
+@category "engine-internal"
+forkPriorsProject : (priors: a) -> (acc: b) -> b
+forkPriorsProject priors acc =
+  case head priors of
+    Nothing -> acc
+    Just p -> forkPriorsProject (eufRest priors) (appendItem (forkArmProject p) acc)
+
+@label "fork: arm-neg-domain"
+@description "decide-substrate Phase 8μ.3 — the NEGATIVE domain on arm k's scrutinee: `complement(SeUnion ⟦prior projections⟧)`. A catch-all prior ⇒ SeNone directly (the union is the universe); no priors ⇒ SeAll (nothing excluded); else SeComplement of the SeUnion of the prior projections. decideEmpty of this only proves Just true for the SeNone (catch-all) case ⇒ sound dead-arm pruning. Internal helper."
+@tags "engine" "internal" "fork-exec" "sector" "decide-substrate" "phase-8mu"
+@category "engine-internal"
+forkArmNegDomain : (priors: a) -> b
+forkArmNegDomain priors =
+  if forkPriorsCatchAll priors then SeNone
+  else
+    case head priors of
+      Nothing -> SeAll
+      Just p -> SeComplement { inner = SeUnion { branches = forkPriorsProject priors [] } }
+
+@label "fork: arm-dead"
+@description "decide-substrate Phase 8μ.3 — true when arm k is UNREACHABLE: its negative domain (forkArmNegDomain over the prior patterns) decides EMPTY (setAlgebraDecideEmpty ⇒ Just true). Only fires when a prior arm is a catch-all (the union covers the universe ⇒ SeNone) — a sound dead-arm prune. Internal helper."
+@tags "engine" "internal" "fork-exec" "sector" "decide-substrate" "phase-8mu"
+@category "engine-internal"
+forkArmDead : (priors: a) -> Boolean
+forkArmDead priors =
+  case setAlgebraDecideEmpty (forkArmNegDomain priors) of
+    Just b -> b
+    Nothing -> false
+
+@label "fork: arm-unshadowed"
+@description "decide-substrate Phase 8μ.3 — true when arm k is provably NOT shadowed by any earlier arm: its projection (forkArmProject) is provably DISJOINT (setAlgebraIsDisjoint ⇒ Just true) from EVERY prior arm's projection. Over-approximation is the sound direction for disjointness (subsets of disjoint sets are disjoint) ⇒ a lifted shadowable is a real witness-safe path. Any unprovable pair ⇒ false (stay shadowed — conservative). No priors (k=0) ⇒ true. Internal helper."
+@tags "engine" "internal" "fork-exec" "sector" "decide-substrate" "phase-8mu"
+@category "engine-internal"
+forkArmUnshadowed : (pat: a) -> (priors: b) -> Boolean
+forkArmUnshadowed pat priors =
+  forkArmDisjointAll (forkArmProject pat) priors
+
+@label "fork: arm-disjoint-all"
+@description "decide-substrate Phase 8μ.3 — true when a projection is provably disjoint (setAlgebraIsDisjoint ⇒ Just true) from every prior arm's projection; any non-`Just true` ⇒ false. Internal helper."
+@tags "engine" "internal" "fork-exec" "sector" "decide-substrate" "phase-8mu"
+@category "engine-internal"
+forkArmDisjointAll : (proj: a) -> (priors: b) -> Boolean
+forkArmDisjointAll proj priors =
+  case head priors of
+    Nothing -> true
+    Just p ->
+      case setAlgebraIsDisjoint proj (forkArmProject p) of
+        Just b -> if b then forkArmDisjointAll proj (eufRest priors) else false
+        Nothing -> false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Forkability of a match — every arm guard-free + pattern ctor-of-(vars/lits),
+-- lit, var, or wildcard. Any guard / nested-or-record pattern ⇒ FENCE the whole
+-- match (the honesty rule: a partially-forked match would mis-enumerate).
+-- ─────────────────────────────────────────────────────────────────────────
+@label "fork: forkable-match"
+@description "partial-evaluator-substrate Phase 3 — true when EVERY arm of an EMatch is fork-safe: guard-free (a `guard` key FENCES the whole match) AND its pattern is fork-safe (patForkable — wildcard / var / lit / ctor-of-simple-args). One non-forkable arm fences the whole match (it stays an opaque residual leaf). Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkableMatch : (arms: a) -> Boolean
+forkableMatch arms =
+  case head arms of
+    Nothing -> true
+    Just arm ->
+      case lookup arm "guard" of
+        Just g -> false
+        Nothing -> if patForkable arm.pattern then forkableMatch (eufRest arms) else false
+
+@label "fork: pat-forkable"
+@description "partial-evaluator-substrate Phase 3 — a pattern is fork-safe iff it is PatWildcard / PatVar / PatLit / a PatConstruct whose args are ALL simple (PatVar/PatWildcard/PatLit — no nested constructor or record patterns). Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+patForkable : (pat: a) -> Boolean
+patForkable pat =
+  case pat of
+    PatWildcard -> true
+    PatVar { name = n } -> true
+    PatLit { value = v } -> true
+    PatConstruct { args = as } -> simplePatArgs as
+    other -> false
+
+@label "fork: simple-pat-args"
+@description "partial-evaluator-substrate Phase 3 — true when every ctor-argument pattern is simple (PatVar / PatWildcard / PatLit); a nested PatConstruct (or anything else) makes the enclosing ctor pattern non-forkable. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+simplePatArgs : (as: a) -> Boolean
+simplePatArgs as =
+  case head as of
+    Nothing -> true
+    Just a ->
+      let ok =
+            case a of
+              PatVar { name = n } -> true
+              PatWildcard -> true
+              PatLit { value = v } -> true
+              other -> false
+      if ok then simplePatArgs (eufRest as) else false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- armAssume — the POSITIVE arm assumption + captures. ctor ⇒ eq scrutinee
+-- (EConstruct C [fresh…]) + the payload captures; lit ⇒ eq scrutinee (ELit L);
+-- var ⇒ capture the whole scrutinee; wildcard ⇒ nothing.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "fork: arm-assume"
+@description "partial-evaluator-substrate Phase 3 — build a forkable arm's POSITIVE assumption + captures: PatWildcard ⇒ { assume=Nothing, captures=[] }; PatVar n ⇒ { assume=Nothing, captures=[{name=n, expr=scrutinee}] } (the var binds the whole scrutinee); PatLit L ⇒ { assume=Just (eq scrutinee (ELit L)), captures=[] }; PatConstruct C args ⇒ forkCtorAssume (eq scrutinee (EConstruct C [fresh vars/lits]) + the payload captures). Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+armAssume : (scrutinee: a) -> (pat: b) -> (path: String) -> c
+armAssume scrutinee pat path =
+  case pat of
+    PatWildcard -> { assume = Nothing, captures = [] }
+    PatVar { name = n } -> { assume = Nothing, captures = appendItem { name = n, expr = scrutinee } [] }
+    PatLit { value = v } -> { assume = Just (ECall { fnId = "eq", args = concat (appendItem scrutinee []) (appendItem (ELit { value = v }) []) }), captures = [] }
+    PatConstruct { ctor = c, args = as } -> forkCtorAssume scrutinee c as path
+    other -> { assume = Nothing, captures = [] }
+
+@label "fork: ctor-assume"
+@description "partial-evaluator-substrate Phase 3 — the ctor-pattern arm assumption: build the payload exprs (fresh `?fork:` EVars for var/wildcard args, ELit for lit args) + the captures (each PatVar arg ⇒ its fresh var), then `eq scrutinee (EConstruct C [payload…])`. Positional (no field metadata) — datatype distinctness keys on the ctor NAME; injectivity on the shared signature. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkCtorAssume : (scrutinee: a) -> (c: String) -> (as: b) -> (path: String) -> d
+forkCtorAssume scrutinee c as path =
+  let built = forkCtorArgs as path 0 [] []
+  { assume = Just (ECall { fnId = "eq", args = concat (appendItem scrutinee []) (appendItem (EConstruct { ctor = c, args = built.exprs }) []) }), captures = built.captures }
+
+@label "fork: ctor-args"
+@description "partial-evaluator-substrate Phase 3 — walk a ctor pattern's simple args at index i, threading the payload-expr accumulator + the capture accumulator: PatVar n ⇒ a fresh `?fork:<path>:<i>` EVar (bound to n in captures); PatWildcard ⇒ a fresh EVar (no capture); PatLit L ⇒ ELit L (no capture). Returns { exprs, captures }. The fresh name is DOT-FREE (`/`+`:` separators — the collectFreeVars field-access constraint). Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkCtorArgs : (as: a) -> (path: String) -> (i: Number) -> (exprsAcc: b) -> (capsAcc: c) -> d
+forkCtorArgs as path i exprsAcc capsAcc =
+  case head as of
+    Nothing -> { exprs = exprsAcc, captures = capsAcc }
+    Just a ->
+      let freshName = concat "?fork:" (concat path (concat ":" (toString i)))
+      let r =
+            case a of
+              PatVar { name = n } -> { e = EVar { name = freshName }, caps = appendItem { name = n, expr = EVar { name = freshName } } [] }
+              PatWildcard -> { e = EVar { name = freshName }, caps = [] }
+              PatLit { value = v } -> { e = ELit { value = v }, caps = [] }
+              other -> { e = EVar { name = freshName }, caps = [] }
+      forkCtorArgs (eufRest as) path (add i 1) (appendItem r.e exprsAcc) (concat capsAcc r.caps)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- forkSubst — Expr→Expr capture substitution: every `EVar n` whose name is in
+-- the captures env becomes the captured EXPR (a fresh var / the scrutinee Expr).
+-- Mirrors substituteCaptures' structural descent, but substitutes an Expr
+-- (not an ELit-wrapped value). Capture exprs are NOT recursed.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "fork: subst"
+@description "partial-evaluator-substrate Phase 3 — substitute a match arm's captures into its body: every `EVar n` in the captures env becomes the captured EXPR (a fresh `?fork:` var or the scrutinee Expr); all other nodes recurse structurally (ECall.args / ELambda.body / EMatch.scrutinee+arm-bodies / EConstruct.args / ERecord.fields); ELit passes through. Mirrors substituteCaptures but returns the captured Expr (not ELit-wrapped). Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkSubst : (expr: (Expr Any)) -> (captures: List ({ name: String, expr: (Expr Any) })) -> (Expr Any)
+forkSubst expr captures =
+  case expr of
+    EVar { name = n } ->
+      case forkCapLookup captures n of
+        Just e -> e
+        Nothing -> expr
+    ELit { value = v } -> ELit { value = v }
+    ECall { fnId = f, args = args } -> ECall { fnId = f, args = forkSubstList args captures [] }
+    ELambda { params = ps, body = bd } -> ELambda { params = ps, body = forkSubst bd captures }
+    EMatch { scrutinee = sc, arms = arms } -> EMatch { scrutinee = forkSubst sc captures, arms = forkSubstArms arms captures [] }
+    EConstruct { ctor = c, args = args, fields = fs } -> EConstruct { ctor = c, args = forkSubstList args captures [], fields = fs }
+    EConstruct { ctor = c, args = args } -> EConstruct { ctor = c, args = forkSubstList args captures [] }
+    ERecord { fields = fs } -> ERecord { fields = forkSubstFields fs captures [] }
+
+@label "fork: subst-list"
+@description "partial-evaluator-substrate Phase 3 — forkSubst over an Expr list (ECall.args / EConstruct.args), threading the accumulator. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkSubstList : (exprs: a) -> (captures: b) -> (acc: c) -> c
+forkSubstList exprs captures acc =
+  case head exprs of
+    Nothing -> acc
+    Just h ->
+      let acc2 = appendItem (forkSubst h captures) acc
+      case tail exprs of
+        Nothing -> acc2
+        Just rest -> forkSubstList rest captures acc2
+
+@label "fork: subst-arms"
+@description "partial-evaluator-substrate Phase 3 — forkSubst over EMatch arm bodies, preserving each arm's pattern (and guard when present). Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkSubstArms : (arms: a) -> (captures: b) -> (acc: c) -> c
+forkSubstArms arms captures acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let body2 = forkSubst arm.body captures
+      let armOut =
+            case lookup arm "guard" of
+              Just g -> { pattern = arm.pattern, guard = g, body = body2 }
+              Nothing -> { pattern = arm.pattern, body = body2 }
+      case tail arms of
+        Nothing -> appendItem armOut acc
+        Just rest -> forkSubstArms rest captures (appendItem armOut acc)
+
+@label "fork: subst-fields"
+@description "partial-evaluator-substrate Phase 3 — forkSubst over ERecord field values, preserving each field name. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkSubstFields : (fields: a) -> (captures: b) -> (acc: c) -> c
+forkSubstFields fields captures acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let acc2 = appendItem { name = f.name, value = forkSubst f.value captures } acc
+      case tail fields of
+        Nothing -> acc2
+        Just rest -> forkSubstFields rest captures acc2
+
+@label "fork: cap-lookup"
+@description "partial-evaluator-substrate Phase 3 — find a name in the captures env (a list of { name, expr }); Just expr on hit, Nothing otherwise. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkCapLookup : (captures: a) -> (n: String) -> Maybe b
+forkCapLookup captures n =
+  case head captures of
+    Nothing -> Nothing
+    Just c ->
+      if eq c.name n then Just c.expr
+      else forkCapLookup (eufRest captures) n
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- splitCondInto — LOSSLESS split of a POSITIVE assumed condition into
+-- { atoms, opaque }: each and-spine conjunct that atomizes (eq/neq/not(eq)/
+-- lte/lt/gte/gt) goes to atoms; every other conjunct is preserved RAW in opaque
+-- (so the witness face reconstructs the FULL condition — nothing is silently
+-- dropped, unlike noWhereFold which drops for the subset-only refutation view).
+-- ─────────────────────────────────────────────────────────────────────────
+@label "fork: split-cond"
+@description "partial-evaluator-substrate Phase 3 — LOSSLESSLY split a positive assumed condition Expr into { atoms, opaque }: walk the `and`-spine; an atomizing conjunct (eq/neq/not(eq)/lte/lt/gte/gt — via the theory-combine adders noAddEq/noAddNeq/noAddLte/noAddLt/noAddGteFlip/noAddGtFlip) extends atoms; every other conjunct is appended RAW to opaque (so the witness reconstruction is faithful — nothing dropped). Internal helper."
+@tags "engine" "internal" "fork-exec" "theory-combine" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+splitCondInto : (e: (Expr Any)) -> (acc: a) -> a
+splitCondInto e acc =
+  case e of
+    ECall { fnId = f, args = a } ->
+      if eq f "and" then splitCondList a acc
+      else if eq f "eq" then { atoms = noAddEq a acc.atoms, opaque = acc.opaque }
+      else if eq f "neq" then { atoms = noAddNeq a acc.atoms, opaque = acc.opaque }
+      else if eq f "not" then splitNot a e acc
+      else if eq f "lte" then { atoms = noAddLte a acc.atoms, opaque = acc.opaque }
+      else if eq f "lt" then { atoms = noAddLt a acc.atoms, opaque = acc.opaque }
+      else if eq f "gte" then { atoms = noAddGteFlip a acc.atoms, opaque = acc.opaque }
+      else if eq f "gt" then { atoms = noAddGtFlip a acc.atoms, opaque = acc.opaque }
+      else { atoms = acc.atoms, opaque = appendItem e acc.opaque }
+    other -> { atoms = acc.atoms, opaque = appendItem e acc.opaque }
+
+@label "fork: split-cond-list"
+@description "partial-evaluator-substrate Phase 3 — fold splitCondInto over an `and`'s operand list, threading the { atoms, opaque } accumulator. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+splitCondList : (args: a) -> (acc: b) -> b
+splitCondList args acc =
+  case head args of
+    Nothing -> acc
+    Just a ->
+      let acc1 = splitCondInto a acc
+      case tail args of
+        Nothing -> acc1
+        Just rest -> splitCondList rest acc1
+
+@label "fork: split-not"
+@description "partial-evaluator-substrate Phase 3 — the `not` arm of splitCondInto: `not(eq x y)` ⇒ a neq atom (noAddNeq); any other negated head is preserved RAW in opaque (no De Morgan in v1). `e` is the whole `not(…)` Expr. Internal helper."
+@tags "engine" "internal" "fork-exec" "theory-combine" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+splitNot : (a: b) -> (e: (Expr Any)) -> (acc: c) -> c
+splitNot a e acc =
+  case head a of
+    Nothing -> { atoms = acc.atoms, opaque = appendItem e acc.opaque }
+    Just inner ->
+      case inner of
+        ECall { fnId = g, args = ia } ->
+          if eq g "eq" then { atoms = noAddNeq ia acc.atoms, opaque = acc.opaque }
+          else { atoms = acc.atoms, opaque = appendItem e acc.opaque }
+        other -> { atoms = acc.atoms, opaque = appendItem e acc.opaque }
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- negateCondInto — the NEGATION TABLE applied to the else-world / arm-mismatch:
+-- `¬(eq)`⇒neq, `¬(neq)`⇒eq, `¬(¬d)`⇒assume d; ORDER/and/or/call ⇒ OPAQUE
+-- `not(cond)` (the sound cross-type abstention — no `b<a` from `¬(a≤b)`).
+-- ─────────────────────────────────────────────────────────────────────────
+@label "fork: negate-cond"
+@description "partial-evaluator-substrate Phase 3 / decide-substrate Phase 7 — the NEGATION TABLE for the else-world (¬cond) into { atoms, opaque }, threading the numeric-certified term list `certs`: `¬(eq a b)` ⇒ a neq atom; `¬(neq a b)` ⇒ an eq atom; `¬(not d)` ⇒ assume d (splitCondInto d); an ORDER atom (lte/lt/gte/gt) whose BOTH operands are certified NUMERIC (numeric-ELit or eufValEq-member of certs) ⇒ the flipped strict/nonstrict atom (`¬(a≤b) ⇒ b<a`, `¬(a<b) ⇒ b≤a`, `¬(a≥b) ⇒ a<b`, `¬(a>b) ⇒ a≤b` — EXACT within one type, since both-numeric ⇒ same type ⇒ trichotomy); an UNCERTIFIED order atom (cross-type-possible), an `and`/`or`, or any other call ⇒ the RAW `not(cond)` in opaque (NO atom — the sound cross-type abstention). Internal helper."
+@tags "engine" "internal" "fork-exec" "theory-combine" "partial-evaluator-substrate" "phase-3" "decide-substrate" "phase-7"
+@category "engine-internal"
+negateCondInto : (certs: c) -> (cond: (Expr Any)) -> (acc: a) -> a
+negateCondInto certs cond acc =
+  case cond of
+    ECall { fnId = f, args = a } ->
+      if eq f "eq" then { atoms = noAddNeq a acc.atoms, opaque = acc.opaque }
+      else if eq f "neq" then { atoms = noAddEq a acc.atoms, opaque = acc.opaque }
+      else if eq f "not" then
+        (case head a of
+           Just d -> splitCondInto d acc
+           Nothing -> negOpaque cond acc)
+      else if forkIsOrder f then negOrder certs f a cond acc
+      else negOpaque cond acc
+    other -> negOpaque cond acc
+
+@label "fork: neg-opaque"
+@description "decide-substrate Phase 7 — record a negated condition RAW in opaque (the sound abstention arm of negateCondInto): append `not(cond)` to opaque, atoms unchanged. Internal helper."
+@tags "engine" "internal" "fork-exec" "decide-substrate" "phase-7"
+@category "engine-internal"
+negOpaque : (cond: (Expr Any)) -> (acc: a) -> a
+negOpaque cond acc =
+  { atoms = acc.atoms, opaque = appendItem (ECall { fnId = "not", args = appendItem cond [] }) acc.opaque }
+
+@label "fork: is-order"
+@description "decide-substrate Phase 7 — true when a call head is an ORDER relation (lte / lt / gte / gt) — the negated-order certificate's candidate set. Internal helper."
+@tags "engine" "internal" "fork-exec" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkIsOrder : (f: String) -> Boolean
+forkIsOrder f = or (eq f "lte") (or (eq f "lt") (or (eq f "gte") (eq f "gt")))
+
+@label "fork: neg-order"
+@description "decide-substrate Phase 7 — the CERTIFIED negated-order flip: when BOTH operands of the order call are certified numeric (forkBothCertNumeric over certs), emit the flipped atom (`¬(a≤b) ⇒ b<a`, `¬(a<b) ⇒ b≤a`, `¬(a≥b) ⇒ a<b`, `¬(a>b) ⇒ a≤b`); otherwise the RAW `not(cond)` opaque abstention (the Phase-3 same-type-only fence). Internal helper."
+@tags "engine" "internal" "fork-exec" "theory-combine" "decide-substrate" "phase-7"
+@category "engine-internal"
+negOrder : (certs: c) -> (f: String) -> (a: b) -> (cond: (Expr Any)) -> (acc: d) -> d
+negOrder certs f a cond acc =
+  if forkBothCertNumeric certs a
+  then { atoms = negOrderAtom f a acc.atoms, opaque = acc.opaque }
+  else negOpaque cond acc
+
+@label "fork: neg-order-atom"
+@description "decide-substrate Phase 7 — build the flipped order atom into the atoms accumulator: `¬(lte a b)` ⇒ lt (b,a); `¬(lt a b)` ⇒ lte (b,a); `¬(gte a b)` ⇒ lt (a,b); `¬(gt a b)` ⇒ lte (a,b) (via the theory-combine adders over the original / reversed arg list). Internal helper."
+@tags "engine" "internal" "fork-exec" "theory-combine" "decide-substrate" "phase-7"
+@category "engine-internal"
+negOrderAtom : (f: String) -> (a: b) -> (atoms: c) -> c
+negOrderAtom f a atoms =
+  if eq f "lte" then noAddLt (forkRevArgs a) atoms
+  else if eq f "lt" then noAddLte (forkRevArgs a) atoms
+  else if eq f "gte" then noAddLt a atoms
+  else noAddLte a atoms
+
+@label "fork: rev-args"
+@description "decide-substrate Phase 7 — reverse a 2-arg list `[x, y]` to `[y, x]` (the operand swap for the ¬(a≤b) ⇒ b<a flip); a non-2-arg list is returned unchanged. Internal helper."
+@tags "engine" "internal" "fork-exec" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkRevArgs : (a: b) -> b
+forkRevArgs a =
+  case eufTwoArgs a of
+    Just pr -> concat (appendItem pr.rhs []) (appendItem pr.lhs [])
+    Nothing -> a
+
+@label "fork: cert-numeric"
+@description "decide-substrate Phase 7 — true when an Expr is certified NUMERIC: a numeric-valued `ELit`, OR a term eufValEq-equal to a member of the certs list (a read/EVar whose resolved domain / return type is numeric). The negated-order certificate's per-operand check. Internal helper."
+@tags "engine" "internal" "fork-exec" "euf" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkCertNumeric : (certs: a) -> (e: (Expr Any)) -> Boolean
+forkCertNumeric certs e =
+  case e of
+    ELit { value = v } -> isNumber v
+    other -> forkCertMember certs e
+
+@label "fork: cert-member"
+@description "decide-substrate Phase 7 — true when an Expr is eufValEq-equal to some member of the certs list (the numeric-certified term set). Internal helper."
+@tags "engine" "internal" "fork-exec" "euf" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkCertMember : (certs: a) -> (e: (Expr Any)) -> Boolean
+forkCertMember certs e =
+  case head certs of
+    Nothing -> false
+    Just c -> if eufValEq c e then true else forkCertMember (eufRest certs) e
+
+@label "fork: both-cert-numeric"
+@description "decide-substrate Phase 7 — true when BOTH operands of a 2-arg order call are certified numeric (forkCertNumeric each); a non-2-arg list ⇒ false. Internal helper."
+@tags "engine" "internal" "fork-exec" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkBothCertNumeric : (certs: a) -> (args: b) -> Boolean
+forkBothCertNumeric certs args =
+  case eufTwoArgs args of
+    Just pr -> and (forkCertNumeric certs pr.lhs) (forkCertNumeric certs pr.rhs)
+    Nothing -> false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- forkRefuted / combineFork — the prune predicate + the two-world merge.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "fork: refuted"
+@description "partial-evaluator-substrate Phase 3 — true when the accumulated path atoms are UNSAT (satCombined ⇒ Just false) — the eager-prune predicate. Any other verdict (Nothing / Just true never fires) ⇒ false (keep the subtree). A refuted PREFIX kills the whole subtree (monotone — adding atoms preserves unsat). Internal helper."
+@tags "engine" "internal" "fork-exec" "theory-combine" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkRefuted : (atoms: a) -> Boolean
+forkRefuted atoms =
+  case satCombined atoms.eqs atoms.neqs atoms.ltes atoms.lts of
+    Just false -> true
+    other -> false
+
+@label "fork: combine"
+@description "partial-evaluator-substrate Phase 3 — merge two fork sub-results { paths, complete }: concat the path lists; complete = both complete UNLESS the merged count exceeds the budget (⇒ complete=false, the overflow signal — consumers degrade to Nothing). No truncation (eager pruning bounds the real explosion; the budget is a completeness flag). Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+combineFork : (budget: Number) -> (r1: a) -> (r2: a) -> a
+combineFork budget r1 r2 =
+  let allPaths = concat r1.paths r2.paths
+  if gt (length allPaths) budget
+  then { paths = allPaths, complete = false }
+  else { paths = allPaths, complete = and r1.complete r2.complete }
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- forkEqExprs / forkWitnessExpr — rebuild a path condition back to an `Expr`
+-- conjunction (the inverse of noWhereAtoms) for the witness face:
+-- eq-atoms ++ [residual] ++ neq/order-atoms ++ opaque-raw, `and`-joined (the
+-- enum-seeding conjuncts first — solve's fold requires it).
+-- ─────────────────────────────────────────────────────────────────────────
+@label "fork: eq-exprs"
+@description "partial-evaluator-substrate Phase 3 — map a { lhs, rhs } atom list to `ECall op [lhs, rhs]` predicate Exprs at a fixed op name. Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkEqExprs : (pairs: a) -> (op: String) -> b
+forkEqExprs pairs op =
+  case head pairs of
+    Nothing -> []
+    Just p ->
+      let here = ECall { fnId = op, args = concat (appendItem p.lhs []) (appendItem p.rhs []) }
+      concat (appendItem here []) (forkEqExprs (eufRest pairs) op)
+
+@label "fork: witness-expr"
+@description "partial-evaluator-substrate Phase 3 — rebuild the full path condition as an `and`-conjunction for the witness face — the LOSSLESS FULL condition (eq atoms + the residual + the neq/order atoms + the raw opaque conjuncts), so solve either witnesses it or honestly abstains. ORDER MATTERS for solve (not for meaning): the ENUM-seeding conjuncts (eq atoms + the residual, usually the leaf `==`) come FIRST, then the neq/order atoms, then opaque — solve's intersect fold must seed on an enumerable set before narrowing by intervals (a bare-interval-first fold can't enumerate). A single conjunct returns bare; else a residual `ECall \"and\"`. Internal helper."
+@tags "engine" "internal" "fork-exec" "solve" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkWitnessExpr : (p: a) -> (Expr Any)
+forkWitnessExpr p =
+  let eqs = forkEqExprs p.atoms.eqs "eq"
+  let rest = concat (forkEqExprs p.atoms.neqs "neq") (concat (forkEqExprs p.atoms.ltes "lte") (forkEqExprs p.atoms.lts "lt"))
+  let conjs = concat eqs (concat (appendItem p.residual []) (concat rest p.opaque))
+  if eq (length conjs) 1 then at conjs 0 else ECall { fnId = "and", args = conjs }
+
+-- =========================================================================
+-- TYPED DOMAINS (14c) — decide-substrate Phase 7. Each minted read gains a
+-- DOMAIN SetExpr: an explicit scoped `SymbolicDomain` instance (wins) or the
+-- effect method's declared return type projected via `typeToSetExpr`. Consumed
+-- two ways (the two-presentations principle): the WITNESS face INTERSECTS the
+-- path's witness solve with the domain (an interval-only pred becomes
+-- witnessable under an enum domain); the REFUTATION face injects numeric BOUNDS
+-- ATOMS on the read terms (type-driven refutation, zero IO). The atoms are
+-- IMPLIED by domain membership (path-independent global facts) ⇒ seeded into the
+-- INITIAL path condition. HONEST: only `SeInterval` with numeric-lit bounds +
+-- all-numeric `SeEnum` yield atoms/certs; everything else (SeAll / non-numeric /
+-- unions / SeWhere) ⇒ NO atom, NO cert.
+--
+-- The two marshal-supplied lists (NO nulls — absence is list-absence):
+--   • domInsts : List { typeName, methodName, domain }  (explicit instances)
+--   • domTypes : List { typeName, methodName, returnType } (returnType = a
+--     shared `$`-free TraversalType; domainFor runs typeToSetExpr over it)
+-- =========================================================================
+
+@label "fork: domainFor"
+@description "decide-substrate Phase 7 — the per-read DOMAIN lookup: an explicit scoped `SymbolicDomain` instance for (typeName, methodName) WINS (domInstLookup); else the effect method's declared return type projected via `typeToSetExpr` (domTypeLookup — a `SeAll` result carries NO information ⇒ Nothing). Returns Maybe SetExpr. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domainFor : (domInsts: a) -> (domTypes: b) -> (typeName: String) -> (methodName: String) -> Maybe c
+domainFor domInsts domTypes typeName methodName =
+  case domInstLookup domInsts typeName methodName of
+    Just d -> Just d
+    Nothing -> domTypeLookup domTypes typeName methodName
+
+@label "fork: dom-inst-lookup"
+@description "decide-substrate Phase 7 — find the explicit `SymbolicDomain` domain SetExpr for (typeName, methodName) in the domInsts list; Just domain on hit, Nothing otherwise. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domInstLookup : (domInsts: a) -> (typeName: String) -> (methodName: String) -> Maybe b
+domInstLookup domInsts typeName methodName =
+  case head domInsts of
+    Nothing -> Nothing
+    Just r ->
+      if and (eq r.typeName typeName) (eq r.methodName methodName)
+      then Just r.domain
+      else domInstLookup (eufRest domInsts) typeName methodName
+
+@label "fork: dom-type-lookup"
+@description "decide-substrate Phase 7 — find the effect method's declared return type for (typeName, methodName) in the domTypes list, project it via `typeToSetExpr`; a `SeAll` projection carries no information ⇒ Nothing (else Just the SetExpr). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "inference" "decide-substrate" "phase-7"
+@category "engine-internal"
+domTypeLookup : (domTypes: a) -> (typeName: String) -> (methodName: String) -> Maybe b
+domTypeLookup domTypes typeName methodName =
+  case head domTypes of
+    Nothing -> Nothing
+    Just r ->
+      if and (eq r.typeName typeName) (eq r.methodName methodName)
+      then domTypeProject r.returnType
+      else domTypeLookup (eufRest domTypes) typeName methodName
+
+@label "fork: dom-type-project"
+@description "Project a method's return TraversalType to its domain with typeToSetProjection; degradation or SeAll carries no information and becomes Nothing, otherwise return Just the SetExpr. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "inference" "decide-substrate" "phase-7"
+@category "engine-internal"
+domTypeProject : (returnType: a) -> Maybe b
+domTypeProject returnType =
+  let projection = typeToSetProjection returnType
+  if projection.degraded then Nothing
+  else if eq (seTag projection.set) "SeAll" then Nothing
+  else Just projection.set
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- domBoundsAtoms — the numeric bounds-atom extractor per the §1 table: a
+-- `SeInterval` with numeric-lit bounds ⇒ the lo/hi order atoms (strict per the
+-- bound's inclusive flag); an all-numeric `SeEnum` ⇒ min/max inclusive bounds;
+-- everything else ⇒ empty. Returns a `{ ltes, lts }` delta (lists of
+-- { lhs, rhs }). The bound value is read from BOTH the wire shape
+-- (`{ value, inclusive }`, bare scalar) AND the registered `SetBound`/`BvNumber`
+-- ADT shape — a user-authored SymbolicDomain instance may carry either.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "fork: dom-bounds-atoms"
+@description "decide-substrate Phase 7 — extract the numeric BOUNDS ATOMS a domain implies for a read `term`, as a `{ ltes, lts }` delta: a SeInterval with numeric-lit bounds ⇒ `lo ≤/< term` + `term ≤/< hi` (strict per the bound's inclusive flag); an all-numeric SeEnum ⇒ `min ≤ term ≤ max` (inclusive); every other shape (SeAll / non-numeric / unions / SeWhere) ⇒ empty. Sound: the bounds are implied by domain membership. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domBoundsAtoms : (domain: SetExpr) -> (term: (Expr Any)) -> { ltes: List ({ lhs: (Expr Any), rhs: (Expr Any) }), lts: List ({ lhs: (Expr Any), rhs: (Expr Any) }) }
+domBoundsAtoms domain term =
+  let t = seTag domain
+  if eq t "SeInterval" then domIntervalAtoms domain term
+  else if eq t "SeEnum" then domEnumAtoms domain term
+  else { ltes = [], lts = [] }
+
+@label "fork: dom-interval-atoms"
+@description "The interval-to-native-order fence. Interval membership admits exact Nat/Int records as well as native Numbers, while generic order expressions require scalar carriers. A bare interval therefore contributes no native order atoms; a separate carrier proof would be needed to recover them."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domIntervalAtoms : (domain: a) -> (term: (Expr Any)) -> b
+domIntervalAtoms domain term = { ltes = [], lts = [] }
+
+@label "fork: dom-lo-atom"
+@description "decide-substrate Phase 7 — the lower-bound atom of an interval: a numeric lo bound ⇒ `lo ≤ term` (inclusive) or `lo < term` (exclusive); Nothing / non-numeric ⇒ empty delta. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domLoAtom : (lo: a) -> (term: (Expr Any)) -> b
+domLoAtom lo term = domBoundAtom lo true term
+
+@label "fork: dom-hi-atom"
+@description "decide-substrate Phase 7 — the upper-bound atom of an interval: a numeric hi bound ⇒ `term ≤ hi` (inclusive) or `term < hi` (exclusive); Nothing / non-numeric ⇒ empty delta. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domHiAtom : (hi: a) -> (term: (Expr Any)) -> b
+domHiAtom hi term = domBoundAtom hi false term
+
+@label "fork: dom-bound-atom"
+@description "decide-substrate Phase 7 — the order atom of one interval bound (isLo = the lo side): a present numeric bound ⇒ the delta from domBoundDelta; Nothing / non-numeric ⇒ empty. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domBoundAtom : (mb: a) -> (isLo: Boolean) -> (term: (Expr Any)) -> b
+domBoundAtom mb isLo term =
+  case mb of
+    Just b -> domBoundAtomJust b isLo term
+    Nothing -> { ltes = [], lts = [] }
+
+@label "fork: dom-bound-atom-just"
+@description "decide-substrate Phase 7 — the order-atom delta of a PRESENT interval bound: a numeric value ⇒ domBoundDelta; a non-numeric (string/expr) bound ⇒ empty delta. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domBoundAtomJust : (b: a) -> (isLo: Boolean) -> (term: (Expr Any)) -> c
+domBoundAtomJust b isLo term =
+  case domBoundNum b of
+    Just n -> domBoundDelta n b.inclusive isLo term
+    Nothing -> { ltes = [], lts = [] }
+
+@label "fork: dom-bound-delta"
+@description "decide-substrate Phase 7 — build the order-atom delta for a numeric bound value `n`: the atom is `ELit n ≤/< term` on the lo side (isLo) or `term ≤/< ELit n` on the hi side; inclusive ⇒ an lte atom, exclusive ⇒ an lt atom. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domBoundDelta : (n: Number) -> (inclusive: Boolean) -> (isLo: Boolean) -> (term: (Expr Any)) -> a
+domBoundDelta n inclusive isLo term =
+  let atom = if isLo then { lhs = ELit { value = n }, rhs = term } else { lhs = term, rhs = ELit { value = n } }
+  if inclusive then { ltes = appendItem atom [], lts = [] } else { ltes = [], lts = appendItem atom [] }
+
+@label "fork: dom-bound-num"
+@description "decide-substrate Phase 7 — extract the numeric value of an interval bound, tolerating BOTH the wire shape (`{ value, inclusive }` with a bare scalar `value`) AND the registered `SetBound { value = BvNumber { value = n } }` ADT shape; a non-numeric (string / expr) bound ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domBoundNum : (b: a) -> Maybe Number
+domBoundNum b =
+  if isNumber b.value then Just b.value
+  else
+    case b.value of
+      BvNumber { value = n } -> if isNumber n then Just n else Nothing
+      _ -> Nothing
+
+@label "fork: dom-enum-atoms"
+@description "decide-substrate Phase 7 — the SeEnum arm of domBoundsAtoms: an all-numeric non-empty enum ⇒ the inclusive min/max bounds `min ≤ term ≤ max` (both lte atoms); a non-numeric / empty enum ⇒ empty delta. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domEnumAtoms : (domain: a) -> (term: (Expr Any)) -> b
+domEnumAtoms domain term =
+  case domain of
+    SeEnum { values = vs } -> domEnumAtomsVs vs term
+    _ -> { ltes = [], lts = [] }
+
+@label "fork: dom-enum-atoms-vs"
+@description "decide-substrate Phase 7 — the enum-values arm of domEnumAtoms: an all-numeric non-empty list ⇒ the min/max bounds (domEnumAtomsMM ∘ domMinMax); else empty delta. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domEnumAtomsVs : (vs: a) -> (term: (Expr Any)) -> b
+domEnumAtomsVs vs term =
+  if domAllNumeric vs then domEnumAtomsMM (domMinMax vs) term else { ltes = [], lts = [] }
+
+@label "fork: dom-enum-atoms-mm"
+@description "decide-substrate Phase 7 — build the inclusive min/max bounds atoms `min ≤ term ≤ max` from a { min, max } (both lte); Nothing ⇒ empty delta. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domEnumAtomsMM : (mm: a) -> (term: (Expr Any)) -> b
+domEnumAtomsMM mm term =
+  case mm of
+    Just m ->
+      let loAtom = { lhs = ELit { value = m.min }, rhs = term }
+      let hiAtom = { lhs = term, rhs = ELit { value = m.max } }
+      { ltes = concat (appendItem loAtom []) (appendItem hiAtom []), lts = [] }
+    Nothing -> { ltes = [], lts = [] }
+
+@label "fork: dom-all-numeric"
+@description "decide-substrate Phase 7 — true when a value list is non-empty and every element passes isNumber (the all-numeric enum gate). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domAllNumeric : (vs: List Any) -> Boolean
+domAllNumeric vs =
+  case head vs of
+    Nothing -> false
+    Just v -> if isNumber v then domAllNumericRest (eufRest vs) else false
+
+@label "fork: dom-all-numeric-rest"
+@description "decide-substrate Phase 7 — the tail loop of domAllNumeric: true when every remaining element is numeric (empty ⇒ true). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domAllNumericRest : (vs: List Any) -> Boolean
+domAllNumericRest vs =
+  case head vs of
+    Nothing -> true
+    Just v -> if isNumber v then domAllNumericRest (eufRest vs) else false
+
+@label "fork: dom-min-max"
+@description "decide-substrate Phase 7 — the { min, max } of a non-empty numeric value list (folded via lt); empty ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domMinMax : (vs: a) -> Maybe b
+domMinMax vs =
+  case head vs of
+    Nothing -> Nothing
+    Just v0 -> Just (domMinMaxFold (eufRest vs) { min = v0, max = v0 })
+
+@label "fork: dom-min-max-fold"
+@description "decide-substrate Phase 7 — fold a numeric value list into the running { min, max } (lt comparisons). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domMinMaxFold : (vs: a) -> (acc: b) -> b
+domMinMaxFold vs acc =
+  case head vs of
+    Nothing -> acc
+    Just v ->
+      let mn = if lt v acc.min then v else acc.min
+      let mx = if lt acc.max v then v else acc.max
+      domMinMaxFold (eufRest vs) { min = mn, max = mx }
+
+@label "fork: dom-numeric"
+@description "decide-substrate Phase 7 — the certificate SOURCE predicate: true when a Maybe-domain is a numeric-bounded SeInterval (at least one numeric bound) OR an all-numeric non-empty SeEnum — the shapes over which a read term is certified numeric (the negated-order flip source). Nothing / SeAll / non-numeric ⇒ false. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domNumeric : (md: Maybe SetExpr) -> Boolean
+domNumeric md =
+  case md of
+    Just d ->
+      let t = seTag d
+      if eq t "SeEnum" then domEnumNumeric d
+      else if eq t "SeInterval" then domIntervalNumeric d
+      else false
+    Nothing -> false
+
+@label "fork: dom-enum-numeric"
+@description "decide-substrate Phase 7 — true when a SeEnum's values are all numeric (non-empty). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domEnumNumeric : (d: SetExpr) -> Boolean
+domEnumNumeric d =
+  case d of
+    SeEnum { values = vs } -> domAllNumeric vs
+    _ -> false
+
+@label "fork: dom-interval-numeric"
+@description "A bare interval cannot certify a native Number carrier: exact Nat/Int records may inhabit numeric bounds. False preserves the native-order negation fence; all-numeric enum certificates remain available."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domIntervalNumeric : (d: SetExpr) -> Boolean
+domIntervalNumeric d = false
+
+@label "fork: dom-bound-numeric"
+@description "decide-substrate Phase 7 — true when a Maybe-bound is present with a numeric value (domBoundNum ⇒ Just). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domBoundNumeric : (mb: Maybe Any) -> Boolean
+domBoundNumeric mb =
+  case mb of
+    Just b -> (case domBoundNum b of
+                 Just n -> true
+                 Nothing -> false)
+    Nothing -> false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- domAddBounds / the seeders — merge a domain's bounds atoms into the running
+-- `{ eqs, neqs, ltes, lts }` state atoms + accumulate the numeric-certified
+-- terms. `domSeedRefute` folds the value-number GROUPS (reads kept AS terms —
+-- the read `ECall` reconstructed from the group's class/method/argTerms);
+-- `domSeedWitness` folds the mint TABLE (each `?sym:` EVar term).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "fork: dom-add-bounds"
+@description "decide-substrate Phase 7 — merge a domain's `{ ltes, lts }` bounds delta (domBoundsAtoms) into the full `{ eqs, neqs, ltes, lts }` atoms accumulator (eqs/neqs unchanged). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domAddBounds : (domain: a) -> (term: (Expr Any)) -> (atoms: b) -> b
+domAddBounds domain term atoms =
+  let delta = domBoundsAtoms domain term
+  { eqs = atoms.eqs, neqs = atoms.neqs, ltes = concat atoms.ltes delta.ltes, lts = concat atoms.lts delta.lts }
+
+@label "fork: dom-seed-entry"
+@description "decide-substrate Phase 7 — seed one (typeName, methodName, term) against the domains into the running `{ atoms, certs }`: no domain ⇒ unchanged; a domain ⇒ merge its bounds atoms (domAddBounds) and, when the domain is numeric (domNumeric), append the term to certs (the negated-order certificate source). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domSeedEntry : (domInsts: a) -> (domTypes: b) -> (typeName: String) -> (methodName: String) -> (term: (Expr Any)) -> (acc: c) -> c
+domSeedEntry domInsts domTypes typeName methodName term acc =
+  case domainFor domInsts domTypes typeName methodName of
+    Nothing -> acc
+    Just d ->
+      let atoms2 = domAddBounds d term acc.atoms
+      let certs2 = if domNumeric (Just d) then appendItem term acc.certs else acc.certs
+      { atoms = atoms2, certs = certs2 }
+
+@label "fork: dom-seed-refute"
+@description "decide-substrate Phase 7 — build the refutation face's seeded `{ atoms, certs }` by folding the value-number GROUPS (symBuildGroups): for each group, reconstruct the read term (`ECall $effect:<class>:<method> argTerms`) and seed its domain's bounds atoms + numeric cert (domSeedEntry). Reads stay AS terms (no mint) — the reconstructed term is eufValEq-equal to the predicate's read occurrences ⇒ the bounds atoms prune congruently. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domSeedRefute : (groups: a) -> (domInsts: b) -> (domTypes: c) -> (acc: d) -> d
+domSeedRefute groups domInsts domTypes acc =
+  case head groups of
+    Nothing -> acc
+    Just g ->
+      let term = domReconstructRead g.typeName g.methodName g.argTerms
+      let acc2 = domSeedEntry domInsts domTypes g.typeName g.methodName term acc
+      domSeedRefute (eufRest groups) domInsts domTypes acc2
+
+@label "fork: dom-reconstruct-read"
+@description "decide-substrate Phase 7 — rebuild the original read `ECall` term for a value-number group: `ECall { fnId = $effect:<typeName>:<methodName>, args = argTerms }` — eufValEq-equal to the predicate's read occurrences (the refutation face's term-identity for domain atoms). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "effect" "decide-substrate" "phase-7"
+@category "engine-internal"
+domReconstructRead : (typeName: String) -> (methodName: String) -> (argTerms: a) -> (Expr Any)
+domReconstructRead typeName methodName argTerms =
+  ECall { fnId = concat "$effect:" (concat typeName (concat ":" methodName)), args = argTerms }
+
+@label "fork: dom-seed-witness"
+@description "decide-substrate Phase 7 — build the witness face's seeded `{ atoms, certs, domMap }` by folding the mint TABLE (symbolizeSharedDetailed): for each row, the minted `?sym:` `EVar` term seeds its domain's bounds atoms + numeric cert (domSeedEntry), AND — when a domain exists — a `{ varName, domain }` row joins domMap (the witness-solve domain lookup, keyed by the free var name). Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domSeedWitness : (mintTable: a) -> (domInsts: b) -> (domTypes: c) -> (acc: d) -> d
+domSeedWitness mintTable domInsts domTypes acc =
+  case head mintTable of
+    Nothing -> acc
+    Just row ->
+      let term = EVar { name = row.varName }
+      let seeded = domSeedEntry domInsts domTypes row.typeName row.methodName term { atoms = acc.atoms, certs = acc.certs }
+      let domMap2 =
+            case domainFor domInsts domTypes row.typeName row.methodName of
+              Just d -> appendItem { varName = row.varName, domain = d } acc.domMap
+              Nothing -> acc.domMap
+      domSeedWitness (eufRest mintTable) domInsts domTypes { atoms = seeded.atoms, certs = seeded.certs, domMap = domMap2 }
+
+@label "fork: dom-lookup-var"
+@description "decide-substrate Phase 7 — find a minted var's domain in the witness domMap (a list of { varName, domain }); Just domain on hit, Nothing otherwise. Internal helper."
+@tags "engine" "internal" "fork-exec" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+domLookupVar : (domMap: a) -> (v: String) -> Maybe b
+domLookupVar domMap v =
+  case head domMap of
+    Nothing -> Nothing
+    Just r -> if eq r.varName v then Just r.domain else domLookupVar (eufRest domMap) v
+
+-- =========================================================================
+-- THE FACES — the branching refutation + witness surfaces. Thin `.fenel` over
+-- the SHIPPED symbolize gate / symbolizeShared mint / solve / satCombined, now
+-- with the PE-normalizer front (normalizeForDecide) + typed-domain seeding
+-- (decide-substrate Phase 7). The TS `dispatched*` wrappers supply effectFnIds +
+-- the Symbolic spec + the fold set + the domain lists (the P13/P16 facts-env
+-- marshal class). budget = the fixed 64 at the faces.
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- satSymbolicPaths — the BRANCHING refutation face. LIFTS the symbolize.fenel
+-- D-B fence for refutation: `if (read k == 1) then (read k == 2) else False` is
+-- now refutable (both paths die), where satSymbolic abstains. Gate (reads-only,
+-- unchanged) → forkPaths → every path's atoms ∪ residual-atoms refuted AND
+-- complete ⇒ Just false; else Nothing. Reads stay AS terms (NO mint — the
+-- two-presentations principle; congruence needs the structure).
+-- ─────────────────────────────────────────────────────────────────────────
+@label "Sat symbolic paths"
+@description "partial-evaluator-substrate Phase 3 / decide-substrate Phase 7 — the BRANCHING Nelson-Oppen refutation face over an effectful predicate `Expr`. NORMALIZE FIRST (normalizeForDecide — PE const-folds + dead-branch prunes + whole-concrete collapse, gating on the residual). The LAWFUL GATE (every effect site is a declared read of a Symbolic-in-scope class — no writes, no unknown classes; any violation ⇒ Nothing) then TYPED-DOMAIN seeding (per value-number group with a domain: inject the numeric BOUNDS ATOMS + the numeric cert into the initial path condition — type-driven refutation, zero IO: `read k : [1,3] ∧ read k > 5` ⇒ Just false; `¬(read k ≤ 5)` under a numeric domain flips to `5 < read k` — the negated-order certificate) then forkPathsSeeded (budget 64, reads kept AS `ECall` terms — congruence needs the structure, NO mint): if the enumeration is COMPLETE and EVERY feasible path's atoms ∪ its residual's atoms refute (satCombined ⇒ Just false), return Just false; else Nothing (never Just true). LIFTS the symbolize.fenel D-B branching fence for refutation — `if (read k == 1) then (read k == 2) else False` refutes (both paths die), where satSymbolic abstains; `case read k of Just v -> read k == Nothing` refutes by datatype distinctness. `spec` = List { effectClass, reads }; `domInsts`/`domTypes` = the scoped SymbolicDomain / method-return-type domains."
+@tags "engine" "fork-exec" "symbolize" "euf" "solve" "prover" "partial-evaluator-substrate" "phase-3" "decide-substrate" "phase-7"
+satSymbolicPaths : (spec: a) -> (effectFnIds: b) -> (pred: (Expr Any)) -> (foldableFnIds: List String) -> (nullValue: c) -> (domInsts: d) -> (domTypes: e) -> Maybe Boolean
+satSymbolicPaths spec effectFnIds pred foldableFnIds nullValue domInsts domTypes =
+  let normalized = normalizeForDecide foldableFnIds nullValue pred
+  let sites = symCollectSites effectFnIds normalized
+  if not (symAllSitesScopedReads spec sites) then Nothing
+  else
+    let parseable = symAllSitesParseable sites
+    let groups = symBuildGroups spec sites parseable
+    let seed = domSeedRefute groups domInsts domTypes { atoms = { eqs = [], neqs = [], ltes = [], lts = [] }, certs = [] }
+    let state0 = { atoms = seed.atoms, opaque = [], shadowable = false, certs = seed.certs }
+    let fr = forkPathsSeeded effectFnIds 64 state0 normalized
+    if not fr.complete then Nothing
+    else forkAllRefuted fr.paths
+
+@label "fork: residual-false"
+@description "partial-evaluator-substrate Phase 3 — true when a path's residual LEAF predicate is the constant boolean false (`ELit false` or `EConstruct \"False\"` — the two spellings of the Bool `False`). Such a leaf is unsatisfiable regardless of the path atoms ⇒ the path is refuted (this is what makes an `else False` dead-branch die, lifting the D-B fence). Internal helper."
+@tags "engine" "internal" "fork-exec" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkResidualFalse : (e: (Expr Any)) -> Boolean
+forkResidualFalse e =
+  case e of
+    ELit { value = v } -> eq v false
+    EConstruct { ctor = c } -> eq c "False"
+    other -> false
+
+@label "fork: all-refuted"
+@description "partial-evaluator-substrate Phase 3 — true-verdict fold behind satSymbolicPaths: each path is refuted iff its residual is the constant `False` (forkResidualFalse — an unsatisfiable leaf) OR its path atoms ∪ its residual's atoms (noWhereFold over the residual) are UNSAT (satCombined ⇒ Just false). If EVERY path is refuted, return Just false (an empty path list = everything pruned = unsat ⇒ Just false too); a single non-refuting path ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "fork-exec" "theory-combine" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkAllRefuted : (paths: a) -> Maybe Boolean
+forkAllRefuted paths =
+  case head paths of
+    Nothing -> Just false
+    Just p ->
+      if forkResidualFalse p.residual then forkAllRefuted (eufRest paths)
+      else
+        let merged = noWhereFold p.residual { eqs = p.atoms.eqs, neqs = p.atoms.neqs, ltes = p.atoms.ltes, lts = p.atoms.lts }
+        case satCombined merged.eqs merged.neqs merged.ltes merged.lts of
+          Just false -> forkAllRefuted (eufRest paths)
+          other -> Nothing
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- solveSymbolicPaths — the BRANCHING witness face. Gate → symbolizeShared (mint
+-- FIRST — path conditions range over the shared `?sym:` vars) → forkPaths → for
+-- each WITNESS-SAFE (non-shadowable) feasible path IN ORDER, solve
+-- `and(pathAtoms ∧ opaque ∧ residual)`; first Just w wins. Lifts the D-B
+-- witness half: `if (read k > 40) then (read k == 42) else False` ⇒ Just 42.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "Solve symbolic paths"
+@description "partial-evaluator-substrate Phase 3 / decide-substrate Phase 7 — the BRANCHING witness face: NORMALIZE FIRST (normalizeForDecide) → the LAWFUL GATE (declared-reads-only; any write/unknown class ⇒ Nothing) → symbolizeSharedDetailed (mint FIRST — path conditions range over the shared `?sym:` vars; the mint table drives TYPED-DOMAIN seeding: each minted var's numeric bounds atoms + cert seed the path condition, and its domain joins the witness domMap) → forkPathsSeeded (budget 64) → for each WITNESS-SAFE (non-shadowable) feasible path IN ORDER, rebuild `and(pathAtoms ∧ opaque ∧ residual)`; a minted var WITH a domain solves DOMAIN-AWARE (`inhabit (SeIntersect [domain, comprehend v we])`, enum-first — an interval-only pred becomes witnessable under an enum domain: `read k > 2` @ `SeEnum [1,2,3]` ⇒ Just 3); else plain solve. The first Just w wins, all-Nothing ⇒ Nothing. Inherits solve's single-unknown fence honestly. Lifts the symbolize.fenel D-B witness half: `if (read k > 40) then (read k == 42) else False` ⇒ Just 42. `spec` = List { effectClass, reads }; `domInsts`/`domTypes` = the domains."
+@tags "engine" "fork-exec" "symbolize" "solve" "effect" "partial-evaluator-substrate" "phase-3" "decide-substrate" "phase-7"
+solveSymbolicPaths : (spec: a) -> (effectFnIds: b) -> (expr: (Expr Any)) -> (foldableFnIds: List String) -> (nullValue: c) -> (domInsts: d) -> (domTypes: e) -> Maybe f
+solveSymbolicPaths spec effectFnIds expr foldableFnIds nullValue domInsts domTypes =
+  let normalized = normalizeForDecide foldableFnIds nullValue expr
+  let sites = symCollectSites effectFnIds normalized
+  if not (symAllSitesScopedReads spec sites) then Nothing
+  else
+    let det = symbolizeSharedDetailed spec effectFnIds normalized
+    let seed = domSeedWitness det.mintTable domInsts domTypes { atoms = { eqs = [], neqs = [], ltes = [], lts = [] }, certs = [], domMap = [] }
+    let state0 = { atoms = seed.atoms, opaque = [], shadowable = false, certs = seed.certs }
+    let fr = forkPathsSeeded effectFnIds 64 state0 det.residual
+    forkFirstWitnessDom fr.paths seed.domMap
+
+@label "fork: first-witness-dom"
+@description "decide-substrate Phase 7 — the DOMAIN-AWARE witness fold behind solveSymbolicPaths: walk the feasible paths IN ORDER, SKIPPING shadowable ones; for a witness-safe path, rebuild forkWitnessExpr, find its single free var, and — when that var has a domain (domMap) — solve `inhabit (SeIntersect [domain, comprehend v witnessExpr])` (ENUM-FIRST: the domain leads so the intersect fold seeds on the enumerable member, making an interval-only pred witnessable under an enum domain); no domain / not-single-free-var ⇒ plain `solve` (unchanged). The first Just w wins; all exhausted ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "fork-exec" "solve" "inhabit" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkFirstWitnessDom : (paths: a) -> (domMap: b) -> Maybe c
+forkFirstWitnessDom paths domMap =
+  case head paths of
+    Nothing -> Nothing
+    Just p ->
+      if p.shadowable then forkFirstWitnessDom (eufRest paths) domMap
+      else
+        case forkWitnessDomSolve p domMap of
+          Just w -> Just w
+          Nothing -> forkFirstWitnessDom (eufRest paths) domMap
+
+@label "fork: witness-dom-solve"
+@description "decide-substrate Phase 7 — solve one witness-safe path domain-aware: rebuild forkWitnessExpr, collectFreeVars; a SINGLE free var WITH a domain ⇒ `inhabit (SeIntersect [domain, comprehend v we])` (domain enum-first); else plain `solve we` (the Phase-3 behavior — single-unknown fence honored by solve). Internal helper."
+@tags "engine" "internal" "fork-exec" "solve" "inhabit" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkWitnessDomSolve : (p: a) -> (domMap: b) -> Maybe c
+forkWitnessDomSolve p domMap =
+  let we = forkWitnessExpr p
+  let free = collectFreeVars we [] []
+  if eq (length free) 1 then forkWitnessDomSingle free we domMap else solve we
+
+@label "fork: witness-dom-single"
+@description "decide-substrate Phase 7 — dispatch a single-free-var witness path: look the var up in the domMap; a domain ⇒ the domain-aware intersect-inhabit (forkWitnessDomVar); else plain solve. Internal helper."
+@tags "engine" "internal" "fork-exec" "solve" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkWitnessDomSingle : (free: a) -> (we: (Expr Any)) -> (domMap: b) -> Maybe c
+forkWitnessDomSingle free we domMap =
+  case head free of
+    Nothing -> solve we
+    Just v -> forkWitnessDomVar v we domMap
+
+@label "fork: witness-dom-var"
+@description "decide-substrate Phase 7 — the domain-aware witness solve for a free var `v`: a domain in the domMap ⇒ `inhabit (SeIntersect [domain, comprehend v we])` (domain enum-first — the intersect fold seeds on the enumerable member); no domain ⇒ plain `solve we`. Internal helper."
+@tags "engine" "internal" "fork-exec" "solve" "inhabit" "symbolic-domain" "decide-substrate" "phase-7"
+@category "engine-internal"
+forkWitnessDomVar : (v: String) -> (we: (Expr Any)) -> (domMap: b) -> Maybe c
+forkWitnessDomVar v we domMap =
+  case domLookupVar domMap v of
+    Just d ->
+      let inter = SeIntersect { branches = concat (appendItem d []) (appendItem (comprehend v we) []) }
+      inhabit inter
+    Nothing -> solve we
+
+@label "fork: first-witness"
+@description "partial-evaluator-substrate Phase 3 — witness fold behind solveSymbolicPaths: walk the feasible paths IN ORDER, SKIPPING shadowable ones (a k≥1 match-arm path — positive-only assumptions can't rule out earlier-arm shadowing); for a witness-safe path, solve `forkWitnessExpr` — the first Just w wins; all exhausted ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "fork-exec" "solve" "partial-evaluator-substrate" "phase-3"
+@category "engine-internal"
+forkFirstWitness : (paths: a) -> Maybe b
+forkFirstWitness paths =
+  case head paths of
+    Nothing -> Nothing
+    Just p ->
+      if p.shadowable then forkFirstWitness (eufRest paths)
+      else
+        case solve (forkWitnessExpr p) of
+          Just w -> Just w
+          Nothing -> forkFirstWitness (eufRest paths)

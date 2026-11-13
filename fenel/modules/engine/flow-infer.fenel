@@ -1,0 +1,380 @@
+module engine where
+
+-- =========================================================================
+-- flow-infer.fenel — `inferFlow` + `backwardInfer`, the flow-graph inference
+-- ORCHESTRATORS. The LAST pure-logic in `fenel-check.ts` ported to Fenel;
+-- after this the file is a 100% marshal seam (every type-inference DECISION
+-- — assign / infer / narrow / type→set / flow-forward / flow-backward — is a
+-- Fenel body). unified-static-analysis Phase 3b-flow (brief:
+-- `workstreams/unified-static-analysis/briefs/phase-3b-flow-inferflow-backwardinfer-port.md`).
+--
+-- THE PORT (the orchestrator, COMPOSING the already-Fenel leaves). The leaves
+-- shipped in prior slices: `inferExprType` (the forward walk, fenel-check.fenel),
+-- `invert` (the backward transfer, invert.fenel), `normMarker` (the step-wise
+-- normalize point, fenel-check.fenel — `setAlgebraNormalize` over Se* since
+-- decide-substrate Phase 1 Stage E retired the Sm* marker vocabulary),
+-- `envLookup` / `envSet` / `nthArg` (env +
+-- list helpers, fenel-check.fenel). This file adds the GRAPH orchestration on
+-- top — Kahn's topological sort, the forward type-propagation pass, the per-edge
+-- source-type + assignability classification, and the binary-arith backward
+-- inversion — all calling those leaves BY BARE NAME over `$`-free markers (same
+-- engine module, zero re-marshalling). Net: the file's final TS decision logic
+-- retires; a test-LESS dormant feature (the flow-graph type checker for Fenel's
+-- visual / node-graph surface) gains its first parity oracle.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE `$`-KEY BARRIER (the fenel-check.fenel / assignable.fenel precedent this
+-- rides). A `.fenel` body CANNOT author OR read `$`-prefixed-key objects, so the
+-- TS delegate (`inferFlow` / `backwardInfer` in fenel-check.ts) owns ALL
+-- `$`-key marshalling. Each FlowNode is lowered to a `$`-free FlowNodeMarker, each
+-- FlowEdge to a FlowEdgeMarker, the env to the same `$`-free assoc list the
+-- inferExprType `var` arm reads:
+--
+-- FlowNodeMarker (TS-built; the SETS are canonical `$tag` Se* SetExpr since
+-- decide-substrate Phase 1 Stage E — `setExprToTag` at the boundary):
+--   { id = String, hasExpr = Bool, expr = ExprMarker,           — expr is a dummy Lit when absent
+--     bindings = [{ name = String, set = SetExpr }],            — empty when absent
+--     hasDeclared = Bool, declaredType = SetExpr }              — declaredType is a dummy SeAll when absent
+-- FlowEdgeMarker (TS-built):
+--   { from = String, to = String, hasSlot = Bool, slot = String }
+--
+-- The body returns `{ nodes, edges }`:
+--   nodes = [{ id = String, set = SetExpr }]                    — result.nodes (the inferred output type per node)
+--   edges = [{ source = SetExpr, proof = ProofMarker }]         — ALIGNED to the input-edge order
+-- ProofMarker (per edge — the assignability decision, classified IN-Fenel):
+--   { needsCheck = False, ok = True, confidence = "proven" }    — no declared slot constraint ⇒ the always-ok default
+--   { needsCheck = True, source = SetExpr, target = SetExpr }   — declared slot ⇒ DEFER the real check to checkAssignable
+--
+-- D-FLOW-4 (the per-edge proof deferral — carrier kept, premise UPDATED):
+-- the per-edge assignability proof for a declared slot is DEFERRED to the
+-- existing `checkAssignable` TS seam (which owns the kernel round-trip + the
+-- `$diff`-gap precompute + the confidence grading) via the `needsCheck = True`
+-- carrier; the CLASSIFICATION (which edges defer vs default) is decided HERE.
+-- HISTORY: the original reachability argument ("the body holds only `$`-free
+-- SetMarkers, the kernel needs `$`-keyed SetExpr") DISSOLVED at decide-substrate
+-- Phase 1 Stage E — the body now holds canonical `$tag` Se* and could call
+-- `decideSubset` in-body (the `set:witnessSound` precedent). The carrier stays
+-- because the checkAssignable seam ALSO owns the kernel-verify + gap + grading
+-- composition; folding that in-body is a real unlock but belongs to the
+-- decide-substrate Phase-2 kernel work, not this port. The intersect IS in-body
+-- (normMarker over SeIntersect — the applyComparisonNarrow precedent).
+--
+-- NO ENTITY DECLS (the fenel-check.fenel / propagate.fenel audit-green
+-- invariant): every marker is a plain record, NOT a registered ADT — the entity
+-- oracle + law count move +0, the audit stays exit-0. Engine FNS are safe (law
+-- +0, lock +0).
+-- =========================================================================
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- inferFlow — the public entry. Topo-sort the nodes (Kahn), forward-propagate
+-- types in that order (threading the growing result.nodes), then classify each
+-- edge's source type + assignability proof. The TS delegate marshals the nodes
+-- / edges in and rebuilds the Map-typed FlowTypeMap (resolving every
+-- needsCheck carrier through checkAssignable) out.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Infer flow graph types"
+@description "Flow-graph type inference: topologically sort the nodes (Kahn's algorithm — a cyclic node never reaches in-degree 0 and is OMITTED, getting no inferred type, never an error), forward-propagate types through each node's expression (env = its bindings ∪ the already-inferred types arriving on its incoming edges; output = inferExprType, intersected with the declared type when present), then classify each edge: its source type (the from-node's inferred type, $all when absent) plus an assignability proof — the always-ok { proven } default when the target slot is undeclared, else a needsCheck carrier of (source, target) the TS seam resolves through checkAssignable. Returns `{ nodes, edges }` over `$`-free markers; the TS delegate owns the FlowNode/FlowEdge marshal + the Map-typed FlowTypeMap rebuild. The port of fenel-check's inferFlow orchestrator onto the Fenel inference substrate, composing inferExprType / normMarker / checkAssignable. unified-static-analysis Phase 3b-flow."
+@tags "engine" "inference" "flow" "unified-static-analysis" "phase-3b-flow"
+inferFlow : (nodes: a) -> (edges: b) -> (tbl: c) -> d
+inferFlow nodes edges tbl =
+  let order = flowTopoOrder nodes edges
+  let resultNodes = flowForward order nodes edges [] tbl
+  { nodes = resultNodes, edges = flowEdges edges nodes resultNodes }
+
+
+-- =========================================================================
+-- A. Kahn's algorithm — topological order as a fuel-bounded immutable fixpoint
+-- (the anaReachClose / totClose precedent). A cyclic node never reaches
+-- in-degree 0, so it never enters the queue and is OMITTED from `order` — the
+-- TS inferFlow's exact soundness behaviour (a cycle ⇒ no inferred type, NOT an
+-- error). In-degree counts ALL edges into a node (an edge from a non-node
+-- `from` still increments its target's in-degree but is never decremented, so
+-- the target stays blocked — mirroring the TS, where such a target waits on a
+-- predecessor that never enters the queue).
+-- =========================================================================
+
+@label "flow: topo order (Kahn)"
+@description "Kahn's-algorithm topological order of the node ids. Seed the in-degree of each node (the count of all edges into it), queue the in-degree-0 nodes in node order, then peel: pop a node, decrement each successor's in-degree, enqueue any that reach 0. Fuel-bounded (length nodes + 1 — each node is processed at most once); a cyclic node never reaches in-degree 0 and is OMITTED. Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowTopoOrder : (nodes: a) -> (edges: b) -> c
+flowTopoOrder nodes edges =
+  let indeg = map (\n -> { id = n.id, deg = length (filter (\e -> eq e.to n.id) edges) }) nodes
+  let queue0 = map (\x -> x.id) (filter (\x -> eq x.deg 0) indeg)
+  flowKahn (add (length nodes) 1) edges { order = [], indeg = indeg, queue = queue0 }
+
+@label "flow: kahn step"
+@description "One Kahn iteration over the threaded state { order, indeg, queue }: pop the queue head, append it to the order, decrement each of its out-edge targets' in-degrees (enqueuing any that reach 0), recurse with one less fuel. Empty queue or exhausted fuel ⇒ return the accumulated order (cyclic / unreached nodes stay omitted — sound). Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowKahn : (fuel: a) -> (edges: b) -> (st: c) -> d
+flowKahn fuel edges st =
+  if eq fuel 0 then st.order
+  else
+    case head st.queue of
+      Nothing -> st.order
+      Just q ->
+        let baseQ = case tail st.queue of
+                      Nothing -> []
+                      Just r -> r
+        let st1 = { order = appendItem q st.order, indeg = st.indeg, queue = baseQ }
+        let outs = filter (\e -> eq e.from q) edges
+        let st2 = flowKahnDec st1 outs
+        flowKahn (sub fuel 1) edges st2
+
+@label "flow: kahn decrement out-edges"
+@description "Fold a node's out-edges into the Kahn state, decrementing each target's in-degree and enqueuing any that reach exactly 0 (a target with no in-degree entry — a non-node — is left untouched, no enqueue). Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowKahnDec : (st: a) -> (outs: b) -> a
+flowKahnDec st outs =
+  case head outs of
+    Nothing -> st
+    Just e ->
+      let st2 = flowKahnDecEdge st e
+      case tail outs of
+        Nothing -> st2
+        Just rest -> flowKahnDec st2 rest
+
+@label "flow: kahn decrement one edge"
+@description "Decrement the in-degree of one edge's target; if its new in-degree is exactly 0 (and it has an in-degree entry — i.e. it is a real node), enqueue it. Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowKahnDecEdge : (st: a) -> (e: b) -> a
+flowKahnDecEdge st e =
+  let ni = map (\x -> if eq x.id e.to then { id = x.id, deg = sub x.deg 1 } else x) st.indeg
+  let nq = case flowDegLookup e.to ni of
+             Nothing -> st.queue
+             Just d -> if eq d 0 then appendItem e.to st.queue else st.queue
+  { order = st.order, indeg = ni, queue = nq }
+
+@label "flow: in-degree lookup"
+@description "Search the in-degree assoc list [{id, deg}] for an id, returning Just its current degree or Nothing (the id is not a node). The sibling of envLookup over the in-degree table. Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowDegLookup : (id: String) -> (indeg: a) -> b
+flowDegLookup id indeg =
+  case head indeg of
+    Nothing -> Nothing
+    Just x ->
+      if eq x.id id then Just x.deg
+      else
+        case tail indeg of
+          Nothing -> Nothing
+          Just rest -> flowDegLookup id rest
+
+
+-- =========================================================================
+-- B. The forward pass — fold the topo order, threading the growing
+-- result.nodes assoc list. Per node: assemble its env (bindings, then the
+-- types arriving on its incoming declared-slot edges, read from the
+-- already-computed result.nodes — overwriting same-slot bindings, last wins),
+-- infer the output via inferExprType, intersect the declared type. A topo-order
+-- id with no matching node (a non-node that entered the queue) is skipped (the
+-- TS `if (!node) continue`).
+-- =========================================================================
+
+@label "flow: forward pass"
+@description "Fold the topo order, threading the result.nodes assoc list: per node, infer its output type (flowInferNode) and append { id, set }; skip an order entry with no matching node. Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowForward : (order: a) -> (nodes: b) -> (edges: c) -> (resultNodes: d) -> (tbl: e) -> d
+flowForward order nodes edges resultNodes tbl =
+  case head order of
+    Nothing -> resultNodes
+    Just id ->
+      let rn2 = case flowNodeLookup id nodes of
+                  Nothing -> resultNodes
+                  Just node -> appendItem { id = id, set = flowInferNode node id edges resultNodes tbl } resultNodes
+      case tail order of
+        Nothing -> rn2
+        Just rest -> flowForward rest nodes edges rn2 tbl
+
+@label "flow: infer one node"
+@description "Infer a node's canonical SetExpr output: start the env from its bindings, add the types arriving on incoming declared-slot edges (from already-computed result.nodes), infer via inferExprType when it has an expression (else SeAll), then intersect the declared type when present via normMarker over SeIntersect. Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowInferNode : (node: a) -> (id: String) -> (edges: b) -> (resultNodes: c) -> (tbl: d) -> e
+flowInferNode node id edges resultNodes tbl =
+  let env = flowAddIncoming id edges resultNodes node.bindings
+  let out = if node.hasExpr then normMarker (inferExprType node.expr env tbl) else SeAll
+  if node.hasDeclared
+    then normMarker (SeIntersect { branches = appendItem node.declaredType (appendItem out []) })
+    else out
+
+@label "flow: add incoming edge types"
+@description "Fold the edges into a node's env: for each edge into `id` carrying a slot, look the source node's inferred type up in result.nodes and (when present) bind it to the slot, overwriting any same-slot binding (last incoming edge wins, matching the TS env.set order). Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowAddIncoming : (id: String) -> (edges: a) -> (resultNodes: b) -> (env: c) -> c
+flowAddIncoming id edges resultNodes env =
+  case head edges of
+    Nothing -> env
+    Just e ->
+      let env2 = if eq e.to id
+                   then
+                     if e.hasSlot
+                       then
+                         case flowNode2Lookup e.from resultNodes of
+                           Nothing -> env
+                           Just s -> envSet e.slot s env
+                       else env
+                   else env
+      case tail edges of
+        Nothing -> env2
+        Just rest -> flowAddIncoming id rest resultNodes env2
+
+
+-- =========================================================================
+-- C. The edges pass — per edge (in input order, so the TS seam can zip the
+-- result with the edge array + build the cosmetic edgeId key host-side,
+-- D-FLOW-2), record the source type (the from-node's inferred type, $all when
+-- absent) + the assignability proof. A declared target slot ⇒ a needsCheck
+-- carrier of (source, expected) the TS seam resolves through checkAssignable
+-- (D-FLOW-4); otherwise the always-ok { proven } default.
+-- =========================================================================
+
+@label "flow: edges pass"
+@description "Map each edge (in input order) to { source, proof }: the source type read from result.nodes ($all when absent) + the assignability proof classified by flowEdgeProof. Aligned to the input-edge order so the TS seam zips it with the edge array. Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowEdges : (edges: a) -> (nodes: b) -> (resultNodes: c) -> a
+flowEdges edges nodes resultNodes =
+  map (\e -> flowEdge e nodes resultNodes) edges
+
+@label "flow: one edge"
+@description "Classify one edge: source = the from-node's inferred type ($all when absent); proof = needsCheck carrier of (source, expected) when the target node declares a binding for the edge's slot, else the always-ok { proven } default. Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowEdge : (e: a) -> (nodes: b) -> (resultNodes: c) -> d
+flowEdge e nodes resultNodes =
+  let src = case flowNode2Lookup e.from resultNodes of
+              Nothing -> SeAll
+              Just s -> s
+  { source = src, proof = flowEdgeProof e src nodes }
+
+@label "flow: edge proof"
+@description "The assignability proof for one edge: when the target node exists, has the edge's slot, AND declares a binding for it ⇒ a needsCheck carrier of (source, expected) the TS seam resolves through checkAssignable; otherwise the always-ok { needsCheck = False, ok = True, confidence = \"proven\" } default. Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowEdgeProof : (e: a) -> (src: b) -> (nodes: c) -> d
+flowEdgeProof e src nodes =
+  case flowNodeLookup e.to nodes of
+    Nothing -> { needsCheck = False, ok = True, confidence = "proven" }
+    Just tn ->
+      if e.hasSlot
+        then
+          case envLookup e.slot tn.bindings of
+            Nothing -> { needsCheck = False, ok = True, confidence = "proven" }
+            Just expected -> { needsCheck = True, source = src, target = expected }
+        else { needsCheck = False, ok = True, confidence = "proven" }
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- node lookups — by id into the node-marker list (the whole marker) and into
+-- the result.nodes assoc list (the inferred SetMarker). Siblings of envLookup.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "flow: node lookup"
+@description "Search the node-marker list for a node by id, returning Just the whole marker or Nothing. Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowNodeLookup : (id: String) -> (nodes: a) -> b
+flowNodeLookup id nodes =
+  case head nodes of
+    Nothing -> Nothing
+    Just n ->
+      if eq n.id id then Just n
+      else
+        case tail nodes of
+          Nothing -> Nothing
+          Just rest -> flowNodeLookup id rest
+
+@label "flow: result-node lookup"
+@description "Search result.nodes [{id, set}] for an id, returning Just its inferred canonical SetExpr or Nothing (not yet inferred / absent). Internal helper."
+@tags "engine" "internal" "flow" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+flowNode2Lookup : (id: String) -> (resultNodes: a) -> b
+flowNode2Lookup id resultNodes =
+  case head resultNodes of
+    Nothing -> Nothing
+    Just n ->
+      if eq n.id id then Just n.set
+      else
+        case tail resultNodes of
+          Nothing -> Nothing
+          Just rest -> flowNode2Lookup id rest
+
+
+-- =========================================================================
+-- D. backwardInfer — given a binary-arith expression with one variable side,
+-- a declared output constraint, and the known inputs, infer the OTHER side's
+-- type, invert the constraint onto the variable, and intersect it into the env.
+-- Mirrors the TS's conservative early-returns exactly (non-Op marker /
+-- non-`+-*/` op / arity ≠ 2 / both-or-neither side a var ⇒ env unchanged). The
+-- whole chain composes the Fenel leaves bare-name: inferExprType the known
+-- side, invert the constraint, normMarker the intersect.
+-- =========================================================================
+
+@label "Backward infer"
+@description "Backward flow inference: given a binary-arithmetic expression (as an ExprMarker), a declared canonical SetExpr output constraint, and the known-input env (a plain assoc list carrying canonical SetExpr values), infer the constraints the inputs must satisfy. Only `+ - * /` with exactly two args and exactly ONE variable side narrows: infer the known side's type, invert the output constraint onto the variable (with SeAll on the variable side), and—when the inverted constraint is not SeAll—intersect it into the variable's env binding via normMarker over SeIntersect. Every conservative case returns the env unchanged. unified-static-analysis Phase 3b-flow / floor-kernel Phase 4."
+@tags "engine" "inference" "flow" "backward" "unified-static-analysis" "phase-3b-flow"
+backwardInfer : (expr: a) -> (outC: b) -> (env: c) -> (tbl: d) -> c
+backwardInfer expr outC env tbl =
+  if not (eq expr.tag "Op") then env
+  else if not (backIsArith expr.op) then env
+  else if not (eq (length expr.args) 2) then env
+  else backwardArith expr.op expr.args outC env tbl
+
+@label "flow: backward is arithmetic?"
+@description "True for the four invertible binary arithmetic ops (+ - * /). Internal helper."
+@tags "engine" "internal" "flow" "backward" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+backIsArith : (op: String) -> Bool
+backIsArith op =
+  if eq op "+" then True
+  else if eq op "-" then True
+  else if eq op "*" then True
+  else if eq op "/" then True
+  else False
+
+@label "flow: backward arith"
+@description "The binary-arith backward arm: read the two arg markers; if exactly the left is a var ⇒ infer the right side, invert onto the left (idx 0); if exactly the right is a var ⇒ infer the left side, invert onto the right (idx 1); both-or-neither var ⇒ env unchanged. Internal helper."
+@tags "engine" "internal" "flow" "backward" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+backwardArith : (op: String) -> (args: a) -> (outC: b) -> (env: c) -> (tbl: d) -> c
+backwardArith op args outC env tbl =
+  case nthArg args 0 of
+    Nothing -> env
+    Just left ->
+      case nthArg args 1 of
+        Nothing -> env
+        Just right ->
+          if isVarM left
+            then
+              if isVarM right then env
+              else backwardOneVar op left.name (inferExprType right env tbl) 1 outC env tbl
+            else
+              if isVarM right
+                then backwardOneVar op right.name (inferExprType left env tbl) 0 outC env tbl
+                else env
+
+@label "flow: backward one var"
+@description "Invert the output constraint onto a single variable side: build the input markers ($all in the variable slot, the known side's inferred type in the other — knownIdx), invert (then normalize), and — unless the inverted constraint is $all — intersect it into the variable's current env binding (default $all). Returns the env unchanged when the constraint is $all. Internal helper."
+@tags "engine" "internal" "flow" "backward" "unified-static-analysis" "phase-3b-flow"
+@category "engine-internal"
+backwardOneVar : (op: String) -> (varName: String) -> (knownType: a) -> (knownIdx: Number) -> (outC: b) -> (env: c) -> (tbl: d) -> c
+backwardOneVar op varName knownType knownIdx outC env tbl =
+  let inputs = if eq knownIdx 1
+                 then appendItem knownType (appendItem SeAll [])
+                 else appendItem SeAll (appendItem knownType [])
+  let unknownIdx = if eq knownIdx 1 then 0 else 1
+  let constraint = normMarker (invert op outC inputs unknownIdx)
+  if eq (seTag constraint) "SeAll" then env
+  else
+    let existing = case envLookup varName env of
+                     Just s -> s
+                     Nothing -> SeAll
+    envSet varName (normMarker (SeIntersect { branches = appendItem constraint (appendItem existing []) })) env

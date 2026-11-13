@@ -1,0 +1,229 @@
+-- codecs — wire-format codec helpers ported as Fenel bodies.
+--
+-- Phase 11b sub-step 1 port — telegram-codec.ts (the camelCase ↔
+-- snake_case wire codec for the Telegram HTTP API). The runtime/src/
+-- pure-algorithms tier (Phase 11a) lands runtime:triggerMatches; this
+-- sub-step extends the same runtime-bodies-dispatch.ts precedent to a
+-- codec walk — a different shape (structural recursion over a typed
+-- ADT, plus per-char string transforms) on the same harness.
+--
+-- The bodies fall into two distinct shape concerns:
+--
+--   * Shape A — pure string transforms (camelToSnake / snakeToCamel).
+--     These walk chars and emit new chars. camelToSnake uses chars +
+--     per-char map; snakeToCamel uses chars + std:fold over an
+--     anonymous state record because the underscore-followed-by-letter
+--     consumption rule is stateful (afterUnderscore flag threads
+--     through the fold).
+--
+--   * Shape B — structural codec walk (toTelegramWire /
+--     fromTelegramWire). The TS wrapper at runtime-bodies-dispatch.ts
+--     pre-marshals an arbitrary JS value (string / number / boolean /
+--     null / array / plain object) into the CodecValue ADT shape; the
+--     Fenel body recursively walks the ADT and rewrites object keys
+--     via camelToSnake / snakeToCamel. The wrapper post-walks the
+--     result back to a plain JS shape. Same Phase 21.5 marshal-once
+--     recipe as engine-bodies-dispatch.ts's normaliseToCore.
+--
+-- Higher-order function-reference passing is NOT used to share a
+-- single rewriteKeys body between the two directions. Fenel's parser
+-- normalises ident-headed calls to `{call: [name, ...args]}` with name
+-- as a literal string — a parameter holding a function reference
+-- can't be invoked by that surface syntax because the param name
+-- gets stringified rather than var-looked-up. (Top-level fnIds work
+-- because the bare-ident fall-through in resolveVar at json-logic.ts
+-- :773 returns the fnId name string for unknown idents that ARE
+-- registered functions — but that fall-through fires only for unbound
+-- vars, not for parameter-shadowed vars.) Two parallel codec walks
+-- (toTelegramWire + toTelegramWirePair, fromTelegramWire +
+-- fromTelegramWirePair) — minor duplication, but each walk is a
+-- focused matrix-visible publish surface that's clearer than a
+-- direction-parameterised walker would have been.
+--
+-- All internal helpers are prefixed with their direction (camelToSnake
+-- / snakeToCamel / toTelegramWire / fromTelegramWire) for traceability
+-- in the matrix + audit-effects views.
+--
+-- typed-function-references Phase FM-retire-5 Step 5b (2026-06-06) — gained the
+-- `module runtime where` header + sigs + facets; unions with the other 3
+-- runtime body files at the seam. Ids stay `runtime:<fn>`.
+
+module runtime where
+
+-- ---------------------------------------------------------------------------
+-- CodecValue — pre-marshalled JS value for the structural codec walk.
+--
+-- The TS wrapper walks an arbitrary JS value at the boundary and emits
+-- one CodecValue. The body's case-of dispatch traverses the ADT shape
+-- and reconstructs a new CodecValue with object keys rewritten.
+--
+--   CvNull            — JS null / undefined
+--   CvBool   value:b  — JS boolean
+--   CvNumber value:n  — JS number
+--   CvString value:s  — JS string (pass-through; key transform applies
+--                       to OBJECT KEYS only, NEVER to string values)
+--   CvArray  items    — JS array; items are List CodecValue
+--   CvObject pairs    — JS plain object; pairs is List CodecPair
+-- ---------------------------------------------------------------------------
+
+CodecValue =
+  CvNull
+  | CvBool value: Bool
+  | CvNumber value: Number
+  | CvString value: String
+  | CvArray items: a
+  | CvObject pairs: a
+
+-- ---------------------------------------------------------------------------
+-- CodecPair — single object-key/value pair in a CvObject's pairs list.
+--
+-- Single-constructor record. The body uses field access (p.key /
+-- p.value) rather than case-of pattern matching since there's only
+-- one shape.
+-- ---------------------------------------------------------------------------
+
+CodecPair = CodecPair key: String value: a
+
+-- ---------------------------------------------------------------------------
+-- camelToSnake — convert a camelCase identifier to snake_case.
+--
+-- Mirrors the TS oracle at runtime/src/handlers/telegram-codec.ts:18:
+--   s.replace(/[A-Z]/g, (ch) => `_${ch.toLowerCase()}`)
+--
+-- Body: split into chars, transform each via camelToSnakeChar, rejoin.
+-- The per-char predicate `neq (lower c) c` flags ASCII A-Z (and any
+-- character whose lowercase differs from itself — for non-ASCII upper
+-- letters this is a minor superset of the TS oracle's `[A-Z]` regex,
+-- harmless for Telegram-API keys which are always ASCII identifiers).
+-- ---------------------------------------------------------------------------
+
+camelToSnake : String -> String
+@label "telegram-codec: camelToSnake"
+@description "Phase 11b sub-step 1 — convert a camelCase identifier to snake_case. Body splits the string via std:chars + maps each char through camelToSnakeChar + joins with empty separator. Mirrors the regex /[A-Z]/g => `_${ch.toLowerCase()}` from runtime/src/handlers/telegram-codec.ts:18."
+@tags "runtime" "codec" "telegram" "string" "phase-11b"
+camelToSnake s = join (map camelToSnakeChar (chars s)) ""
+
+camelToSnakeChar : String -> String
+@label "telegram-codec: camelToSnakeChar"
+@description "Phase 11b sub-step 1 — per-char helper for camelToSnake. If the char's lowercase differs from itself (ASCII A-Z), prepend `_` and lowercase. Else pass through. Internal helper consumed by `runtime:camelToSnake` via std:map. Body-only fnId — not exposed as a dispatched wrapper."
+@tags "runtime" "codec" "telegram" "internal" "phase-11b"
+@category "runtime-internal"
+camelToSnakeChar c =
+  if neq (lower c) c then concat "_" (lower c)
+  else c
+
+-- ---------------------------------------------------------------------------
+-- snakeToCamel — convert a snake_case identifier to camelCase.
+--
+-- Mirrors the TS oracle at runtime/src/handlers/telegram-codec.ts:25:
+--   s.replace(/_([a-zA-Z0-9])/g, (_m, ch) => ch.toUpperCase())
+--
+-- Body: std:fold over the char list with a state record threading
+-- `pendingUnderscore` (true after an `_` is consumed without yet
+-- emitting it — the next non-underscore char gets uppercased; an
+-- underscore at end-of-input is flushed in the finalise step).
+--
+-- State shape: anonymous record `{ output: String,
+-- pendingUnderscore: Bool }` — single-shape, no constructor needed.
+-- Field access via . is the usual record access.
+--
+-- Edge cases preserved (verified against the TS oracle in the smoke
+-- script):
+--   `""`     -> `""`        (empty)
+--   `"foo"`  -> `"foo"`     (no underscores)
+--   `"_foo"` -> `"Foo"`     (leading underscore)
+--   `"foo_"` -> `"foo_"`    (trailing underscore — finalise restores)
+--   `"__a"`  -> `"_A"`      (double underscore — first is emitted, second is consumed)
+--   `"a_b_c"`-> `"aBC"`     (multiple underscores)
+-- ---------------------------------------------------------------------------
+
+snakeToCamel : String -> String
+@label "telegram-codec: snakeToCamel"
+@description "Phase 11b sub-step 1 — convert a snake_case identifier to camelCase. Body std:fold over std:chars with an anonymous state record { output: String, pendingUnderscore: Bool }; the snakeToCamelStep per-char closure threads the underscore-consumption invariant. A trailing pendingUnderscore is flushed back into the output before return (preserves the TS oracle's behavior on trailing `_`). Mirrors the regex /_([a-zA-Z0-9])/g => ch.toUpperCase() from runtime/src/handlers/telegram-codec.ts:25."
+@tags "runtime" "codec" "telegram" "string" "phase-11b"
+snakeToCamel s =
+  let cs = chars s
+  let initState = { output = "", pendingUnderscore = False }
+  let finalState = fold snakeToCamelStep initState cs
+  if finalState.pendingUnderscore then concat finalState.output "_"
+  else finalState.output
+
+snakeToCamelStep : a -> String -> a
+@label "telegram-codec: snakeToCamelStep"
+@description "Phase 11b sub-step 1 — per-char fold step for snakeToCamel. Threads `pendingUnderscore` state: `_` flips it on (or emits the held `_` when already pending); a non-`_` char while pending becomes upper(c) and resets pending; otherwise passes through. Internal helper consumed by `runtime:snakeToCamel` via std:fold. Body-only fnId."
+@tags "runtime" "codec" "telegram" "internal" "phase-11b"
+@category "runtime-internal"
+snakeToCamelStep state c =
+  if eq c "_" then
+    if state.pendingUnderscore then
+      { output = concat state.output "_", pendingUnderscore = True }
+    else
+      { output = state.output, pendingUnderscore = True }
+  else
+    if state.pendingUnderscore then
+      { output = concat state.output (upper c), pendingUnderscore = False }
+    else
+      { output = concat state.output c, pendingUnderscore = False }
+
+-- ---------------------------------------------------------------------------
+-- toTelegramWire — outbound codec: camelCase keys -> snake_case keys.
+--
+-- Mirrors the TS oracle at runtime/src/handlers/telegram-codec.ts:51
+-- via the rewriteKeys helper at line 38. The Fenel body dispatches on
+-- the CodecValue variant: scalars (CvNull / CvBool / CvNumber /
+-- CvString) pass through unchanged; CvArray recurses into items;
+-- CvObject recurses into pairs via toTelegramWirePair.
+--
+-- The $tag field is preserved verbatim — Fenel's discriminator for
+-- variant values nested inside the codec input MUST NOT be renamed
+-- to snake_case (it'd break downstream pattern-matching on the value).
+-- ---------------------------------------------------------------------------
+
+toTelegramWire : a -> a
+@label "telegram-codec: toTelegramWire"
+@description "Phase 11b sub-step 1 — outbound Telegram codec: convert a Fenel-shaped record (camelCase keys) to the Telegram wire shape (snake_case keys). The TS wrapper at runtime/src/runtime-bodies-dispatch.ts pre-marshals the JS value into the CodecValue ADT; the body dispatches on the variant and recursively rewrites object keys via toTelegramWirePair + camelToSnake. $tag fields are preserved verbatim (load-bearing for Fenel discriminators nested inside the codec input). Boundary adapter dispatched via `dispatchedToTelegramWire`. Mirrors runtime/src/handlers/telegram-codec.ts:51."
+@tags "runtime" "codec" "telegram" "boundary" "phase-11b"
+toTelegramWire v = case v of
+  CvNull -> v
+  CvBool { value = _ } -> v
+  CvNumber { value = _ } -> v
+  CvString { value = _ } -> v
+  CvArray { items = is } -> CvArray { items = map toTelegramWire is }
+  CvObject { pairs = ps } -> CvObject { pairs = map toTelegramWirePair ps }
+
+toTelegramWirePair : a -> a
+@label "telegram-codec: toTelegramWirePair"
+@description "Phase 11b sub-step 1 — per-pair helper for toTelegramWire. Rewrites a CodecPair's key via camelToSnake (preserving `$tag` verbatim) and recurses into the value. Internal helper consumed by `runtime:toTelegramWire` via std:map. Body-only fnId."
+@tags "runtime" "codec" "telegram" "internal" "phase-11b"
+@category "runtime-internal"
+toTelegramWirePair p =
+  let newKey = if eq p.key "$tag" then p.key else camelToSnake p.key
+  CodecPair { key = newKey, value = toTelegramWire p.value }
+
+-- ---------------------------------------------------------------------------
+-- fromTelegramWire — inbound codec: snake_case keys -> camelCase keys.
+--
+-- Mirrors the TS oracle at runtime/src/handlers/telegram-codec.ts:57.
+-- Same shape as toTelegramWire — only the key-transform differs.
+-- ---------------------------------------------------------------------------
+
+fromTelegramWire : a -> a
+@label "telegram-codec: fromTelegramWire"
+@description "Phase 11b sub-step 1 — inbound Telegram codec: convert a Telegram response (snake_case keys) to the Fenel shape (camelCase keys). Same shape as toTelegramWire but the pair helper rewrites keys via snakeToCamel. Boundary adapter dispatched via `dispatchedFromTelegramWire`. Mirrors runtime/src/handlers/telegram-codec.ts:57."
+@tags "runtime" "codec" "telegram" "boundary" "phase-11b"
+fromTelegramWire v = case v of
+  CvNull -> v
+  CvBool { value = _ } -> v
+  CvNumber { value = _ } -> v
+  CvString { value = _ } -> v
+  CvArray { items = is } -> CvArray { items = map fromTelegramWire is }
+  CvObject { pairs = ps } -> CvObject { pairs = map fromTelegramWirePair ps }
+
+fromTelegramWirePair : a -> a
+@label "telegram-codec: fromTelegramWirePair"
+@description "Phase 11b sub-step 1 — per-pair helper for fromTelegramWire. Rewrites a CodecPair's key via snakeToCamel (preserving `$tag` verbatim) and recurses into the value. Internal helper consumed by `runtime:fromTelegramWire` via std:map. Body-only fnId."
+@tags "runtime" "codec" "telegram" "internal" "phase-11b"
+@category "runtime-internal"
+fromTelegramWirePair p =
+  let newKey = if eq p.key "$tag" then p.key else snakeToCamel p.key
+  CodecPair { key = newKey, value = fromTelegramWire p.value }

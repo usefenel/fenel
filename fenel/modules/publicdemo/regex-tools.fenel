@@ -1,0 +1,118 @@
+module ImportDemo where
+
+using std (map, chars, charCode, isString, isArray, isBoolean, numberIsFinite, floor, all, length, appendItem, join, bindResult, fold, max, not)
+using engine (RxNode)
+
+-- Inspect the existing reader's semantic RxNode, before Pattern lowering drops
+-- its named groups. This projection is ordinary record/list data, not another
+-- regex AST or parser. Plain/noncapturing wrappers and boundary anchors are
+-- absent from RxNode; inherited escape, class and brace meanings remain.
+-- This is not JavaScript Regex validation, execution, capture matching or a
+-- lossless syntax tree. Raw source is retained exactly. Bound source before
+-- recursive parsing, then bound projected semantic depth and node count.
+
+-- The public registry deliberately omits executable engine functions. This
+-- existing A4 harness boundary enters the same reader; it contains no parser
+-- or projection logic. Bounds and token construction remain in Fenel below.
+@native
+@label "Regex reader boundary"
+@description "Forward already-authored character/code-point tokens to the existing engine regex reader. Internal public-profile bridge; no parser logic or host act."
+@category "engine-internal"
+regexToolRead : (tokens: List ({ ch: String, code: Number })) -> Result String RxNode
+
+@label "Regex semantic node kind"
+RegexNodeKind = RegexEmpty | RegexEmptyText | RegexLiteral | RegexCharacterClass | RegexAnyCharacter | RegexSequence | RegexAlternative | RegexRepetition | RegexNamedGroup
+
+@label "Regex code-point range"
+@description "Inclusive numeric character-class endpoints reported by the existing reader. Reversed endpoints and surrogate values retain inherited reader meanings; this projection does not validate Unicode scalar ranges."
+RegexCodeRange = RegexCodeRange lower: Nat upper: Nat
+
+@label "Regex semantic node"
+@description "One retained semantic node. Paths describe the reader's tree, not source offsets. Repetition maximum Nothing means unbounded when kind is RegexRepetition. Fields irrelevant to a kind stay empty or Nothing."
+RegexNodeBreakdown = RegexNodeBreakdown path: String depth: Nat kind: RegexNodeKind literal: Maybe String codePoint: Maybe Nat ranges: List RegexCodeRange negated: Bool minimum: Maybe Nat maximum: Maybe Nat retainedName: Maybe String
+
+@label "Regex inspection"
+@description "Exact source and a typed flattened projection of the existing reader's semantic tree. Counts cover semantic nodes and retained named groups, not all source parentheses or runtime captures. Root depth is zero."
+RegexInspection = RegexInspection source: String nodes: List RegexNodeBreakdown semanticNodeCount: Nat retainedNamedGroupCount: Nat maximumDepth: Nat explanation: String
+
+regexToolRow : (path: String) -> (depth: Nat) -> (kind: RegexNodeKind) -> (literal: Maybe String) -> (codePoint: Maybe Nat) -> (ranges: List RegexCodeRange) -> (negated: Bool) -> (minimum: Maybe Nat) -> (maximum: Maybe Nat) -> (retainedName: Maybe String) -> RegexNodeBreakdown
+regexToolRow path depth kind literal codePoint ranges negated minimum maximum retainedName = RegexNodeBreakdown { path = path, depth = depth, kind = kind, literal = literal, codePoint = codePoint, ranges = ranges, negated = negated, minimum = minimum, maximum = maximum, retainedName = retainedName }
+
+regexToolNodeRow : (node: RxNode) -> (path: String) -> (depth: Nat) -> RegexNodeBreakdown
+regexToolNodeRow node path depth = case node of
+  RxEmpty -> regexToolRow path depth (RegexEmpty) Nothing Nothing [] false Nothing Nothing Nothing
+  RxEps -> regexToolRow path depth (RegexEmptyText) Nothing Nothing [] false Nothing Nothing Nothing
+  RxChar character code -> regexToolRow path depth (RegexLiteral) (Just character) (Just code) [] false Nothing Nothing Nothing
+  RxCls ranges negated -> regexToolRow path depth (RegexCharacterClass) Nothing Nothing (map (\range -> RegexCodeRange { lower = range.lo, upper = range.hi }) ranges) negated Nothing Nothing Nothing
+  RxDot -> regexToolRow path depth (RegexAnyCharacter) Nothing Nothing [] false Nothing Nothing Nothing
+  RxSeq left right -> regexToolRow path depth (RegexSequence) Nothing Nothing [] false Nothing Nothing Nothing
+  RxAlt left right -> regexToolRow path depth (RegexAlternative) Nothing Nothing [] false Nothing Nothing Nothing
+  RxRep child minimum maximum -> regexToolRow path depth (RegexRepetition) Nothing Nothing [] false (Just minimum) (if maximum == -1 then Nothing else Just maximum) Nothing
+  RxGroup name child -> regexToolRow path depth (RegexNamedGroup) Nothing Nothing [] false Nothing Nothing (Just name)
+
+regexToolChildPath : (path: String) -> (child: String) -> String
+regexToolChildPath path child = join [path, ".", child] ""
+
+regexToolNatural : (value: Any) -> Bool
+regexToolNatural value = numberIsFinite value && value >= 0 && floor value == value
+
+regexToolCodePoint : (value: Any) -> Bool
+regexToolCodePoint value = regexToolNatural value && value <= 1114111
+
+regexToolNodeRepresentable : (node: RxNode) -> Bool
+regexToolNodeRepresentable node = case node of
+  RxEmpty -> true
+  RxEps -> true
+  RxDot -> true
+  RxSeq left right -> true
+  RxAlt left right -> true
+  RxChar character code -> isString character && length character == 1 && regexToolCodePoint code
+  RxCls ranges negated -> isArray ranges && isBoolean negated && all ranges (\range -> regexToolCodePoint range.lo && regexToolCodePoint range.hi)
+  RxRep child minimum maximum -> regexToolNatural minimum && (maximum == -1 || regexToolNatural maximum)
+  RxGroup name child -> isString name
+  _ -> false
+
+regexToolFlatten : (node: RxNode) -> (path: String) -> (depth: Nat) -> (rows: List RegexNodeBreakdown) -> Result String (List RegexNodeBreakdown)
+regexToolFlatten node path depth rows =
+  if depth > 64 then Err "The reader's semantic tree may reach at most depth 64, with the root at zero."
+  else if length rows >= 256 then Err "Inspect at most 256 semantic nodes."
+  else if not (regexToolNodeRepresentable node) then Err "The reader produced a node outside the declared typed projection."
+  else
+    let next = appendItem (regexToolNodeRow node path depth) rows
+    case node of
+      RxSeq left right -> bindResult (regexToolFlatten left (regexToolChildPath path "left") (depth + 1) next) (\collected -> regexToolFlatten right (regexToolChildPath path "right") (depth + 1) collected)
+      RxAlt left right -> bindResult (regexToolFlatten left (regexToolChildPath path "left") (depth + 1) next) (\collected -> regexToolFlatten right (regexToolChildPath path "right") (depth + 1) collected)
+      RxRep child minimum maximum -> regexToolFlatten child (regexToolChildPath path "child") (depth + 1) next
+      RxGroup name child -> regexToolFlatten child (regexToolChildPath path "child") (depth + 1) next
+      _ -> Ok next
+
+regexToolNamedGroupCount : (rows: List RegexNodeBreakdown) -> Nat
+regexToolNamedGroupCount rows =
+  let countGroup = \count row ->
+    case row.kind of
+      RegexNamedGroup -> count + 1
+      _ -> count
+  fold countGroup 0 rows
+
+@label "Inspect regex text"
+@description "Inspect at most 128 Unicode code points through Fenel's existing regex reader. See semantic paths, kinds, class ranges, repetitions and retained named-group nesting. Plain/noncapturing parentheses and boundary anchors disappear from this semantic tree; counts are not source group counts. Inherited escape/class/brace meanings remain, so acceptance is not full JavaScript Regex validity. No matching, query or program is executed. Trees over depth 64 or 256 nodes refuse."
+@tags "utility" "regex" "parse" "structure"
+inspectRegexText : (text: String) -> Result String RegexInspection
+inspectRegexText text =
+  if not (isString text) then Err "Expected regex source text."
+  else if length text > 128 then Err "Inspect at most 128 Unicode code points of regex source."
+  else
+    let tokens = map (\character -> { ch = character, code = charCode character }) (chars text)
+    bindResult (regexToolRead tokens) (\node -> bindResult (regexToolFlatten node "root" 0 []) (\rows ->
+      Ok (RegexInspection { source = text, nodes = rows, semanticNodeCount = length rows, retainedNamedGroupCount = regexToolNamedGroupCount rows, maximumDepth = fold (\depth row -> max depth row.depth) 0 rows, explanation = "The existing reader keeps semantic nodes and named groups. Plain/noncapturing wrappers and boundary anchors are absent. Paths are semantic positions, not source spans; counts are not all parentheses or runtime captures. Escape/class/brace meanings are Fenel's inherited fragment, not complete JavaScript Regex validation. Reversed ranges and surrogate values retain their reader meanings; numeric repetition bounds retain the reader's Number precision." })))
+
+@label "Inspect regex"
+@description "Edit ordinary multiline regex source and inspect the existing reader's typed semantic breakdown. Retained named groups, ranges, repetition bounds and node/depth counts stay ordinary data. This is a bounded Fenel-reader inspection, not a general JavaScript Regex validator or capture matcher."
+@tags "utility" "regex" "parse" "structure"
+inspectRegexInput : (input: ImportTextInput) -> Result String RegexInspection
+inspectRegexInput input = inspectRegexText input.text
+
+regexDemoStartingInputs : List ({ function: Any, arguments: List Any })
+regexDemoStartingInputs = [
+  { function = inspectRegexInput, arguments = [ImportTextInput { text = "^(?<word>(?<first>[A-Z])[a-z]+)-(?<digits>[0-9]{2,4})$" }] }
+]

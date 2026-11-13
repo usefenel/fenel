@@ -1,0 +1,148 @@
+-- =========================================================================
+-- Evaluator strategies — `eagerEval` / `lazyEval` / `partialEval` / `jitEval`
+-- foreign declarations. The four evaluation strategies (call-by-value,
+-- call-by-name, symbolic / Futamura specialiser, JIT = PE ∘ CompileJs ∘ exec)
+-- are native-backed: they re-enter the evaluator (and, for the JIT path, the
+-- partial-evaluator + compile-js pipeline), so a `.fenel` body can't express
+-- them. Their impls live in the `ffi/evaluator-strategies-ffi.ts` leaf.
+--
+-- module-substrate Phase 3h (2026-05-30) — evaluator-strategies is the
+-- representative of the LAST unproven native-tier axis: the BOTH-MAPS-FALLBACK.
+-- Unlike picture (a clean disjoint plain/ctx split) every one of these four
+-- fnIds is dual-registered — the SAME codeName lands in BOTH `evaluatorNatives`
+-- (plain) AND `evaluatorNativesCtx` (ctx). Both forward to the same underlying
+-- `*Native(expr, ctx?)` impl, differing only in whether `ctx` is threaded.
+-- At `applyOp` `ctx.nativesCtx` strictly wins, so the plain copy is dispatch-
+-- dead THERE — but it is LOAD-BEARING for direct test readers
+-- (`evaluator-dispatch.test.ts` builds its plain `natives` map from the
+-- re-exported `evaluatorNatives`), so the migration preserves both maps. The
+-- @native foreign decl is UNIFORM — plain-vs-ctx (here both-at-once) is decided
+-- ENTIRELY by which seam map the impl lands in; NO `@nativeCtx` marker is
+-- needed (axis #4 holds for the overlap case too).
+--
+-- HEADER WRINKLE — this file is HEADER-LESS (no `module evaluator-strategies
+-- where`): the parser rejects a hyphen in the `module … where` header name
+-- (`module evaluator-strategies where` → "Unexpected :"). The valid path the
+-- 143 pre-header files use: omit the header, let `effectiveName` fall back to
+-- the `loadFenelModule(TYPES_SRC, "evaluator-strategies")` name arg — so the
+-- `evaluator-strategies:` id-prefix is preserved byte-for-byte. Teaching the
+-- module-decl grammar to carry hyphenated names is the deferred hyphenated-
+-- module question (owed before the compile-{js,wasm,llvm} sweep).
+--
+-- The native categories are `evaluator` (NOT the `evaluator-strategies`
+-- header default), so each carries an explicit `@category "evaluator"`.
+-- 0 entities, 0 bodied helpers (all-natives, like `games`). The 4
+-- `Evaluator <Strategy>` dispatch instances stay in the sibling
+-- `instances.fenel` (loaded `{ dispatchInstanceFile: true }`), NOT here.
+-- expr-substrate Phase 8 (2026-06-16) added a 5th native, `evalApply` — the
+-- ctx-threaded apply seam behind the explicit-strategy entry `engine:evaluateWith`
+-- (CTX-ONLY, not part of the both-maps-fallback; see its decl below).
+-- =========================================================================
+
+-- ----- Foreign declarations (native-backed; impl in ffi/evaluator-strategies-ffi.ts) ----
+-- All four re-enter the engine evaluator. `eagerEval` / `lazyEval` wrap the
+-- direct `evaluate` path; `partialEval` walks the symbolic partial-evaluator;
+-- `jitEval` composes PE ∘ compile-js ∘ exec. Each is dual-registered into BOTH
+-- the plain and the ctx seam maps (the both-maps-fallback). No Fenel body: the
+-- registry resolves each call to the ffi leaf keyed by codeName.
+
+@native
+@label "Eager evaluate (call-by-value)"
+@description "Today's default Fenel evaluator wrapped as a typeclass-dispatched method. Evaluates every sub-expression in source order before passing values to operators / functions; throws-as-Err wraps exceptions into `Err InternalError`. Behaviour-faithful to the direct `evaluate` function from `json-logic.ts` — the EagerEvaluator instance's `eval` method id points here."
+@category "evaluator"
+@tags "evaluator" "strategy" "eager" "call-by-value"
+eagerEval : (expression: Expression, context: EvaluateContext) -> Result EvalError Value
+
+@native
+@label "Lazy evaluate (call-by-name)"
+@description "Call-by-name evaluator: function arguments are NOT pre-evaluated; each parameter reference inside the body re-evaluates the corresponding arg expression. Recognises `{call: [fnName, …args]}` shapes for user functions with a Fenel body; falls through to the eager path for everything else (literal expressions, single operator-ops, primitive calls). NOT call-by-need (no thunk memoisation) — re-evaluates each access. Phase 6 proof of concept; upgrade to call-by-need is straightforward."
+@category "evaluator"
+@tags "evaluator" "strategy" "lazy" "call-by-name"
+lazyEval : (expression: Expression, context: EvaluateContext) -> Result EvalError Value
+
+@native
+@label "Partial evaluate (symbolic / Futamura specialiser)"
+@description "Symbolic evaluator: walks the AST, substitutes known variable bindings, constant-folds pure sub-expressions, prunes dead branches under known conditions, β-reduces pure user-function calls (full eval when all args known; partial inline when some args remain residual). The output's value channel is either a concrete value (full reduction) or a residual JSON-Logic AST that, re-evaluated under any extension of the known-inputs context, computes the same value as the original. Composes with `Compilable JsModule` to derive the Futamura projection: specialise an interpreter to a program → the residual IS the program compiled. Reads known inputs from `ctx._known` and a recursive-inline depth budget from `ctx._partialBudget` (default 8)."
+@category "evaluator"
+@tags "evaluator" "strategy" "partial" "symbolic" "futamura" "specialiser"
+partialEval : (expression: Expression, context: EvaluateContext) -> Result EvalError Value
+
+@native
+@label "JIT evaluate (PE ∘ CompileJs ∘ exec)"
+@description "Just-in-time evaluator: partial-evaluate the input expression with known bindings, then if a residual remains, compile to JS via `compileFenelToJs` and execute via `new Function`. When PE fully reduces the input, the compile-and-exec round-trip is skipped and the concrete value passes through. This is the smallest demonstration of the Futamura projection composition working through the dispatch substrate; production-grade JIT (speculative deoptimisation, polymorphic inline caches, tiered compilation) is Phase 8+ work."
+@category "evaluator"
+@tags "evaluator" "strategy" "jit" "compile-and-exec" "futamura"
+jitEval : (expression: Expression, context: EvaluateContext) -> Result EvalError Value
+
+-- partial-evaluator-substrate Phase 1 — the CONST-FOLD host-`evaluate` re-entry
+-- behind the Fenel-bodied `engine:partialEvaluate` walker (brief:
+-- `workstreams/partial-evaluator-substrate/briefs/phase-1-faithful-port.md`).
+-- The PE walker decides fold-readiness (all leaves concrete-or-ELambda) and
+-- egresses the rebuilt call/construct tree via `exprToJsonLogic`; `peEval` is
+-- the irreducible final step — `evaluate(jl, {}, ctx)` in a try/catch ⇒ a
+-- `Result String a` (Ok folded value / Err host-throw message). NATIVE because
+-- a `.fenel` body cannot re-enter the host interpreter to const-fold a concrete
+-- call (the P8 `evalApply` precedent — the SAME irreducible host-evaluator
+-- re-entry category as the four `*Eval` natives + `evalApply`). CTX-ONLY (no
+-- plain-map copy: it needs the live ctx for user-function dispatch). LEDGERED:
+-- `design/ts-exceptions-ledger.md` (addition to the evaluator-strategies host-
+-- re-entry class). `@codeName` makes it globally resolvable from the engine body.
+@native
+@codeName "peEval"
+@label "PE const-fold (host evaluate re-entry)"
+@description "partial-evaluator-substrate Phase 1 const-fold seam: given a JSON-Logic value (the residualizing evaluator's rebuilt call/construct tree, egressed from Expr via `exprToJsonLogic`), evaluate it against an empty data context and the live EvaluateContext, returning `Ok foldedValue` on success or `Err message` on a host throw (the fall-to-residual signal). The fold-readiness decision (all leaves concrete-or-ELambda) happens in the Fenel body `engine:partialEvaluate`; this native is only the irreducible host-evaluator re-entry (a `.fenel` body cannot re-enter the interpreter). Folds higher-order calls for free — an egressed `{fn:…}` becomes a host closure. CTX-ONLY."
+@category "evaluator"
+@tags "evaluator" "partial-evaluation" "const-fold" "partial-evaluator-substrate" "phase-1"
+peEval : (jl: {  }) -> Result String a
+
+-- partial-evaluator-substrate Phase 1 Steps 3-5 — the β-REDUCE fn-spec
+-- introspection behind the Fenel-bodied `engine:partialEvaluate` walker (the
+-- Step-0 D-3 on-demand option: a pre-marshalled env can't know the transitively
+-- discovered fnId closure ahead of time without lifting the whole registry).
+-- Reads the THREADED ctx's `getFunction` (so the parity oracle's extra test fns
+-- resolve identically on both sides) and lifts the raw JSON-Logic body to `Expr`
+-- via the live `dispatchedJsonLogicToExpr` INSIDE the native — a lift `Err`
+-- (the adapter's Unsupported class) yields `body = Nothing`, which the walker
+-- treats as not-β-reducible (divergence class D-inline: TS specialises raw JL,
+-- Fenel leaves the residual call — tier-2 equal). Bodyless `@native` fns also
+-- yield `body = Nothing` (fold still applies; inline doesn't). NATIVE because a
+-- `.fenel` body cannot read the registry spec nor run the marshal boundary.
+-- CTX-ONLY. LEDGERED: `design/ts-exceptions-ledger.md` A2 (the second and LAST
+-- planned Phase-1 addition after `peEval`). Per-call, no cache (perf = 1R lever).
+@native
+@codeName "peFnSpec"
+@label "PE fn-spec introspection (β-reduce)"
+@description "partial-evaluator-substrate Phase 1 β-reduce seam: given a callee fnId, introspect the threaded context's registry spec and return `Nothing` (unregistered) or `Just { params, body }` where `params` is the declared param-name list and `body` is `Just <Expr>` (the raw JSON-Logic body lifted through jsonLogicToExpr inside the native) or `Nothing` (bodyless @native / a body the adapter cannot lift — the D-inline class). The Fenel body `engine:partialEvaluate` gates inlining on the foldable set + budget; this native is only the irreducible registry read + marshal boundary. CTX-ONLY."
+@category "evaluator"
+@tags "evaluator" "partial-evaluation" "beta-reduce" "introspection" "partial-evaluator-substrate" "phase-1"
+peFnSpec : (fnId: String) -> Maybe a
+
+-- expr-substrate Phase 8 — the APPLY SEAM behind the explicit-strategy entry
+-- `engine:evaluateWith` (brief:
+-- `workstreams/expr-substrate/briefs/phase-8-explicit-strategy-evaluate.md`).
+-- `evaluateWith strategy expr` does the DISPATCH in `.fenel` (resolve
+-- `Evaluator <strategy>` via `dispatchLookupOne`, read `.eval`); `evalApply`
+-- is the irreducible apply: invoke the resolved eval ctx-native on `expr`,
+-- threading the live `EvaluateContext`. NATIVE because a `.fenel` body cannot
+-- author the direct ctx-native call — EvaluateContext is not a Fenel value, AND
+-- the `*Eval` foreign decls declare 2 params (expression + ctx-threaded
+-- context), so the generic `{call:[fnId, expr]}` path returns a partial-app on a
+-- single arg (json-logic.ts arity check). Mirrors `makeStrategyWrapper`'s direct
+-- `ctx.nativesCtx[fnId](ctx, expr)` (which bypasses invokeFunction for the same
+-- reason). CTX-ONLY (no plain-map copy — it genuinely needs ctx). `@codeName`
+-- makes it globally resolvable from the `engine` module body.
+--
+-- modules-as-values (2026-09-24) — the first parameter is the `eval` method
+-- VALUE, typed as the strategy function it names (the shape of the four
+-- `*Eval` natives above): a function id string or a `{$ref}` reference to that
+-- function. The native resolves a reference to its canonical id through the
+-- threaded registry; one that resolves to no function is an `Err`. The inner
+-- parameters are positional, and the parameter keeps its name `evalFnId`: a
+-- named parameter is a field identity, so a new name is a new lock row.
+@native
+@codeName "evalApply"
+@label "Apply a resolved Evaluator eval method"
+@description "expr-substrate Phase 8 apply seam: given an already-resolved Evaluator `eval` method (the strategy function, named by its id such as \"evaluator-strategies:eagerEval\" or by a reference to it) and an Expression, invoke that strategy's evaluator on the expression, threading the live EvaluateContext, and return its `Result EvalError Value` verbatim. A reference that resolves to no function is an `Err InternalError`. The dispatch (resolving the `Evaluator <strategy>` instance and reading its `.eval`) happens in the Fenel body `engine:evaluateWith`; this native is only the irreducible ctx-threaded host-evaluator re-entry (a `.fenel` body cannot author the direct ctx-native call). Falls back to a registry call for user-defined Fenel-body strategies (none ship today)."
+@category "evaluator"
+@tags "evaluator" "strategy" "apply" "expr-substrate" "phase-8"
+evalApply : (evalFnId: ((Expression, EvaluateContext) -> Result EvalError Value), expression: Expression) -> Result EvalError Value

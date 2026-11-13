@@ -1,0 +1,163 @@
+module std where
+
+-- =========================================================================
+-- Real arithmetic — the PURE source of truth (numeric-tower Phase 4).
+--
+-- These bodies define arithmetic + comparison over the pure ADT
+--   Real = Real seq: (Nat -> Rational) modulus: (Nat -> Nat) converges: Cauchy
+-- (D3 — Cauchy-sequence-with-modulus; type-foundation / fenel/std/foundation.fenel).
+-- A real is an INFINITE object: `seq n` is the n-th rational approximation and
+-- `modulus k` is the index past which all terms agree within 1/2^k (the MODULUS
+-- CONVENTION, chosen at Step 0). They COMPOSE the Phase-3 Rational ops
+-- (ratAdd/ratSub/ratMul/ratNeg/ratLt) + the Phase-1 Nat ops (natMul/natLt) + the
+-- Phase-2 mkInt, building each result's seq/modulus POINTWISE from the operands.
+-- [[feedback_opaque_is_optimization]]
+--
+-- THE STRUCTURAL DIFFERENCE FROM THE FINITE RUNGS. Nat/Int/Rational each had a
+-- normalizing smart constructor (mkInt / mkRational) that put every value in a
+-- unique finite canonical form, which is what made their `eq` structural. A real
+-- has NO finite canonical form (it is an infinite object), so this rung BREAKS
+-- that inheritance: there is no `mkReal`; the modulus + the (stubbed) convergence
+-- proof carry the well-formedness the normalizer carried below. Consequently
+-- equality is NOT decidable by inspection — it goes PARTIAL (realLt/realEq below).
+--
+-- ARITHMETIC IS TOTAL; COMPARISON IS PARTIAL (D4 — the rung's reason to exist).
+-- realNegate/realAdd/realSub/realMul always produce a Real (construction is always
+-- defined). realLt/realEq return `Maybe Bool` — the FIRST typed-partial operations
+-- in the tower. Two reals are equal iff their sequences share a limit, but NO
+-- finite sampling can CONFIRM equality (they could agree to a billion digits then
+-- diverge); INEQUALITY is semi-decidable (sample until a SEPARATION WITNESS
+-- appears). So the comparisons sample both operands at increasing precision up to a
+-- modulus BUDGET (a Nat fuel arg), returning `Just …` on a separation witness and
+-- `Nothing` on budget exhaustion — SOUND by construction (never a `Just` without a
+-- witness). The `Nothing` IS the decidability boundary as a value (north-star §6/§9).
+--
+-- TOTALITY NOTE (a clarification, not the natGcd Unknown story). The comparison
+-- workhorse `realSeparate` recurses on the FUEL argument (`Succ f -> … f`), a
+-- STRUCTURAL decrease, so it terminates — the totality checker can certify it
+-- @total (or returns Unknown, tolerated). The "partiality" here is SEMANTIC (the
+-- `Maybe` codomain — Nothing = undecided-within-budget), NOT divergence: the
+-- functions are TOTAL with a typed-partial RESULT. So these are NOT marked
+-- @partial (that would be a false "may diverge" claim — cf. the natGcd/natDiv
+-- Unknown precedent, which IS about a non-structural measure; this is cleaner).
+--
+-- These are NEW, standalone, Real-typed fnIds (`std:realAdd` …). They are NOT
+-- added to `stdNatives`/`BUILTIN_OP_NATIVES` (the D1 shadow trap), NOT given a
+-- `defineFunction` TS spec, and do NOT touch the `Number` natives / DirectOp
+-- lowering (D2/D7 fences). Phase 5's `Numeric Real` instance will REFERENCE these.
+
+-- --- the tiny Nat helper this rung needs (the natGcd-homed-in-rational precedent) -
+-- natMax is conceptually a Nat op but is needed ONLY by the Real modulus
+-- combinators, so it is homed HERE to keep the frozen Phase-1 nat-arith.fenel
+-- untouched. Total (structural via natLt). fnId `std:natMax`.
+@label "Nat max"
+@description "The larger of two Nats: natMax a b = if natLt a b then b else a. The new Nat op the Real modulus combinators need (the modulus of a+b/a*b takes the max of the operands' moduli at a shifted precision). Homed in the real module to keep nat-arith.fenel frozen (the natGcd-in-rational precedent). Total."
+@tags "numeric" "nat" "max"
+natMax : (a: Nat) -> (b: Nat) -> Nat
+natMax a b = if natLt a b then b else a
+
+-- --- the combined-error bound at precision k -----------------------------------
+-- MODULUS CONVENTION = `1/(k+1)` (chosen at Step 0; the brief's `1/2^k` vs
+-- `1/(k+1)` fork). `modulus k` ⇒ all terms within 1/(k+1) of the limit. The
+-- combined-error bound used by the separation test is therefore ratEps2 k =
+-- 2/(k+1) — at precision k each operand's sampled approximation is within 1/(k+1)
+-- of its limit, so two reals are definitively separated when their samples differ
+-- by more than 2·(1/(k+1)) = ratEps2 k. WHY 1/(k+1) AND NOT 1/2^k: the bound is a
+-- plain `Succ k` denominator — NO `pow2` recursion. The `1/2^k` convention needs a
+-- `pow2 k` helper whose body is `natMul (pow2 p) 2` (recursive call as an arg to
+-- natMul), which triggers an engine scope-collision bug (a non-tail recursive
+-- caller whose pattern var collides with natMul's internal recursion var returns
+-- one-level-deep — see the roadmap Phase-4 surprises) AND materializes a 2^k-deep
+-- Peano spine (an interpreter blow-up). 1/(k+1) sidesteps BOTH at the cost of
+-- linear-instead-of-geometric precision convergence (the separation search just
+-- needs a few more iterations — fine for a fuel-bounded search). Decidability is
+-- unchanged; the convention is a constructive-content choice, not a semantic one.
+@label "Combined error bound 2/(k+1)"
+@description "The combined-error Rational 2/(k+1) at precision k = mkRational 2 (k+1), built via the NUMBER BRIDGES (numberToInt over add (natToNumber k) 1) rather than Succ-literals. WHY THE BRIDGE PATH: feeding a Succ-literal-built or mkInt-built Nat/Int (e.g. `mkInt (Succ k) False`) into mkRational — which runs natGcd/natDiv on it — triggers an engine evaluation blow-up (Maximum-call-stack; see the roadmap Phase-4 surprises), whereas numberToInt/numberToNat-built values feed the deep arithmetic recursion cleanly. So eps2 routes k through the bridge (Nat → Number → Int) — robust + still exact for the small k a fuel-bounded search reaches. The Real comparison separation test declares two reals separated when their sampled approximations differ by more than this. Decreases toward 0 linearly (the 1/(k+1) modulus convention)."
+@tags "numeric" "rational" "real" "epsilon"
+ratEps2 : (k: Nat) -> Rational
+ratEps2 k = mkRational (numberToInt 2) (numberToInt (add (natToNumber k) 1))
+
+-- --- TOTAL arithmetic — pointwise over the operands' sequences -----------------
+
+@label "Real negate"
+@description "Arithmetic negation, pointwise: (−a).seq n = ratNeg (a.seq n); the modulus is UNCHANGED (|−x − −y| = |x − y|). TOTAL. converges is the Axiom-discharged stub CauchyAx (the proof that ratNeg preserves Cauchy-ness with the same modulus is stated, not kernel-checked this phase)."
+@tags "numeric" "real" "unary"
+realNegate : (a: Real) -> Real
+realNegate a = case a of
+  Real { seq = sa, modulus = ma, converges = ca } -> Real { seq = \n -> ratNeg (sa n), modulus = ma, converges = CauchyAx }
+
+@label "Real add"
+@description "Addition, pointwise: (a+b).seq n = ratAdd (a.seq n) (b.seq n). MODULUS: to get the sum within 1/2^k, each summand must be within 1/2^(k+1), so (a+b).modulus k = natMax (a.modulus (Succ k)) (b.modulus (Succ k)) — the standard constructive-reals additive modulus. TOTAL. Composes ratAdd + natMax. converges = CauchyAx (stub)."
+@tags "numeric" "real"
+realAdd : (a: Real) -> (b: Real) -> Real
+realAdd a b = case a of
+  Real { seq = sa, modulus = ma, converges = ca } -> case b of
+    Real { seq = sb, modulus = mb, converges = cb } -> Real { seq = \n -> ratAdd (sa n) (sb n), modulus = \k -> natMax (ma (Succ k)) (mb (Succ k)), converges = CauchyAx }
+
+@label "Real subtract"
+@description "realSub a b = realAdd a (realNegate b). TOTAL."
+@tags "numeric" "real"
+realSub : (a: Real) -> (b: Real) -> Real
+realSub a b = realAdd a (realNegate b)
+
+@label "Real multiply"
+@description "Multiplication, pointwise: (a·b).seq n = ratMul (a.seq n) (b.seq n). MODULUS — STUB (flagged): a RIGOROUS multiplication modulus depends on the operands' MAGNITUDE bounds (to bound the product error |a·Δb + b·Δa| one needs N with 2^N ≥ |a|,|b|), which requires materializing magnitude bounds the kernel `converges` proof would carry. This phase uses the same conservative additive-shape modulus as realAdd — natMax (a.modulus (Succ k)) (b.modulus (Succ k)) — which is SOUND for the bounded-magnitude reals the tests exercise; the rigorous magnitude-aware modulus is DEFERRED alongside the kernel convergence proof (numeric-tower Phase 4 fence §3). TOTAL. Composes ratMul + natMax."
+@tags "numeric" "real"
+realMul : (a: Real) -> (b: Real) -> Real
+realMul a b = case a of
+  Real { seq = sa, modulus = ma, converges = ca } -> case b of
+    Real { seq = sb, modulus = mb, converges = cb } -> Real { seq = \n -> ratMul (sa n) (sb n), modulus = \k -> natMax (ma (Succ k)) (mb (Succ k)), converges = CauchyAx }
+
+-- --- PARTIAL comparison — the separation-witness search up to a fuel budget -----
+-- DECOMPOSED into three small decls (realSampleAt / sepDecision / realSeparate)
+-- rather than one monolith — the monolithic body exceeded the Fenel parser's
+-- 120-token-per-declaration cap (the ledgered perf-branch PVF_DECL_CAP, parser-
+-- substrate 7h) and would have FENCE-fallen to the TS parser. The split keeps every
+-- decl Fenel-DRIVEN AND is cleaner: realSampleAt is a genuinely useful accessor and
+-- sepDecision is the reusable per-precision decision.
+
+@label "Real sample-at"
+@description "Sample a Real's approximating sequence at precision k: realSampleAt r k = r.seq (r.modulus k) — the rational approximation guaranteed within 1/2^k of the limit. THE fundamental observation of a real (the comparison search + the realToNumber projection both sample through it)."
+@tags "numeric" "real" "sample"
+realSampleAt : (r: Real) -> (k: Nat) -> Rational
+realSampleAt r k = case r of
+  Real { seq = s, modulus = m, converges = c } -> s (m k)
+
+@label "Separation decision"
+@description "The per-precision 3-way separation decision over two sampled approximations pa, pb and the combined error bound eps2 = 2/2^k. If pa + eps2 < pb ⇒ the operands are definitively separated, first below second ⇒ Just True. If pb + eps2 < pa ⇒ separated, first above second ⇒ Just False. Otherwise the samples overlap within the combined error (cannot separate at this precision) ⇒ Nothing. SOUND — a Just is returned only with a genuine gap exceeding the combined sampling error."
+@tags "numeric" "real" "comparison"
+-- NOTE on `Just (True)` / `Just (False)`: the constructor args are PARENTHESIZED.
+-- A bare uppercase ident in argument position parses as a VARIABLE ref
+-- (`Just True` ⇒ {construct:["Just",{var:"True"}]} ⇒ Just null), so the nullary
+-- Bool constructor must be parenthesized to parse as a construct
+-- (`Just (True)` ⇒ {construct:["Just",{construct:["True"]}]} ⇒ Just true). See the
+-- roadmap Phase-4 surprises.
+sepDecision : (pa: Rational) -> (pb: Rational) -> (eps2: Rational) -> Maybe Bool
+sepDecision pa pb eps2 = if ratLt (ratAdd pa eps2) pb then Just (True) else if ratLt (ratAdd pb eps2) pa then Just (False) else Nothing
+
+@label "Real separate"
+@description "The comparison workhorse: search for a SEPARATION WITNESS between a and b, from precision k, within a fuel budget. At each precision k take sepDecision (realSampleAt a k) (realSampleAt b k) (ratEps2 k): a Just is a witness (Just True = a<b, Just False = a>b) returned immediately; a Nothing means the samples still overlap, so increase precision (Succ k), consume one fuel, and retry. Fuel exhausted (Zero) ⇒ Nothing (cannot decide within budget — NOT a wrong answer; includes the genuinely-equal case). Recurses STRUCTURALLY on fuel ⇒ total (the partiality is in the Maybe codomain, not termination)."
+@tags "numeric" "real" "comparison" "partial"
+realSeparate : (a: Real) -> (b: Real) -> (k: Nat) -> (fuel: Nat) -> Maybe Bool
+realSeparate a b k fuel = case fuel of
+  Zero -> Nothing
+  Succ f ->
+    let d = sepDecision (realSampleAt a k) (realSampleAt b k) (ratEps2 k)
+    case d of
+      Nothing -> realSeparate a b (Succ k) f
+      Just x -> Just x
+
+@label "Real less-than (partial)"
+@description "realLt a b fuel : Maybe Bool — strict order with an explicit Nat fuel budget. Delegates to realSeparate from precision Zero: Just True when a is witnessed below b within budget, Just False when a is witnessed above b, Nothing when the budget is exhausted without separation (the honest decidability boundary — real order is only SEMI-decidable). The FIRST typed-partial order op in the tower (Rational lt and below stay TOTAL). The fuel is explicit on the body; the call boundary supplies a sensible default."
+@tags "numeric" "real" "comparison" "partial"
+realLt : (a: Real) -> (b: Real) -> (fuel: Nat) -> Maybe Bool
+realLt a b fuel = realSeparate a b Zero fuel
+
+@label "Real equal (partial)"
+@description "realEq a b fuel : Maybe Bool — equality with an explicit Nat fuel budget. Equality is NEVER positively confirmable by finite sampling (the sequences could agree arbitrarily long then diverge), so this is SOUND-conservative: if a and b SEPARATE within budget (realSeparate returns Just _, either direction), they are unequal ⇒ Just False; otherwise ⇒ Nothing (cannot confirm equality). It NEVER returns Just True — the degenerate definitional Just-True (syntactic identity) is omitted as a deliberate soundness choice (never a Just we cannot witness). Nothing IS the decidability boundary as a value (D4/north-star §6)."
+@tags "numeric" "real" "comparison" "partial"
+realEq : (a: Real) -> (b: Real) -> (fuel: Nat) -> Maybe Bool
+realEq a b fuel = case realSeparate a b Zero fuel of
+  Nothing -> Nothing
+  Just sep -> Just (False)

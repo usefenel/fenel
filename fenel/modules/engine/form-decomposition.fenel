@@ -1,0 +1,1263 @@
+module engine where
+
+-- =========================================================================
+-- form-decomposition.fenel — the SHARED raw-form decomposition (signature-
+-- substrate Phase 4+4b slice 3e). The `fdc*` family.
+--
+-- WHY THIS MODULE EXISTS. Three walkers traverse the same raw evaluator form
+-- set: the TS host `evaluate` / `matchPattern` (the CONCRETE semantics, the
+-- oracle), the `vlg*` signature-use ledger, and the `vob*` observation
+-- provenance analysis. The two analyses each re-derived, BY HAND, the same
+-- STRUCTURAL facts — where a lambda's parameters and body are, which children
+-- are raw versus evaluated, what binders a form writes and in what order,
+-- which matcher tests run in what sequence, which argument index is the
+-- callee. Every recent defect has been one of those, and they are not
+-- analysis-specific: the analyses differ in what they DO with a decomposed
+-- form, not in how the runtime decomposes it. They now delegate here.
+--
+-- WHAT IS SHARED IS A SYNTACTIC PLAN, NOT A DECISION. `vlg*` deliberately
+-- treats patterns as binder-only while `vob*` attaches observation effects to
+-- the same runtime operations. That is a principled difference. Sharing is
+-- coherent precisely because nothing below decides anything: no analysis
+-- accumulator, no provenance, no reasons, no verdict.
+--
+-- "STATE-FREE" MEANS NO ANALYSIS STATE — NOT "NO FROZEN CONTEXT". Some
+-- decompositions genuinely depend on context the evaluator holds
+-- (constructor wire-name projection, the named-versus-positional payload
+-- reading, the pattern field-key table). Those return an EXPLICIT unresolved
+-- case rather than guessing.
+--
+-- EVERY CLAIM BELOW WAS PROBED, NOT READ. The pins in
+-- `signature-form-decomposition.test.ts` call the exported `evaluate` and
+-- `matchPattern` directly and read the answer off the runtime. Source-text
+-- extraction is a drift SENTINEL only. The seven load-bearing answers, as
+-- observed:
+--
+--   * flat  `{fn: ["x", ["y","z"], body]}` binds TWO names, `x` and `"y,z"`
+--     — the runtime String()-coerces each leading argument, so the ARRAY is
+--     ONE binder. Both analyses expanded it into two. They AGREED, and they
+--     were both wrong, which is why walker-agreement is not a safety net.
+--   * canonical `{fn: [[["x"]], body]}` binds ONE name, `x` — the canonical
+--     parameter vector is taken VERBATIM and each entry becomes a property
+--     key at bind time (ToPropertyKey), so a nested array coerces to `x`.
+--   * canonical trailing items are IGNORED (`body` is args[1], full stop).
+--   * `$bind` is TERMINAL: siblings are never visited.
+--   * `{match: [x]}` does NOT evaluate `x` — `matchOp` returns before it.
+--   * `missing` / `missing_some` never evaluate their arguments.
+--   * a `$tag` in a BINDINGS RECORD is an ordinary binding (`Object.entries`
+--     enumerates it); a `$tag` on the do-item CARRIER is not.
+--
+-- SCOPE FENCE. The plan describes the runtime's own decomposition. It does
+-- NOT describe: which arm a match selects (three of `matchPattern`'s six
+-- steps depend on the SCRUTINEE), which binder write wins (conditional on
+-- matching), or whether a key resolves (that is the frozen frame's answer).
+-- Each of those is surfaced as an explicit unresolved/conditional case.
+--
+-- INERT. This module computes plans. It mints no authority, consults no
+-- certificate, and is consumed by no checker, decider, kernel, or dispatch
+-- path — the phase-4 static gate proves it.
+--
+-- Constructor names carry the `Fdc` family prefix because constructor ids are
+-- repo-global.
+-- =========================================================================
+
+-- ---- the top-level node classification -----------------------------------
+
+-- The five exits of `evaluate`'s dispatch cascade, in the runtime's own
+-- recognition order. `FdcPlanKeyed` is the ONE genuinely resolution-dependent
+-- top-level decision: the runtime asks `ctx.getFunction(op) || op in
+-- BUILTIN_OP_NATIVES` and only falls back to the inert/record reading on a
+-- miss, so the plan carries the fallback rather than guessing the answer.
+FdcNodePlan =
+  FdcPlanInert reason: String
+  | FdcPlanSeq items: a
+  | FdcPlanRecord fields: a
+  | FdcPlanOp op: String rawArgs: (JsonLogic Any) argList: a schedule: FdcSchedule
+  | FdcPlanKeyed op: String rawArgs: (JsonLogic Any) argList: a unresolved: FdcKeyedFallback
+
+-- What the runtime does with a single-key object whose key resolves to
+-- NOTHING: a `$`-prefixed key is an inert data marker, anything else is a
+-- single-field record literal whose VALUE is the evaluated child.
+FdcKeyedFallback = FdcKeyedInert | FdcKeyedField key: String
+
+-- One KNOWN_OP's child schedule: the semantic form plus which argument slots
+-- the runtime actually evaluates.
+FdcSchedule = FdcSchedule form: FdcForm slots: FdcSlots
+
+-- WHICH SLOTS ARE EVALUATED. `FdcSlotsAll` is the exception, not the rule —
+-- most eager intrinsics read a FIXED number of slots and ignore the rest, and
+-- two of them evaluate NOTHING at the wrong arity. Both analyses walked every
+-- slot of every eager op, minting rows and observations for children the
+-- runtime is guaranteed never to reach.
+FdcSlots =
+  FdcSlotsNone
+  | FdcSlotsAll
+  | FdcSlotsFirst take: Nat
+  | FdcSlotsExact arity: Nat
+  | FdcSlotsGated minArity: Nat take: Nat
+  | FdcSlotsSkip take: Nat skip: Nat
+
+-- The closed semantic classification of the 40 KNOWN_OPS. Closed by
+-- construction: `fdcOpSchedule` is the single table and `fdcIsKnownOp` reads
+-- it, so a new op cannot be known to one consumer and unknown to another.
+FdcForm =
+  FdcFormVar
+  | FdcFormEnvPath kind: String
+  | FdcFormLazy
+  | FdcFormEager
+  | FdcFormRawRule ruleIndex: Nat
+  | FdcFormAnn
+  | FdcFormBinding kind: String
+  | FdcFormMatch
+  | FdcFormLambda
+  | FdcFormCall
+  | FdcFormConstruct
+  | FdcFormMethod
+  | FdcFormWithInstance
+  | FdcFormTypeDef
+  | FdcFormDynamicApply kind: String
+
+-- ---- names ---------------------------------------------------------------
+
+-- The binder spelling a raw entry installs. `FdcNameLiteral` is a written
+-- name; `FdcNameCoerced` is one the runtime MANUFACTURES by string coercion
+-- and this decomposition reproduces EXACTLY; `FdcNameOpaque` is one it
+-- refuses to reproduce, and every consumer must FENCE there rather than
+-- invent a spelling.
+--
+-- THE LITERAL/COERCED DISTINCTION IS LOAD-BEARING, not cosmetic:
+-- `maybeReorderNamedArgs` tests the RAW parameter entries for a named-record
+-- call, so a canonical `[["x"]]` parameter installs the binder `x` yet does
+-- NOT accept `{x = …}` as a named argument, while a flat `"x"` does.
+FdcParamName =
+  FdcNameLiteral name: String
+  | FdcNameCoerced name: String
+  | FdcNameOpaque reason: String
+
+-- ---- lambda --------------------------------------------------------------
+
+FdcLambdaParam = FdcLambdaParam raw: (JsonLogic Any) name: FdcParamName
+
+-- ONE layout, not separate parameter and body functions — separate functions
+-- can disagree, and that disagreement is how the flat-array defect survived
+-- in both analyses.
+FdcLambdaLayout = FdcLambdaLayout grammar: String params: [FdcLambdaParam] bodyPresent: Boolean body: (JsonLogic Any) ignored: a namesTotal: Boolean
+
+-- ---- patterns ------------------------------------------------------------
+
+FdcPatFieldRole = FdcPatRoleWireTag | FdcPatRolePayload
+
+FdcPatField = FdcPatField key: String value: (JsonLogic Any) role: FdcPatFieldRole
+
+-- The ORDERED conditional matcher tests, in `matchPattern`'s own order — NOT
+-- a selected arm. The wildcard, `$bind`, and the structural arms are decided
+-- by the pattern alone; identity and the Boolean-representation coercion
+-- depend on the SCRUTINEE, so they appear as steps that COULD fire.
+FdcPatternStep =
+  FdcPatWildcard
+  | FdcPatBind name: FdcParamName
+  | FdcPatIdentity
+  | FdcPatBoolRepr tag: String
+  | FdcPatWireRoute tag: String
+  | FdcPatFields fields: [FdcPatField]
+  | FdcPatItems items: a
+  | FdcPatFail
+
+-- `boolReprPossible` is the one fact a consumer cannot recompute from the
+-- step list without re-deriving the rule: an earlier successful Boolean-repr
+-- match produces an EMPTY binding set, so any binder underneath is
+-- CONDITIONAL on the scrutinee not being a native boolean.
+FdcPatternPlan = FdcPatternPlan steps: [FdcPatternStep] boolReprPossible: Boolean
+
+FdcBindRoute = FdcBindWhole | FdcBindField key: String | FdcBindItem index: Nat
+
+-- One binder write in RUNTIME WRITE ORDER. `conditional` records that an
+-- earlier matcher step could succeed WITHOUT performing this write, which is
+-- the state-dependence a state-free plan must not hide. The overwrite RULE (a
+-- later successful write replaces an earlier one at the same name) IS
+-- state-free and holds for this list; "the winner" is not, and is not offered.
+FdcBindWrite = FdcBindWrite name: FdcParamName route: [FdcBindRoute] conditional: Boolean
+
+-- ---- match ---------------------------------------------------------------
+
+FdcMatchArm = FdcMatchArm index: Nat pattern: (JsonLogic Any) guarded: Boolean guard: (JsonLogic Any) body: (JsonLogic Any)
+
+FdcMatchLayout = FdcMatchLayout scrutineePresent: Boolean scrutinee: (JsonLogic Any) arms: [FdcMatchArm] fallbackPresent: Boolean fallbackIndex: Nat fallback: (JsonLogic Any)
+
+-- ---- calls ---------------------------------------------------------------
+
+FdcCallRole = FdcRoleCallee | FdcRoleActual | FdcRoleRawName | FdcRoleIgnored
+
+-- BOTH coordinate systems, exposed. `vlg*` numbers actuals from logical 0 and
+-- `vob*` from the raw index; a shared layout that silently picked one would
+-- break the other consumer's paths.
+FdcCallSlot = FdcCallSlot rawIndex: Nat logicalIndex: Nat role: FdcCallRole node: (JsonLogic Any) evaluated: Boolean
+
+FdcCalleeKind =
+  FdcCalleeName name: String
+  | FdcCalleeDollar
+  | FdcCalleeVar name: String
+  | FdcCalleeExpr
+  | FdcCalleeAbsent
+
+FdcCallLayout = FdcCallLayout form: String callee: FdcCalleeKind calleePresent: Boolean calleeNode: (JsonLogic Any) slots: [FdcCallSlot] actualCount: Nat
+
+-- ---- bindings ------------------------------------------------------------
+
+FdcBindingEntry = FdcBindingEntry name: String index: Nat value: (JsonLogic Any)
+
+-- PRESENCE IS SEPARATE FROM EMPTINESS. The runtime detects an inline `do` let
+-- by the KEY being present, so an absent `let` and a present-but-empty one
+-- are different answers and conflating them replaces a live binding scope
+-- with the enclosing one.
+--
+-- `total = false` means the entry list is NOT the one the runtime enumerates
+-- and the consumer must fence.
+FdcBindingLayout = FdcBindingLayout kind: String present: Boolean entries: [FdcBindingEntry] bodyPresent: Boolean body: (JsonLogic Any) total: Boolean reason: String
+
+-- ---- construction --------------------------------------------------------
+
+-- The named-versus-positional payload reading is decided by the CONSTRUCTOR
+-- TABLE (`ctx._constructors` / the dynamic table), which a pure body does not
+-- have. Rather than have each consumer guess it separately, the layout
+-- publishes BOTH readings once and flags that the choice is unresolved.
+FdcCtorLayout = FdcCtorLayout namePresent: Boolean name: String payload: a namedFields: a namedPossible: Boolean needsTable: Boolean boolFastPath: Boolean
+
+-- ---- the evaluator's structural exit inventory (D5) ----------------------
+
+-- One structural exit of `evaluate`. This is the STRUCTURAL half of what
+-- slice 3d pinned as `obs.form.arms`: the exit set itself is a property of
+-- the evaluator, shared by every walker. The mapping of these exits onto an
+-- analysis's own semantic transfer classes stays with that analysis.
+--
+-- HONEST CLASSIFICATION: a source-DRIFT sentinel, not a theorem. Nothing here
+-- proves the list is complete; it fails loudly when the evaluator grows an
+-- exit the table does not name.
+FdcExitArm = FdcExitArm id: String reachable: Boolean note: String
+
+-- =========================================================================
+-- names — the string coercion the runtime performs on a raw entry
+-- =========================================================================
+
+-- fdcCoerceName — the binder spelling a raw entry installs, at TOP level.
+--
+-- Both lambda grammars converge here. The flat grammar applies `String` at
+-- closure-construction time; the canonical grammar keeps the entry verbatim
+-- and the coercion happens when the invoker installs it with
+-- `Object.defineProperty`, whose key goes through ToPropertyKey. Either way
+-- the installed spelling is the entry's string form, and `$bind` uses the
+-- same `String` call.
+--
+-- WHAT IS REPRODUCED, AND WHY THE REST IS REFUSED. A literal string is
+-- itself. An array is its `join(",")` over recursively-stringified elements —
+-- exactly reproducible with pure string operations, and the case that closes
+-- the shared flat-lambda defect. Numbers, booleans, objects and nulls are
+-- refused: a marshalled `JlNull` conflates host null, undefined, and
+-- unsupported host shapes, whose coercions differ ("null" / "undefined" / the
+-- function source), and rendering a host number from a cloned analysis
+-- context is the recorded `[object Object]` landmine. Refusing them costs
+-- coverage on shapes the corpus does not contain; guessing them would mint a
+-- spelling the runtime never installs.
+@label "Decompose coerced name"
+@description "The binder spelling a raw entry installs. A literal string is itself; an array is its recursive comma-join (exactly what String() produces, which is how a flat lambda's array parameter becomes ONE binder); every other shape is opaque and the consumer must fence rather than invent a spelling."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcCoerceName : (node: (JsonLogic Any)) -> FdcParamName
+fdcCoerceName node =
+  case node of
+    JlString { value = v } -> FdcNameLiteral { name = v }
+    JlArray { items = xs } ->
+      case fdcArrayName xs of
+        Nothing -> FdcNameOpaque { reason = "array entry contains a shape whose string coercion is not reproducible" }
+        Just n -> FdcNameCoerced { name = n }
+    _ -> FdcNameOpaque { reason = "entry is not a literal name and its string coercion is not reproducible" }
+
+-- fdcArrayName — `String(array)`: `Array.prototype.toString` is `join(",")`,
+-- and `String` of a nested array is its own join. The join is performed at
+-- EVERY array node rather than over flattened leaves, because an empty nested
+-- array still contributes a separator (`String(["a",[],"b"])` is `"a,,b"`,
+-- not `"a,b"`).
+@label "Decompose array name"
+@description "String(array) as the runtime produces it: join(\",\") over recursively stringified elements, performed at every array node — an empty nested array still contributes its separator. Nothing when any element's coercion is not reproducible."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcArrayName : (items: a) -> Maybe String
+fdcArrayName items = fdcArrayNameGo items "" true
+
+@label "Decompose array name fold"
+@description "The comma-join fold behind fdcArrayName. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcArrayNameGo : (items: a) -> (acc: String) -> (first: Boolean) -> Maybe String
+fdcArrayNameGo items acc first =
+  case head items of
+    Nothing -> Just acc
+    Just item ->
+      case fdcElemName item of
+        Nothing -> Nothing
+        Just piece ->
+          let acc2 = if first then piece else concat acc (concat "," piece)
+          fdcArrayNameGo (eufRest items) acc2 false
+
+@label "Decompose array element name"
+@description "One array element's contribution to String(array). A literal string is itself and a nested array is its own join; every other shape is unreproducible. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcElemName : (item: (JsonLogic Any)) -> Maybe String
+fdcElemName item =
+  case item of
+    JlString { value = v } -> Just v
+    JlArray { items = xs } -> fdcArrayName xs
+    _ -> Nothing
+
+@label "Decompose name is exact"
+@description "True when a coerced name is exactly recoverable (literal or reproducibly coerced), false for an opaque one."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcNameExact : (n: FdcParamName) -> Boolean
+fdcNameExact n =
+  case n of
+    FdcNameLiteral -> true
+    FdcNameCoerced -> true
+    FdcNameOpaque -> false
+
+@label "Decompose name spelling"
+@description "The installed spelling of an exact name; the empty string for an opaque one (which no consumer may use — check fdcNameExact first)."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcNameSpelling : (n: FdcParamName) -> String
+fdcNameSpelling n =
+  case n of
+    FdcNameLiteral { name = s } -> s
+    FdcNameCoerced { name = s } -> s
+    FdcNameOpaque -> ""
+
+-- =========================================================================
+-- the top-level node plan
+-- =========================================================================
+
+-- fdcNodePlan — `evaluate`'s dispatch cascade, arm for arm.
+--
+-- ORDER IS THE CONTENT. A `$tag`-bearing object is self-evaluating BEFORE the
+-- key count is examined, so a single-key `{$tag: <non-string>}` is inert and
+-- never reaches key-as-fnId resolution — and the marshaller only produces
+-- `JlTagged` for a STRING tag, so that shape arrives as a `JlObject` and has
+-- to be recognized here. Key-as-fnId resolution is tried BEFORE the
+-- `$`-prefix inertness rule, which is why the fallback rides on the plan
+-- instead of being applied eagerly.
+@label "Decompose node plan"
+@description "The top-level form classification and child schedule, mirroring `evaluate`'s dispatch cascade arm for arm: scalars and $tag-bearing objects are inert, arrays are elementwise literals, single-key KNOWN_OPS carry their child schedule, any other single key is decided by RESOLUTION with its fallback attached, and remaining multi-key objects are record literals."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcNodePlan : (node: (JsonLogic Any)) -> FdcNodePlan
+fdcNodePlan node =
+  case node of
+    JlNull -> FdcPlanInert { reason = "scalar" }
+    JlBool -> FdcPlanInert { reason = "scalar" }
+    JlNumber -> FdcPlanInert { reason = "scalar" }
+    JlString -> FdcPlanInert { reason = "scalar" }
+    JlArray { items = xs } -> FdcPlanSeq { items = xs }
+    JlTagged -> FdcPlanInert { reason = "self-evaluating tagged value" }
+    JlObject { fields = fs } ->
+      if fdcHasTagField fs
+      then FdcPlanInert { reason = "self-evaluating tagged value" }
+      else if eq (length fs) 1
+      then fdcSingleKeyPlan (unwrapFirstField fs)
+      else if objectHasDollarPrefixedKey fs
+      then FdcPlanInert { reason = "dollar-prefixed data marker" }
+      else FdcPlanRecord { fields = fs }
+
+-- The runtime's `"$tag" in rule` test runs before the key count, and a
+-- non-string `$tag` marshals to a plain `JlObject`, so the recognizer has to
+-- look for the FIELD rather than rely on the `JlTagged` carrier.
+@label "Decompose has tag field"
+@description "True when an object carries a `$tag` field. The runtime returns any such object untouched BEFORE examining the key count, and a non-string $tag marshals as a plain object, so the recognizer looks for the field rather than the tagged carrier. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcHasTagField : (fields: a) -> Boolean
+fdcHasTagField fields =
+  case lookupFieldInList "$tag" fields of
+    Nothing -> false
+    Just -> true
+
+@label "Decompose single key plan"
+@description "The single-key object arm: a KNOWN_OP carries its schedule; any other key is the resolution-dependent key-as-fnId form, whose unresolved fallback is an inert `$`-marker or a single-field record literal. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcSingleKeyPlan : (field: a) -> FdcNodePlan
+fdcSingleKeyPlan field =
+  let argList = normalizeToArgList field.value []
+  case fdcOpSchedule field.name of
+    Just sched -> FdcPlanOp { op = field.name, rawArgs = field.value, argList = argList, schedule = sched }
+    Nothing ->
+      let fallback =
+            if startsWith field.name "$"
+            then FdcKeyedInert
+            else FdcKeyedField { key = field.name }
+      FdcPlanKeyed { op = field.name, rawArgs = field.value, argList = argList, unresolved = fallback }
+
+-- =========================================================================
+-- the KNOWN_OPS schedule table — the single closed classification
+-- =========================================================================
+
+-- fdcOpSchedule — every KNOWN_OP, its semantic form, and WHICH SLOTS the
+-- runtime evaluates.
+--
+-- The slot half is where both analyses were wrong. `min` / `max` / `merge`
+-- consume every supplied slot; nothing else eager does. The bitwise binaries
+-- read exactly two, `~` and `length` exactly one, `in` two, `substr` two plus
+-- an optional third. `deepEq` and `withInstance` evaluate NOTHING unless the
+-- arity is exactly two. `|>` and `apply` evaluate nothing below arity two and
+-- then only the first two. Walking the residue mints rows and observations
+-- for children the runtime is guaranteed never to reach.
+@label "Decompose op schedule"
+@description "The closed classification of every KNOWN_OP: its semantic form plus which argument slots the runtime actually evaluates. Nothing for a key that is not a KNOWN_OP (which makes it the key-as-fnId call form). This is the single table — fdcIsKnownOp reads it rather than repeating the list."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcOpSchedule : (op: String) -> Maybe FdcSchedule
+fdcOpSchedule op =
+  if eq op "var" then Just (FdcSchedule { form = FdcFormVar, slots = FdcSlotsNone })
+  else if eq op "missing" then Just (FdcSchedule { form = FdcFormEnvPath { kind = "missing" }, slots = FdcSlotsNone })
+  else if eq op "missing_some" then Just (FdcSchedule { form = FdcFormEnvPath { kind = "missing_some" }, slots = FdcSlotsNone })
+  else if eq op "if" then Just (FdcSchedule { form = FdcFormLazy, slots = FdcSlotsAll })
+  else if eq op "?:" then Just (FdcSchedule { form = FdcFormLazy, slots = FdcSlotsAll })
+  else if eq op "and" then Just (FdcSchedule { form = FdcFormLazy, slots = FdcSlotsAll })
+  else if eq op "or" then Just (FdcSchedule { form = FdcFormLazy, slots = FdcSlotsAll })
+  else if eq op "match" then Just (FdcSchedule { form = FdcFormMatch, slots = FdcSlotsNone })
+  else if eq op "min" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsAll })
+  else if eq op "max" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsAll })
+  else if eq op "merge" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsAll })
+  else if eq op "&" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsFirst { take = 2 } })
+  else if eq op "|" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsFirst { take = 2 } })
+  else if eq op "^" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsFirst { take = 2 } })
+  else if eq op "<<" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsFirst { take = 2 } })
+  else if eq op ">>" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsFirst { take = 2 } })
+  else if eq op "in" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsFirst { take = 2 } })
+  else if eq op "~" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsFirst { take = 1 } })
+  else if eq op "length" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsFirst { take = 1 } })
+  else if eq op "substr" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsFirst { take = 3 } })
+  else if eq op "deepEq" then Just (FdcSchedule { form = FdcFormEager, slots = FdcSlotsExact { arity = 2 } })
+  else if eq op "map" then Just (FdcSchedule { form = FdcFormRawRule { ruleIndex = 1 }, slots = FdcSlotsSkip { take = 2, skip = 1 } })
+  else if eq op "filter" then Just (FdcSchedule { form = FdcFormRawRule { ruleIndex = 1 }, slots = FdcSlotsSkip { take = 2, skip = 1 } })
+  else if eq op "all" then Just (FdcSchedule { form = FdcFormRawRule { ruleIndex = 1 }, slots = FdcSlotsSkip { take = 2, skip = 1 } })
+  else if eq op "some" then Just (FdcSchedule { form = FdcFormRawRule { ruleIndex = 1 }, slots = FdcSlotsSkip { take = 2, skip = 1 } })
+  else if eq op "none" then Just (FdcSchedule { form = FdcFormRawRule { ruleIndex = 1 }, slots = FdcSlotsSkip { take = 2, skip = 1 } })
+  else if eq op "reduce" then Just (FdcSchedule { form = FdcFormRawRule { ruleIndex = 1 }, slots = FdcSlotsSkip { take = 3, skip = 1 } })
+  else if eq op "let" then Just (FdcSchedule { form = FdcFormBinding { kind = "let" }, slots = FdcSlotsNone })
+  else if eq op "do" then Just (FdcSchedule { form = FdcFormBinding { kind = "do" }, slots = FdcSlotsNone })
+  else if eq op "where" then Just (FdcSchedule { form = FdcFormBinding { kind = "where" }, slots = FdcSlotsNone })
+  else if eq op "ann" then Just (FdcSchedule { form = FdcFormAnn, slots = FdcSlotsFirst { take = 1 } })
+  else if eq op "withInstance" then Just (FdcSchedule { form = FdcFormWithInstance, slots = FdcSlotsExact { arity = 2 } })
+  else if eq op "type_def" then Just (FdcSchedule { form = FdcFormTypeDef, slots = FdcSlotsNone })
+  else if eq op "construct" then Just (FdcSchedule { form = FdcFormConstruct, slots = FdcSlotsNone })
+  else if eq op "method" then Just (FdcSchedule { form = FdcFormMethod, slots = FdcSlotsNone })
+  else if eq op "call" then Just (FdcSchedule { form = FdcFormCall, slots = FdcSlotsNone })
+  else if eq op "fn" then Just (FdcSchedule { form = FdcFormLambda, slots = FdcSlotsNone })
+  else if eq op "apply" then Just (FdcSchedule { form = FdcFormDynamicApply { kind = "apply" }, slots = FdcSlotsGated { minArity = 2, take = 2 } })
+  else if eq op "|>" then Just (FdcSchedule { form = FdcFormDynamicApply { kind = "pipe-bin" }, slots = FdcSlotsGated { minArity = 2, take = 2 } })
+  else if eq op "pipe" then Just (FdcSchedule { form = FdcFormDynamicApply { kind = "pipe" }, slots = FdcSlotsAll })
+  else Nothing
+
+-- fdcOpNames — the same forty names the schedule table decides, enumerated.
+--
+-- UNIT PARAMETER, and it is not decoration: a bare lowercase identifier with
+-- no lexical binding resolves through `resolveVar`'s registry fall-through to
+-- a `{$ref: id}` VALUE rather than being CALLED, so a nullary enumeration
+-- referenced by name would hand every consumer a reference instead of a list.
+--
+-- This is the ROSTER half of the single table: a consumer that needs to
+-- enumerate the ops reads it here rather than keeping its own copy, so an op
+-- cannot be known to the schedule and absent from a consumer's roster.
+@label "Decompose op names"
+@description "All forty KNOWN_OPS verbatim — the roster half of the single schedule table, so no consumer keeps its own copy. The unit parameter forces a real application (a bare nullary name would resolve to a reference value, not a call)."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcOpNames : (unit: Any) -> List String
+fdcOpNames unit =
+  [ "var", "missing", "missing_some"
+  , "if", "?:", "match", "and", "or"
+  , "min", "max"
+  , "&", "|", "^", "~", "<<", ">>"
+  , "substr", "length"
+  , "in", "merge", "map", "filter", "reduce", "all", "some", "none"
+  , "let", "do", "ann", "where", "withInstance"
+  , "type_def", "construct"
+  , "method"
+  , "deepEq"
+  , "call", "pipe", "|>", "fn", "apply"
+  ]
+
+@label "Decompose is known op"
+@description "True for a KNOWN_OP. Reads the single schedule table rather than repeating the list, so a known op cannot be known to one consumer and unknown to another."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcIsKnownOp : (op: String) -> Boolean
+fdcIsKnownOp op =
+  case fdcOpSchedule op of
+    Nothing -> false
+    Just -> true
+
+-- fdcScheduledSlots — the argument nodes the runtime actually evaluates,
+-- paired with their RAW index, given a slot schedule and the argument list.
+@label "Decompose scheduled slots"
+@description "The argument nodes the runtime actually evaluates for a slot schedule, each paired with its RAW argument index. A gated or exact-arity schedule whose precondition fails yields the empty list."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcScheduledSlots : (slots: FdcSlots) -> (argList: a) -> [FdcCallSlot]
+fdcScheduledSlots slots argList =
+  let n = length argList
+  case slots of
+    FdcSlotsNone -> []
+    FdcSlotsAll -> fdcTakeSlots argList n 0 []
+    FdcSlotsFirst { take = k } -> fdcTakeSlots argList k 0 []
+    FdcSlotsExact { arity = k } -> if eq n k then fdcTakeSlots argList k 0 [] else []
+    FdcSlotsGated { minArity = m, take = k } -> if lt n m then [] else fdcTakeSlots argList k 0 []
+    FdcSlotsSkip { take = k, skip = s } -> fdcSkipSlots (fdcTakeSlots argList k 0 []) s []
+
+-- A raw-RULE slot is not an expression the runtime evaluates in the current
+-- environment — it is an AST re-evaluated per element in a DERIVED data
+-- context — so it is excluded from the evaluated schedule and reached through
+-- the form's own `ruleIndex` instead. `reduce` is why this cannot be a plain
+-- "first N": it evaluates slots 0 and 2 with the RULE between them.
+@label "Decompose skip slot"
+@description "Drop the raw-RULE slot from an evaluated schedule. The rule is not evaluated in the current environment — it is re-evaluated per element in a derived data context — and reduce evaluates the slots on BOTH sides of it, which is why the schedule cannot be a plain prefix. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcSkipSlots : (slots: [FdcCallSlot]) -> (skip: Nat) -> (acc: [FdcCallSlot]) -> [FdcCallSlot]
+fdcSkipSlots slots skip acc =
+  case head slots of
+    Nothing -> acc
+    Just s ->
+      let next = if eq s.rawIndex skip then acc else appendItem s acc
+      fdcSkipSlots (eufRest slots) skip next
+
+@label "Decompose take slots"
+@description "Take the first `remaining` present argument nodes as evaluated actual slots, numbering raw and logical index alike. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcTakeSlots : (items: a) -> (remaining: Nat) -> (index: Nat) -> (acc: [FdcCallSlot]) -> [FdcCallSlot]
+fdcTakeSlots items remaining index acc =
+  if eq remaining 0
+  then acc
+  else
+    case head items of
+      Nothing -> acc
+      Just item ->
+        let slot = FdcCallSlot { rawIndex = index, logicalIndex = index, role = FdcRoleActual, node = item, evaluated = true }
+        fdcTakeSlots (eufRest items) (sub remaining 1) (add index 1) (appendItem slot acc)
+
+-- =========================================================================
+-- the lambda layout
+-- =========================================================================
+
+-- fdcLambdaLayout — `fnOp`'s three grammars, in one value.
+--
+--   empty      `{fn: []}`               — no parameters, no body.
+--   canonical  `args[0]` is an ARRAY    — the parameter vector is that array
+--                                         VERBATIM, the body is `args[1]`,
+--                                         and EVERY trailing item is ignored.
+--   flat       otherwise                — every leading argument is a
+--                                         String-coerced parameter and the
+--                                         LAST is the body.
+--
+-- The flat grammar's coercion is why `{fn: ["x", ["y","z"], body]}` binds TWO
+-- names — `x` and `"y,z"` — not three. Both analyses expanded the array into
+-- separate binders, which is over-binding: the invented `y` and `z` shadow
+-- outer spellings the runtime leaves visible, and the real binder `"y,z"` is
+-- never introduced.
+@label "Decompose lambda layout"
+@description "The whole lambda decomposition in ONE value: grammar, raw parameter entries with their installed spellings, body presence, and the canonical grammar's ignored trailing items. Separate parameter and body functions can disagree, which is how the flat-array parameter defect survived in both analyses."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcLambdaLayout : (argList: a) -> FdcLambdaLayout
+fdcLambdaLayout argList =
+  case head argList of
+    Nothing -> FdcLambdaLayout { grammar = "empty", params = [], bodyPresent = false, body = JlNull, ignored = [], namesTotal = true }
+    Just first ->
+      case first of
+        JlArray { items = ps } -> fdcLambdaCanonical ps argList
+        _ -> fdcLambdaFlat argList
+
+@label "Decompose canonical lambda"
+@description "The canonical `{fn: [[p…], body, …]}` grammar: the parameter vector is args[0] VERBATIM (each entry installed under its string coercion), the body is args[1], and every trailing item is ignored. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcLambdaCanonical : (ps: a) -> (argList: a) -> FdcLambdaLayout
+fdcLambdaCanonical ps argList =
+  let params = fdcParamsOf ps []
+  let rest = eufRest argList
+  case head rest of
+    Nothing -> FdcLambdaLayout { grammar = "canonical", params = params, bodyPresent = false, body = JlNull, ignored = [], namesTotal = fdcNamesTotal params }
+    Just body -> FdcLambdaLayout { grammar = "canonical", params = params, bodyPresent = true, body = body, ignored = eufRest rest, namesTotal = fdcNamesTotal params }
+
+@label "Decompose flat lambda"
+@description "The flat `{fn: [p…, body]}` grammar: every leading argument is a String-coerced parameter and the last is the body. A lone argument is a zero-parameter thunk. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcLambdaFlat : (argList: a) -> FdcLambdaLayout
+fdcLambdaFlat argList =
+  let n = length argList
+  let params = fdcParamsOf (fdcTakeItems argList (sub n 1) []) []
+  FdcLambdaLayout { grammar = "flat", params = params, bodyPresent = true, body = ifNthArg argList (sub n 1), ignored = [], namesTotal = fdcNamesTotal params }
+
+@label "Decompose take items"
+@description "The first `remaining` items of a JsonLogic item list, in order. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcTakeItems : (items: a) -> (remaining: Nat) -> (acc: a) -> a
+fdcTakeItems items remaining acc =
+  if eq remaining 0
+  then acc
+  else
+    case head items of
+      Nothing -> acc
+      Just item -> fdcTakeItems (eufRest items) (sub remaining 1) (appendItem item acc)
+
+@label "Decompose lambda params"
+@description "One parameter entry per raw item, each carrying the raw node and the spelling it installs. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcParamsOf : (items: a) -> (acc: [FdcLambdaParam]) -> [FdcLambdaParam]
+fdcParamsOf items acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let p = FdcLambdaParam { raw = item, name = fdcCoerceName item }
+      fdcParamsOf (eufRest items) (appendItem p acc)
+
+@label "Decompose lambda names total"
+@description "True when every parameter's installed spelling is exactly recoverable. False means the consumer must fence: an unnamed binder does not shadow the outer one, so a body read would resolve to the wrong target. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcNamesTotal : (params: [FdcLambdaParam]) -> Boolean
+fdcNamesTotal params =
+  case head params of
+    Nothing -> true
+    Just p -> if fdcNameExact p.name then fdcNamesTotal (eufRest params) else false
+
+@label "Decompose lambda param spellings"
+@description "The installed spellings of a lambda's parameters, in binder order. Only meaningful when the layout's namesTotal is true."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcParamSpellings : (params: [FdcLambdaParam]) -> (acc: List String) -> List String
+fdcParamSpellings params acc =
+  case head params of
+    Nothing -> acc
+    Just p -> fdcParamSpellings (eufRest params) (appendItem (fdcNameSpelling p.name) acc)
+
+-- =========================================================================
+-- the pattern plan
+-- =========================================================================
+
+-- fdcPatternPlan — `matchPattern`'s six steps, in the runtime's own order.
+--
+--   1. the wildcard `"_"` matches everything and binds nothing — TERMINAL.
+--   2. an object carrying `$bind` binds the WHOLE scrutinee and returns
+--      IMMEDIATELY — TERMINAL, siblings never visited.
+--   3. host identity `pattern === scrutinee` — scrutinee-dependent.
+--   4. the Boolean representation coercion: a `True`/`False` tag pattern
+--      against a NATIVE boolean scrutinee — scrutinee-dependent, and it
+--      returns an EMPTY binding set, which is what makes any binder beneath
+--      such a pattern conditional.
+--   5. the structural arm: every pattern key must be present on the
+--      scrutinee, and each recurses.
+--   6. the fall-through: no match.
+--
+-- A `JlTagged` carrier has had its `$tag` stripped by the marshaller, so the
+-- structural field list RECONSTRUCTS it — the runtime's own `Object.keys`
+-- sees it and compares it. Its position among the keys was not preserved;
+-- that is immaterial here because the comparison binds nothing and the arm is
+-- a conjunction over all keys.
+@label "Decompose pattern plan"
+@description "The ORDERED conditional matcher tests of matchPattern, in the runtime's own order — not a selected arm, because three of the six steps depend on the scrutinee. The wildcard and $bind arms are terminal; the Boolean-representation step returns an EMPTY binding set, which is what makes binders beneath such a pattern conditional."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcPatternPlan : (pattern: (JsonLogic Any)) -> FdcPatternPlan
+fdcPatternPlan pattern =
+  case pattern of
+    JlString { value = s } ->
+      if eq s "_"
+      then FdcPatternPlan { steps = [FdcPatWildcard], boolReprPossible = false }
+      else FdcPatternPlan { steps = [FdcPatIdentity, FdcPatFail], boolReprPossible = false }
+    JlArray { items = xs } -> FdcPatternPlan { steps = [FdcPatIdentity, FdcPatItems { items = xs }, FdcPatFail], boolReprPossible = false }
+    JlObject { fields = fs } -> fdcPatternObject fs (fdcPatternFields fs "" false) false
+    JlTagged { tag = t, fields = fs } -> fdcPatternObject fs (fdcPatternFields fs t true) true
+    _ -> FdcPatternPlan { steps = [FdcPatIdentity, FdcPatFail], boolReprPossible = false }
+
+@label "Decompose pattern object arm"
+@description "The object/tagged pattern arms: a `$bind` field is terminal, otherwise identity, then the Boolean-representation step when the wire tag is a literal True/False (or an unresolved wire-route marker when the carrier is TAGGED at all — presence decides that, never an empty-string sentinel, because the marshaller admits an empty tag), then the structural field arm. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcPatternObject : (fs: a) -> (fields: [FdcPatField]) -> (tagged: Boolean) -> FdcPatternPlan
+fdcPatternObject fs fields tagged =
+  case lookupFieldInList "$bind" fs of
+    Just bound -> FdcPatternPlan { steps = [FdcPatBind { name = fdcCoerceName bound }], boolReprPossible = false }
+    Nothing ->
+      let tag = fdcPatternTagOf fields
+      if fdcIsBoolTag tag
+      then FdcPatternPlan { steps = [FdcPatIdentity, FdcPatBoolRepr { tag = tag }, FdcPatFields { fields = fields }, FdcPatFail], boolReprPossible = true }
+      else if not tagged
+      then FdcPatternPlan { steps = [FdcPatIdentity, FdcPatFields { fields = fields }, FdcPatFail], boolReprPossible = false }
+      else FdcPatternPlan { steps = [FdcPatIdentity, FdcPatWireRoute { tag = tag }, FdcPatFields { fields = fields }, FdcPatFail], boolReprPossible = false }
+
+-- The Boolean-representation step fires on the WIRE-PROJECTED tag, and the
+-- projection table is context this decomposition does not have. A literal
+-- `True`/`False` is the parser's own spelling and the projection is identity
+-- there; any OTHER literal tag could in principle project onto one, so the
+-- plan emits an explicit `FdcPatWireRoute` marker naming it rather than
+-- pretending the question is closed. No consumer holds the table today, so
+-- the residual — a wire-ALIASED Boolean pattern carrying nested binders — is
+-- a stated side condition, not a silent assumption.
+@label "Decompose is bool tag"
+@description "True for the parser's own Boolean constructor spellings, where the wire projection is identity. Any other literal tag gets an explicit unresolved wire-route marker instead. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcIsBoolTag : (tag: String) -> Boolean
+fdcIsBoolTag tag = if eq tag "True" then true else if eq tag "False" then true else false
+
+@label "Decompose pattern tag"
+@description "The literal string value of a pattern's wire `$tag` field, or the empty string when it has none or it is not a literal. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcPatternTagOf : (fields: [FdcPatField]) -> String
+fdcPatternTagOf fields =
+  case head fields of
+    Nothing -> ""
+    Just f ->
+      case f.role of
+        FdcPatRoleWireTag ->
+          case f.value of
+            JlString { value = v } -> v
+            _ -> ""
+        FdcPatRolePayload -> fdcPatternTagOf (eufRest fields)
+
+-- The complete key list the runtime's structural arm iterates. For a
+-- `JlTagged` carrier the marshaller stripped `$tag`, so it is reconstructed
+-- here: `Object.keys` sees it and `matchPattern` compares it like any other
+-- key. A `$tag` whose value is a literal string is the WIRE DISCRIMINATOR
+-- role (the runtime compares two strings and never recurses); any other
+-- `$tag` value is an ordinary payload read.
+--
+-- PRESENCE IS A SEPARATE ARGUMENT, not an empty-string sentinel: the
+-- marshaller admits `{$tag: ""}` as a tagged carrier (`""` is a string), and a
+-- sentinel would have silently dropped its reconstructed key. The runtime then
+-- projects `""` to the invalid-wire marker and the match fails — which is a
+-- MATCH outcome, not a reason to lose the key from the plan.
+@label "Decompose pattern fields"
+@description "The complete key list the structural matcher arm iterates, with the wire-discriminator role marked. A tagged carrier's stripped $tag is RECONSTRUCTED, because the runtime's own Object.keys sees it and matches it."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcPatternFields : (fs: a) -> (tag: String) -> (tagged: Boolean) -> [FdcPatField]
+fdcPatternFields fs tag tagged =
+  let base = if tagged then [FdcPatField { key = "$tag", value = JlString { value = tag }, role = FdcPatRoleWireTag }] else []
+  fdcPatternFieldsGo fs base
+
+@label "Decompose pattern fields fold"
+@description "The per-field role classification behind fdcPatternFields. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcPatternFieldsGo : (fs: a) -> (acc: [FdcPatField]) -> [FdcPatField]
+fdcPatternFieldsGo fs acc =
+  case head fs of
+    Nothing -> acc
+    Just f ->
+      let role = fdcPatFieldRole f
+      fdcPatternFieldsGo (eufRest fs) (appendItem (FdcPatField { key = f.name, value = f.value, role = role }) acc)
+
+@label "Decompose pattern field role"
+@description "The role of one pattern field: the WIRE discriminator when it is named $tag AND carries a literal string (the runtime compares two strings and never recurses), otherwise an ordinary payload read. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcPatFieldRole : (f: a) -> FdcPatFieldRole
+fdcPatFieldRole f =
+  if not (eq f.name "$tag")
+  then FdcPatRolePayload
+  else
+    case f.value of
+      JlString -> FdcPatRoleWireTag
+      _ -> FdcPatRolePayload
+
+-- =========================================================================
+-- pattern binder writes
+-- =========================================================================
+
+-- fdcPatternBindWrites — the binder writes a pattern performs, in RUNTIME
+-- WRITE ORDER (depth-first over the pattern's own key order, `$bind`
+-- terminal at each node).
+--
+-- WHY `conditional` EXISTS. A write is not unconditional just because it
+-- appears in the pattern. The Boolean-representation step matches a
+-- `True`/`False` tag pattern against a native boolean scrutinee and returns
+-- an EMPTY binding set BEFORE the structural arm runs — so every binder
+-- beneath such a pattern happens only when the scrutinee is not a native
+-- boolean. Treating those writes as unconditional is unsafe in BOTH
+-- directions: the ledger would turn a registered occurrence into a lexical
+-- row and erase its evidence edge, and the observation analysis would give a
+-- body read the scrutinee's provenance where the runtime gives it the outer
+-- binder's.
+@label "Decompose pattern bind writes"
+@description "The binder writes a pattern performs, in RUNTIME WRITE ORDER, each with its installed spelling and whether it is CONDITIONAL on an earlier matcher step not succeeding. Deliberately not 'the winner': whether a write happens depends on the scrutinee, while the later-overwrites-earlier rule does not."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcPatternBindWrites : (pattern: (JsonLogic Any)) -> [FdcBindWrite]
+fdcPatternBindWrites pattern = fdcBindWritesAt pattern [] false []
+
+@label "Decompose bind writes at"
+@description "The binder-write walk, threading the descent route and whether an ancestor step could match without reaching here. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcBindWritesAt : (pattern: (JsonLogic Any)) -> (route: [FdcBindRoute]) -> (conditional: Boolean) -> (acc: [FdcBindWrite]) -> [FdcBindWrite]
+fdcBindWritesAt pattern route conditional acc =
+  let plan = fdcPatternPlan pattern
+  let cond2 = if plan.boolReprPossible then true else conditional
+  fdcBindWritesSteps plan.steps route conditional cond2 acc
+
+@label "Decompose bind writes over steps"
+@description "Dispatch the binder-write walk over a pattern plan's steps: the bind step writes here, the field and item steps descend. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcBindWritesSteps : (steps: [FdcPatternStep]) -> (route: [FdcBindRoute]) -> (here: Boolean) -> (below: Boolean) -> (acc: [FdcBindWrite]) -> [FdcBindWrite]
+fdcBindWritesSteps steps route here below acc =
+  case head steps of
+    Nothing -> acc
+    Just step ->
+      let next =
+            case step of
+              FdcPatBind { name = n } -> appendItem (FdcBindWrite { name = n, route = appendItem FdcBindWhole route, conditional = here }) acc
+              FdcPatFields { fields = fs } -> fdcBindWritesFields fs route below acc
+              FdcPatItems { items = xs } -> fdcBindWritesItems xs route below 0 acc
+              _ -> acc
+      fdcBindWritesSteps (eufRest steps) route here below next
+
+@label "Decompose bind writes over fields"
+@description "Descend a structural pattern's payload fields in key order; the wire discriminator is a string comparison and writes nothing. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcBindWritesFields : (fields: [FdcPatField]) -> (route: [FdcBindRoute]) -> (conditional: Boolean) -> (acc: [FdcBindWrite]) -> [FdcBindWrite]
+fdcBindWritesFields fields route conditional acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let next =
+            case f.role of
+              FdcPatRoleWireTag -> acc
+              FdcPatRolePayload -> fdcBindWritesAt f.value (appendItem (FdcBindField { key = f.key }) route) conditional acc
+      fdcBindWritesFields (eufRest fields) route conditional next
+
+@label "Decompose bind writes over items"
+@description "Descend an array pattern's positional items. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcBindWritesItems : (items: a) -> (route: [FdcBindRoute]) -> (conditional: Boolean) -> (index: Nat) -> (acc: [FdcBindWrite]) -> [FdcBindWrite]
+fdcBindWritesItems items route conditional index acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let next = fdcBindWritesAt item (appendItem (FdcBindItem { index = index }) route) conditional acc
+      fdcBindWritesItems (eufRest items) route conditional (add index 1) next
+
+-- fdcPatternBindsTotal — the ONE question both consumers ask: may this
+-- pattern's binder set be used at all? It folds `fdcPatternBindWrites`, so it
+-- cannot disagree with it.
+@label "Decompose pattern binds total"
+@description "True when every binder a pattern writes is exactly nameable AND unconditional. False means the consumer must fence: an unnameable binder does not shadow the outer one, and a conditional one may not be written at all."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcPatternBindsTotal : (pattern: (JsonLogic Any)) -> Boolean
+fdcPatternBindsTotal pattern = fdcBindWritesTotal (fdcPatternBindWrites pattern)
+
+@label "Decompose bind writes total"
+@description "True when every write in a list is exactly nameable and unconditional. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcBindWritesTotal : (writes: [FdcBindWrite]) -> Boolean
+fdcBindWritesTotal writes =
+  case head writes of
+    Nothing -> true
+    Just w ->
+      if w.conditional
+      then false
+      else if not (fdcNameExact w.name)
+      then false
+      else fdcBindWritesTotal (eufRest writes)
+
+@label "Decompose bind write spellings"
+@description "The binder spellings a pattern writes, in runtime write order. Only meaningful when fdcPatternBindsTotal is true."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcBindWriteSpellings : (writes: [FdcBindWrite]) -> (acc: List String) -> List String
+fdcBindWriteSpellings writes acc =
+  case head writes of
+    Nothing -> acc
+    Just w -> fdcBindWriteSpellings (eufRest writes) (appendItem (fdcNameSpelling w.name) acc)
+
+-- =========================================================================
+-- the match layout
+-- =========================================================================
+
+-- fdcMatchLayout — `{match: [scrut, p1, b1, p2, b2, …, else?]}`.
+--
+-- The runtime returns null at fewer than two arguments WITHOUT evaluating the
+-- scrutinee, so a one-argument match has no scrutinee at all. Arms pair from
+-- raw index 1; when the pattern slot is the last element it is the DEFAULT
+-- arm's BODY, evaluated in the OUTER scope. A failing guard falls through to
+-- the NEXT arm rather than failing the match.
+@label "Decompose match layout"
+@description "The match form's arm pairing plus the guard split. A one-argument match has NO scrutinee — the runtime returns before evaluating it. A lone trailing element is the default arm's body, evaluated in the outer scope."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcMatchLayout : (argList: a) -> FdcMatchLayout
+fdcMatchLayout argList =
+  if lt (length argList) 2
+  then FdcMatchLayout { scrutineePresent = false, scrutinee = JlNull, arms = [], fallbackPresent = false, fallbackIndex = 0, fallback = JlNull }
+  else
+    let scrut = ifNthArg argList 0
+    fdcMatchArms (eufRest argList) 0 [] scrut
+
+@label "Decompose match arms"
+@description "Pair match arms from the argument list, splitting each arm's guard. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcMatchArms : (items: a) -> (index: Nat) -> (acc: [FdcMatchArm]) -> (scrut: (JsonLogic Any)) -> FdcMatchLayout
+fdcMatchArms items index acc scrut =
+  case head items of
+    Nothing -> FdcMatchLayout { scrutineePresent = true, scrutinee = scrut, arms = acc, fallbackPresent = false, fallbackIndex = index, fallback = JlNull }
+    Just rawPattern ->
+      if eq (length items) 1
+      then FdcMatchLayout { scrutineePresent = true, scrutinee = scrut, arms = acc, fallbackPresent = true, fallbackIndex = index, fallback = rawPattern }
+      else
+        let split = fdcGuardSplit rawPattern
+        let arm = FdcMatchArm { index = index, pattern = split.pattern, guarded = split.guarded, guard = split.condition, body = ifNthArg items 1 }
+        fdcMatchArms (eufRest (eufRest items)) (add index 1) (appendItem arm acc) scrut
+
+-- fdcGuardSplit — the runtime strips `$guard` only when it is TOP-LEVEL and
+-- ARRAY-valued, and it reads the key off ANY object — a `$tag`-bearing
+-- carrier included. A `$guard` that survives this split is an ordinary
+-- matched field, and the matcher then requires the scrutinee to carry it.
+--
+-- A ONE-ELEMENT `$guard` array is STRIPPED but NOT GUARDED. The runtime reads
+-- the condition as slot 1, finds `undefined`, and its test is
+-- `guard !== undefined && !truthy(...)` — so the arm proceeds with no
+-- condition evaluated at all. Reporting `guarded = true` with a fabricated
+-- null condition would charge a test the runtime never performs.
+@label "Decompose guard split"
+@description "Split a `{$guard: [pattern, condition]}` arm. The runtime reads $guard off ANY object — a tagged carrier included — and strips it only when it is TOP-LEVEL and ARRAY-valued; a $guard that survives is an ordinary matched field."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcGuardSplit : (rawPattern: (JsonLogic Any)) -> a
+fdcGuardSplit rawPattern =
+  case rawPattern of
+    JlObject { fields = fs } -> fdcGuardOf rawPattern fs
+    JlTagged { fields = fs } -> fdcGuardOf rawPattern fs
+    _ -> { pattern = rawPattern, condition = JlNull, guarded = false }
+
+@label "Decompose guard of"
+@description "The guard split over a field list: only an ARRAY-valued $guard is stripped, taking slot 0 as the pattern and slot 1 as the condition. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcGuardOf : (rawPattern: (JsonLogic Any)) -> (fs: a) -> b
+fdcGuardOf rawPattern fs =
+  case lookupFieldInList "$guard" fs of
+    Nothing -> { pattern = rawPattern, condition = JlNull, guarded = false }
+    Just guardValue ->
+      case guardValue of
+        JlArray { items = xs } ->
+          if lt (length xs) 2
+          then { pattern = ifNthArg xs 0, condition = JlNull, guarded = false }
+          else { pattern = ifNthArg xs 0, condition = ifNthArg xs 1, guarded = true }
+        _ -> { pattern = rawPattern, condition = JlNull, guarded = false }
+
+-- =========================================================================
+-- the call layout
+-- =========================================================================
+
+-- fdcCallLayout — where the callee is, where the actuals start, and both
+-- index systems.
+--
+-- THE `$` VEHICLE IS A DIFFERENT LAYOUT. `{call: ["$", callee, …args]}` is
+-- application by a language-core head: the callee is raw slot 1 and the
+-- actuals begin at raw slot 2, and the runtime BYPASSES registry resolution
+-- entirely. Reading slot 0 as an ordinary callee resolves the spelling `$`
+-- against the frozen frame — which can succeed, since a registered `($)`
+-- exists — and produces a POSITIVE row for a target the runtime never
+-- dispatches.
+@label "Decompose call layout"
+@description "The application decomposition: which slot is the callee, where the actuals begin, and BOTH index systems (raw and logical), because the two consumers number actuals differently. The `$` vehicle puts the callee at raw slot 1 and bypasses registry resolution."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcCallLayout : (form: String) -> (argList: a) -> FdcCallLayout
+fdcCallLayout form argList =
+  if eq form "method"
+  then
+    let actuals = fdcActualSlots (eufRest (eufRest argList)) 2 0 []
+    FdcCallLayout { form = form, callee = fdcMethodCallee argList, calleePresent = false, calleeNode = JlNull, slots = fdcRawNameSlots argList, actualCount = length actuals }
+  else if eq form "keyed"
+  then FdcCallLayout { form = form, callee = FdcCalleeAbsent, calleePresent = false, calleeNode = JlNull, slots = fdcActualSlots argList 0 0 [], actualCount = length argList }
+  else
+    case head argList of
+      Nothing -> FdcCallLayout { form = form, callee = FdcCalleeAbsent, calleePresent = false, calleeNode = JlNull, slots = [], actualCount = 0 }
+      Just headNode -> fdcCallHead form headNode argList
+
+@label "Decompose call head"
+@description "Classify a call form's head and lay out its actuals: the `$` vehicle takes the callee from raw slot 1 with actuals from raw slot 2, every other head is the callee at raw slot 0 with actuals from raw slot 1. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcCallHead : (form: String) -> (headNode: (JsonLogic Any)) -> (argList: a) -> FdcCallLayout
+fdcCallHead form headNode argList =
+  case headNode of
+    JlString { value = h } ->
+      if eq h "$"
+      then
+        let actuals = fdcActualSlots (eufRest (eufRest argList)) 2 0 []
+        FdcCallLayout { form = form, callee = FdcCalleeDollar, calleePresent = true, calleeNode = ifNthArg argList 1, slots = actuals, actualCount = length actuals }
+      else
+        let actuals = fdcActualSlots (eufRest argList) 1 0 []
+        FdcCallLayout { form = form, callee = FdcCalleeName { name = h }, calleePresent = false, calleeNode = headNode, slots = actuals, actualCount = length actuals }
+    _ ->
+      let actuals = fdcActualSlots (eufRest argList) 1 0 []
+      FdcCallLayout { form = form, callee = fdcIndirectCallee headNode, calleePresent = true, calleeNode = headNode, slots = actuals, actualCount = length actuals }
+
+@label "Decompose indirect callee"
+@description "Classify a non-literal call head: a single-key `{var: name}` is a named indirect callee, anything else is an ordinary expression evaluated to a callable value. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcIndirectCallee : (headNode: (JsonLogic Any)) -> FdcCalleeKind
+fdcIndirectCallee headNode =
+  case headNode of
+    JlObject { fields = fs } ->
+      if eq (length fs) 1
+      then
+        let first = unwrapFirstField fs
+        if eq first.name "var"
+        then
+          case first.value of
+            JlString { value = n } -> FdcCalleeVar { name = n }
+            _ -> FdcCalleeExpr
+        else FdcCalleeExpr
+      else FdcCalleeExpr
+    _ -> FdcCalleeExpr
+
+@label "Decompose method callee"
+@description "The method form's METHOD NAME slot, when it is literal. It deliberately does NOT validate the CLASS slot: the qualified key a consumer builds needs both, and the consumer owns that join — the observation analysis re-reads slot 0 and answers an unresolvable key when it is not literal. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcMethodCallee : (argList: a) -> FdcCalleeKind
+fdcMethodCallee argList =
+  case ifNthArg argList 1 of
+    JlString { value = m } -> FdcCalleeName { name = m }
+    _ -> FdcCalleeExpr
+
+@label "Decompose raw-name slots"
+@description "The method form's two leading slots, which the runtime String()-reads rather than evaluating, followed by its evaluated actuals. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcRawNameSlots : (argList: a) -> [FdcCallSlot]
+fdcRawNameSlots argList =
+  let raws = [FdcCallSlot { rawIndex = 0, logicalIndex = 0, role = FdcRoleRawName, node = ifNthArg argList 0, evaluated = false }, FdcCallSlot { rawIndex = 1, logicalIndex = 1, role = FdcRoleRawName, node = ifNthArg argList 1, evaluated = false }]
+  fdcAppendSlots raws (fdcActualSlots (eufRest (eufRest argList)) 2 0 [])
+
+@label "Decompose append slots"
+@description "Concatenate two call-slot lists. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcAppendSlots : (left: [FdcCallSlot]) -> (right: [FdcCallSlot]) -> [FdcCallSlot]
+fdcAppendSlots left right =
+  case head right of
+    Nothing -> left
+    Just s -> fdcAppendSlots (appendItem s left) (eufRest right)
+
+@label "Decompose actual slots"
+@description "The evaluated actual arguments, each carrying BOTH its raw argument index and its logical (zero-based actual) index. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcActualSlots : (items: a) -> (rawIndex: Nat) -> (logicalIndex: Nat) -> (acc: [FdcCallSlot]) -> [FdcCallSlot]
+fdcActualSlots items rawIndex logicalIndex acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let slot = FdcCallSlot { rawIndex = rawIndex, logicalIndex = logicalIndex, role = FdcRoleActual, node = item, evaluated = true }
+      fdcActualSlots (eufRest items) (add rawIndex 1) (add logicalIndex 1) (appendItem slot acc)
+
+-- =========================================================================
+-- the binding layout
+-- =========================================================================
+
+-- fdcBindingLayout — `let` / `where` / the inline `do` let.
+--
+-- `let`: the carrier is argument slot 0 and the form's value is the LAST
+-- binding — there is no separate body at rest.
+-- `where`: the bindings are argument slot 1 and are evaluated FIRST, into a
+-- copied context, each seeing the preceding ones; the body is slot 0.
+--
+-- A CARRIER THAT IS NOT A PLAIN OBJECT IS NOT TOTAL. The runtime enumerates
+-- it with `Object.entries`, and for a `$tag`-bearing record that INCLUDES the
+-- discriminator as an ordinary binding — while the marshal has discarded its
+-- position among the keys, so the binder ORDER is unrecoverable. Both
+-- analyses previously bound nothing there, which is the unsafe under-binding
+-- direction; the layout reports the loss and the consumer fences.
+--
+-- AN ABSENT OR NULL CARRIER IS NOT TOTAL EITHER, and for a stronger reason:
+-- `Object.entries(null)` and `Object.entries(undefined)` THROW, so `{let: []}`
+-- / `{let: null}` / `{where: [x]}` produce no value at all. `present` is still
+-- reported false — the distinction is real — but `total` is false, because a
+-- form that throws is not a form whose bindings this analysis has enumerated.
+@label "Decompose binding layout"
+@description "The let / where binding decomposition, preserving PRESENCE separately from emptiness. A carrier that is not a plain object is reported NOT TOTAL: the runtime enumerates a tagged record's discriminator as an ordinary binding, and the marshal discarded its position, so the binder order is unrecoverable and the consumer must fence."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcBindingLayout : (kind: String) -> (argList: a) -> FdcBindingLayout
+fdcBindingLayout kind argList =
+  if eq kind "where"
+  then fdcBindingOf kind (ifNthArg argList 1) true (ifNthArg argList 0)
+  else fdcBindingOf kind (ifNthArg argList 0) false JlNull
+
+@label "Decompose binding of"
+@description "Build a binding layout from a carrier node, classifying a non-plain-object carrier as not total. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcBindingOf : (kind: String) -> (carrier: (JsonLogic Any)) -> (bodyPresent: Boolean) -> (body: (JsonLogic Any)) -> FdcBindingLayout
+fdcBindingOf kind carrier bodyPresent body =
+  case carrier of
+    JlObject { fields = fs } -> FdcBindingLayout { kind = kind, present = true, entries = fdcBindingEntries fs 0 [], bodyPresent = bodyPresent, body = body, total = true, reason = "" }
+    JlTagged -> FdcBindingLayout { kind = kind, present = true, entries = [], bodyPresent = bodyPresent, body = body, total = false, reason = "a tagged bindings record binds its discriminator too, and the marshal discarded that key's position, so the binder order is unrecoverable" }
+    JlNull -> FdcBindingLayout { kind = kind, present = false, entries = [], bodyPresent = bodyPresent, body = body, total = false, reason = "an ABSENT or null bindings carrier makes the host enumeration THROW, so the form produces no value at all" }
+    _ -> FdcBindingLayout { kind = kind, present = true, entries = [], bodyPresent = bodyPresent, body = body, total = false, reason = "a bindings carrier that is not a record is enumerated by the host in a way this decomposition does not reproduce" }
+
+@label "Decompose binding entries"
+@description "The sequential binding entries of a bindings record, in enumeration order. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcBindingEntries : (fs: a) -> (index: Nat) -> (acc: [FdcBindingEntry]) -> [FdcBindingEntry]
+fdcBindingEntries fs index acc =
+  case head fs of
+    Nothing -> acc
+    Just f -> fdcBindingEntries (eufRest fs) (add index 1) (appendItem (FdcBindingEntry { name = f.name, index = index, value = f.value }) acc)
+
+-- fdcInlineLet — a `do` item that carries a `let` KEY.
+--
+-- The runtime's test is PRESENCE (`"let" in expr`), not single-key: an item
+-- like `{let: {…}, ignored: 0}` still binds, and its sibling fields are
+-- NEVER EVALUATED — the runtime takes the binding branch instead of
+-- evaluating the item at all. Walking the whole item is therefore not merely
+-- surplus reporting: the later binding values would be walked without the
+-- sequential scope the runtime gives them, which can resolve a spelling to a
+-- registered target where the runtime sees an earlier local binder.
+--
+-- The item's OWN `$tag` is irrelevant — only `expr.let`'s entries are read —
+-- so a tagged do-item is fully recoverable. It is the BINDINGS RECORD being
+-- tagged that loses information.
+@label "Decompose inline let"
+@description "A `do` item carrying a `let` KEY. Detection is by PRESENCE, matching the runtime's `\"let\" in expr` test — a multi-key item still binds and its siblings are NEVER evaluated. The item's own $tag is irrelevant; only expr.let's entries are read, so a tagged do-item is fully recoverable."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcInlineLet : (item: (JsonLogic Any)) -> FdcBindingLayout
+fdcInlineLet item =
+  case item of
+    JlObject { fields = fs } -> fdcInlineLetOf fs
+    JlTagged { fields = fs } -> fdcInlineLetOf fs
+    _ -> FdcBindingLayout { kind = "do-let", present = false, entries = [], bodyPresent = false, body = JlNull, total = true, reason = "" }
+
+@label "Decompose inline let of"
+@description "The inline-let recognition over a field list, reporting PRESENCE separately from the binding entries. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcInlineLetOf : (fs: a) -> FdcBindingLayout
+fdcInlineLetOf fs =
+  case lookupFieldInList "let" fs of
+    Nothing -> FdcBindingLayout { kind = "do-let", present = false, entries = [], bodyPresent = false, body = JlNull, total = true, reason = "" }
+    Just letValue -> fdcBindingOf "do-let" letValue false JlNull
+
+-- =========================================================================
+-- the construction layout
+-- =========================================================================
+
+-- fdcCtorLayout — `{construct: [Name, …payload]}`.
+--
+-- THE PAYLOAD READING IS CONTEXT-DEPENDENT AND THE PLAN SAYS SO. With the
+-- constructor table, a single plain-object payload whose keys are ALL
+-- declared fields is a NAMED record and the runtime evaluates each field
+-- value; otherwise the object is one POSITIONAL argument evaluated whole.
+-- Without the table both readings are live. Rather than have each consumer
+-- guess separately — which is exactly the duplication this slice removes —
+-- the layout publishes both and flags the choice unresolved. A consumer may
+-- then take the sound superset in its own direction, or fence.
+--
+-- `True` / `False` at arity one are the opaque-representation fast path to
+-- native JS booleans and have no payload at all.
+--
+-- THE FAST-PATH TEST IS PROJECTION-DEPENDENT, and this layout does NOT consult
+-- the projection. `applyOp` runs the source name through `_constructorWireNames`
+-- and tests the PROJECTED name, so a constructor wire-ALIASED onto `True` takes
+-- the fast path while a `True` aliased onto something else does not. The
+-- consequence is bounded to nothing observable: at arity one the fast path and
+-- the payload-free shell are both GROUND, and the ledger resolves the SOURCE
+-- name through the frozen frame either way. Recorded as a stated side
+-- condition, in the same class as `FdcPatWireRoute`.
+@label "Decompose constructor layout"
+@description "The construction decomposition, publishing BOTH payload readings once: positional payload nodes always, plus the named-record field list when a single plain-object payload makes that reading live. The choice needs the constructor table a pure body lacks, so it is flagged unresolved rather than guessed by each consumer separately."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcCtorLayout : (argList: a) -> FdcCtorLayout
+fdcCtorLayout argList =
+  let payload = eufRest argList
+  case head argList of
+    Nothing -> FdcCtorLayout { namePresent = false, name = "", payload = [], namedFields = [], namedPossible = false, needsTable = false, boolFastPath = false }
+    Just nameNode ->
+      case nameNode of
+        JlString { value = n } -> fdcCtorNamed n payload (length argList)
+        _ -> FdcCtorLayout { namePresent = false, name = "", payload = payload, namedFields = [], namedPossible = false, needsTable = false, boolFastPath = false }
+
+@label "Decompose named constructor"
+@description "The constructor layout for a literal constructor name, including the Boolean opaque-representation fast path and the live named-record reading. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcCtorNamed : (n: String) -> (payload: a) -> (arity: Nat) -> FdcCtorLayout
+fdcCtorNamed n payload arity =
+  if fdcIsBoolTag n
+  then
+    if eq arity 1
+    then FdcCtorLayout { namePresent = true, name = n, payload = [], namedFields = [], namedPossible = false, needsTable = false, boolFastPath = true }
+    else fdcCtorPayload n payload
+  else fdcCtorPayload n payload
+
+-- A TAGGED payload's `$tag` is an ORDINARY NAMED ENTRY, and a load-bearing one:
+-- the runtime writes the constructor tag into the result first and THEN
+-- enumerates the payload, so a payload carrying its own `$tag` OVERWRITES it.
+-- The marshaller stripped that key, so the named reading reconstructs it — the
+-- same repair the pattern field list makes, for the same reason.
+@label "Decompose tagged named fields"
+@description "The named-record entry list of a TAGGED constructor payload, with its stripped `$tag` reconstructed. The runtime enumerates that key like any other, and because the constructor tag is written BEFORE the payload, a payload `$tag` overwrites it. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcTaggedNamedFields : (tag: String) -> (fs: a) -> a
+fdcTaggedNamedFields tag fs = concat [JlField { name = "$tag", value = JlString { value = tag } }] fs
+
+@label "Decompose constructor payload"
+@description "Publish both payload readings: the positional nodes, plus the named-record field list when the payload is exactly one OBJECT. The runtime's named test is any non-null non-array object, a $tag-bearing and a $-keyed one included, so the named reading is offered for those too — narrowing it to a plain record would under-report the branch the runtime may take. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "decomposition"
+@category "engine-internal"
+fdcCtorPayload : (n: String) -> (payload: a) -> FdcCtorLayout
+fdcCtorPayload n payload =
+  if eq (length payload) 1
+  then
+    case head payload of
+      Nothing -> FdcCtorLayout { namePresent = true, name = n, payload = payload, namedFields = [], namedPossible = false, needsTable = false, boolFastPath = false }
+      Just only ->
+        case only of
+          JlObject { fields = fs } -> FdcCtorLayout { namePresent = true, name = n, payload = payload, namedFields = fs, namedPossible = true, needsTable = true, boolFastPath = false }
+          JlTagged { tag = t, fields = fs } -> FdcCtorLayout { namePresent = true, name = n, payload = payload, namedFields = fdcTaggedNamedFields t fs, namedPossible = true, needsTable = true, boolFastPath = false }
+          _ -> FdcCtorLayout { namePresent = true, name = n, payload = payload, namedFields = [], namedPossible = false, needsTable = false, boolFastPath = false }
+  else FdcCtorLayout { namePresent = true, name = n, payload = payload, namedFields = [], namedPossible = false, needsTable = false, boolFastPath = false }
+
+-- =========================================================================
+-- the evaluator's structural exit inventory (D5)
+-- =========================================================================
+
+-- fdcExitInventory — the STRUCTURAL half of what slice 3d pinned as
+-- `obs.form.arms`. `evaluate` has twelve return arms; two of them cannot be
+-- reached from a marshalled body at all, because the carrier has no case for
+-- a live host closure or an ArrayBuffer view. The exit set is a property of
+-- the EVALUATOR and is therefore shared; the mapping of these exits onto any
+-- analysis's own semantic transfer classes is not, and stays with that
+-- analysis.
+--
+-- HONEST CLASSIFICATION: a source-DRIFT sentinel. Nothing here proves the
+-- list complete — it fails loudly when the evaluator grows an exit the table
+-- does not name.
+@label "Decompose exit inventory"
+@description "The structural exit inventory of `evaluate` — its twelve return arms and which of them a marshalled body can reach. The exit set is a property of the evaluator and is shared; mapping it onto an analysis's semantic transfer classes is not. A source-DRIFT sentinel, not a theorem."
+@tags "engine" "signature-substrate" "phase-4" "validation" "decomposition"
+fdcExitInventory : (unit: a) -> [FdcExitArm]
+fdcExitInventory unit =
+  [ FdcExitArm { id = "nullish-passthrough", reachable = true, note = "null and undefined return verbatim" }
+  , FdcExitArm { id = "scalar-passthrough", reachable = true, note = "string, number and boolean return verbatim" }
+  , FdcExitArm { id = "array-elementwise", reachable = true, note = "an array is mapped elementwise" }
+  , FdcExitArm { id = "callable-passthrough", reachable = false, note = "a live closure or partial has no marshalled carrier" }
+  , FdcExitArm { id = "buffer-passthrough", reachable = false, note = "a typed-array view has no marshalled carrier" }
+  , FdcExitArm { id = "tagged-passthrough", reachable = true, note = "any object carrying $tag returns verbatim, before the key count is examined" }
+  , FdcExitArm { id = "known-op", reachable = true, note = "a single key in KNOWN_OPS dispatches structurally" }
+  , FdcExitArm { id = "key-as-fnid", reachable = true, note = "a single key the registry or the builtin natives resolve is a call" }
+  , FdcExitArm { id = "dollar-marker", reachable = true, note = "an unresolved single $-prefixed key is inert data" }
+  , FdcExitArm { id = "single-field-record", reachable = true, note = "an unresolved single ordinary key is a one-field record literal" }
+  , FdcExitArm { id = "dollar-multikey-marker", reachable = true, note = "a multi-key object with any $-prefixed key is inert data" }
+  , FdcExitArm { id = "record-literal", reachable = true, note = "a remaining multi-key object evaluates every field" }
+  ]

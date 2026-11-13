@@ -1,0 +1,297 @@
+-- =========================================================================
+-- stepConversation — unified typed-Update entry point for the bot's
+-- form-fill dispatch + /start collector autostart + callback-query
+-- handling.
+--
+-- Phase 11c sub-step 3 of the ts-elimination workstream. Convergence
+-- point for:
+--   - A2 typed ConversationStatus (Active | Confirming | … — landed 2b)
+--   - B1 body-owns-IO pattern (lookup + dispatch live in the body, not
+--     in a TS wrapper that pre-resolves)
+--   - C-full typed Update dispatch (decoder lifted 2c — this body
+--     pattern-matches on the typed Update directly, retiring 2c's
+--     interim updateToFlatPayload shim)
+--
+-- Subsumes the pre-3 dispatch-collector-event.fenel routing layer
+-- (dispatchCollectorEvent + handleMessageEvent +
+-- handleCallbackQueryEvent — file deleted) AND the
+-- handleCollectorStart + handleCollectorPick TS handlers (the C2 anti-
+-- pattern flagged in the Phase 11c retroactive audit at commit 6bf1a9e
+-- — runtime/src/handlers/telegram-collector.ts:85-170 in pre-3 layout).
+--
+-- One coherent Fenel body owns: pattern-match the typed Update; extract
+-- (chatId, userId, text, messageDate) or (chatId, userId, callbackData,
+-- callbackQueryId); dispatch to the right routing body
+-- (routeConfirmation / routeTelegramMessage) by precedence; on /start
+-- or `collector:N` callback, handle the collector autostart logic
+-- (pending-Confirming check, deep-link match, single-vs-multi-entry
+-- picker, bounds-checked entry pick). Leaf IO actions (sendMessageText,
+-- ackCallbackQuery, sendCollectorPicker, startCollectorEntry) remain
+-- TS — they're the irreducible Telegram-API / form-fill orchestration
+-- side effects.
+--
+-- module-substrate Phase 3o (2026-05-31) — migrated to `module telegram where`.
+-- The defineFunction spec + STEP_CONVERSATION_BODY extraction RETIRED; identity
+-- rides @facet directives. stepConversation has NO @ioAction (it's called by
+-- handleUpdate's body, not dispatched as an action). The six helpers
+-- (handleMessageStep / handleCallbackStep / handleCollectorStartFromMessage /
+-- handleCollectorPickFromCallback / parseDeepLink / findEntryByTypeIdOrLabel)
+-- stay directive-free → Codeable-only (3j default). `requires` INFERRED. Bodies
+-- UNCHANGED.
+-- =========================================================================
+
+module telegram where
+
+-- ---------------------------------------------------------------------------
+-- stepConversation — top-level dispatch on the typed Update ADT.
+-- MessageUpdate-bearing variants share a single handler;
+-- CallbackQueryUpdate routes to its own. Long-tail Update variants
+-- (channel posts / business / boost / inline / payment / poll /
+-- chat-member) currently no-op (return 0) — they aren't part of the
+-- collector dispatch surface. User-defined triggers still see them
+-- via the umbrella telegram.update processEvent (preserved at the
+-- webhook route).
+-- ---------------------------------------------------------------------------
+
+@label "Step conversation (typed Update dispatch)"
+@description "Phase 11c sub-step 3 unified entry point for the bot's form-fill dispatch + /start collector autostart + callback-query handling. Pattern-matches on the typed Update ADT: Message-bearing variants extract (chatId, userId, text, messageDate) and route by precedence (confirmation → form-fill → /start collector); CallbackQueryUpdate dispatches on callback-data prefix (confirm:/field:/collector:). Subsumes the pre-3 dispatch-collector-event.fenel routing layer + the handleCollectorStart + handleCollectorPick TS handlers (the C2 anti-pattern flagged in the Phase 11c retroactive audit). Body in fenel/modules/telegram/step-conversation.fenel."
+@tags "telegram" "io" "collector" "dispatch"
+stepConversation : (botId: String) -> (update: Update) -> (accountId: String) -> Unit
+stepConversation botId update accountId =
+  case update of
+    MessageUpdate { message = message } -> handleMessageStep botId accountId message
+    EditedMessageUpdate { message = message } -> handleMessageStep botId accountId message
+    BusinessMessageUpdate { message = message } -> handleMessageStep botId accountId message
+    EditedBusinessMessageUpdate { message = message } -> handleMessageStep botId accountId message
+    CallbackQueryUpdate { callbackQuery = cq } -> handleCallbackStep botId accountId cq
+    _ -> 0
+
+-- ---------------------------------------------------------------------------
+-- handleMessageStep — extract (chatId, userId, text, messageDate) from
+-- the typed Message and route by precedence. Confirming conversation
+-- first; then active form-fill (routeTelegramMessage); fallback to
+-- /start command parsing only when no form-fill claimed the message
+-- (Decision HH — preserve the pre-3 precedence so an active form-fill
+-- claims `/start` before the collector logic runs).
+-- ---------------------------------------------------------------------------
+
+-- Message is nominal, but this helper also crosses the dynamic conversation
+-- and bot-row IO surfaces below. Its numeric sentinel result is intentional in
+-- the existing dispatch body, so keep that exact boundary authored.
+handleMessageStep : String -> String -> Message -> Number
+handleMessageStep botId accountId message =
+  let chatId = case message.chat.id of
+    ById { id = n } -> n
+    ByUsername { username = _u } -> 0
+  let userId = case message.from of
+    Nothing -> 0
+    Just u -> u.id
+  let text = case message.text of
+    Nothing -> ""
+    Just t -> t
+  let messageDate = Just (message.date * 1000)
+  let confirmed = routeConfirmation botId chatId userId text
+  if confirmed
+  then 0
+  else
+    let routed = routeTelegramMessage botId chatId userId text messageDate
+    if routed
+    then 0
+    else
+      let trimmed = lower (trim text)
+      if startsWith trimmed "/start"
+      then handleCollectorStartFromMessage botId accountId chatId userId text
+      else 0
+
+-- ---------------------------------------------------------------------------
+-- handleCallbackStep — extract callbackData / chatId / userId from the
+-- typed CallbackQuery and dispatch on callback-data prefix. Order of
+-- operations (Decision II): the routing body runs FIRST, then
+-- ackCallbackQuery (matches the pre-3 dispatch-collector-event.fenel
+-- ordering — keeps the spinner UX coherent across all paths). The
+-- `collector:` arm delegates ack timing to handleCollectorPickFromCallback
+-- since its index-parse + bounds-check failure paths still need to ack.
+-- ---------------------------------------------------------------------------
+
+handleCallbackStep : String -> String -> CallbackQuery -> Number
+handleCallbackStep botId accountId cq =
+  let userId = cq.from.id
+  let chatId = case cq.message of
+    Nothing -> 0
+    Just m ->
+      case m.chat.id of
+        ById { id = n } -> n
+        ByUsername { username = _u } -> 0
+  let callbackData = case cq.data of
+    Nothing -> ""
+    Just d -> d
+  if startsWith callbackData "confirm:"
+  then
+    let answer = slice callbackData 8 (length callbackData)
+    routeConfirmation botId chatId userId answer
+    ackCallbackQuery botId cq.id
+    0
+  else if startsWith callbackData "field:"
+  then
+    let syntheticText = slice callbackData 6 (length callbackData)
+    routeTelegramMessage botId chatId userId syntheticText Nothing
+    ackCallbackQuery botId cq.id
+    0
+  else if startsWith callbackData "collector:"
+  then handleCollectorPickFromCallback botId accountId chatId userId cq.id callbackData
+  else 0
+
+-- ---------------------------------------------------------------------------
+-- handleCollectorStartFromMessage — owns the 3 decisions from the pre-3
+-- handleCollectorStart TS handler (telegram-collector.ts:85-142):
+--   (a) pending-Confirming check via findConfirmingConversation
+--   (b) deep-link match against config entries (by typeId or label)
+--   (c) single-vs-multi-entry dispatch (auto-start single; picker for
+--       multi)
+-- All three decisions live in the body per the workstream's first
+-- principle (TS only for irreducible IO leaves). The bot lookup is via
+-- findBotById (B1 pattern — Decision FF — body owns the lookup; not
+-- pre-resolved by a TS wrapper).
+-- ---------------------------------------------------------------------------
+
+handleCollectorStartFromMessage : String -> String -> Int -> Int -> String -> Number
+handleCollectorStartFromMessage botId accountId chatId userId text =
+  let botMaybe = findBotById botId
+  case botMaybe of
+    Nothing -> 0
+    Just bot ->
+      if not bot.enabled
+      then 0
+      else
+        let pendingMaybe = findConfirmingConversation botId chatId userId
+        case pendingMaybe of
+          Just _pending ->
+            sendMessageText bot.token chatId "You have a pending submission awaiting confirmation. Type 'yes' to confirm, or 'cancel' to discard it before starting again."
+            0
+          Nothing ->
+            let configMaybe = bot.collectorConfig
+            case configMaybe of
+              Nothing -> 0
+              Just config ->
+                let n = length config
+                if n == 0
+                then 0
+                else if n == 1
+                then
+                  let entry = at config 0
+                  startCollectorEntry botId chatId userId entry
+                  0
+                else
+                  let deepLink = parseDeepLink text
+                  case deepLink of
+                    Just dl ->
+                      let matched = findEntryByTypeIdOrLabel config dl
+                      case matched of
+                        Just entry ->
+                          startCollectorEntry botId chatId userId entry
+                          0
+                        Nothing ->
+                          sendCollectorPicker bot.token chatId config
+                          0
+                    Nothing ->
+                      sendCollectorPicker bot.token chatId config
+                      0
+
+-- ---------------------------------------------------------------------------
+-- handleCollectorPickFromCallback — owns: parse `collector:N` index via
+-- std:tryParseInt, look up bot + config, bounds-check, ack callback,
+-- check pending-Confirming, dispatch startCollectorEntry. Pre-3 logic
+-- was in telegram-collector.ts:145-170. The pending-Confirming check is
+-- duplicated from handleCollectorStartFromMessage so the picker path
+-- also rejects on a pending submission (matches the pre-3 implicit
+-- behavior — the pre-3 handleCollectorPick called startCollectorEntry
+-- directly without re-checking pending, but the Conversation insert
+-- inside startTelegramForm would have cancelled the prior conversation;
+-- here we surface the same rejection UX consistently across both
+-- pick-paths).
+-- ---------------------------------------------------------------------------
+
+handleCollectorPickFromCallback : String -> String -> Int -> Int -> String -> String -> Number
+handleCollectorPickFromCallback botId accountId chatId userId callbackQueryId callbackData =
+  let idxStr = slice callbackData 10 (length callbackData)
+  case tryParseInt idxStr of
+    Nothing ->
+      ackCallbackQuery botId callbackQueryId
+      0
+    Just idx ->
+      let botMaybe = findBotById botId
+      case botMaybe of
+        Nothing ->
+          ackCallbackQuery botId callbackQueryId
+          0
+        Just bot ->
+          if not bot.enabled
+          then
+            ackCallbackQuery botId callbackQueryId
+            0
+          else
+            let configMaybe = bot.collectorConfig
+            case configMaybe of
+              Nothing ->
+                ackCallbackQuery botId callbackQueryId
+                0
+              Just config ->
+                if idx < 0 or idx >= length config
+                then
+                  ackCallbackQuery botId callbackQueryId
+                  0
+                else
+                  let entry = at config idx
+                  ackCallbackQuery botId callbackQueryId
+                  let pendingMaybe = findConfirmingConversation botId chatId userId
+                  case pendingMaybe of
+                    Just _pending ->
+                      sendMessageText bot.token chatId "You have a pending submission awaiting confirmation. Type 'yes' to confirm, or 'cancel' to discard it before starting again."
+                      0
+                    Nothing ->
+                      startCollectorEntry botId chatId userId entry
+                      0
+
+-- ---------------------------------------------------------------------------
+-- parseDeepLink — extract the deep-link payload from a `/start <payload>`
+-- message. Returns Nothing when the message has no payload (bare /start)
+-- or doesn't start with /start. The payload is the second whitespace-
+-- separated token (Telegram's deep-link convention: t.me/<botname>?
+-- start=<payload> renders to "/start <payload>" in the chat).
+-- ---------------------------------------------------------------------------
+
+-- The shipped `length` scheme is list-specific while this legacy helper also
+-- applies the runtime overload to String tokens; exact HM congruence therefore
+-- requires the intended boundary instead of treating String as List.
+parseDeepLink : String -> Maybe String
+parseDeepLink text =
+  let trimmed = trim text
+  if not (startsWith (lower trimmed) "/start")
+  then Nothing
+  else
+    let tokens = split trimmed " "
+    case tail tokens of
+      Nothing -> Nothing
+      Just rest ->
+        let nonEmpty = filter (\t -> length t > 0) rest
+        head nonEmpty
+
+-- ---------------------------------------------------------------------------
+-- findEntryByTypeIdOrLabel — walk the collector config and return the
+-- first entry whose typeId or label matches the supplied deep-link
+-- payload. Mirrors the pre-3 TS predicate
+-- (entries.find e => e.typeId === dl || e.label === dl).
+-- ---------------------------------------------------------------------------
+
+findEntryByTypeIdOrLabel : List CollectorEntry -> String -> Maybe CollectorEntry
+findEntryByTypeIdOrLabel config dl =
+  let matching = filter (\e -> e.typeId == dl or e.label == dl) config
+  head matching
+
+-- Note: the IO leaf telegram.send_collector_picker takes the raw
+-- CollectorEntry list and builds the inline_keyboard wire form
+-- (label + indexed `collector:N` callback_data) TS-side (Decision GG
+-- defer-provisional — full typed InlineKeyboardMarkup construction in
+-- the body is queued for 11c-4; the IO leaf accepts the typed config
+-- list for now to keep substrate small and avoid adding a substrate
+-- primitive `std:mapIndexed`).

@@ -1,0 +1,118 @@
+module std where
+
+-- Descriptor-only runtime observation. This is one outer host layer: child
+-- values keep their identity and are inspected through another snapshot only
+-- when the source policy asks for it. Accessors are unreadable, never invoked.
+RepresentationOwnField = RepresentationOwnField name: String value: Anything
+RepresentationValueSnapshot =
+  SnapshotNumber Number
+  | SnapshotString String
+  | SnapshotBoolean Bool
+  | SnapshotArray (List Anything)
+  | SnapshotRecord (List RepresentationOwnField)
+  | SnapshotOther
+  | SnapshotUnreadable
+
+@native
+@category "engine-internal"
+representationValueSnapshot : (value: a) -> RepresentationValueSnapshot
+
+representationSnapshotField : (snapshot: RepresentationValueSnapshot) -> (name: String) -> Maybe Anything
+representationSnapshotField snapshot name = case snapshot of
+  SnapshotRecord fields -> case find (\field -> field.name == name) fields of
+    Just field -> Just field.value
+    Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+representationSnapshotConstructorField : (snapshot: RepresentationValueSnapshot) -> (name: String) -> (ordinal: Number) -> Maybe Anything
+representationSnapshotConstructorField snapshot name ordinal =
+  let positionalName = join ["_", toString ordinal] ""
+  if name == positionalName then representationSnapshotField snapshot name
+  else case representationSnapshotField snapshot name of
+    Just field -> case representationSnapshotField snapshot positionalName of
+      Just duplicate -> Nothing
+      Nothing -> Just field
+    Nothing -> representationSnapshotField snapshot positionalName
+
+-- Structural language inspection reifies record representations. Scalar
+-- Number needs the constructor or declared binding type to identify its owner;
+-- text, Boolean and arrays retain their existing evaluator fast surfaces.
+representationProjectionPolicy : (snapshot: RepresentationValueSnapshot) -> (hasExpectedOwner: Bool) -> (owner: String) -> (nativeOwner: Maybe String) -> Maybe Bool
+representationProjectionPolicy snapshot hasExpectedOwner owner nativeOwner = case nativeOwner of
+  Just native -> if native == owner then Just false else representationProjectionShape snapshot hasExpectedOwner
+  Nothing -> representationProjectionShape snapshot hasExpectedOwner
+
+representationProjectionShape : (snapshot: RepresentationValueSnapshot) -> (hasExpectedOwner: Bool) -> Maybe Bool
+representationProjectionShape snapshot hasExpectedOwner = case snapshot of
+  SnapshotRecord fields -> Just true
+  SnapshotNumber n -> Just hasExpectedOwner
+  SnapshotUnreadable -> Nothing
+  _ -> Just false
+
+-- Self-naming native declarations describe physical carriers at this boundary.
+-- List remains parametric: the spine crossing never rechecks its elements.
+@category "engine-internal"
+representationSelfNativeAdmission : (owner: String) -> (snapshot: RepresentationValueSnapshot) -> Maybe Bool
+representationSelfNativeAdmission owner snapshot =
+  if owner == "String" then case snapshot of
+    SnapshotString _ -> Just true
+    _ -> Just false
+  else if owner == "List" then case snapshot of
+    SnapshotArray _ -> Just true
+    _ -> Just false
+  else Nothing
+
+-- A negative presence check only. Visibility, priority, ties and the selected
+-- method remain the complete resolver's responsibility. General rows must
+-- reach that resolver so its explicit unsupported verdict stays fail-closed.
+representationProjectionCandidate : (owner: String) -> (rows: List a) -> (frames: List b) -> (generalScopes: List c) -> Bool
+representationProjectionCandidate owner rows frames generalScopes =
+  let pooled = some rows (\row -> representationProjectionTuple owner row.args)
+  let blocked = some frames (\frame -> frame.typeName == "Reprable" && representationProjectionTuple owner frame.args)
+  length generalScopes > 0 || pooled || blocked
+
+representationProjectionTuple : (owner: String) -> (args: Maybe (List String)) -> Bool
+representationProjectionTuple owner args = case args of
+  Just tuple -> tuple == ["JsRuntime", owner]
+  Nothing -> true
+
+RepresentationProjectionOwnerFacts = RepresentationProjectionOwnerFacts all: Bool owners: List String
+
+representationProjectionOwnerFacts : (rows: List a) -> RepresentationProjectionOwnerFacts
+representationProjectionOwnerFacts rows = fold (\facts row -> representationProjectionOwnerFact row.args facts) (RepresentationProjectionOwnerFacts { all = false, owners = [] }) rows
+
+representationProjectionOwnerFact : (args: Maybe (List String)) -> (facts: RepresentationProjectionOwnerFacts) -> RepresentationProjectionOwnerFacts
+representationProjectionOwnerFact args facts = case args of
+  Nothing -> RepresentationProjectionOwnerFacts { all = true, owners = facts.owners }
+  Just tuple ->
+    if length tuple != 2 then facts
+    else case head tuple of
+      Nothing -> facts
+      Just target ->
+        if target != "JsRuntime" then facts
+        else case head (fromMaybe [] (tail tuple)) of
+          Nothing -> facts
+          Just owner -> RepresentationProjectionOwnerFacts { all = facts.all, owners = concat facts.owners [owner] }
+
+representationProjectionFrameCandidate : (owner: String) -> (frames: List a) -> Bool
+representationProjectionFrameCandidate owner frames = some frames (\frame -> frame.typeName == "Reprable" && representationProjectionTuple owner frame.args)
+
+@category "engine-internal"
+representationSnapshotConstructorFields : (snapshot: RepresentationValueSnapshot) -> (names: List String) -> Maybe (List Anything)
+representationSnapshotConstructorFields snapshot names = case snapshot of
+  SnapshotRecord fields ->
+    let tagCount = case representationSnapshotField snapshot "$tag" of
+          Just tag -> 1
+          Nothing -> 0
+    if length fields != length names + tagCount then Nothing
+    else representationSnapshotConstructorFieldsWalk snapshot names 0 []
+  _ -> Nothing
+
+@category "engine-internal"
+representationSnapshotConstructorFieldsWalk : (snapshot: RepresentationValueSnapshot) -> (names: List String) -> (ordinal: Number) -> (acc: List Anything) -> Maybe (List Anything)
+representationSnapshotConstructorFieldsWalk snapshot names ordinal acc = case head names of
+  Nothing -> Just acc
+  Just name -> case representationSnapshotConstructorField snapshot name ordinal of
+    Nothing -> Nothing
+    Just value -> representationSnapshotConstructorFieldsWalk snapshot (fromMaybe [] (tail names)) (ordinal + 1) (appendItem value acc)

@@ -1,0 +1,117 @@
+module engine where
+
+-- Independent checker-side resource accounting. Repeated graph edges consume
+-- the same shared quota as distinct edges; a visited-owner path only detects
+-- recursive closures, and never acts as a cache of already checked values.
+
+@category "engine-internal"
+rckBoundCaptureBindings : (snapshot: RecipeAnalysisSnapshot) -> (captures: List ReifiedCapture) -> (occurrence: RecipeOccurrence) -> (visited: List RecipeSourceOwner) -> (budget: Nat) -> { bindings: List RecipeSymbolicBinding, remaining: Nat }
+rckBoundCaptureBindings snapshot captures occurrence visited budget =
+  let remaining = if numberIsFinite budget && floor budget == budget && budget > 0 then budget else 0
+  rcbBindings snapshot captures occurrence visited remaining 0 []
+
+@category "engine-internal"
+rcbBindings : (snapshot: RecipeAnalysisSnapshot) -> (captures: List ReifiedCapture) -> (occurrence: RecipeOccurrence) -> (visited: List RecipeSourceOwner) -> (remaining: Nat) -> (depth: Nat) -> (acc: List RecipeSymbolicBinding) -> { bindings: List RecipeSymbolicBinding, remaining: Nat }
+rcbBindings snapshot captures occurrence visited remaining depth acc = case head captures of
+  Nothing -> { bindings = acc, remaining = remaining }
+  Just capture ->
+    -- Retain lexical shadows without inspecting any remaining raw values or
+    -- callable observations. Appending one mapped suffix avoids rebuilding
+    -- an increasingly large prefix once expansion has already stopped.
+    if remaining <= 0 || depth >= 128 then { bindings = concat acc (map (rcbStoppedBinding occurrence) captures), remaining = 0 }
+    else
+      let checked = rcbValue snapshot occurrence capture.name [] capture.value visited remaining depth
+      rcbBindings snapshot (rckRest captures) occurrence visited checked.remaining depth (appendItem (RecipeSymbolicBinding { name = capture.name, value = checked.value }) acc)
+
+@category "engine-internal"
+rcbStoppedBinding : (occurrence: RecipeOccurrence) -> (capture: ReifiedCapture) -> RecipeSymbolicBinding
+rcbStoppedBinding occurrence capture = RecipeSymbolicBinding { name = capture.name, value = rckResidualValue occurrence (EVar { name = capture.name }) RecipeBudgetExhausted }
+
+@category "engine-internal"
+rcbExhausted : (occurrence: RecipeOccurrence) -> (name: String) -> { value: RecipeSymbolicValue, remaining: Nat }
+rcbExhausted occurrence name = { value = rckResidualValue occurrence (EVar { name = name }) RecipeBudgetExhausted, remaining = 0 }
+
+@category "engine-internal"
+rcbValue : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (name: String) -> (path: List String) -> (value: Any) -> (visited: List RecipeSourceOwner) -> (remaining: Nat) -> (depth: Nat) -> { value: RecipeSymbolicValue, remaining: Nat }
+rcbValue snapshot occurrence name path value visited remaining depth =
+  if remaining <= 0 || depth >= 128 then rcbExhausted occurrence name
+  else
+    let observations = filter (\observation -> deepEqValue observation.owner occurrence.owner && observation.capture == name && deepEqValue observation.path path) snapshot.callables
+    let rest = remaining - 1
+    if length observations > 1 then { value = rckResidualValue occurrence (EVar { name = name }) RecipeUnavailable, remaining = rest }
+    else case head observations of
+      Just observation -> case observation.outcome of
+        Reified { package = package } ->
+          let defined = RecipeOccurrence { owner = recipeSourceCapturedOwner observation, path = [], invocation = occurrence.invocation }
+          if std.some visited (\owner -> deepEqValue owner defined.owner) then { value = rckResidualValue occurrence (EVar { name = name }) RecipeRecursive, remaining = rest }
+          else
+            let captured = rcbBindings snapshot package.captures defined (concat [defined.owner] visited) rest (depth + 1) []
+            { value = RvClosure { params = package.params, body = package.body, bindings = captured.bindings, occurrence = defined }, remaining = captured.remaining }
+        OpaqueBody {} -> { value = rckResidualValue occurrence (EVar { name = name }) RecipeOpaque, remaining = rest }
+        Unavailable -> { value = rckResidualValue occurrence (EVar { name = name }) RecipeUnavailable, remaining = rest }
+      Nothing ->
+        if rckCallableRaw value then { value = RvLiteral { value = value }, remaining = rest }
+        else case representationValueSnapshot value of
+          -- An admitted canonical Food is a nullary constructor value, never
+          -- an array. Avoid rckLift's eager array recursion before accounting.
+          SnapshotArray items -> rcbItems snapshot occurrence name path items visited rest (depth + 1) 0 []
+          SnapshotRecord fields -> case rckLift snapshot value of
+            RvFood { rank = rank } -> { value = RvFood { rank = rank }, remaining = rest }
+            _ -> rcbFields snapshot occurrence name path fields visited rest (depth + 1) []
+          _ -> { value = rckLift snapshot value, remaining = rest }
+
+@category "engine-internal"
+rcbFields : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (name: String) -> (path: List String) -> (fields: List RepresentationOwnField) -> (visited: List RecipeSourceOwner) -> (remaining: Nat) -> (depth: Nat) -> (acc: List RecipeSymbolicField) -> { value: RecipeSymbolicValue, remaining: Nat }
+rcbFields snapshot occurrence name path fields visited remaining depth acc = case head fields of
+  Nothing -> { value = RvRecord { fields = acc }, remaining = remaining }
+  Just field ->
+    if remaining <= 0 || depth >= 128 then rcbExhausted occurrence name
+    else
+      let checked = rcbValue snapshot occurrence name (appendItem field.name path) field.value visited remaining depth
+      rcbFields snapshot occurrence name path (rckRest fields) visited checked.remaining depth (appendItem (RecipeSymbolicField { name = field.name, value = checked.value }) acc)
+
+@category "engine-internal"
+rcbItems : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (name: String) -> (path: List String) -> (items: List Any) -> (visited: List RecipeSourceOwner) -> (remaining: Nat) -> (depth: Nat) -> (index: Nat) -> (acc: List RecipeSymbolicValue) -> { value: RecipeSymbolicValue, remaining: Nat }
+rcbItems snapshot occurrence name path items visited remaining depth index acc = case head items of
+  Nothing -> { value = RvList { items = acc }, remaining = remaining }
+  Just item ->
+    if remaining <= 0 || depth >= 128 then rcbExhausted occurrence name
+    else
+      let checked = rcbValue snapshot occurrence name (appendItem (toString index) path) item visited remaining depth
+      rcbItems snapshot occurrence name path (rckRest items) visited checked.remaining depth (index + 1) (appendItem checked.value acc)
+
+-- This is a traversal cost cap, not semantic admission. It observes the raw
+-- representation shallowly and charges every repeated edge. A hostile DAG or
+-- cycle cannot cause an unbounded recursive walk before source comparison.
+@category "engine-internal"
+rckEvidenceWithinBudget : (budget: Nat) -> (value: Any) -> Bool
+rckEvidenceWithinBudget budget value =
+  if not (numberIsFinite budget && floor budget == budget && budget > 0) then false
+  else
+    let checked = rcbEvidenceNode budget 0 value
+    checked.ok
+
+@category "engine-internal"
+rcbEvidenceNode : (remaining: Nat) -> (depth: Nat) -> (value: Any) -> { ok: Bool, remaining: Nat }
+rcbEvidenceNode remaining depth value =
+  if remaining <= 0 || depth >= 128 then { ok = false, remaining = 0 }
+  else case representationValueSnapshot value of
+    SnapshotArray items -> rcbEvidenceItems (remaining - 1) (depth + 1) items
+    SnapshotRecord fields -> rcbEvidenceFields (remaining - 1) (depth + 1) fields
+    _ -> { ok = true, remaining = remaining - 1 }
+
+-- Folds in the host: a list of several hundred items (a declaration scope's
+-- bindings) must not nest one evaluator call per item, which a browser
+-- worker's stack cannot hold. Same walk: items in order, each charged against
+-- what the previous one left, and nothing visited after the first refusal.
+@category "engine-internal"
+rcbEvidenceItems : (remaining: Nat) -> (depth: Nat) -> (items: List Any) -> { ok: Bool, remaining: Nat }
+rcbEvidenceItems remaining depth items =
+  let start = { ok = true, remaining = remaining }
+  fold (\checked item -> if not checked.ok then checked else rcbEvidenceNode checked.remaining depth item) start items
+
+@category "engine-internal"
+rcbEvidenceFields : (remaining: Nat) -> (depth: Nat) -> (fields: List RepresentationOwnField) -> { ok: Bool, remaining: Nat }
+rcbEvidenceFields remaining depth fields =
+  let start = { ok = true, remaining = remaining }
+  fold (\checked field -> if not checked.ok then checked else rcbEvidenceNode checked.remaining depth field.value) start fields

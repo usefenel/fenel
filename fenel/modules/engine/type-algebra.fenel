@@ -1,0 +1,1241 @@
+module engine where
+
+-- Phase 3 field-identity cutover.
+--
+-- This module is the semantic authority for pure field/type algebra. The host
+-- boundary marshals each root/batch once through TraversalType, reattaches
+-- opaque FieldDef tokens, and writes the final `$` envelope. TraversalType to
+-- TaType/TaField conversion, exact Maybe recognition, root-shape policy, every
+-- selection/join/conflict, rename, positional reassignment, and readable-path
+-- resolution are decided here from FieldKey. A current wireName is carried
+-- only as a projection.
+
+TaType =
+  TaRecord fields: a
+  | TaMaybe inner: a passthrough: a
+  | TaWrapMaybe inner: a
+  | TaRefined base: a set: a
+  | TaOther passthrough: a
+
+TaField = TaField key: a wireName: String type: a raw: a
+
+TaFieldWrite =
+  TaPreserve path: a field: a
+  | TaReuse path: a field: a
+  | TaMint path: a field: a
+  | TaNeedsMint path: a draft: a
+
+TaParentIntent =
+  TaParentReuse field: a
+  | TaParentMint field: a
+  | TaParentNeedsMint draft: a
+
+TaProjection = TaProjection key: a wireName: String
+
+TaListOp =
+  TaPick paths: a flatten: Bool
+  | TaOmit paths: a
+  | TaPartial
+  | TaRequired
+  | TaFlatten key: a projections: a
+  | TaNest keys: a parent: a
+  | TaMerge fields: a
+  | TaWrites writes: a
+  | TaRename path: a wireName: String
+  | TaReorder keys: a
+  | TaConstrain path: a set: a
+
+-- -------------------------------------------------------------------------
+-- TraversalType -> algebra plan
+--
+-- TtField.raw is the raw field TYPE; algebra needs the complete FieldDef's
+-- presentation/default facts on egress. The traversal marshaller therefore
+-- supplies its opaque `token`, which rides as `Just token` in TaField.raw.
+-- `Nothing` remains reserved for Fenel-generated fields (tupleToRecord).
+-- -------------------------------------------------------------------------
+
+@category "engine-internal"
+typeAlgebraTraversalFields : (fields: List a) -> (acc: List a) -> List a
+typeAlgebraTraversalFields fields acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let planned = TaField {
+        key = field.semanticKey,
+        wireName = field.wireName,
+        type = typeAlgebraTraversalType field.type,
+        raw = Just field.token
+      }
+      typeAlgebraTraversalFields (tailOr fields) (appendItem planned acc)
+
+@category "engine-internal"
+typeAlgebraTraversalType : (node: TraversalType) -> TaType
+typeAlgebraTraversalType node =
+  case node of
+    TtRecord { fields = fields } ->
+      TaRecord { fields = typeAlgebraTraversalFields fields [] }
+    TtRefined { base = base, set = set } ->
+      TaRefined { base = typeAlgebraTraversalType base, set = set }
+    TtVariant { cases = cases, raw = raw } ->
+      case typeTraversalMaybeInner cases of
+        Just inner -> TaMaybe { inner = typeAlgebraTraversalType inner, passthrough = raw }
+        Nothing -> TaOther { passthrough = raw }
+    other -> TaOther { passthrough = other.raw }
+
+@category "engine-internal"
+typeAlgebraTraversalTypes : (items: List TraversalType) -> (acc: List TaType) -> List TaType
+typeAlgebraTraversalTypes items acc =
+  case head items of
+    Nothing -> acc
+    Just item -> typeAlgebraTraversalTypes (tailOr items) (appendItem (typeAlgebraTraversalType item) acc)
+
+@category "engine-internal"
+typeAlgebraTraversalKind : (node: TraversalType) -> String
+typeAlgebraTraversalKind node =
+  case node of
+    TtNamed -> "$ref"
+    TtVar -> "$var"
+    TtUnit -> "$unit"
+    TtVoid -> "$void"
+    TtTypeUniverse -> "$type"
+    TtEl -> "$el"
+    TtRecord -> "$record"
+    TtVariant -> "$variant"
+    TtTuple -> "$tuple"
+    TtMap -> "$map"
+    TtApp -> "$el"
+    TtRefined -> "$refined"
+    TtMu -> "$mu"
+    TtTagged -> "$tagged"
+    TtOpaque -> "$opaque"
+    TtArrow -> "$arrow"
+    TtUnion -> "$union"
+    TtIntersect -> "$intersect"
+    TtComplement -> "$complement"
+    TtUnknown -> "unknown"
+
+@category "engine-internal"
+typeAlgebraExpectedShapeError : (operation: String) -> (expected: String) -> (node: TraversalType) -> String
+typeAlgebraExpectedShapeError operation expected node =
+  concat "type-algebra/" (concat operation (concat ": expected " (concat expected (concat ", got " (typeAlgebraTraversalKind node)))))
+
+@category "engine-internal"
+typeAlgebraTraversalRecordRoots : (items: List TraversalType) -> (operation: String) -> (acc: List a) -> Result String (List a)
+typeAlgebraTraversalRecordRoots items operation acc =
+  case head items of
+    Nothing -> Ok acc
+    Just item ->
+      case typeAlgebraTraversalType item of
+        TaRecord { fields = fields } ->
+          typeAlgebraTraversalRecordRoots (tailOr items) operation (appendItem fields acc)
+        other -> Err (typeAlgebraExpectedShapeError operation "$record" item)
+
+@label "Type algebra record-root batch plan"
+@description "Convert one host-marshalled TraversalType tuple of record roots into TaField batches. Record/refined/Maybe classification and expected-record diagnostics are Fenel-owned; fields carry opaque reattachment tokens."
+@tags "engine" "type" "algebra" "field-identity" "boundary" "phase-3"
+typeAlgebraRecordRootPlan : (batch: TraversalType) -> (operation: String) -> Result String (List a)
+typeAlgebraRecordRootPlan batch operation =
+  case traversalSemanticSlotsError batch of
+    Just message -> Err (concat "type-algebra/" (concat operation (concat ": invalid semantic slots: " message)))
+    Nothing ->
+      case batch of
+        TtTuple { items = items } -> typeAlgebraTraversalRecordRoots items operation []
+        other -> Err (typeAlgebraExpectedShapeError operation "$tuple" other)
+
+@label "Type algebra tuple-item plan"
+@description "Validate one tuple root and convert its items to TaType in order. TypeScript supplies only the shared TraversalType tree and reattaches token facts on egress."
+@tags "engine" "type" "algebra" "field-identity" "boundary" "phase-3"
+typeAlgebraTupleItemsPlan : (node: TraversalType) -> (operation: String) -> Result String (List TaType)
+typeAlgebraTupleItemsPlan node operation =
+  case traversalSemanticSlotsError node of
+    Just message -> Err (concat "type-algebra/" (concat operation (concat ": invalid semantic slots: " message)))
+    Nothing ->
+      case node of
+        TtTuple { items = items } -> Ok (typeAlgebraTraversalTypes items [])
+        other -> Err (typeAlgebraExpectedShapeError operation "$tuple" other)
+
+@category "engine-internal"
+typeAlgebraFieldWithType : (field: TaField) -> (nextType: TaType) -> TaField
+typeAlgebraFieldWithType field nextType =
+  TaField { key = field.key, wireName = field.wireName, type = nextType, raw = field.raw }
+
+@category "engine-internal"
+typeAlgebraFieldWithWire : (field: TaField) -> (wireName: String) -> TaField
+typeAlgebraFieldWithWire field wireName =
+  TaField { key = field.key, wireName = wireName, type = field.type, raw = field.raw }
+
+@category "engine-internal"
+typeAlgebraValidateType : (t: TaType) -> Maybe String
+typeAlgebraValidateType t =
+  case t of
+    TaRecord { fields = fields } -> typeAlgebraValidateFields fields
+    TaMaybe { inner = inner } -> typeAlgebraValidateType inner
+    TaWrapMaybe { inner = inner } -> typeAlgebraValidateType inner
+    TaRefined { base = base } -> typeAlgebraValidateType base
+    TaOther -> Nothing
+
+@category "engine-internal"
+typeAlgebraValidateNested : (fields: List a) -> Maybe String
+typeAlgebraValidateNested fields =
+  case head fields of
+    Nothing -> Nothing
+    Just field ->
+      case typeAlgebraValidateType field.type of
+        Just message -> Just message
+        Nothing -> typeAlgebraValidateNested (tailOr fields)
+
+@category "engine-internal"
+typeAlgebraValidateFields : (fields: List a) -> Maybe String
+typeAlgebraValidateFields fields =
+  case fieldSemanticSlotsError fields of
+    Just message -> Just message
+    Nothing -> typeAlgebraValidateNested fields
+
+@category "engine-internal"
+typeAlgebraValidateField : (field: TaField) -> Maybe String
+typeAlgebraValidateField field =
+  if not (fieldKeyValid field.key)
+  then Just (concat "field algebra: invalid " (fieldKeyDiagnostic field.key))
+  else if eq field.wireName ""
+  then Just (concat "field algebra: empty wire projection for " (fieldKeyToken field.key))
+  else typeAlgebraValidateType field.type
+
+@category "engine-internal"
+typeAlgebraValidated : (fields: List a) -> Result String (List a)
+typeAlgebraValidated fields =
+  case typeAlgebraValidateFields fields of
+    Nothing -> Ok fields
+    Just message -> Err message
+
+@category "engine-internal"
+typeAlgebraPathErrorFrom : (path: List a) -> Maybe String
+typeAlgebraPathErrorFrom path =
+  case head path of
+    Nothing -> Nothing
+    Just key ->
+      if fieldKeyValid key
+      then typeAlgebraPathErrorFrom (tailOr path)
+      else Just (concat "field algebra: invalid key path segment " (fieldKeyDiagnostic key))
+
+@category "engine-internal"
+typeAlgebraPathError : (path: List a) -> Maybe String
+typeAlgebraPathError path =
+  if eq (length path) 0
+  then Just "field algebra: key path must not be empty"
+  else typeAlgebraPathErrorFrom path
+
+@category "engine-internal"
+typeAlgebraPathsError : (paths: List a) -> Maybe String
+typeAlgebraPathsError paths =
+  case head paths of
+    Nothing -> Nothing
+    Just path ->
+      case typeAlgebraPathError path of
+        Just message -> Just message
+        Nothing -> typeAlgebraPathsError (tailOr paths)
+
+@category "engine-internal"
+typeAlgebraKeysError : (keys: List a) -> Maybe String
+typeAlgebraKeysError keys =
+  case head keys of
+    Nothing -> Nothing
+    Just key ->
+      if fieldKeyValid key
+      then typeAlgebraKeysError (tailOr keys)
+      else Just (concat "field algebra: invalid key " (fieldKeyDiagnostic key))
+
+@category "engine-internal"
+typeAlgebraKeyMember : (key: a) -> (keys: List a) -> Bool
+typeAlgebraKeyMember key keys =
+  case head keys of
+    Nothing -> false
+    Just candidate ->
+      if fieldKeyEq key candidate
+      then true
+      else typeAlgebraKeyMember key (tailOr keys)
+
+@category "engine-internal"
+typeAlgebraFindField : (fields: List a) -> (key: a) -> Maybe a
+typeAlgebraFindField fields key =
+  case head fields of
+    Nothing -> Nothing
+    Just field ->
+      if fieldKeyEq field.key key
+      then Just field
+      else typeAlgebraFindField (tailOr fields) key
+
+@category "engine-internal"
+typeAlgebraFindWireField : (fields: List a) -> (wireName: String) -> Maybe a
+typeAlgebraFindWireField fields wireName =
+  case head fields of
+    Nothing -> Nothing
+    Just field ->
+      if eq field.wireName wireName
+      then Just field
+      else typeAlgebraFindWireField (tailOr fields) wireName
+
+@category "engine-internal"
+RuntimeMemberLayerPlan =
+  RuntimeMemberKeep
+  | RuntimeMemberUseRaw Any
+  | RuntimeMemberResolveRef String
+  | RuntimeMemberUnfold Any
+
+-- The evaluator's captured declaration projection has its own deliberately
+-- bounded layer selection: peel outer refinements/tags, resolve at most one
+-- named reference, then expose exactly one opaque pure layer or one root mu.
+-- An opaque pure layer is not peeled again. The host follows these inert
+-- re-entry markers; source remains the authority for selecting the layer.
+@category "engine-internal"
+typeAlgebraRuntimeMemberLayerPlan : (node: TraversalType) -> RuntimeMemberLayerPlan
+typeAlgebraRuntimeMemberLayerPlan node = case node of
+  TtRefined { base = base } -> typeAlgebraRuntimeMemberLayerPlan base
+  TtTagged { value = value } -> typeAlgebraRuntimeMemberLayerPlan value
+  TtNamed { name = name, origin = origin } ->
+    if eq origin "ref" then RuntimeMemberResolveRef name else RuntimeMemberKeep
+  _ -> typeAlgebraRuntimeMemberResolvedLayerPlan node
+
+@category "engine-internal"
+typeAlgebraRuntimeMemberResolvedLayerPlan : (node: TraversalType) -> RuntimeMemberLayerPlan
+typeAlgebraRuntimeMemberResolvedLayerPlan node = case node of
+  TtOpaque { pure = pure } -> RuntimeMemberUseRaw pure.raw
+  TtMu { raw = raw } -> RuntimeMemberUnfold raw
+  _ -> RuntimeMemberKeep
+
+@category "engine-internal"
+typeAlgebraConstructorMemberType : (layer: TraversalType) -> (tag: String) -> (wireName: String) -> Maybe Any
+typeAlgebraConstructorMemberType layer tag wireName = case layer of
+  TtRecord { fields = fields } -> typeAlgebraConstructorMemberFields fields wireName
+  TtVariant { cases = cases } ->
+    let matching = filter (\variantCase -> variantCase.name == tag) cases
+    if length matching != 1 then Nothing
+    else case head matching of
+      Nothing -> Nothing
+      Just variantCase -> typeAlgebraConstructorMemberFields variantCase.fields wireName
+  _ -> Nothing
+
+@category "engine-internal"
+typeAlgebraConstructorMemberFields : (fields: List a) -> (wireName: String) -> Maybe Any
+typeAlgebraConstructorMemberFields fields wireName = case fieldSemanticSlotsErrorWithSourceHandles (typeTraversalSemanticFieldProjections fields) of
+  Just message -> Nothing
+  Nothing ->
+    let matching = filter (\field -> field.wireName == wireName) fields
+    if length matching != 1 then Nothing
+    else case typeAlgebraFindWireField fields wireName of
+      Nothing -> Nothing
+      Just field -> Just field.raw
+
+@category "engine-internal"
+typeAlgebraReplaceField : (fields: List a) -> (key: a) -> (replacement: a) -> (acc: List a) -> List a
+typeAlgebraReplaceField fields key replacement acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let next = if fieldKeyEq field.key key then replacement else field
+      typeAlgebraReplaceField (tailOr fields) key replacement (appendItem next acc)
+
+@category "engine-internal"
+typeAlgebraAppendAll : (items: List a) -> (acc: List a) -> List a
+typeAlgebraAppendAll items acc =
+  case head items of
+    Nothing -> acc
+    Just item -> typeAlgebraAppendAll (tailOr items) (appendItem item acc)
+
+@category "engine-internal"
+typeAlgebraAnyEmptyPath : (paths: List a) -> Bool
+typeAlgebraAnyEmptyPath paths =
+  case head paths of
+    Nothing -> false
+    Just path ->
+      if eq (length path) 0
+      then true
+      else typeAlgebraAnyEmptyPath (tailOr paths)
+
+@category "engine-internal"
+typeAlgebraCollectRestsForKey : (paths: List a) -> (key: a) -> (acc: List a) -> List a
+typeAlgebraCollectRestsForKey paths key acc =
+  case head paths of
+    Nothing -> acc
+    Just path ->
+      case head path of
+        Nothing -> typeAlgebraCollectRestsForKey (tailOr paths) key acc
+        Just first ->
+          let nextAcc =
+                if fieldKeyEq first key
+                then appendItem (tailOr path) acc
+                else acc
+          typeAlgebraCollectRestsForKey (tailOr paths) key nextAcc
+
+@category "engine-internal"
+typeAlgebraPickWalk : (fields: List a) -> (paths: List a) -> (flatten: Bool) -> (acc: List a) -> List a
+typeAlgebraPickWalk fields paths flatten acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let rests = typeAlgebraCollectRestsForKey paths field.key []
+      let nextAcc =
+            if eq (length rests) 0
+            then acc
+            else if typeAlgebraAnyEmptyPath rests
+            then appendItem field acc
+            else
+              case field.type of
+                TaRecord { fields = inner } ->
+                  let selected = typeAlgebraPickWalk inner rests false []
+                  if flatten
+                  then typeAlgebraAppendAll selected acc
+                  else appendItem (typeAlgebraFieldWithType field (TaRecord { fields = selected })) acc
+                _ -> acc
+      typeAlgebraPickWalk (tailOr fields) paths flatten nextAcc
+
+@category "engine-internal"
+typeAlgebraOmitWalk : (fields: List a) -> (paths: List a) -> (acc: List a) -> List a
+typeAlgebraOmitWalk fields paths acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let rests = typeAlgebraCollectRestsForKey paths field.key []
+      let nextAcc =
+            if eq (length rests) 0
+            then appendItem field acc
+            else if typeAlgebraAnyEmptyPath rests
+            then acc
+            else
+              case field.type of
+                TaRecord { fields = inner } ->
+                  let kept = typeAlgebraOmitWalk inner rests []
+                  appendItem (typeAlgebraFieldWithType field (TaRecord { fields = kept })) acc
+                _ -> appendItem field acc
+      typeAlgebraOmitWalk (tailOr fields) paths nextAcc
+
+@category "engine-internal"
+typeAlgebraMaybeValue : (t: TaType) -> Maybe TaType
+typeAlgebraMaybeValue t =
+  case t of
+    TaMaybe { inner = inner } -> Just inner
+    TaWrapMaybe { inner = inner } -> Just inner
+    TaRefined { base = base } -> typeAlgebraMaybeValue base
+    _ -> Nothing
+
+@category "engine-internal"
+typeAlgebraPartialFields : (fields: List a) -> (acc: List a) -> List a
+typeAlgebraPartialFields fields acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let nextField =
+            case typeAlgebraMaybeValue field.type of
+              Just inner -> field
+              Nothing ->
+                case field.type of
+                  TaRecord { fields = nested } ->
+                    typeAlgebraFieldWithType field (TaWrapMaybe { inner = TaRecord { fields = typeAlgebraPartialFields nested [] } })
+                  _ -> typeAlgebraFieldWithType field (TaWrapMaybe { inner = field.type })
+      typeAlgebraPartialFields (tailOr fields) (appendItem nextField acc)
+
+@category "engine-internal"
+typeAlgebraRequiredFields : (fields: List a) -> (acc: List a) -> List a
+typeAlgebraRequiredFields fields acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let unwrapped =
+            case typeAlgebraMaybeValue field.type of
+              Just inner -> inner
+              Nothing -> field.type
+      let nextType =
+            case unwrapped of
+              TaRecord { fields = nested } -> TaRecord { fields = typeAlgebraRequiredFields nested [] }
+              _ -> unwrapped
+      typeAlgebraRequiredFields (tailOr fields) (appendItem (typeAlgebraFieldWithType field nextType) acc)
+
+@category "engine-internal"
+typeAlgebraProjectionFor : (projections: List a) -> (key: a) -> Maybe String
+typeAlgebraProjectionFor projections key =
+  case head projections of
+    Nothing -> Nothing
+    Just projection ->
+      if fieldKeyEq projection.key key
+      then Just projection.wireName
+      else typeAlgebraProjectionFor (tailOr projections) key
+
+@category "engine-internal"
+typeAlgebraApplyProjections : (fields: List a) -> (projections: List a) -> (acc: List a) -> List a
+typeAlgebraApplyProjections fields projections acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let next =
+            case typeAlgebraProjectionFor projections field.key of
+              Nothing -> field
+              Just wireName -> typeAlgebraFieldWithWire field wireName
+      typeAlgebraApplyProjections (tailOr fields) projections (appendItem next acc)
+
+@category "engine-internal"
+typeAlgebraFlattenWalk : (fields: List a) -> (key: a) -> (projections: List a) -> (acc: List a) -> List a
+typeAlgebraFlattenWalk fields key projections acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let nextAcc =
+            if fieldKeyEq field.key key
+            then
+              case field.type of
+                TaRecord { fields = nested } ->
+                  typeAlgebraAppendAll (typeAlgebraApplyProjections nested projections []) acc
+                _ -> appendItem field acc
+            else appendItem field acc
+      typeAlgebraFlattenWalk (tailOr fields) key projections nextAcc
+
+@category "engine-internal"
+typeAlgebraSelectedFields : (fields: List a) -> (keys: List a) -> (acc: List a) -> List a
+typeAlgebraSelectedFields fields keys acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let nextAcc = if typeAlgebraKeyMember field.key keys then appendItem field acc else acc
+      typeAlgebraSelectedFields (tailOr fields) keys nextAcc
+
+@category "engine-internal"
+typeAlgebraNestWalk : (fields: List a) -> (keys: List a) -> (parent: a) -> (inserted: Bool) -> (acc: List a) -> List a
+typeAlgebraNestWalk fields keys parent inserted acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      if typeAlgebraKeyMember field.key keys
+      then
+        let nextAcc = if inserted then acc else appendItem parent acc
+        typeAlgebraNestWalk (tailOr fields) keys parent true nextAcc
+      else typeAlgebraNestWalk (tailOr fields) keys parent inserted (appendItem field acc)
+
+@category "engine-internal"
+typeAlgebraParentField : (intent: TaParentIntent) -> Result String TaField
+typeAlgebraParentField intent =
+  case intent of
+    TaParentReuse { field = field } -> Ok field
+    TaParentMint { field = field } -> Ok field
+    TaParentNeedsMint -> Err "field algebra: NeedsMint — nest requires an explicit supplied FieldKey"
+
+@category "engine-internal"
+typeAlgebraNest : (fields: List a) -> (keys: List a) -> (intent: TaParentIntent) -> Result String (List a)
+typeAlgebraNest fields keys intent =
+  case typeAlgebraKeysError keys of
+    Just message -> Err message
+    Nothing ->
+      case typeAlgebraParentField intent of
+        Err message -> Err message
+        Ok parent ->
+          case typeAlgebraValidateField parent of
+            Just message -> Err message
+            Nothing ->
+              let nested = typeAlgebraSelectedFields fields keys []
+              if eq (length nested) 0
+              then Ok fields
+              else
+                let nestedParent = typeAlgebraFieldWithType parent (TaRecord { fields = nested })
+                typeAlgebraValidated (typeAlgebraNestWalk fields keys nestedParent false [])
+
+@category "engine-internal"
+typeAlgebraMergeOne : (fields: List a) -> (incoming: TaField) -> Result String (List a)
+typeAlgebraMergeOne fields incoming =
+  case typeAlgebraFindField fields incoming.key of
+    Just existing ->
+      if not (eq existing.wireName incoming.wireName)
+      then Err (concat "field algebra: same semantic key has conflicting wire projections " (concat existing.wireName (concat " and " incoming.wireName)))
+      else Ok (typeAlgebraReplaceField fields incoming.key incoming [])
+    Nothing ->
+      case typeAlgebraFindWireField fields incoming.wireName of
+        Just collision ->
+          Err (concat "field algebra: wire projection " (concat incoming.wireName " belongs to a different semantic key"))
+        Nothing -> Ok (appendItem incoming fields)
+
+@category "engine-internal"
+typeAlgebraMergeAll : (fields: List a) -> (incoming: List a) -> Result String (List a)
+typeAlgebraMergeAll fields incoming =
+  case head incoming of
+    Nothing -> Ok fields
+    Just field ->
+      case typeAlgebraMergeOne fields field of
+        Err message -> Err message
+        Ok next -> typeAlgebraMergeAll next (tailOr incoming)
+
+@category "engine-internal"
+typeAlgebraWriteLeaf : (fields: List a) -> (field: TaField) -> (mode: String) -> Result String (List a)
+typeAlgebraWriteLeaf fields field mode =
+  case typeAlgebraFindField fields field.key of
+    Just existing ->
+      if eq mode "mint"
+      then Err (concat "field algebra: supplied mint key already exists " (fieldKeyToken field.key))
+      else if not (eq existing.wireName field.wireName)
+      then Err (concat "field algebra: same semantic key has conflicting wire projections " (concat existing.wireName (concat " and " field.wireName)))
+      else Ok (typeAlgebraReplaceField fields field.key field [])
+    Nothing ->
+      if eq mode "preserve"
+      then Err (concat "field algebra: cannot preserve missing field " (fieldKeyToken field.key))
+      else
+        case typeAlgebraFindWireField fields field.wireName of
+          Just collision -> Err (concat "field algebra: wire projection " (concat field.wireName " belongs to a different semantic key"))
+          Nothing -> Ok (appendItem field fields)
+
+@category "engine-internal"
+typeAlgebraWriteAt : (fields: List a) -> (path: List a) -> (field: TaField) -> (mode: String) -> Result String (List a)
+typeAlgebraWriteAt fields path field mode =
+  case head path of
+    Nothing -> Err "field algebra: key path must not be empty"
+    Just key ->
+      let rest = tailOr path
+      if eq (length rest) 0
+      then
+        if not (fieldKeyEq key field.key)
+        then Err "field algebra: write field key does not match the final key-path segment"
+        else typeAlgebraWriteLeaf fields field mode
+      else
+        case typeAlgebraFindField fields key of
+          Nothing -> Err (concat "field algebra: missing parent " (fieldKeyToken key))
+          Just parent ->
+            case parent.type of
+              TaRecord { fields = nested } ->
+                case typeAlgebraWriteAt nested rest field mode of
+                  Err message -> Err message
+                  Ok nextNested ->
+                    let nextParent = typeAlgebraFieldWithType parent (TaRecord { fields = nextNested })
+                    Ok (typeAlgebraReplaceField fields key nextParent [])
+              _ -> Err (concat "field algebra: parent is not a record " (fieldKeyToken key))
+
+@category "engine-internal"
+typeAlgebraApplyWrite : (fields: List a) -> (write: TaFieldWrite) -> Result String (List a)
+typeAlgebraApplyWrite fields write =
+  case write of
+    TaNeedsMint -> Err "field algebra: NeedsMint — new fields require an explicit supplied UUID or positional ordinal"
+    TaPreserve { path = path, field = field } ->
+      case typeAlgebraPathError path of
+        Just message -> Err message
+        Nothing ->
+          case typeAlgebraValidateField field of
+            Just message -> Err message
+            Nothing -> typeAlgebraWriteAt fields path field "preserve"
+    TaReuse { path = path, field = field } ->
+      case typeAlgebraPathError path of
+        Just message -> Err message
+        Nothing ->
+          case typeAlgebraValidateField field of
+            Just message -> Err message
+            Nothing -> typeAlgebraWriteAt fields path field "reuse"
+    TaMint { path = path, field = field } ->
+      case typeAlgebraPathError path of
+        Just message -> Err message
+        Nothing ->
+          case typeAlgebraValidateField field of
+            Just message -> Err message
+            Nothing -> typeAlgebraWriteAt fields path field "mint"
+
+@category "engine-internal"
+typeAlgebraApplyWrites : (fields: List a) -> (writes: List a) -> Result String (List a)
+typeAlgebraApplyWrites fields writes =
+  case head writes of
+    Nothing -> typeAlgebraValidated fields
+    Just write ->
+      case typeAlgebraApplyWrite fields write of
+        Err message -> Err message
+        Ok next -> typeAlgebraApplyWrites next (tailOr writes)
+
+@category "engine-internal"
+typeAlgebraRenameAt : (fields: List a) -> (path: List a) -> (wireName: String) -> Result String (List a)
+typeAlgebraRenameAt fields path wireName =
+  case head path of
+    Nothing -> Err "field algebra: key path must not be empty"
+    Just key ->
+      case typeAlgebraFindField fields key of
+        Nothing -> Err (concat "field algebra: missing field " (fieldKeyToken key))
+        Just field ->
+          let rest = tailOr path
+          if eq (length rest) 0
+          then Ok (typeAlgebraReplaceField fields key (typeAlgebraFieldWithWire field wireName) [])
+          else
+            case field.type of
+              TaRecord { fields = nested } ->
+                case typeAlgebraRenameAt nested rest wireName of
+                  Err message -> Err message
+                  Ok nextNested ->
+                    let nextField = typeAlgebraFieldWithType field (TaRecord { fields = nextNested })
+                    Ok (typeAlgebraReplaceField fields key nextField [])
+              _ -> Err (concat "field algebra: parent is not a record " (fieldKeyToken key))
+
+@category "engine-internal"
+typeAlgebraConstrainAt : (fields: List a) -> (path: List a) -> (set: a) -> Result String (List a)
+typeAlgebraConstrainAt fields path set =
+  case head path of
+    Nothing -> Err "field algebra: key path must not be empty"
+    Just key ->
+      case typeAlgebraFindField fields key of
+        Nothing -> Err (concat "field algebra: missing field " (fieldKeyToken key))
+        Just field ->
+          let rest = tailOr path
+          if eq (length rest) 0
+          then
+            let nextType =
+                  case field.type of
+                    TaRefined { base = base, set = existing } ->
+                      TaRefined { base = base, set = SeIntersect { branches = [existing, set] } }
+                    _ -> TaRefined { base = field.type, set = set }
+            Ok (typeAlgebraReplaceField fields key (typeAlgebraFieldWithType field nextType) [])
+          else
+            case field.type of
+              TaRecord { fields = nested } ->
+                case typeAlgebraConstrainAt nested rest set of
+                  Err message -> Err message
+                  Ok nextNested ->
+                    let nextField = typeAlgebraFieldWithType field (TaRecord { fields = nextNested })
+                    Ok (typeAlgebraReplaceField fields key nextField [])
+              _ -> Err (concat "field algebra: parent is not a record " (fieldKeyToken key))
+
+@category "engine-internal"
+typeAlgebraCollectOrdered : (keys: List a) -> (fields: List a) -> (seen: List String) -> (acc: List a) -> a
+typeAlgebraCollectOrdered keys fields seen acc =
+  case head keys of
+    Nothing -> { fields = acc, seen = seen }
+    Just key ->
+      let token = fieldKeyToken key
+      if elem token seen
+      then typeAlgebraCollectOrdered (tailOr keys) fields seen acc
+      else
+        case typeAlgebraFindField fields key of
+          Nothing -> typeAlgebraCollectOrdered (tailOr keys) fields seen acc
+          Just field -> typeAlgebraCollectOrdered (tailOr keys) fields (appendItem token seen) (appendItem field acc)
+
+@category "engine-internal"
+typeAlgebraAppendUnseen : (fields: List a) -> (seen: List String) -> (acc: List a) -> List a
+typeAlgebraAppendUnseen fields seen acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let token = fieldKeyToken field.key
+      let nextAcc = if elem token seen then acc else appendItem field acc
+      typeAlgebraAppendUnseen (tailOr fields) seen nextAcc
+
+@category "engine-internal"
+typeAlgebraReindexPositional : (fields: List a) -> (ordinal: Number) -> (acc: List a) -> List a
+typeAlgebraReindexPositional fields ordinal acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let next =
+            case field.key of
+              PositionalField ->
+                TaField {
+                  key = PositionalField { index = ordinal },
+                  wireName = concat "_" (toString ordinal),
+                  type = field.type,
+                  raw = field.raw
+                }
+              NamedField -> field
+      typeAlgebraReindexPositional (tailOr fields) (add ordinal 1) (appendItem next acc)
+
+@category "engine-internal"
+typeAlgebraReorder : (fields: List a) -> (keys: List a) -> Result String (List a)
+typeAlgebraReorder fields keys =
+  case typeAlgebraKeysError keys of
+    Just message -> Err message
+    Nothing ->
+      let ordered = typeAlgebraCollectOrdered keys fields [] []
+      let all = typeAlgebraAppendUnseen fields ordered.seen ordered.fields
+      typeAlgebraValidated (typeAlgebraReindexPositional all 0 [])
+
+@label "Type algebra operate"
+@description "Phase 3 identity-total field/type algebra. Validates the recursive semantic view once, executes a FieldKey plan, and validates the result. wireName is used only by explicit rename/projection operations."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+typeAlgebraOperate : (fields: List a) -> (op: TaListOp) -> Result String (List a)
+typeAlgebraOperate fields op =
+  case typeAlgebraValidateFields fields of
+    Just message -> Err message
+    Nothing ->
+      case op of
+        TaPick { paths = paths, flatten = flatten } ->
+          case typeAlgebraPathsError paths of
+            Just message -> Err message
+            Nothing -> typeAlgebraValidated (typeAlgebraPickWalk fields paths flatten [])
+        TaOmit { paths = paths } ->
+          case typeAlgebraPathsError paths of
+            Just message -> Err message
+            Nothing -> typeAlgebraValidated (typeAlgebraOmitWalk fields paths [])
+        TaPartial -> typeAlgebraValidated (typeAlgebraPartialFields fields [])
+        TaRequired -> typeAlgebraValidated (typeAlgebraRequiredFields fields [])
+        TaFlatten { key = key, projections = projections } ->
+          if not (fieldKeyValid key)
+          then Err (concat "field algebra: invalid flatten key " (fieldKeyDiagnostic key))
+          else typeAlgebraValidated (typeAlgebraFlattenWalk fields key projections [])
+        TaNest { keys = keys, parent = parent } -> typeAlgebraNest fields keys parent
+        TaMerge { fields = incoming } ->
+          case typeAlgebraValidateFields incoming of
+            Just message -> Err message
+            Nothing ->
+              case typeAlgebraMergeAll fields incoming of
+                Err message -> Err message
+                Ok merged -> typeAlgebraValidated merged
+        TaWrites { writes = writes } -> typeAlgebraApplyWrites fields writes
+        TaRename { path = path, wireName = wireName } ->
+          case typeAlgebraPathError path of
+            Just message -> Err message
+            Nothing ->
+              case typeAlgebraRenameAt fields path wireName of
+                Err message -> Err message
+                Ok renamed -> typeAlgebraValidated renamed
+        TaReorder { keys = keys } -> typeAlgebraReorder fields keys
+        TaConstrain { path = path, set = set } ->
+          case typeAlgebraPathError path of
+            Just message -> Err message
+            Nothing ->
+              case typeAlgebraConstrainAt fields path set of
+                Err message -> Err message
+                Ok constrained -> typeAlgebraValidated constrained
+
+@label "Pick type"
+@description "Identity-total record pick. Paths are non-empty lists of FieldKey; recursive matching never reads wireName."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+pickType : (fields: List a) -> (paths: List a) -> (emptyList: List a) -> Result String (List a)
+pickType fields paths emptyList = typeAlgebraOperate fields (TaPick { paths = paths, flatten = false })
+
+@label "Omit type"
+@description "Identity-total record omit. Paths are non-empty lists of FieldKey; recursive matching never reads wireName."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+omitType : (fields: List a) -> (paths: List a) -> (emptyList: List a) -> Result String (List a)
+omitType fields paths emptyList = typeAlgebraOperate fields (TaOmit { paths = paths })
+
+@label "Extend type"
+@description "Apply explicit preserve/reuse/supplied-mint writes addressed by FieldKey paths. A NeedsMint input is returned as an error; no body mints entropy."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+extendType : (fields: List a) -> (writes: List a) -> (emptyList: List a) -> Result String (List a)
+extendType fields writes emptyList = typeAlgebraOperate fields (TaWrites { writes = writes })
+
+@label "Merge type"
+@description "Merge identity-total record fields by FieldKey. Same key with conflicting current projection and same projection with different key reject."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+mergeType : (left: List a) -> (right: List a) -> (emptyList: List a) -> Result String (List a)
+mergeType left right emptyList = typeAlgebraOperate left (TaMerge { fields = right })
+
+@label "Rename type"
+@description "Apply an explicit current-wire rename at a FieldKey path while preserving the semantic key."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+renameType : (fields: List a) -> (path: List a) -> (wireName: String) -> (emptyList: List a) -> Result String (List a)
+renameType fields path wireName emptyList = typeAlgebraOperate fields (TaRename { path = path, wireName = wireName })
+
+@label "type-algebra: freeze fields"
+@description "Validate the ordered identity-bearing field snapshot before the host B3 edge wraps it in a `$record`. No name-keyed map or host-side identity policy participates."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+freezeTypeFields : (fields: List a) -> Result String (List a)
+freezeTypeFields fields = typeAlgebraValidated fields
+
+@label "type-algebra: thaw fields"
+@description "Validate the ordered identity-bearing fields read from a `$record` before returning the thawed entry list. The host edge only reads the `$record` envelope."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+thawTypeFields : (fields: List a) -> Result String (List a)
+thawTypeFields fields = typeAlgebraValidated fields
+
+@category "engine-internal"
+typeAlgebraResolveWirePath : (fields: List a) -> (wirePath: List String) -> (acc: List a) -> Result String (List a)
+typeAlgebraResolveWirePath fields wirePath acc =
+  case head wirePath of
+    Nothing -> Ok acc
+    Just wireName ->
+      case typeAlgebraFindWireField fields wireName of
+        Nothing -> Err (concat "field algebra: current wire path does not resolve " wireName)
+        Just field ->
+          let nextAcc = appendItem field.key acc
+          let rest = tailOr wirePath
+          if eq (length rest) 0
+          then Ok nextAcc
+          else
+            case field.type of
+              TaRecord { fields = nested } -> typeAlgebraResolveWirePath nested rest nextAcc
+              _ -> Err (concat "field algebra: current wire path enters non-record " wireName)
+
+@category "engine-internal"
+typeAlgebraResolveWirePathsFrom : (fields: List a) -> (wirePaths: List a) -> (acc: List a) -> Result String (List a)
+typeAlgebraResolveWirePathsFrom fields wirePaths acc =
+  case head wirePaths of
+    Nothing -> Ok acc
+    Just wirePath ->
+      case typeAlgebraResolveWirePath fields wirePath [] of
+        Err message -> Err message
+        Ok keyPath -> typeAlgebraResolveWirePathsFrom fields (tailOr wirePaths) (appendItem keyPath acc)
+
+@label "Resolve current wire field paths"
+@description "Explicit readable boundary adapter: resolve current wire-name paths once against a validated owner-local field view and return FieldKey paths. Recursive algebra consumes only the returned keys."
+@tags "engine" "type" "algebra" "field-identity" "wire-boundary" "phase-3"
+resolveTypeFieldPaths : (fields: List a) -> (wirePaths: List a) -> Result String (List a)
+resolveTypeFieldPaths fields wirePaths =
+  case typeAlgebraValidateFields fields of
+    Just message -> Err message
+    Nothing -> typeAlgebraResolveWirePathsFrom fields wirePaths []
+
+@category "engine-internal"
+typeAlgebraGetAt : (fields: List a) -> (path: List a) -> Maybe a
+typeAlgebraGetAt fields path =
+  case head path of
+    Nothing -> Nothing
+    Just key ->
+      case typeAlgebraFindField fields key of
+        Nothing -> Nothing
+        Just field ->
+          let rest = tailOr path
+          if eq (length rest) 0
+          then Just field
+          else
+            case field.type of
+              TaRecord { fields = nested } -> typeAlgebraGetAt nested rest
+              _ -> Nothing
+
+@label "Get field by identity path"
+@description "Return the field at a validated FieldKey path. Current names never participate."
+@tags "engine" "field" "algebra" "field-identity" "phase-3"
+fieldAlgebraGetField : (fields: List a) -> (path: List a) -> Result String (Maybe a)
+fieldAlgebraGetField fields path =
+  case typeAlgebraValidateFields fields of
+    Just message -> Err message
+    Nothing ->
+      case typeAlgebraPathError path of
+        Just message -> Err message
+        Nothing -> Ok (typeAlgebraGetAt fields path)
+
+@category "engine-internal"
+typeAlgebraFieldPathsWalk : (fields: List a) -> (deep: Bool) -> (prefix: List a) -> (acc: List a) -> List a
+typeAlgebraFieldPathsWalk fields deep prefix acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let path = concat prefix [field.key]
+      let withSelf = appendItem path acc
+      let withNested =
+            if deep
+            then
+              case field.type of
+                TaRecord { fields = nested } -> typeAlgebraFieldPathsWalk nested true path withSelf
+                _ -> withSelf
+            else withSelf
+      typeAlgebraFieldPathsWalk (tailOr fields) deep prefix withNested
+
+@label "List field identity paths"
+@description "List top-level or recursive FieldKey paths in source order. Readable names are deliberately absent."
+@tags "engine" "field" "algebra" "field-identity" "phase-3"
+fieldAlgebraFieldPaths : (fields: List a) -> (deep: Bool) -> Result String (List a)
+fieldAlgebraFieldPaths fields deep =
+  case typeAlgebraValidateFields fields of
+    Just message -> Err message
+    Nothing -> Ok (typeAlgebraFieldPathsWalk fields deep [] [])
+
+@label "Tuple to identified record"
+@description "Convert tuple item types to an identity-total positional record. Each output field has PositionalField(index) and canonical wire projection _index."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+tupleToRecord : (items: List a) -> List a
+tupleToRecord items = typeAlgebraTupleToRecordWalk items 0 []
+
+@category "engine-internal"
+typeAlgebraTupleToRecordWalk : (items: List a) -> (index: Number) -> (acc: List a) -> List a
+typeAlgebraTupleToRecordWalk items index acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let field = TaField {
+        key = PositionalField { index = index },
+        wireName = concat "_" (toString index),
+        type = item,
+        raw = Nothing
+      }
+      typeAlgebraTupleToRecordWalk (tailOr items) (add index 1) (appendItem field acc)
+
+@category "engine-internal"
+typeAlgebraRecordTypes : (fields: List a) -> (acc: List a) -> Result String (List a)
+typeAlgebraRecordTypes fields acc =
+  case head fields of
+    Nothing -> Ok acc
+    Just field ->
+      case field.key of
+        NamedField -> Err (concat "recordToTuple: field " (concat field.wireName " is not positional"))
+        PositionalField ->
+          typeAlgebraRecordTypes (tailOr fields) (appendItem field.type acc)
+
+@label "Identified record to tuple"
+@description "Inverse of tupleToRecord. Validates key/ordinal/wire agreement and rejects any named field."
+@tags "engine" "type" "algebra" "field-identity" "phase-3"
+recordToTuple : (fields: List a) -> Result String (List a)
+recordToTuple fields =
+  case typeAlgebraValidateFields fields of
+    Just message -> Err message
+    Nothing -> typeAlgebraRecordTypes fields []
+
+-- ============================================================================
+-- autoCaseName + untaggedToVariant — the untagged-union desugar.
+-- containment-substrate Phase 6 — ported off type-algebra.ts. The kill-2-birds:
+-- `untaggedToVariant` composes the now-Fenel `disjoint` (the containment trio)
+-- + the ported `autoCaseName`. The TS wrapper resolves each `{$ref}` candidate
+-- (refToStructuralOrNamed — the registry ref-resolution boundary, KEPT) then
+-- marshals each resolved candidate once as TraversalType. Fenel owns List /
+-- Maybe / Result / nominal / structural classification as well as the case
+-- name. `raw` is the passthrough type embedded in the output variant case
+-- (`$variant` is `$`-keyed ⇒ authored at the boundary, not in-body).
+-- ============================================================================
+
+-- UtvCand — one resolved candidate: its TraversalType (`op`, shared by the
+-- pairwise disjointness and case-name folds) plus its raw passthrough type.
+UtvCand = UtvCand op: a raw: a
+
+-- UtvCase — one output variant case before the `$variant` envelope: the
+-- (deduplicated) case name + the passthrough payload type. The TS wrapper wraps
+-- `valueType` in the `{ name = "value", … }` field shape.
+UtvCase = UtvCase name: String valueType: a
+
+-- UtvResult — the body's return (positional fields ⇒ `_0`): an error string, a
+-- single passthrough type (the 1-candidate fast path), or the case list.
+UtvResult =
+  UtvErr String
+  | UtvSingle a
+  | UtvVariant a
+
+@label "type-algebra: autoCaseName"
+@description "Derive an untagged-union case name directly from TraversalType. Exact List/Maybe/Result recognition, nominal handles, wrapper recursion, and structural kind selection are Fenel-owned; current field spellings never participate."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+autoCaseName : (node: TraversalType) -> (listHeadKey: FieldKey) -> String
+autoCaseName node listHeadKey =
+  case node of
+    TtNamed { name = n } -> n
+    TtRefined { base = b } -> autoCaseName b listHeadKey
+    other -> autoCaseNameRecognized other listHeadKey
+
+@category "engine-internal"
+autoCaseNameRecognized : (node: TraversalType) -> (listHeadKey: FieldKey) -> String
+autoCaseNameRecognized node listHeadKey =
+  case peelList node listHeadKey of
+    Just _ -> "List"
+    Nothing -> case peelMaybe node of
+      Just _ -> "Maybe"
+      Nothing -> case peelResult node of
+        Just _ -> "Result"
+        Nothing -> autoCaseNameStructural node listHeadKey
+
+@category "engine-internal"
+autoCaseNameStructural : (node: TraversalType) -> (listHeadKey: FieldKey) -> String
+autoCaseNameStructural node listHeadKey =
+  case node of
+    TtOpaque { name = n } -> n
+    TtTagged { value = v } -> autoCaseName v listHeadKey
+    TtTuple -> "Tuple"
+    TtRecord -> "Record"
+    TtVariant -> "Variant"
+    TtMap -> "Map"
+    TtMu -> "Mu"
+    TtUnit -> "Unit"
+    TtVoid -> "Void"
+    TtVar { name = n } -> n
+    TtApp { head = h } -> h
+    _ -> "Case"
+
+@label "Untagged to variant"
+@description "Desugar a list of candidate types into a tagged `$variant`, erroring when any pair is not provably disjoint. TraversalType classification and case naming are Fenel-owned; the host supplies only the canonical List-head FieldKey and authors the final `$variant` envelope."
+@tags "engine" "type" "algebra" "boundary" "containment-substrate"
+untaggedToVariant : (cands: List a) -> (listHeadKey: FieldKey) -> UtvResult
+untaggedToVariant cands listHeadKey =
+  if eq (length cands) 0
+  then UtvErr "untaggedToVariant: empty union"
+  else if eq (length cands) 1
+  then case head cands of
+         Just c -> UtvSingle c.raw
+         Nothing -> UtvErr "untaggedToVariant: empty union"
+  else case untaggedFirstNonDisjoint cands 0 of
+         Just msg -> UtvErr msg
+         Nothing -> UtvVariant (untaggedBuildCases cands listHeadKey [] [])
+
+@label "type-algebra: untaggedFirstNonDisjoint"
+@description "containment-substrate Phase 6 — outer loop of untaggedToVariant's pairwise disjointness check: compare cand[i] against every cand[j>i] (untaggedInnerDisjoint), returning the first not-provably-disjoint pair's error message (byte-identical to the TS oracle) or Nothing if all pairs are disjoint. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+untaggedFirstNonDisjoint : (cands: List a) -> (i: Number) -> Maybe String
+untaggedFirstNonDisjoint cands i =
+  case head cands of
+    Nothing -> Nothing
+    Just c ->
+      case tail cands of
+        Nothing -> Nothing
+        Just rest ->
+          case untaggedInnerDisjoint c rest i (add i 1) of
+            Just msg -> Just msg
+            Nothing -> untaggedFirstNonDisjoint rest (add i 1)
+
+@label "type-algebra: untaggedInnerDisjoint"
+@description "containment-substrate Phase 6 — inner loop of untaggedToVariant's pairwise check: test cand `c` (index i) against each remaining cand `d` (index j); the first pair with `disjoint c.op d.op` NOT a positive proof (containmentProven) yields the not-provably-disjoint error. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+untaggedInnerDisjoint : (c: a) -> (rest: List a) -> (i: Number) -> (j: Number) -> Maybe String
+untaggedInnerDisjoint c rest i j =
+  case head rest of
+    Nothing -> Nothing
+    Just d ->
+      if containmentProven (disjoint c.op d.op)
+      then case tail rest of
+             Nothing -> Nothing
+             Just r2 -> untaggedInnerDisjoint c r2 i (add j 1)
+      else Just (concat "untaggedToVariant: candidates " (concat (toString i) (concat " and " (concat (toString j) " are not provably disjoint — name your cases"))))
+
+@label "type-algebra: untaggedBuildCases"
+@description "Build output cases in candidate order from the Fenel-owned TraversalType name fold, deduplicating with base/base2/base3 suffixes."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+untaggedBuildCases : (cands: List a) -> (listHeadKey: FieldKey) -> (used: List String) -> (acc: List a) -> List a
+untaggedBuildCases cands listHeadKey used acc =
+  case head cands of
+    Nothing -> acc
+    Just c ->
+      let nm = untaggedDedup (autoCaseName c.op listHeadKey) used
+      let caseRec = UtvCase { name = nm, valueType = c.raw }
+      let nextAcc = appendItem caseRec acc
+      case tail cands of
+        Nothing -> nextAcc
+        Just rest -> untaggedBuildCases rest listHeadKey (appendItem nm used) nextAcc
+
+@label "type-algebra: untaggedDedup"
+@description "containment-substrate Phase 6 — first-free case name: `base` if unused, else `base2`/`base3`/… (untaggedDedupSuffix from n=2). Mirrors the TS `while (used.has(name)) name = base + n++`. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+untaggedDedup : (base: String) -> (used: List String) -> String
+untaggedDedup base used =
+  if elem base used
+  then untaggedDedupSuffix base used 2
+  else base
+
+@label "type-algebra: untaggedDedupSuffix"
+@description "containment-substrate Phase 6 — the numeric-suffix tail of untaggedDedup: return the first `base<n>` (n from 2 upward) not already used. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+untaggedDedupSuffix : (base: String) -> (used: List String) -> (n: Number) -> String
+untaggedDedupSuffix base used n =
+  let cand = concat base (toString n)
+  if elem cand used
+  then untaggedDedupSuffix base used (add n 1)
+  else cand
+
+-- ============================================================================
+-- substituteVar — one-step μ-unfold via structural variable substitution.
+-- containment-substrate Phase 6 — the SOURCE OF TRUTH for the legacy
+-- set-algebra.ts:substituteVar / unfold (which stay a ledgered PERFORMANCE
+-- BRANCH: the live structural.ts:unfold consumer is on the structural-dispatch /
+-- derive hot path, so interpreted-Fenel would regress it — the fenel-parser.ts
+-- precedent). `substituteVar(t, name)` walks the marshalled TraversalType,
+-- replacing every free `TtVar name` with the replacement (carried at the TS
+-- boundary, NOT in-body), STOPPING at a shadowing `$mu` with the same var. It
+-- emits a StOut marker tree ISOMORPHIC to the input; the TS unmarshal walks it
+-- in parallel with the original raw FenelType, patching only the StReplace
+-- leaves while preserving every container's metadata (the legacy `{...f, type}`
+-- spread) — that is how a `$`-keyed type producer rides the `$`-barrier without
+-- authoring `$record`/`$variant`/`$mu` in-body.
+--
+-- FAITHFUL to the legacy quirks: NO $arrow / $union / $intersect / $complement
+-- / $type arm (the legacy `substituteVar` has none ⇒ those return UNCHANGED =
+-- StKeep); `$refined.set` / `$map.keys` carried RAW (not recursed); `$el.call`
+-- recurses its type args; an opaque-without-pure marshals to TtNamed ⇒ StKeep
+-- (the legacy shallow-copy is JSON-equal to the original).
+-- ============================================================================
+
+-- StOut — the substituteVar result marker (positional fields ⇒ `_0`/`_1`).
+StOut =
+  StKeep
+  | StReplace
+  | StRecord a
+  | StVariant a
+  | StTuple a
+  | StMap StOut
+  | StRefined StOut
+  | StMu StOut
+  | StTagged StOut StOut
+  | StOpaque StOut
+  | StApp a
+
+@label "type-algebra: substituteVar"
+@description "containment-substrate Phase 6 — one-step μ-substitution `B[var := replacement]` over the marshalled TraversalType, emitting a StOut marker isomorphic to the input (the TS unmarshal patches it against the raw, preserving metadata). The SOURCE OF TRUTH for set-algebra.ts:substituteVar (a ledgered performance branch). Stops at a shadowing `$mu`; no arm for $arrow/$union/$intersect/$complement/$type (legacy returns them unchanged = StKeep); $refined.set / $map.keys ride raw. Dispatched via dispatchedSubstituteVar / dispatchedUnfold. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "mu" "containment-substrate"
+@category "engine-internal"
+substituteVar : (t: TraversalType) -> (name: String) -> StOut
+substituteVar t name =
+  case t of
+    TtVar { name = vn } -> if eq vn name then StReplace else StKeep
+    TtVoid -> StKeep
+    TtUnit -> StKeep
+    TtNamed -> StKeep
+    TtTypeUniverse -> StKeep
+    TtEl -> StKeep
+    TtUnknown -> StKeep
+    TtArrow -> StKeep
+    TtUnion -> StKeep
+    TtIntersect -> StKeep
+    TtComplement -> StKeep
+    TtRecord { fields = fs } -> StRecord (substVarFields fs name)
+    TtVariant { cases = cs } -> StVariant (substVarCases cs name)
+    TtTuple { items = its } -> StTuple (substVarList its name)
+    TtMap { values = v } -> StMap (substituteVar v name)
+    TtRefined { base = b } -> StRefined (substituteVar b name)
+    TtMu { body = bdy, var = mv } -> if eq mv name then StKeep else StMu (substituteVar bdy name)
+    TtTagged { value = v, phantom = ph } -> StTagged (substituteVar v name) (substituteVar ph name)
+    TtOpaque { pure = p } -> StOpaque (substituteVar p name)
+    TtApp { args = ar } -> StApp (substVarList ar name)
+
+@label "type-algebra: substVarList"
+@description "containment-substrate Phase 6 — substituteVar over a marshalled-type list (tuple items / `$el.call` args), order-preserving. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+substVarList : (items: List a) -> (name: String) -> List StOut
+substVarList items name = substVarListAcc items name []
+
+@label "type-algebra: substVarListAcc"
+@description "containment-substrate Phase 6 — accumulator walk for substVarList. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+substVarListAcc : (items: List a) -> (name: String) -> (acc: List StOut) -> List StOut
+substVarListAcc items name acc =
+  case head items of
+    Nothing -> acc
+    Just it ->
+      let nextAcc = appendItem (substituteVar it name) acc
+      case tail items of
+        Nothing -> nextAcc
+        Just rest -> substVarListAcc rest name nextAcc
+
+@label "type-algebra: substVarFields"
+@description "containment-substrate Phase 6 — substituteVar over each record/case field's `type`, returning one StOut per field (order-preserving). Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+substVarFields : (fields: List a) -> (name: String) -> List StOut
+substVarFields fields name = substVarFieldsAcc fields name []
+
+@label "type-algebra: substVarFieldsAcc"
+@description "containment-substrate Phase 6 — accumulator walk for substVarFields. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+substVarFieldsAcc : (fields: List a) -> (name: String) -> (acc: List StOut) -> List StOut
+substVarFieldsAcc fields name acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let nextAcc = appendItem (substituteVar f.type name) acc
+      case tail fields of
+        Nothing -> nextAcc
+        Just rest -> substVarFieldsAcc rest name nextAcc
+
+@label "type-algebra: substVarCases"
+@description "containment-substrate Phase 6 — substituteVar over each variant case's field list, returning one (List StOut) per case (order-preserving). Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+substVarCases : (cases: List a) -> (name: String) -> List a
+substVarCases cases name = substVarCasesAcc cases name []
+
+@label "type-algebra: substVarCasesAcc"
+@description "containment-substrate Phase 6 — accumulator walk for substVarCases. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "algebra" "containment-substrate"
+@category "engine-internal"
+substVarCasesAcc : (cases: List a) -> (name: String) -> (acc: List a) -> List a
+substVarCasesAcc cases name acc =
+  case head cases of
+    Nothing -> acc
+    Just c ->
+      let nextAcc = appendItem (substVarFields c.fields name) acc
+      case tail cases of
+        Nothing -> nextAcc
+        Just rest -> substVarCasesAcc rest name nextAcc

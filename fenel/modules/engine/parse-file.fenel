@@ -1,0 +1,308 @@
+module engine where
+
+-- =========================================================================
+-- PER-DECLARATION parsing — the token-stream split that makes the Fenel parser
+-- practical on real files. parser-substrate Phase 5b1 (brief:
+-- `workstreams/parser-substrate/briefs/phase-5b-per-decl-parsing-and-corpus-measurement.md`).
+--
+-- THE 6b2 BUDGET FINDING (roadmap, the re-measured budget table): whole-file
+-- `parseProgToks` is super-linearly impractical (the grammar ladder stays
+-- super-linear post-lever-A — 136 → 3.5 tok/sec from 14 → 66 toks; a whole real
+-- file parsed as ONE token stream does not finish in practical time). The fix:
+-- parse per-DECLARATION — each top-level decl is a short token run (tens of
+-- toks, the FAST part of the curve), and decls parse INDEPENDENTLY. The lexer +
+-- layout stay whole-file (linear, fast); only the GRAMMAR partitions.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE SPLIT (pinned by RUNNING `layoutTokens(lexAll src)`, 2026-06-13):
+-- After layout a header-less file is `vopen Decl (vsemi Decl)* vclose eof`; a
+-- headered file is `vopen module IDENT where vopen Decls vclose vclose eof`
+-- (header-only = `vopen module IDENT where vclose eof`, no inner block). The
+-- split:
+--   1. Detect headered (after the outer vopen: `module` ident + IDENT + `where`)
+--      vs header-less; capture the module name. Headered-full has an inner
+--      `vopen` after `where`; headered-empty closes immediately.
+--   2. Strip the framing to the inner DECLS token run (header-less: drop 1 front
+--      `vopen` + 2 back `vclose eof`; headered-full: drop 5 front
+--      `vopen module IDENT where vopen` + 3 back `vclose vclose eof`).
+--   3. Partition the decls run at **depth-0** `vsemi` — track depth (`vopen`
+--      ⇒ +1, `vclose` ⇒ −1); a `vsemi` at depth 0 ends a decl-LINE; a `vsemi`
+--      nested in a decl's own body block (depth ≥ 1) is KEPT (multi-stmt bodies,
+--      multi-line `|`-variants). Each chunk = one decl-LINE (`@directive` OR
+--      sig / def / typedef).
+--   4. GROUP leading `@directive` chunks with the FOLLOWING real decl chunk
+--      (directives attach to the next decl — the loader's collectLeads /
+--      buildDecls behaviour), re-joining the chunks in a group with a `vsemi`
+--      between them. A group is then a self-contained mini-Decls run.
+--
+-- `parseFileFrames` re-wraps each group as a header-less Program
+-- (`vopen <group> vclose eof`) and runs the EXISTING `parseProgToks` per group
+-- — each over a short token run (the fast curve) — then concats the per-group
+-- element lists (`buildDecls` runs inside each group, so directives reassemble
+-- onto their decl) and prepends the `module_decl` element for headered files.
+-- The result is byte-identical to `parseProgToks(whole-file)` (the 5b1 oracle).
+--
+-- WHY parseProgToks-per-GROUP (not a "DeclLine" production): a group already
+-- carries its directives + its one decl, so a header-less Program parse over the
+-- group runs `buildDecls` over exactly those lines ⇒ ONE `{frame, directives}`
+-- element, identical to the whole-file slice. Per-group vocab (`declGrammar`
+-- closes `vocabFor` over the wrapped group's toks) suffices — a decl references
+-- only its own idents/strings, so the smaller vocab parses it identically.
+--
+-- THE COMPILED PATH (the measurement, 5b2): `parseProgToks` is a COMPILED parser
+-- ENTRY (engine-bodies-dispatch.ts), so the 5b2 measurement harness drives the
+-- per-group loop calling the COMPILED `parseProgToks` per group (the split via
+-- this file's `splitTopLevelDecls`, interpreted — pure linear list ops). This
+-- file's `parseFileFrames` is the pure Fenel REFERENCE orchestrator the 5b1
+-- oracle verifies on a small in-budget subset (interpreted); it is NOT a new
+-- compiled entry (the artifact closure + `--check` stay unchanged).
+--
+-- NO new entities (the split result + groups are plain records / token lists).
+-- NO laws. All pure list logic ⇒ all `.fenel` (the no-non-mandatory-TS rule).
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- List helpers (front/back drop, take) — pure, total. `tailOr` is the layout
+-- helper (engine:tailOr); reused here.
+-- -------------------------------------------------------------------------
+
+@label "Take N"
+@description "The first `n` elements of a list (fewer if shorter), built into the accumulator `acc` (call with `[]`). ACCUMULATOR TAIL-RECURSIVE (parser-substrate Phase 7d): the recursive call is the WHOLE result, so the self-host pipeline's lever-B self-tail-call → `while`-loop conversion eliminates the stack growth on big files (the latent non-tail `concat (… (takeN …))` form overflowed the host stack on long inputs — a wrong-at-scale legacy bug, killed here as the split becomes a compiled parser ENTRY). `appendItem` appends to the END so the accumulator is in source order — no reverse needed. Internal parse-file helper. parser-substrate Phase 5b1 / 7d."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b" "phase-7d"
+@category "engine-internal"
+takeN : (n: a) -> (xs: a) -> (acc: a) -> a
+takeN n xs acc =
+  if eq n 0 then acc
+  else
+    case head xs of
+      Nothing -> acc
+      Just h -> takeN (sub n 1) (tailOr xs) (appendItem h acc)
+
+@label "Drop front N"
+@description "Drop the first `n` elements of a list. Internal parse-file helper. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+dropFront : (n: a) -> (xs: a) -> a
+dropFront n xs =
+  if eq n 0 then xs
+  else dropFront (sub n 1) (tailOr xs)
+
+@label "Drop back N"
+@description "Drop the last `n` elements of a list (take length − n). Internal parse-file helper. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+dropBack : (n: a) -> (xs: a) -> a
+dropBack n xs = takeN (sub (length xs) n) xs []
+
+@label "Token type at"
+@description "The `t` field of the list element at index `i`, or `\"\"` when out of range. Used to peek the module-header shape on the raw layout token list. Internal parse-file helper. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+tokTypeAt : (xs: a) -> (i: a) -> String
+tokTypeAt xs i =
+  if lt i (length xs)
+  then
+    let e = at xs i
+    e.t
+  else ""
+
+@label "Token value at"
+@description "The `v` field of the list element at index `i`, or `\"\"` when out of range. Internal parse-file helper. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+tokValAt : (xs: a) -> (i: a) -> String
+tokValAt xs i =
+  if lt i (length xs)
+  then
+    let e = at xs i
+    e.v
+  else ""
+
+
+-- -------------------------------------------------------------------------
+-- splitTopLevelDecls — the full layout token list ⇒ `{ headered, name, groups }`.
+-- `groups` is a list of token runs, one per decl GROUP (leading directives +
+-- the one real decl, vsemi-joined). The lexer/layout stay whole-file; only this
+-- partition is per-decl. parser-substrate Phase 5b1.
+-- -------------------------------------------------------------------------
+
+@label "Split top-level declarations"
+@description "Partition a whole-file layout token stream (`layoutTokens(lexAll src)`) into per-declaration GROUPS: detect + strip the module header / program framing, split the inner decls run at depth-0 `vsemi` into decl-LINES, and group leading `@directive` lines with the following real decl (vsemi-joined). Returns `{ headered, name, groups }` (name = \"\" header-less). The 6b2 budget fix — each group is a short token run (the fast curve). parser-substrate Phase 5b1."
+@tags "engine" "parser" "parse-file" "parser-substrate" "phase-5b"
+splitTopLevelDecls : (toks: a) -> a
+splitTopLevelDecls toks =
+  -- Header detection on the RAW token list: after the outer vopen (index 0),
+  -- a headered file reads `module IDENT where` at indices 1/2/3.
+  let isHeadered = and (eq (tokValAt toks 1) "module") (and (eq (tokTypeAt toks 1) "ident") (and (eq (tokTypeAt toks 2) "ident") (eq (tokTypeAt toks 3) "where")))
+  if isHeadered
+  then
+    let name = tokValAt toks 2
+    -- headered-full has an inner `vopen` after `where` (index 4); headered-empty
+    -- closes immediately (`vclose eof`).
+    if eq (tokTypeAt toks 4) "vopen"
+    then
+      let declsRun = dropBack 3 (dropFront 5 toks)
+      { headered = true, name = name, groups = groupDecls (splitDepthZero declsRun) }
+    else { headered = true, name = name, groups = [] }
+  else
+    let declsRun = dropBack 2 (dropFront 1 toks)
+    { headered = false, name = "", groups = groupDecls (splitDepthZero declsRun) }
+
+@label "Split at depth-zero vsemi"
+@description "Partition a decls token run into decl-LINE chunks at depth-0 `vsemi` boundaries: thread a bracket-block depth (`vopen` ⇒ +1, `vclose` ⇒ −1); a `vsemi` at depth 0 ends a chunk, a nested `vsemi` (depth ≥ 1 — multi-stmt body, multi-line `|`-variant) is kept. Empty chunks are dropped. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+splitDepthZero : (toks: a) -> a
+splitDepthZero toks = splitDepthGo toks 0 [] []
+
+@label "Split depth (go)"
+@description "splitDepthZero's walk: thread `{ depth, cur, chunks }` — flush `cur` to `chunks` on a depth-0 `vsemi`, else accumulate the token (adjusting depth on vopen/vclose). Flushes the trailing chunk at end-of-input. Internal parse-file helper. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+splitDepthGo : (toks: a) -> (depth: a) -> (cur: a) -> (chunks: a) -> a
+splitDepthGo toks depth cur chunks =
+  case head toks of
+    Nothing -> flushChunk cur chunks
+    Just tk ->
+      let rest = tailOr toks
+      if and (eq tk.t "vsemi") (eq depth 0)
+      then splitDepthGo rest depth [] (flushChunk cur chunks)
+      else
+        let depth2 = if eq tk.t "vopen" then add depth 1 else if eq tk.t "vclose" then sub depth 1 else depth
+        splitDepthGo rest depth2 (appendItem tk cur) chunks
+
+@label "Flush chunk"
+@description "Append `cur` to `chunks` only when non-empty (defensive against leading/trailing/double `vsemi`). Internal parse-file helper. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+flushChunk : (cur: a) -> (chunks: a) -> a
+flushChunk cur chunks =
+  if eq (length cur) 0 then chunks else appendItem cur chunks
+
+@label "Group declarations"
+@description "Group leading `@directive` decl-LINE chunks with the FOLLOWING real decl chunk (directives attach to the next decl — the loader's collectLeads / buildDecls behaviour): accumulate directive chunks, and on each real chunk emit the vsemi-joined run of (pending directives ++ the decl). Trailing directives with NO following decl are emitted as their own final group, which buildDecls turns into a `dangling` frame the loader marshal rejects — they used to be silently DROPPED here (declaration-annotations Phase 1 A.1). parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+groupDecls : (chunks: a) -> a
+groupDecls chunks = groupDeclsGo chunks [] []
+
+@label "Group declarations (go)"
+@description "groupDecls' walk: thread `{ pending directives, out groups }` — a directive chunk accumulates, a real chunk closes a group `joinChunks (pending ++ [chunk])` and resets. At end of input any STILL-PENDING directives are emitted as a final directive-only group (they annotate nothing); dropping them was silent data loss (declaration-annotations Phase 1 A.1). Internal parse-file helper. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+groupDeclsGo : (chunks: a) -> (pending: a) -> (out: a) -> a
+groupDeclsGo chunks pending out =
+  case head chunks of
+    -- End of input. Pending directives here annotate NOTHING — the file ended.
+    -- Emit them as their own group rather than dropping them: buildDecls turns
+    -- a directive-only group into a `dangling` frame, which programToFrames maps
+    -- to `{}` and the loader marshal rejects (the importFrame precedent —
+    -- parity of rejection, never silent drop). The empty-pending guard is what
+    -- keeps every VALID file byte-identical: joinChunks [] = [], and an empty
+    -- trailing group would otherwise be appended to every parse.
+    Nothing -> if eq (length pending) 0 then out else appendItem (joinChunks pending) out
+    Just c ->
+      let rest = tailOr chunks
+      if isDirectiveChunk c
+      then groupDeclsGo rest (appendItem c pending) out
+      else groupDeclsGo rest [] (appendItem (joinChunks (appendItem c pending)) out)
+
+@label "Is directive chunk"
+@description "True when a decl-LINE chunk is a `@directive` line — its first token is `@`. Internal parse-file helper. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+isDirectiveChunk : (chunk: a) -> Bool
+isDirectiveChunk chunk =
+  case head chunk of
+    Nothing -> false
+    Just h -> eq h.t "@"
+
+@label "Join chunks"
+@description "Flatten a list of decl-LINE chunks into one token run, inserting a synthesized `vsemi` token between consecutive chunks (the layout-virtual the Decls production expects between decl-lines). parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+joinChunks : (chunks: a) -> a
+joinChunks chunks =
+  case head chunks of
+    Nothing -> []
+    Just first ->
+      joinChunksGo (tailOr chunks) first
+
+@label "Join chunks (go)"
+@description "joinChunks' walk: prepend-accumulated run; each further chunk is appended after a synthesized `vsemi` token. Internal parse-file helper. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+joinChunksGo : (chunks: a) -> (acc: a) -> a
+joinChunksGo chunks acc =
+  case head chunks of
+    Nothing -> acc
+    Just c ->
+      joinChunksGo (tailOr chunks) (concat acc (concat (appendItem { t = "vsemi", v = "", ln = 0, col = 0 } []) c))
+
+
+-- -------------------------------------------------------------------------
+-- parseFileFrames — the per-decl orchestrator (the 5b1 reference). Split into
+-- groups, parse each group as a header-less Program via the existing
+-- `parseProgToks`, concat the element lists, prepend the module element for
+-- headered files. Returns `Maybe [{frame, directives}]` (Nothing if ANY group
+-- fails — the all-or-nothing parity with whole-file `parseProgToks`).
+-- parser-substrate Phase 5b1.
+-- -------------------------------------------------------------------------
+
+@label "Parse file frames"
+@description "The per-declaration program parse: split the whole-file layout token stream into decl GROUPS (splitTopLevelDecls), parse each group as a header-less Program via the existing `parseProgToks` (each over a short token run — the 6b2 fast curve), concat the per-group `{frame, directives}` element lists, and prepend the `module_decl` element for headered files. Returns `Just [element]` on a full parse, Nothing if any group fails (the all-or-nothing parity with whole-file parseProgToks). The 5b1 reference orchestrator (NOT a compiled entry). parser-substrate Phase 5b1."
+@tags "engine" "parser" "parse-file" "parser-substrate" "phase-5b"
+parseFileFrames : (table: a) -> (nullValue: a) -> (toks: a) -> Maybe a
+parseFileFrames table nullValue toks =
+  let s = splitTopLevelDecls toks
+  case parseGroups table nullValue s.groups of
+    Nothing -> Nothing
+    Just els ->
+      if s.headered
+      then Just (concat (appendItem { frame = { kind = "module", name = s.name }, directives = [] } []) els)
+      else Just els
+
+@label "Parse groups"
+@description "Parse a list of decl GROUPS, sequencing the Maybe results: each group ⇒ `parseOneGroup` ⇒ `Just [element]`; concat all; Nothing if any group fails. parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+parseGroups : (table: a) -> (nullValue: a) -> (groups: a) -> Maybe a
+parseGroups table nullValue groups =
+  case head groups of
+    Nothing -> Just []
+    Just g ->
+      case parseOneGroup table nullValue g of
+        Nothing -> Nothing
+        Just els ->
+          case parseGroups (applySourceFixityElements table els) nullValue (tailOr groups) of
+            Nothing -> Nothing
+            Just rest -> Just (concat els rest)
+
+-- File-local fixities affect only following declaration groups. Keep the
+-- existing notation-to-function mapping while replacing precedence/association.
+@category "engine-internal"
+applySourceFixityElements : (table: a) -> (elements: a) -> a
+applySourceFixityElements table elements = fold applySourceFixityElement table elements
+
+@category "engine-internal"
+applySourceFixityElement : (table: a) -> (element: a) -> a
+applySourceFixityElement table element =
+  let f = element.frame
+  if neq f.kind "fixity" then table
+  else
+    let prior = fixityOf table f.op
+    concat [{ notation = f.op, fnId = prior.fnId, prec = f.prec, assoc = f.assoc }] (filter (\row -> neq row.notation f.op) table)
+
+@label "Parse one group"
+@description "Parse one decl GROUP token run as a header-less Program: re-wrap as `vopen <group> vclose eof` and call the existing `parseProgToks`, returning its `Just [element]` element list (one element — buildDecls runs over the group's directive+decl lines). parser-substrate Phase 5b1."
+@tags "engine" "internal" "parser" "parse-file" "parser-substrate" "phase-5b"
+@category "engine-internal"
+parseOneGroup : (table: a) -> (nullValue: a) -> (group: a) -> Maybe a
+parseOneGroup table nullValue group =
+  let vopenTok = { t = "vopen", v = "", ln = 0, col = 0 }
+  let vcloseTok = { t = "vclose", v = "", ln = 0, col = 0 }
+  let eofTok = { t = "eof", v = "", ln = 0, col = 0 }
+  let tail2 = concat group (concat (appendItem vcloseTok []) (appendItem eofTok []))
+  let wrapped = concat (appendItem vopenTok []) tail2
+  parseProgToks table nullValue wrapped

@@ -1,0 +1,2729 @@
+module engine where
+
+-- =========================================================================
+-- solveRel / solveFnRel — multi-binder relational solve (stage-1 conjunctive
+-- Datalog over a THREADED finite fact base). expr-substrate Phase 13 (brief:
+-- `workstreams/expr-substrate/briefs/phase-13-relational-solve.md`).
+--
+-- P5's `solve`/`solveFn` fence the SINGLE-free-var case (0 or ≥2 free vars ⇒
+-- Nothing). This phase adds the SIBLING entries that take the N-var unknowns:
+-- the grandparent query `solveFn (\x y -> and (parentOf x y) (parentOf y
+-- "eleonora"))` ⇒ the bindings `{x = "anna", y = "bob"}`. `solve`/`solveFn`
+-- stay BYTE-UNTOUCHED — the ≥2-var Nothing survives as the UNSAFE-query case
+-- (an unbounded domain has no finite extension; only a relation atom grounds a
+-- var).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE FACTS ENV (threaded — storage-is-an-effect). The pure core NEVER
+-- fetches: the live `state:listInstances → facts` materialization is P16's
+-- half. The CALLER builds a plain marker (the `$`-key barrier — same as the
+-- WitSet markers in solve.fenel):
+--   { relations = [{ name, arity, rows }, …]   — name = the atom head spelling
+--                                                 (bare or namespaced, VERBATIM
+--                                                 as the lambda author wrote —
+--                                                 Step-0 probe 2); rows = the
+--                                                 relation's EXTENSION, each row
+--                                                 a positional scalar list in
+--                                                 the entity's field-decl order.
+--   , rules     = [{ name, params, body }, …] } — a derived relation: a Fenel
+--                                                 fn, body PRE-REIFIED to Expr
+--                                                 (the test/TS side threads it).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE GRAMMAR (decide-substrate Phase 4T Step C widened or/ground-not; 13b
+-- removed the recursion / derived-not / or-in-rule-body fences via the
+-- STRATIFIED SEMI-NAIVE MATERIALIZATION pass — the 13b section at the end
+-- of this file). relSolveSet FIRST materializes (relMaterialize) the finite
+-- extension of every reachable derived predicate that is RECURSIVE, NEGATED,
+-- or OR-BODIED — bottom-up per stratum, semi-naive least fixpoint,
+-- unstratifiable/unsafe/fuel ⇒ Nothing — and appends them to
+-- facts.relations (shadowing their rules). The query then DNF-distributes
+-- any REL-BEARING `or` (dnfBranches — bounded at 64 branches, over-cap ⇒
+-- Nothing; a rel-free `or` stays ONE residual conjunct) into conjunctive
+-- branches; each branch's conjuncts classify:
+--   • ATOM      — `ECall f args`, f ∈ relations (incl. MATERIALIZED derived
+--                 predicates) ⇒ join.
+--   • RULE ATOM — `ECall f args`, f ∈ rules ⇒ unfold (params→argExprs via
+--                 subExpr, re-classify) — the top-down mode for plain
+--                 non-recursive rules, which keeps CONTEXT-SAFETY (`big x =
+--                 gt x 5` decides when the query grounds x). The unfold-
+--                 stack fence is now DEFENSIVE: a recursive rule reachable
+--                 by classification is materialized (hence relation-
+--                 shadowed); only analysis-invisible shapes (e.g. a rule
+--                 call smuggled in through an arg-position substitution)
+--                 still hit it, and they fence exactly as before.
+--   • NEG ATOM  — `not (rel …)` over a RELATION (incl. a MATERIALIZED
+--                 derived predicate — stratified negation, 13b) with
+--                 matching arity ⇒ an ANTIJOIN filter (negation-as-failure
+--                 over the CLOSED finite extension); SAFE only when every
+--                 arg is a positively-grounded var or a literal. A rel-
+--                 bearing non-atom under `not` stays fenced (no De Morgan).
+--   • RESIDUAL  — anything with NO relation/rule head ANYWHERE inside ⇒ a
+--                 per-row closed-term filter (incl. rel-free or/not).
+-- An arity-mismatched atom, a requested var not grounded by ≥1 POSITIVE atom
+-- arg (the Datalog SAFETY condition, checked PER BRANCH — every disjunct must
+-- ground the vars), an unsafe negation, an UNSTRATIFIABLE rule set (a
+-- negative edge inside an SCC), an unmaterializable rule (context-safe-only
+-- body), fixpoint-fuel exhaustion, or any failing branch ⇒ Nothing. The
+-- per-branch row sets UNION (structural dedupe) into ONE SeEnum.
+--
+-- JOIN = select-project-join, fold atoms left-to-right from the unit tuple-set
+-- (`vars = [], rows = [[]]`). Per atom arg: an ELit constant ⇒ SELECT (require
+-- equal); an EVar already bound (in the tuple OR earlier in the SAME atom) ⇒
+-- equality MATCH; an EVar new ⇒ EXTEND/project (append to vars in
+-- first-appearance order). Residuals apply AFTER all atoms (safety ⇒ all their
+-- vars are bound by then).
+--
+-- RESIDUAL FILTER = substitute + closed-term decide, PROVEN-ROWS semantics.
+-- Per row: bind vars via the EXISTING substituteCaptures (row values ⇒ ELit),
+-- then closedEval the closed conjunct (eq/lt/lte/gt/gte over closed AFFINE
+-- terms via P12's `affineOf ""` constant-folder; eq on non-numeric closed ELit
+-- pairs via deepEqValue — structural deep-eq over variant/record/list cells
+-- (solver-extension Phase 5), reference-shallow no longer; and/or/not
+-- compositions; ELit
+-- true/false leaves). UNDECIDED (out-of-language) ⇒ the ROW is conservatively
+-- EXCLUDED — the result is rows PROVEN to satisfy the predicate (an
+-- under-approximation when residuals are partly undecidable; sound for
+-- witnessing — we only assert what we proved).
+-- COMPLETENESS (2026-11-06): the residual filter reports whether it dropped
+-- an undecided row. A single witness keeps the proven rows; the find-all face
+-- (relSolveSetComplete) and every materialized derived predicate answer
+-- Nothing instead, so `Just rows` / `Just []` never claim an answer they did
+-- not decide and `not` over a derived predicate antijoins its completed
+-- extension.
+--
+-- WITNESS = bindings-list. relSolve projects the join onto the REQUESTED vars,
+-- dedupes (set semantics), and emits a `SeEnum` of PRE-ZIPPED binding-record
+-- rows (`SeEnum { values = [[{ name, value }…]…] }` — the P-1 form: a finite
+-- relation IS a finite set; decide-substrate Phase 1 Stage B retired the
+-- WsTuples marker); `inhabit`'s plain SeEnum arm reads it ⇒ the FIRST row's
+-- bindings-list, `enumerateSet` ⇒ all rows. Row ORDER is intrinsic to each
+-- binding record (name+value pairs), not positional — the P-1 var-order note.
+-- var order: solveRel = collectFreeVars order (first-appearance, Step-0
+-- probe 4); solveFnRel = the lambda's param order (reify supplies params).
+--
+-- NO ENTITY DECLS: the facts env + the intermediate tuple-sets are plain
+-- records (the audit-green invariant) ⇒ law +0, lock +0, audit exit-0 (the
+-- emitted SeEnum is the already-registered SetExpr ADT — no new decl).
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Entries.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Solve relational"
+@description "Multi-binder relational solve (stage-1 conjunctive Datalog): find bindings for ALL the free vars of a predicate `Expr` against a THREADED finite fact base. Discovers the unknowns via `collectFreeVars` (first-appearance order). Flattens the top-level `and` tree, classifies each conjunct (relation atom ⇒ join / rule atom ⇒ unfold / residual ⇒ closed-term filter), runs select-project-join over the relations' extensions, applies residuals (proven-rows), projects onto the free vars, and witnesses the first surviving row as `Just [{ name, value }…]`. Unsafe (a var ungrounded by any atom) / out-of-fragment (or/not over atoms, recursion, arity mismatch) ⇒ Nothing. The sibling of P5's single-var `solve` (which stays byte-untouched). expr-substrate Phase 13."
+@tags "engine" "solve" "relational" "datalog" "prover" "expr-substrate" "phase-13"
+solveRel : (expr: (Expr Any)) -> (facts: a) -> Maybe a
+solveRel expr facts =
+  let vars = collectFreeVars expr [] []
+  relSolve vars expr facts
+
+@label "Solve fn relational"
+@description "The relational composition `solveFnRel f facts = solveRel (reify f) facts` (with the lambda's PARAMS as the ordered unknowns): reify the marshalled Fn value to its `Expr` body + captures, substitute the captures, then relational-solve over the param order against the threaded fact base. reify's Err (bodyless / native / non-reifiable) ⇒ Nothing. The headline grandparent query `\\x y -> and (parentOf x y) (parentOf y \"eleonora\")` rides this. expr-substrate Phase 13."
+@tags "engine" "solve" "relational" "reify" "datalog" "prover" "expr-substrate" "phase-13"
+solveFnRel : (input: { body: a, params: List String, env: a }) -> (ctorDefs: a) -> (nullValue: a) -> (facts: a) -> Maybe a
+solveFnRel input ctorDefs nullValue facts =
+  case reify input ctorDefs nullValue of
+    Err e -> Nothing
+    Ok r -> relSolve input.params (substituteCaptures r.body r.captures) facts
+
+-- decide-substrate Phase 3 (the theory-family completion tail) — THE INTERFACE
+-- IS ALREADY FAMILY-INTEGRATED. The design (`design/deciding.md` §7, D-E) named
+-- "rel-solve instance-izes the INTERFACE (the join engine = the body; the 13b
+-- fences unlocked by Phase-4 search)." At HEAD that integration is ALREADY the
+-- shape: `relSolveSet` emits a CANONICAL `SeEnum { values = <binding-rows> }`
+-- SetExpr (a finite relation IS a finite set), which the DecidableMembership
+-- SeEnum theory decides / witnesses / enumerates through its own per-shape faces
+-- (Phase 3 Step A) — `relSolve = relSolveSet >>= inhabit` witnesses via the
+-- family's `inhabit` dispatcher, and solveRelAll / solveFnRelAll enumerate via
+-- `enumerateSet` (the family's enumerate dispatcher). So there is NO separate
+-- "relational theory" instance to register: rel-solve is a Se*-emitting PRODUCER
+-- feeding the existing family, exactly as `comprehend` is (`solve = inhabit ∘
+-- comprehend`). The join engine (its body — flatten / expand / join / residual /
+-- project) is unchanged; the 13b fences (or / not / shared-var, semi-naive
+-- fixpoint) DELEGATE to the Phase-4 search arc (∪-inhabitation), not this phase.
+-- No instance-ization code is needed — the interface already speaks the family's
+-- canonical currency.
+@label "Rel solve"
+@description "The vars-explicit relational solver core shared by solveRel (free-var order) and solveFnRel (param order). Empty vars ⇒ Nothing. Flattens conjuncts, expands (atom/rule/residual classification with the recursion + or/not + arity fences), safety-checks every requested var is grounded by an atom arg, joins the relation extensions, applies residuals, projects onto `vars`, and witnesses via `inhabit`'s SeEnum arm (the first binding-row). expr-substrate Phase 13; Se* since decide-substrate Phase 1 Stage B."
+@tags "engine" "solve" "relational" "datalog" "prover" "expr-substrate" "phase-13"
+relSolve : (vars: List String) -> (expr: (Expr Any)) -> (facts: a) -> Maybe a
+relSolve vars expr facts =
+  case relSolveSet vars expr facts of
+    Nothing -> Nothing
+    Just w -> inhabit w
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- relSolveSet — the SET-returning core (expr-substrate Phase 15). Split out of
+-- relSolve at the witness seam: `relSolve = relSolveSet >>= inhabit`. The
+-- enumeration siblings (solveRelAll / solveFnRelAll, enumerate.fenel) call this
+-- to read the FULL deduped tuple set rather than just its first witness. Every
+-- P13 fence (empty vars / out-of-fragment / unsafe) ⇒ Nothing; a safe query
+-- with no satisfying rows ⇒ Just (SeEnum { values = [] }) (the load-bearing
+-- `Just [] ≠ Nothing` split — relSolve folds it back to Nothing via
+-- inhabit-on-empty-enum, so the P13 behaviour is byte-identical). `vars` is the
+-- requested unknowns (free-var order for solveRel, param order for solveFnRel).
+-- The rows are PRE-ZIPPED binding-record lists (rowsToBindings) — the P-1
+-- SeEnum-of-binding-records form; a finite relation IS a finite set.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Rel solve set"
+@description "The SET-returning relational solver core — `relSolve = relSolveSet >>= inhabit` (expr-substrate Phase 15). Stage-1 Datalog widened by decide-substrate Phase 4T Step C and completed by 13b: relMaterialize FIRST computes the finite extensions of every reachable derived predicate that is recursive, negated, or or-bodied (stratified semi-naive least fixpoint — see the 13b section) and appends them as relations; then the query DNF-distributes rel-bearing `or` conjuncts (dnfBranches — size-bounded at 64 disjunctive branches, over-cap ⇒ the Nothing blowup fence; a REL-FREE `or` stays one residual conjunct, byte-preserving the proven-rows path), and EVERY conjunctive branch runs the classic pipeline (classify/unfold, ground-`not` antijoin, safety-check, join, residual-filter) with the projected binding-row sets UNIONED (structural dedupe). Emits the canonical `SeEnum { values = <binding-row list> }` (each value = one projected row PRE-ZIPPED with the vars into a `[{ name, value }…]` bindings list — the P-1 form). Every fence (empty vars / out-of-fragment / unsafe-var / unsafe-negation / over-cap DNF / any unsafe branch / UNSTRATIFIABLE negation / unmaterializable rule / fixpoint-fuel exhaustion) ⇒ Nothing; a safe-but-empty query ⇒ Just (SeEnum { values = [] }) (the `Just [] ≠ Nothing` split). expr-substrate Phase 15; or/ground-not decide-substrate Phase 4T; recursion/stratified-not/or-in-body decide-substrate 13b."
+@tags "engine" "solve" "relational" "enumerate" "datalog" "prover" "expr-substrate" "phase-13" "phase-15" "decide-substrate" "phase-1" "phase-4"
+relSolveSet : (vars: List String) -> (expr: (Expr Any)) -> (facts: a) -> Maybe a
+relSolveSet vars expr facts =
+  case relSolveSetTracked vars expr facts of
+    Nothing -> Nothing
+    Just r -> Just r.set
+
+-- relSolveSetComplete — the COMPLETE-answer face (2026-11-06 completeness
+-- repair). relSolveSet keeps the proven rows, which is sound for ONE witness;
+-- a find-all answer additionally claims there is no other row, so a query in
+-- which some row's residual was undecided answers Nothing instead of a
+-- silently shortened list (or a false `Just []`).
+@label "Rel solve set complete"
+@description "The complete-answer face of the relational core: Just the binding-row SeEnum only when every joined row was either proven or refuted by the residual conditions; Nothing when any row's residual was undecided (the proven-rows set would then under-approximate the answer). Every relSolveSet fence also answers Nothing. The find-all entries (solveRelAll, solveFnRelAll, queryRel) use this face."
+@tags "engine" "solve" "relational" "enumerate" "datalog" "prover"
+relSolveSetComplete : (vars: List String) -> (expr: (Expr Any)) -> (facts: a) -> Maybe a
+relSolveSetComplete vars expr facts =
+  case relSolveSetTracked vars expr facts of
+    Nothing -> Nothing
+    Just r -> if r.complete then Just r.set else Nothing
+
+@label "Rel solve set tracked"
+@description "The shared relational core behind relSolveSet and relSolveSetComplete: materialize, DNF-distribute, run every branch, and return Just { set = SeEnum of binding rows, complete } where `complete` is false when some row's residual was undecided. Every fence ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog"
+@category "engine-internal"
+relSolveSetTracked : (vars: List String) -> (expr: (Expr Any)) -> (facts: a) -> Maybe a
+relSolveSetTracked vars expr facts =
+  if eq (length vars) 0 then Nothing
+  else
+    case relMaterialize expr facts of
+      Nothing -> Nothing
+      Just facts2 ->
+        case dnfBranches expr facts2 of
+          Nothing -> Nothing
+          Just branches -> relSolveBranches vars branches facts2 [] false
+
+-- relSolveBranches — run every DNF branch through the conjunctive pipeline and
+-- UNION the projected binding-row sets (structural dedupe via valueMember).
+-- ANY branch failing (out-of-fragment / unsafe / unsafe-negation) ⇒ the WHOLE
+-- query is Nothing — the standard safe-disjunction condition (every disjunct
+-- must ground the requested vars; a partial answer over a subset of the
+-- disjuncts would be an under-approximation presented as the full set).
+@label "rel-solve: relSolveBranches"
+@description "decide-substrate Phase 4T Step C — fold the DNF branches: each conjunct-list runs the classic conjunctive pipeline (relSolveBranch); ANY branch Nothing ⇒ Nothing (the safe-disjunction condition — every disjunct must be in-fragment and ground the requested vars); else the projected binding-row sets UNION (structural dedupe, first-seen order across branches in order). Terminal: Just { set = SeEnum of the unioned rows, complete } where complete is false when any branch had an undecided residual row. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+relSolveBranches : (vars: a) -> (branches: a) -> (facts: a) -> (acc: a) -> (undecided: Bool) -> Maybe a
+relSolveBranches vars branches facts acc undecided =
+  case head branches of
+    Nothing ->
+      let vs = acc
+      let s = SeEnum { values = vs }
+      Just { set = s, complete = not undecided }
+    Just b ->
+      case relSolveBranch vars b facts of
+        Nothing -> Nothing
+        Just br ->
+          let acc2 = unionRows br.rows acc
+          let undecided2 = if undecided then true else br.undecided
+          case tail branches of
+            Nothing ->
+              let vs2 = acc2
+              let s2 = SeEnum { values = vs2 }
+              Just { set = s2, complete = not undecided2 }
+            Just rest -> relSolveBranches vars rest facts acc2 undecided2
+
+-- relSolveBranch — the classic conjunctive pipeline over ONE conjunct list
+-- (the pre-Phase-4T relSolveSet body, + the ground-not antijoin).
+@label "rel-solve: relSolveBranch"
+@description "decide-substrate Phase 4T Step C — one conjunctive DNF branch through the classic pipeline: expand (atom / rule-unfold / ground-negated-atom / residual classification), the Datalog safety check (every requested var grounded by a POSITIVE atom) + the negation safety check (every negated atom's args grounded vars or literals), join, residual-filter (proven-rows), ANTIJOIN the negated atoms (a row survives iff the instantiated negated atom has NO matching fact — negation-as-failure over the closed finite fact base), project + dedupe ⇒ Just { rows = binding-row list, undecided } (undecided: some row's residual was neither proven nor refuted). Any fence ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+relSolveBranch : (vars: a) -> (conjuncts: a) -> (facts: a) -> Maybe a
+relSolveBranch vars conjuncts facts =
+  let exp0 = expandConjuncts conjuncts facts [] { ok = true, atoms = [], negAtoms = [], residuals = [] }
+  if exp0.ok
+  then
+    let grounded = groundedVars exp0.atoms []
+    if allGrounded vars grounded
+    then
+      if negAtomsSafe exp0.negAtoms grounded
+      then
+        let joined = joinAll exp0.atoms { vars = [], rows = appendItem [] [] }
+        let filtered = applyResiduals exp0.residuals joined
+        let anti = applyNegAtoms exp0.negAtoms filtered
+        let proj = projectTupleSet vars anti
+        let bindings = rowsToBindings proj.vars proj.rows []
+        Just { rows = bindings, undecided = filtered.undecided }
+      else Nothing
+    else Nothing
+  else Nothing
+
+-- unionRows — structural union (append the rows not already present).
+@label "rel-solve: unionRows"
+@description "decide-substrate Phase 4T Step C — append each row of a branch's binding-row list onto the running union unless a STRUCTURALLY equal row (valueMember / deepEqValue) is already present — cross-branch set semantics for the DNF union. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+unionRows : (rows: a) -> (acc: a) -> a
+unionRows rows acc =
+  case head rows of
+    Nothing -> acc
+    Just r ->
+      let acc2 = if valueMember r acc then acc else appendItem r acc
+      case tail rows of
+        Nothing -> acc2
+        Just rest -> unionRows rest acc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- dnfBranches — disjunctive normal form over the REL-BEARING connective
+-- skeleton (decide-substrate Phase 4T Step C). Returns Maybe (List (List
+-- Expr)) — a list of conjunct lists; Nothing = the 64-branch blowup guard
+-- fired. `and` ⇒ the bounded cartesian product of its args' branch lists
+-- (subsumes flattenConjuncts for or-free trees — same conjunct order);
+-- a REL-BEARING `or` ⇒ the concatenation of its args' branch lists (the
+-- disjunctive split); a REL-FREE `or` ⇒ ONE leaf conjunct (it stays a
+-- closedEval residual — byte-preserving the proven-rows path and avoiding
+-- needless branch multiplication); every other Expr ⇒ ONE leaf conjunct.
+-- `not` is NOT distributed (no De Morgan) — a rel-bearing `not` classifies at
+-- expandOne (a negated RELATION atom ⇒ antijoin; anything else rel-bearing ⇒
+-- the fence); `or` inside RULE BODIES stays fenced (the unfold flattens
+-- conjunctively — distributing mid-unfold is the semi-naive tail's
+-- neighborhood, documented).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "rel-solve: dnfBranches"
+@description "decide-substrate Phase 4T Step C — DNF-distribute a query Expr over its rel-bearing connective skeleton ⇒ Maybe (List of conjunct-lists). `and` ⇒ bounded cartesian product (dnfAnd); a REL-BEARING `or` ⇒ per-arg branch concat (dnfOr — the disjunctive split); a REL-FREE `or` / `not` / any other Expr ⇒ one leaf conjunct (rel-free or stays a closedEval residual; not classifies at expandOne). Nothing = the 64-branch blowup guard. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+dnfBranches : (expr: (Expr Any)) -> (facts: a) -> Maybe a
+dnfBranches expr facts =
+  case expr of
+    ECall { fnId = f, args = args } ->
+      if eq f "and" then dnfAnd args facts (appendItem [] [])
+      else if eq f "or"
+      then
+        if containsRelHead expr facts
+        then dnfOr args facts []
+        else dnfLeaf expr
+      else dnfLeaf expr
+    _ -> dnfLeaf expr
+
+@label "rel-solve: dnfLeaf"
+@description "decide-substrate Phase 4T Step C — one leaf conjunct as a DNF: Just [[expr]]. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+dnfLeaf : (expr: (Expr Any)) -> Maybe a
+dnfLeaf expr =
+  let one = appendItem expr []
+  Just (appendItem one [])
+
+@label "rel-solve: dnfAnd"
+@description "decide-substrate Phase 4T Step C — fold an `and`'s args: the running branch list starts at the unit [[]] and cartesian-products with each arg's own dnfBranches (dnfProduct — each pair concatenates conjunct lists, preserving order). Over-cap (>64 branches) or a Nothing arg ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+dnfAnd : (args: a) -> (facts: a) -> (acc: a) -> Maybe a
+dnfAnd args facts acc =
+  case head args of
+    Nothing -> Just acc
+    Just a ->
+      case dnfBranches a facts of
+        Nothing -> Nothing
+        Just bs ->
+          let prod = dnfProduct acc bs []
+          if gt (length prod) 64 then Nothing
+          else
+            case tail args of
+              Nothing -> Just prod
+              Just rest -> dnfAnd rest facts prod
+
+@label "rel-solve: dnfProduct"
+@description "decide-substrate Phase 4T Step C — the cartesian product of two branch lists: every (left, right) pair concatenates its conjunct lists (left ++ right — conjunct order preserved). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+dnfProduct : (lefts: a) -> (rights: a) -> (acc: a) -> a
+dnfProduct lefts rights acc =
+  case head lefts of
+    Nothing -> acc
+    Just l ->
+      let acc2 = dnfProductOne l rights acc
+      case tail lefts of
+        Nothing -> acc2
+        Just rest -> dnfProduct rest rights acc2
+
+@label "rel-solve: dnfProductOne"
+@description "decide-substrate Phase 4T Step C — one left conjunct-list crossed with every right conjunct-list (concat per pair). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+dnfProductOne : (l: a) -> (rights: a) -> (acc: a) -> a
+dnfProductOne l rights acc =
+  case head rights of
+    Nothing -> acc
+    Just r ->
+      let acc2 = appendItem (concat l r) acc
+      case tail rights of
+        Nothing -> acc2
+        Just rest -> dnfProductOne l rest acc2
+
+@label "rel-solve: dnfOr"
+@description "decide-substrate Phase 4T Step C — concatenate a rel-bearing `or`'s args' branch lists (each arg's own dnfBranches — nested and/or recurse). Over-cap (>64) or a Nothing arg ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+dnfOr : (args: a) -> (facts: a) -> (acc: a) -> Maybe a
+dnfOr args facts acc =
+  case head args of
+    Nothing -> Just acc
+    Just a ->
+      case dnfBranches a facts of
+        Nothing -> Nothing
+        Just bs ->
+          let acc2 = concat acc bs
+          if gt (length acc2) 64 then Nothing
+          else
+            case tail args of
+              Nothing -> Just acc2
+              Just rest -> dnfOr rest facts acc2
+
+-- rowsToBindings — pre-zip each projected row with the var list.
+@label "rel-solve: rowsToBindings"
+@description "Stage B — map each projected tuple-set row onto a bindings list (zipBindings vars row) — the SeEnum values of the P-1 relational set form (rows arrive PRE-DEDUPED from projectTupleSet). The successor of enumerate.fenel's tuplesToBindings, moved to the emit site. Internal helper."
+@tags "engine" "internal" "solve" "relational" "decide-substrate" "phase-1"
+@category "engine-internal"
+rowsToBindings : (vars: a) -> (rows: a) -> (acc: a) -> a
+rowsToBindings vars rows acc =
+  case head rows of
+    Nothing -> acc
+    Just r ->
+      let acc2 = appendItem (zipBindings vars r []) acc
+      case tail rows of
+        Nothing -> acc2
+        Just rest -> rowsToBindings vars rest acc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- flattenConjuncts — flatten the top-level `and` tree (n-ary + nested).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Flatten conjuncts"
+@description "Flatten a predicate `Expr` into its conjunct list: an `ECall \"and\" args` recurses into each arg (so nested and-trees flatten too — Step-0 probe 3); anything else is a single conjunct appended verbatim. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+flattenConjuncts : (expr: (Expr Any)) -> (acc: a) -> a
+flattenConjuncts expr acc =
+  case expr of
+    ECall { fnId = f, args = args } ->
+      if eq f "and" then flattenConjunctList args acc else appendItem expr acc
+    _ -> appendItem expr acc
+
+@label "Flatten conjunct list"
+@description "Recurse flattenConjuncts over an `and` operand list, threading the accumulator. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+flattenConjunctList : (args: a) -> (acc: a) -> a
+flattenConjunctList args acc =
+  case head args of
+    Nothing -> acc
+    Just a ->
+      let acc2 = flattenConjuncts a acc
+      case tail args of
+        Nothing -> acc2
+        Just rest -> flattenConjunctList rest acc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- expandConjuncts — classify each conjunct into atoms / residuals, unfolding
+-- rules; sets ok=false on any stage-1 fence violation (short-circuits).
+-- acc = { ok: Bool, atoms: [{ f, args, rows }], residuals: [Expr] }.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Expand conjuncts"
+@description "Classify a conjunct list into grounding atoms + negated atoms + residuals, unfolding rule atoms (name-stack-bounded). Threads `{ ok, atoms, negAtoms, residuals }` (negAtoms since decide-substrate Phase 4T Step C — the ground-not antijoin bucket); ok=false (short-circuited) on a recursive rule, an arity mismatch, a relation/rule head buried under a residual, or a rel-bearing non-atom under `not`. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13" "decide-substrate" "phase-4"
+@category "engine-internal"
+expandConjuncts : (conjuncts: a) -> (facts: a) -> (stack: a) -> (acc: a) -> a
+expandConjuncts conjuncts facts stack acc =
+  if acc.ok
+  then
+    case head conjuncts of
+      Nothing -> acc
+      Just c ->
+        let acc2 = expandOne c facts stack acc
+        case tail conjuncts of
+          Nothing -> acc2
+          Just rest -> expandConjuncts rest facts stack acc2
+  else acc
+
+@label "Expand one conjunct"
+@description "Classify ONE conjunct: a relation-head ECall (incl. a 13b-MATERIALIZED derived predicate, which shadows its rule) ⇒ an atom (arity-checked; every argument must be a variable or a literal, since the join matches nothing else and a calculation argument would silently drop every row ⇒ ok=false); a rule-head ECall ⇒ unfold its pre-reified body (params→argExprs via subExpr; refused when the parameters are not distinct, since the substitution keeps only the first occurrence and would drop the equality; rules with rule-local variables never reach this arm, they are materialized) and re-expand — the unfold-stack recursion arm is DEFENSIVE since 13b (classification-visible recursive rules are materialized; only analysis-invisible shapes, e.g. an arg-position-substituted rule call, still hit it and fence as before); a `not` over a RELATION atom ⇒ a negated atom (expandNot — the Phase 4T antijoin bucket, since 13b also the stratified-negation face over materialized extensions); anything else ⇒ a residual, UNLESS it hides a relation/rule head inside ⇒ ok=false. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13" "decide-substrate" "phase-4"
+@category "engine-internal"
+expandOne : (c: (Expr Any)) -> (facts: a) -> (stack: a) -> (acc: a) -> a
+expandOne c facts stack acc =
+  case c of
+    ECall { fnId = f, args = args } ->
+      case lookupRelation facts f of
+        Just rel ->
+          if eq (length args) rel.arity
+          then
+            if all args relAtomArg
+            then { ok = acc.ok, atoms = appendItem { f = f, args = args, rows = rel.rows } acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+            else { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+          else { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+        Nothing ->
+          case lookupRule facts f of
+            Just rule ->
+              if elem f stack then { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+              else if eq (length args) (length rule.params)
+                then
+                  if relDistinctNames rule.params
+                  then
+                    let subs = zipSubs rule.params args []
+                    let body2 = subExpr rule.body subs
+                    let subConj = flattenConjuncts body2 []
+                    expandConjuncts subConj facts (appendItem f stack) acc
+                  else { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+                else { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+            Nothing ->
+              if eq f "not" then expandNot c args facts acc
+              else if containsRelHead c facts
+              then { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+              else { ok = acc.ok, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = appendItem c acc.residuals }
+    _ -> { ok = acc.ok, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = appendItem c acc.residuals }
+
+@label "rel-solve: relAtomArg"
+@description "True when a relation-atom argument is a variable or a literal: the only shapes the join (matchOne) can match. A calculation argument such as `add x 0` would match no row, so expandOne fences it instead of answering an empty (false) result. GP-12 review 2026-11-07. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "gp-12"
+@category "engine-internal"
+relAtomArg : (a: (Expr Any)) -> Boolean
+relAtomArg a =
+  case a of
+    EVar {} -> true
+    ELit {} -> true
+    _ -> false
+
+@label "rel-solve: relDistinctNames"
+@description "True when a name list has no repeated entry (rule parameters): inline unfolding substitutes through zipSubs, which keeps only the first occurrence of a repeated parameter and so would drop the equality the repetition states. GP-12 review 2026-11-07. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "gp-12"
+@category "engine-internal"
+relDistinctNames : (names: a) -> Boolean
+relDistinctNames names =
+  case head names of
+    Nothing -> true
+    Just n ->
+      case tail names of
+        Nothing -> true
+        Just rest -> if elem n rest then false else relDistinctNames rest
+
+-- expandNot — classify a `not` conjunct (decide-substrate Phase 4T Step C;
+-- stratified negation 13b). `not (rel …)` where rel is a RELATION with
+-- matching arity ⇒ a negated atom (the antijoin bucket) — since 13b a
+-- MATERIALIZED derived predicate is such a relation, so `not` over a derived
+-- head antijoins its COMPLETED lower-stratum extension (query-level `not`
+-- sits above all strata; unstratifiable sets already fenced at
+-- relMaterialize). A rel-bearing non-atom inner ⇒ the fence (no De Morgan);
+-- the negated-RULE-head arm is DEFENSIVE (a reachable negated rule is
+-- materialized before classification). A rel-FREE `not` ⇒ the classic
+-- residual path VERBATIM (closedEval handles `not` over closed terms).
+@label "rel-solve: expandNot"
+@description "decide-substrate Phase 4T Step C + 13b — classify a `not` conjunct: a single-arg `not (relationAtom)` with matching arity ⇒ append `{ f, args, rows }` to negAtoms (the antijoin bucket; args are safety-checked later — every var must be positively grounded). Since 13b a MATERIALIZED derived predicate IS such a relation (stratified negation over its completed extension); the negated-RULE-head ok=false arm is DEFENSIVE, and a rel-bearing non-atom under `not` stays fenced (no De Morgan). A rel-free `not` ⇒ the classic residual (closedEval decides it per row — byte-preserved). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+expandNot : (c: (Expr Any)) -> (args: a) -> (facts: a) -> (acc: a) -> a
+expandNot c args facts acc =
+  if eq (length args) 1
+  then
+    case head args of
+      Nothing -> { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+      Just inner ->
+        case inner of
+          ECall { fnId = g, args = gargs } ->
+            case lookupRelation facts g of
+              Just rel ->
+                if eq (length gargs) rel.arity
+                then { ok = acc.ok, atoms = acc.atoms, negAtoms = appendItem { f = g, args = gargs, rows = rel.rows } acc.negAtoms, residuals = acc.residuals }
+                else { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+              Nothing ->
+                if containsRelHead inner facts
+                then { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+                else { ok = acc.ok, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = appendItem c acc.residuals }
+          _ ->
+            if containsRelHead inner facts
+            then { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+            else { ok = acc.ok, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = appendItem c acc.residuals }
+  else
+    if containsRelHead c facts
+    then { ok = false, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = acc.residuals }
+    else { ok = acc.ok, atoms = acc.atoms, negAtoms = acc.negAtoms, residuals = appendItem c acc.residuals }
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Relation / rule lookups.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Lookup relation"
+@description "Find a relation entry `{ name, arity, rows }` by name in the facts env. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+lookupRelation : (facts: a) -> (name: String) -> Maybe a
+lookupRelation facts name = findByName facts.relations name
+
+@label "Lookup rule"
+@description "Find a rule entry `{ name, params, body }` by name in the facts env. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+lookupRule : (facts: a) -> (name: String) -> Maybe a
+lookupRule facts name = findByName facts.rules name
+
+@label "Find by name"
+@description "Linear scan a list of `{ name, … }` records for the first whose `.name` matches; Just it / Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+findByName : (items: a) -> (name: String) -> Maybe a
+findByName items name =
+  case head items of
+    Nothing -> Nothing
+    Just it ->
+      if eq it.name name then Just it
+      else
+        case tail items of
+          Nothing -> Nothing
+          Just rest -> findByName rest name
+
+@label "Is relation or rule"
+@description "True when a head name is a relation OR a rule in the facts env. Internal helper for the residual safety check (a residual may not hide a relation/rule head)."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+isRelOrRule : (facts: a) -> (f: String) -> Boolean
+isRelOrRule facts f =
+  case lookupRelation facts f of
+    Just r -> true
+    Nothing ->
+      case lookupRule facts f of
+        Just r -> true
+        Nothing -> false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- containsRelHead — does an Expr mention a relation/rule head ANYWHERE?
+-- (The or/not-over-an-atom fence: a residual must be relation-free.)
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Contains relation head"
+@description "Walk an `Expr` for any `ECall` whose head is a relation/rule in the facts env (anywhere, including under or/not/match/construct/record). True ⇒ the conjunct is NOT a pure residual ⇒ the stage-1 disjunction/negation fence fires. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+containsRelHead : (e: (Expr Any)) -> (facts: a) -> Boolean
+containsRelHead e facts =
+  case e of
+    ECall { fnId = f, args = args } ->
+      if isRelOrRule facts f then true else containsRelHeadList args facts
+    ELambda { body = bd } -> containsRelHead bd facts
+    EMatch { scrutinee = s, arms = arms } ->
+      if containsRelHead s facts then true else containsRelHeadArms arms facts
+    EConstruct { args = args } -> containsRelHeadList args facts
+    ERecord { fields = fs } -> containsRelHeadFields fs facts
+    _ -> false
+
+@label "Contains relation head (list)"
+@description "containsRelHead over an Expr list — true if any element mentions a relation/rule head. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+containsRelHeadList : (exprs: a) -> (facts: a) -> Boolean
+containsRelHeadList exprs facts =
+  case head exprs of
+    Nothing -> false
+    Just h ->
+      if containsRelHead h facts then true
+      else
+        case tail exprs of
+          Nothing -> false
+          Just rest -> containsRelHeadList rest facts
+
+@label "Contains relation head (arms)"
+@description "containsRelHead over EMatch arm bodies — true if any arm body mentions a relation/rule head. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+containsRelHeadArms : (arms: a) -> (facts: a) -> Boolean
+containsRelHeadArms arms facts =
+  case head arms of
+    Nothing -> false
+    Just arm ->
+      if containsRelHead arm.body facts then true
+      else
+        case tail arms of
+          Nothing -> false
+          Just rest -> containsRelHeadArms rest facts
+
+@label "Contains relation head (fields)"
+@description "containsRelHead over ERecord field values — true if any field value mentions a relation/rule head. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+containsRelHeadFields : (fields: a) -> (facts: a) -> Boolean
+containsRelHeadFields fields facts =
+  case head fields of
+    Nothing -> false
+    Just f ->
+      if containsRelHead f.value facts then true
+      else
+        case tail fields of
+          Nothing -> false
+          Just rest -> containsRelHeadFields rest facts
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- subExpr — the Expr-valued substitution (name → EXPR) for rule unfolding.
+-- Mirrors substituteCaptures' 7-case coverage (incl. the EConstruct DUAL
+-- arms) but substitutes argExprs for the rule's formal params, not values.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Sub expr"
+@description "Substitute each `EVar n` whose name is a rule param with the corresponding argument `Expr` (rule unfolding); all other nodes recurse structurally. The Expr-valued sibling of substituteCaptures (which substitutes VALUES as ELit) — mirrors its 7-case coverage including the EConstruct dual (with/without fields) arms. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+subExpr : (expr: (Expr Any)) -> (subs: a) -> (Expr Any)
+subExpr expr subs =
+  case expr of
+    EVar { name = n } ->
+      case subLookup subs n of
+        Just ex -> ex
+        Nothing -> expr
+    ELit { value = v } -> ELit { value = v }
+    ECall { fnId = f, args = args } ->
+      mapSet expr "args" (subExprList args subs [])
+    ELambda { params = ps, body = bd } ->
+      ELambda { params = ps, body = subExpr bd subs }
+    EMatch { scrutinee = scrut, arms = arms } ->
+      EMatch { scrutinee = subExpr scrut subs, arms = subExprArms arms subs [] }
+    EConstruct { ctor = c, args = args, fields = fs } ->
+      EConstruct { ctor = c, args = subExprList args subs [], fields = fs }
+    EConstruct { ctor = c, args = args } ->
+      EConstruct { ctor = c, args = subExprList args subs [] }
+    ERecord { fields = fs } ->
+      ERecord { fields = subExprFields fs subs [] }
+
+@label "Sub expr (list)"
+@description "subExpr over an Expr list (ECall.args / EConstruct.args), threading the accumulator. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+subExprList : (exprs: a) -> (subs: a) -> (acc: a) -> a
+subExprList exprs subs acc =
+  case head exprs of
+    Nothing -> acc
+    Just h ->
+      let dH = subExpr h subs
+      let acc2 = appendItem dH acc
+      case tail exprs of
+        Nothing -> acc2
+        Just rest -> subExprList rest subs acc2
+
+@label "Sub expr (arms)"
+@description "subExpr over EMatch arm bodies, passing each pattern through untouched. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+subExprArms : (arms: a) -> (subs: a) -> (acc: a) -> a
+subExprArms arms subs acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let dBody = subExpr arm.body subs
+      let acc2 = appendItem { pattern = arm.pattern, body = dBody } acc
+      case tail arms of
+        Nothing -> acc2
+        Just rest -> subExprArms rest subs acc2
+
+@label "Sub expr (fields)"
+@description "subExpr over ERecord field values, preserving each field name. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+subExprFields : (fields: a) -> (subs: a) -> (acc: a) -> a
+subExprFields fields subs acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let dVal = subExpr f.value subs
+      let acc2 = appendItem { name = f.name, value = dVal } acc
+      case tail fields of
+        Nothing -> acc2
+        Just rest -> subExprFields rest subs acc2
+
+@label "Sub lookup"
+@description "Find a rule-param name in the subs env (a list of { name, expr } records); Just expr / Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+subLookup : (subs: a) -> (n: String) -> Maybe a
+subLookup subs n =
+  case head subs of
+    Nothing -> Nothing
+    Just s ->
+      if eq s.name n then Just s.expr
+      else
+        case tail subs of
+          Nothing -> Nothing
+          Just rest -> subLookup rest n
+
+@label "Zip subs"
+@description "Zip a rule's formal params with the call's argument Exprs into a subs env (a list of { name, expr }), stopping at the shorter (arity is pre-checked equal). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+zipSubs : (params: a) -> (args: a) -> (acc: a) -> a
+zipSubs params args acc =
+  case head params of
+    Nothing -> acc
+    Just p ->
+      case head args of
+        Nothing -> acc
+        Just a ->
+          let acc2 = appendItem { name = p, expr = a } acc
+          let restP = case tail params of
+                        Nothing -> []
+                        Just r -> r
+          let restA = case tail args of
+                        Nothing -> []
+                        Just r -> r
+          zipSubs restP restA acc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Safety — every requested var must be grounded by ≥1 atom arg (EVar).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Grounded vars"
+@description "Collect the set of var names that appear as a direct `EVar` argument of some grounding atom (post rule-unfold), deduped. The Datalog safety basis. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+groundedVars : (atoms: a) -> (acc: a) -> a
+groundedVars atoms acc =
+  case head atoms of
+    Nothing -> acc
+    Just a ->
+      let acc2 = collectAtomArgVars a.args acc
+      case tail atoms of
+        Nothing -> acc2
+        Just rest -> groundedVars rest acc2
+
+@label "Collect atom arg vars"
+@description "Append the direct EVar-argument names of one atom's arg list to the grounded set (deduped). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+collectAtomArgVars : (args: a) -> (acc: a) -> a
+collectAtomArgVars args acc =
+  case head args of
+    Nothing -> acc
+    Just arg ->
+      let acc2 = case exprAsVar arg of
+                   Just v -> if elem v acc then acc else appendItem v acc
+                   Nothing -> acc
+      case tail args of
+        Nothing -> acc2
+        Just rest -> collectAtomArgVars rest acc2
+
+@label "All grounded"
+@description "True when every requested var is in the grounded set (the safety condition). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+allGrounded : (vars: a) -> (grounded: a) -> Boolean
+allGrounded vars grounded =
+  case head vars of
+    Nothing -> true
+    Just v ->
+      if elem v grounded
+      then
+        case tail vars of
+          Nothing -> true
+          Just rest -> allGrounded rest grounded
+      else false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Negation safety (decide-substrate Phase 4T Step C) — a negated atom is
+-- sound ONLY when every one of its args is a var grounded by the POSITIVE
+-- atoms or a literal (the standard Datalog safety condition for negation:
+-- an ungrounded var under `not` would quantify over an open domain).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "rel-solve: negAtomsSafe"
+@description "decide-substrate Phase 4T Step C — true when EVERY negated atom's args are safe (negArgsGrounded): each an EVar grounded by the positive atoms or an ELit constant; any compound arg or ungrounded var ⇒ false (the branch fences to Nothing). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+negAtomsSafe : (negAtoms: a) -> (grounded: a) -> Boolean
+negAtomsSafe negAtoms grounded =
+  case head negAtoms of
+    Nothing -> true
+    Just na ->
+      if negArgsGrounded na.args grounded
+      then
+        case tail negAtoms of
+          Nothing -> true
+          Just rest -> negAtomsSafe rest grounded
+      else false
+
+@label "rel-solve: negArgsGrounded"
+@description "decide-substrate Phase 4T Step C — one negated atom's arg list: EVar ⇒ must be in the positive grounded set; ELit ⇒ fine; anything else (compound) ⇒ false. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+negArgsGrounded : (args: a) -> (grounded: a) -> Boolean
+negArgsGrounded args grounded =
+  case head args of
+    Nothing -> true
+    Just arg ->
+      let argOk = case arg of
+                    EVar { name = v } -> elem v grounded
+                    ELit {} -> true
+                    _ -> false
+      if argOk
+      then
+        case tail args of
+          Nothing -> true
+          Just rest -> negArgsGrounded rest grounded
+      else false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Join — fold atoms left-to-right; per atom, select-project-join against its
+-- extension. Tuple-set = { vars: [String], rows: [[Value]] } (rows positional
+-- in vars).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Join all"
+@description "Fold the grounding atoms left-to-right via joinStep, starting from the unit tuple-set (vars = [], rows = [[]]). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+joinAll : (atoms: a) -> (acc: a) -> a
+joinAll atoms acc =
+  case head atoms of
+    Nothing -> acc
+    Just a ->
+      let acc2 = joinStep acc a
+      case tail atoms of
+        Nothing -> acc2
+        Just rest -> joinAll rest acc2
+
+@label "Join step"
+@description "Join one atom against the running tuple-set: extend the var list with the atom's new EVar args (first-appearance order), then re-derive the rows by matching every existing tuple against every fact row. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+joinStep : (acc: a) -> (atom: a) -> a
+joinStep acc atom =
+  let nv = concat acc.vars (atomNewVars atom.args acc.vars [])
+  let rows2 = joinExisting acc.rows acc.vars atom.args atom.rows nv []
+  { vars = nv, rows = rows2 }
+
+@label "Atom new vars"
+@description "Collect the EVar argument names of an atom that are NOT already bound (deduped, first-appearance order) — the vars this atom introduces. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+atomNewVars : (args: a) -> (accVars: a) -> (acc: a) -> a
+atomNewVars args accVars acc =
+  case head args of
+    Nothing -> acc
+    Just a ->
+      let acc2 = case exprAsVar a of
+                   Just v -> if elem v accVars then acc else (if elem v acc then acc else appendItem v acc)
+                   Nothing -> acc
+      case tail args of
+        Nothing -> acc2
+        Just rest -> atomNewVars rest accVars acc2
+
+@label "Join existing"
+@description "For each existing tuple, build its var→value bindings and accumulate the extended rows that match the atom against any fact row. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+joinExisting : (existingRows: a) -> (accVars: a) -> (args: a) -> (factRows: a) -> (newVars: a) -> (acc: a) -> a
+joinExisting existingRows accVars args factRows newVars acc =
+  case head existingRows of
+    Nothing -> acc
+    Just er ->
+      let base = zipBindings accVars er []
+      let acc2 = joinFactRows base args factRows newVars acc
+      case tail existingRows of
+        Nothing -> acc2
+        Just rest -> joinExisting rest accVars args factRows newVars acc2
+
+@label "Join fact rows"
+@description "For one existing binding, try each fact row: matchArgs ⇒ Just final-bindings ⇒ append the extended row (the newVars projected from the bindings); Nothing ⇒ skip. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+joinFactRows : (base: a) -> (args: a) -> (factRows: a) -> (newVars: a) -> (acc: a) -> a
+joinFactRows base args factRows newVars acc =
+  case head factRows of
+    Nothing -> acc
+    Just fr ->
+      let acc2 = case matchArgs args fr base of
+                   Just fin -> appendItem (extendRow newVars fin []) acc
+                   Nothing -> acc
+      case tail factRows of
+        Nothing -> acc2
+        Just rest -> joinFactRows base args rest newVars acc2
+
+@label "Match args"
+@description "Walk an atom's args against a fact row in parallel, threading the bindings: an ELit selects (must equal the fact value), an EVar matches (must equal its existing binding) or binds (new), a compound arg fails. Just final-bindings on success / Nothing on any mismatch. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+matchArgs : (args: a) -> (factRow: a) -> (bindings: a) -> Maybe a
+matchArgs args factRow bindings =
+  case head args of
+    Nothing -> Just bindings
+    Just arg ->
+      case head factRow of
+        Nothing -> Nothing
+        Just fv ->
+          case matchOne arg fv bindings of
+            Nothing -> Nothing
+            Just b2 ->
+              let restA = case tail args of
+                            Nothing -> []
+                            Just r -> r
+              let restF = case tail factRow of
+                            Nothing -> []
+                            Just r -> r
+              matchArgs restA restF b2
+
+@label "Match one"
+@description "Match one atom arg against one fact value, threading the bindings: ELit ⇒ require equal; EVar already bound ⇒ require equal (handles tuple-vs-atom AND the SAME var twice in one atom); EVar new ⇒ bind; a compound arg ⇒ Nothing (no match). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+matchOne : (arg: (Expr Any)) -> (fv: a) -> (bindings: a) -> Maybe a
+matchOne arg fv bindings =
+  case arg of
+    ELit { value = c } -> if deepEqValue c fv then Just bindings else Nothing
+    EVar { name = v } ->
+      case capLookup bindings v of
+        Just bv -> if deepEqValue bv fv then Just bindings else Nothing
+        Nothing -> Just (appendItem { name = v, value = fv } bindings)
+    _ -> Nothing
+
+@label "Extend row"
+@description "Project a bindings env onto a var list, producing a positional value row in var order (a missing var is skipped — never happens for newVars/requestedVars by construction). Reused for join projection AND the final result projection. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+extendRow : (vars: a) -> (bindings: a) -> (acc: a) -> a
+extendRow vars bindings acc =
+  case head vars of
+    Nothing -> acc
+    Just v ->
+      let acc2 = case capLookup bindings v of
+                   Just val -> appendItem val acc
+                   Nothing -> acc
+      case tail vars of
+        Nothing -> acc2
+        Just rest -> extendRow rest bindings acc2
+
+@label "Zip bindings"
+@description "Zip a var list with a value row into a bindings env (a list of { name, value }), stopping at the shorter. Used to bind a tuple's row for matching, residual substitution, and the witness. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+zipBindings : (vars: a) -> (row: a) -> (acc: a) -> a
+zipBindings vars row acc =
+  case head vars of
+    Nothing -> acc
+    Just v ->
+      case head row of
+        Nothing -> acc
+        Just val ->
+          let acc2 = appendItem { name = v, value = val } acc
+          let restV = case tail vars of
+                        Nothing -> []
+                        Just r -> r
+          let restR = case tail row of
+                        Nothing -> []
+                        Just r -> r
+          zipBindings restV restR acc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- deepEqValue — STRUCTURAL deep equality over a CELL value (solver-extension
+-- Phase 5). The matching's equality bottoms out HERE instead of shallow std
+-- `eq`, which is reference-shallow on records/arrays (`eq {tag=Just,_0=5}
+-- {tag=Just,_0=5}` ⇒ false). So a query over an ADT-valued field (a `status =
+-- Active` cell, a `Maybe` field `{$tag="Just",_0=x}`, a nested record) now
+-- MATCHES + JOINS — lifting the P16/Phase-4 "variant cells ride but don't
+-- match" honesty fence.
+--
+-- Fork (b) — a Fenel BODY (NOT the key-form-only `{deepEq:[…]}` op): reflects
+-- the value's `$tag` + fields via the existing std `entries` native (the same
+-- value-reflection `fenel-printer.fenel` already uses; ZERO new TS, ZERO new
+-- std fnId). A scalar (Number/String/Bool/Char/null) has NO entries ⇒ bottoms
+-- out in the scalar `eq` leaf, so deep-eq AGREES with shallow eq on scalars
+-- and every existing scalar/numeric query is byte-identical. Arrays compare
+-- element-wise (entries are index-keyed). Two non-array, non-scalar values
+-- (records / variants) compare by key-set + per-key recursion (mirrors the
+-- evaluator's `deepEqual`). A closure-valued cell has no structural entries ⇒
+-- falls to REFERENCE `eq` (distinct closures ⇒ no-match-honest, the proven-rows
+-- discipline — NOT a spurious vacuous match, NOT a crash).
+--
+-- A proper equality (reflexive/symmetric/transitive/total over the cell domain)
+-- ⇒ the repeated-variable join (matchOne's bound-var arm) stays a sound Datalog
+-- equality-join.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Deep eq value"
+@description "Structural deep equality over an arbitrary value (solver-extension Phase 5): scalars (Number/String/Bool/Char/null) via the std `eq` leaf; arrays element-wise (index-keyed entries); records/variants by key-set + per-key recursion over `entries` (reads `$tag`/fields as plain data). Agrees with shallow `eq` on scalars (so scalar queries are byte-identical) but matches structurally-equal variant/record/list cells where shallow `eq` is reference-shallow. Entry-free cells use the host equality boundary: empty plain records compare structurally, while opaque host values retain identity. THE substrate-wide structural equality (decide-substrate Phase 3 Step D): the relational matching (matchOne / rowEq / closedEq), the containment structural-eq tail (seenPair), the enum-trio element-eq (setAlgebraEnumContainsLoop — contains/⊆/∩ over enums, completing the kernel's witness rule for OBJECT witnesses), and enumerate's dedupe/intersection (valueMember) all bottom out here. Internal helper."
+@tags "engine" "internal" "solve" "relational" "deep-eq" "expr-substrate" "phase-13" "solver-extension" "phase-5"
+@category "engine-internal"
+deepEqValue : (a: x) -> (b: y) -> Boolean
+deepEqValue a b =
+  if isArray a
+  then (if isArray b then deepEqEntries (entries a) (entries b) else false)
+  else if isArray b then false
+  else if isScalarV a then eq a b
+  else if isScalarV b then false
+  else
+    let af = eq (fromMaybe false (mapGet a "__fenelFn")) true
+    let bf = eq (fromMaybe false (mapGet b "__fenelFn")) true
+    let ap = eq (fromMaybe false (mapGet a "__fenelPartial")) true
+    let bp = eq (fromMaybe false (mapGet b "__fenelPartial")) true
+    if or (or af bf) (or ap bp)
+    then eq a b
+    else
+      let ea = entries a
+      let eb = entries b
+      if and (eq (length ea) 0) (eq (length eb) 0)
+      then eq a b
+      else deepEqEntries ea eb
+
+@label "Is scalar value"
+@description "True when a value is a solver scalar leaf — null / String / Number / Bool (Char's repr is a 1-char String). Such a value has no `entries` to recurse, so deepEqValue bottoms out in the std `eq` leaf. Internal helper for Phase-5 deep matching."
+@tags "engine" "internal" "solve" "relational" "deep-eq" "solver-extension" "phase-5"
+@category "engine-internal"
+isScalarV : (x: a) -> Boolean
+isScalarV x = or (isNull x) (or (isString x) (or (isNumber x) (isBoolean x)))
+
+@label "Deep eq entries"
+@description "Structural equality of two `entries` lists (records/variants/arrays as {key, value} pairs): equal length AND every entry of the first finds a matching key in the second with deep-equal values (key-set semantics, order-robust — mirrors the evaluator's deepEqual). Internal helper for Phase-5 deep matching."
+@tags "engine" "internal" "solve" "relational" "deep-eq" "solver-extension" "phase-5"
+@category "engine-internal"
+deepEqEntries : (ea: a) -> (eb: a) -> Boolean
+deepEqEntries ea eb =
+  if eq (length ea) (length eb)
+  then deepEqEntriesAll ea eb
+  else false
+
+@label "Deep eq entries all"
+@description "True when EVERY {key, value} entry of the first list finds a same-key entry in the second whose value is deepEqValue-equal (the per-key half of deepEqEntries; lengths are pre-checked equal). Internal helper for Phase-5 deep matching."
+@tags "engine" "internal" "solve" "relational" "deep-eq" "solver-extension" "phase-5"
+@category "engine-internal"
+deepEqEntriesAll : (ea: a) -> (eb: a) -> Boolean
+deepEqEntriesAll ea eb =
+  case head ea of
+    Nothing -> true
+    Just e ->
+      case findEntryByKey eb e.key of
+        Nothing -> false
+        Just other ->
+          if deepEqValue e.value other.value
+          then
+            case tail ea of
+              Nothing -> true
+              Just rest -> deepEqEntriesAll rest eb
+          else false
+
+@label "Find entry by key"
+@description "Linear-scan an `entries` list for the first {key, value} whose `.key` matches; Just it / Nothing. Internal helper for deepEqEntriesAll (the key-set lookup)."
+@tags "engine" "internal" "solve" "relational" "deep-eq" "solver-extension" "phase-5"
+@category "engine-internal"
+findEntryByKey : (es: a) -> (k: String) -> Maybe a
+findEntryByKey es k =
+  case head es of
+    Nothing -> Nothing
+    Just e ->
+      if eq e.key k then Just e
+      else
+        case tail es of
+          Nothing -> Nothing
+          Just rest -> findEntryByKey rest k
+
+-- Kernel singleton equality keeps the ordinary structural helper above for
+-- syntax/runtime callers. This face additionally observes only the canonical
+-- exact Nat/Int/Rational fragment; an unreadable or bounded observation is
+-- unknown, never negative evidence. Reprable and user Eq rows are not evidence.
+-- A numeric positive also requires the bounded raw structural path: equal
+-- components in distinct engineering layouts abstain. This retains the
+-- structural comparator's existing scope, not arbitrary observer equivalence.
+@native
+@category "engine-internal"
+exactValueOwnerType : (value: a) -> (allowUnregisteredCarrier: Bool) -> TraversalType
+
+@native
+@category "engine-internal"
+exactEqualitySourceCall : (fn: Anything) -> (args: List Anything) -> Maybe Anything
+
+@native
+@category "engine-internal"
+exactEqualitySnapshot : (value: a) -> RepresentationValueSnapshot
+
+-- The structural face of deepEqValueTriStep (inspectNumeric = false) as its
+-- sanctioned host performance branch (recipes lane 2, Nov 8, approved by Rom;
+-- engine-bodies-dispatch.ts deepEqValueTriStructural). deepEqValueTriStep
+-- below stays the source of truth; deep-eq-tri-native.test.ts pins the parity.
+@native
+@category "engine-internal"
+deepEqValueTriStructural : (a: x) -> (b: y) -> (remaining: Number) -> (depth: Number) -> ({ verdict: Maybe Bool, remaining: Number })
+
+@category "engine-internal"
+deepEqValueTri : (a: x) -> (b: y) -> Maybe Bool
+deepEqValueTri a b = case exactEqualitySourceCall engine.deepEqValueTriStep [a, b, 4096, 128, true] of
+  Nothing -> Nothing
+  Just result -> result.verdict
+
+@category "engine-internal"
+deepEqValueTriStep : (a: x) -> (b: y) -> (remaining: Number) -> (depth: Number) -> (inspectNumeric: Bool) -> ({ verdict: Maybe Bool, remaining: Number })
+deepEqValueTriStep a b remaining depth inspectNumeric =
+  if remaining <= 0 || depth <= 0 then { verdict = Nothing, remaining = remaining }
+  else
+    let left = exactEqualitySnapshot a
+    let right = exactEqualitySnapshot b
+    let budget = remaining - 1
+    case left of
+      SnapshotUnreadable -> { verdict = Nothing, remaining = budget }
+      _ -> case right of
+        SnapshotUnreadable -> { verdict = Nothing, remaining = budget }
+        _ ->
+          if not inspectNumeric then deepEqStructuralTri a b left right budget (depth - 1) false
+          else case deepEqExactOwner a left of
+            Nothing -> { verdict = Nothing, remaining = budget }
+            Just leftOwner -> case deepEqExactOwner b right of
+              Nothing -> { verdict = Nothing, remaining = budget }
+              Just rightOwner ->
+                if leftOwner != "" || rightOwner != "" then case deepEqExactNumeric a b left right leftOwner rightOwner of
+                  Just true ->
+                    let raw = deepEqValueTriStep a b budget depth false
+                    { verdict = case raw.verdict of Just true -> Just true; _ -> Nothing, remaining = raw.remaining }
+                  verdict -> { verdict = verdict, remaining = budget }
+                else deepEqStructuralTri a b left right budget (depth - 1) true
+
+@category "engine-internal"
+deepEqExactOwner : (value: a) -> (snapshot: RepresentationValueSnapshot) -> Maybe String
+deepEqExactOwner value snapshot = case snapshot of
+  SnapshotUnreadable -> Nothing
+  SnapshotRecord fields -> case std.integerSnapshotTag snapshot of
+    Nothing -> Just ""
+    Just tag ->
+      if elem tag ["Nat", "Int", "Rational", "Zero", "Succ"] then
+        let owner = canonicalRepresentationName (exactValueOwnerType value (tag == "Nat"))
+        if owner == "" then Nothing else Just owner
+      else Just ""
+  _ -> Just ""
+
+@category "engine-internal"
+deepEqExactNumeric : (a: x) -> (b: y) -> (left: RepresentationValueSnapshot) -> (right: RepresentationValueSnapshot) -> (leftOwner: String) -> (rightOwner: String) -> Maybe Bool
+deepEqExactNumeric a b left right leftOwner rightOwner =
+  if leftOwner == "Rational" || rightOwner == "Rational" then
+    if leftOwner != "Rational" || rightOwner != "Rational" then Just false
+    else case std.rationalMembership a of
+      Just true -> case std.rationalMembership b of
+        Just true -> case deepEqRationalComponents a of
+          Nothing -> Nothing
+          Just partsA -> case deepEqRationalComponents b of
+            Nothing -> Nothing
+            Just partsB -> Just (eq partsA partsB)
+        _ -> Nothing
+      _ -> Nothing
+  else if leftOwner != rightOwner || leftOwner == "" then Nothing
+  else case deepEqExactIntegerMember a left leftOwner of
+    Just true -> case deepEqExactIntegerMember b right rightOwner of
+      Just true -> case deepEqExactIntegerComponents a leftOwner of
+          Nothing -> Nothing
+          Just textA -> case deepEqExactIntegerComponents b rightOwner of
+            Nothing -> Nothing
+            Just textB -> Just (eq textA textB)
+      _ -> Nothing
+    _ -> Nothing
+
+@category "engine-internal"
+deepEqExactIntegerMember : (value: a) -> (snapshot: RepresentationValueSnapshot) -> (owner: String) -> Maybe Bool
+deepEqExactIntegerMember value snapshot owner =
+  if owner == "Nat" then case std.natExactMembership value of
+    Just true -> Just true
+    _ -> Nothing
+  else if owner == "Int" then case std.intExactMembership value of
+    Just true -> Just true
+    _ -> Nothing
+  else Nothing
+
+@category "engine-internal"
+deepEqExactIntegerComponents : (value: a) -> (owner: String) -> Maybe Anything
+deepEqExactIntegerComponents value owner =
+  if owner == "Nat" then case std.natExactMembership value of
+    Just true -> case exactEqualitySourceCall std.natToExactText [value] of
+      Just text -> if isString text then Just text else Nothing
+      Nothing -> Nothing
+    _ -> Nothing
+  else if owner == "Int" then deepEqIntComponents value
+  else Nothing
+
+-- Mathematical ratEq deliberately identifies 2/4 with 1/2. Singleton data
+-- identity cannot: the declared num/den fields are observable. Likewise an
+-- admitted pure Int's zero magnitude does not erase its observable sign.
+@category "engine-internal"
+deepEqIntTextComponents : (text: String) -> ({ magnitude: String, negative: Bool })
+deepEqIntTextComponents text =
+  let canonical = std.rationalInputCanonicalInteger text
+  { magnitude = std.rationalInputUnsigned canonical, negative = startsWith canonical "-" }
+
+@category "engine-internal"
+deepEqIntComponents : (value: a) -> Maybe ({ magnitude: String, negative: Bool })
+deepEqIntComponents value = case std.intExactMembership value of
+  Just true ->
+    let snapshot = exactEqualitySnapshot value
+    case snapshot of
+      SnapshotNumber number -> Just (deepEqIntTextComponents (toString number))
+      SnapshotRecord fields -> case std.representationSnapshotField snapshot "digits" of
+        Just digits -> if isString digits then Just (deepEqIntTextComponents digits) else Nothing
+        Nothing -> case std.representationSnapshotConstructorField snapshot "magnitude" 0 of
+          Nothing -> Nothing
+          Just magnitude -> case std.representationSnapshotConstructorField snapshot "negative" 1 of
+            Nothing -> Nothing
+            Just negative -> case exactEqualitySourceCall std.natToExactText [magnitude] of
+              Nothing -> Nothing
+              Just digits -> case exactEqualitySourceCall std.boolToNative [negative] of
+                Nothing -> Nothing
+                Just flag -> if isString digits && isBoolean flag then Just { magnitude = digits, negative = flag } else Nothing
+      _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+deepEqRationalComponents : (value: a) -> Maybe ({ num: { magnitude: String, negative: Bool }, den: String })
+deepEqRationalComponents value =
+  let snapshot = exactEqualitySnapshot value
+  case std.representationSnapshotConstructorField snapshot "num" 0 of
+    Nothing -> Nothing
+    Just numerator -> case std.representationSnapshotConstructorField snapshot "den" 1 of
+      Nothing -> Nothing
+      Just denominator ->
+        if isString numerator && isString denominator then
+          Just { num = deepEqIntTextComponents numerator, den = std.rationalInputCanonicalInteger denominator }
+        else case deepEqIntComponents numerator of
+          Nothing -> Nothing
+          Just parts -> case exactEqualitySourceCall std.natToExactText [denominator] of
+            Nothing -> Nothing
+            Just digits -> if isString digits then Just { num = parts, den = digits } else Nothing
+
+@category "engine-internal"
+deepEqStructuralTri : (a: x) -> (b: y) -> (left: RepresentationValueSnapshot) -> (right: RepresentationValueSnapshot) -> (remaining: Number) -> (depth: Number) -> (inspectNumeric: Bool) -> ({ verdict: Maybe Bool, remaining: Number })
+deepEqStructuralTri a b left right remaining depth inspectNumeric = case left of
+  SnapshotArray values -> case right of
+    SnapshotArray others -> deepEqValueTriArray values others remaining depth inspectNumeric
+    _ -> { verdict = Just false, remaining = remaining }
+  SnapshotRecord fields -> case right of
+    SnapshotRecord others ->
+      if deepEqSnapshotCallable left || deepEqSnapshotCallable right then { verdict = Just (eq a b), remaining = remaining }
+      else if length fields != length others then { verdict = Just false, remaining = remaining }
+      else if length fields == 0 then { verdict = Just (eq a b), remaining = remaining }
+      else deepEqValueTriFields fields others remaining depth inspectNumeric false
+    _ -> { verdict = Just false, remaining = remaining }
+  _ -> { verdict = Just (eq a b), remaining = remaining }
+
+@category "engine-internal"
+deepEqSnapshotCallable : (snapshot: RepresentationValueSnapshot) -> Bool
+deepEqSnapshotCallable snapshot =
+  eq (fromMaybe false (std.representationSnapshotField snapshot "__fenelFn")) true || eq (fromMaybe false (std.representationSnapshotField snapshot "__fenelPartial")) true
+
+@category "engine-internal"
+deepEqValueTriArray : (values: List a) -> (others: List b) -> (remaining: Number) -> (depth: Number) -> (inspectNumeric: Bool) -> ({ verdict: Maybe Bool, remaining: Number })
+deepEqValueTriArray values others remaining depth inspectNumeric =
+  if length values != length others then { verdict = Just false, remaining = remaining }
+  else deepEqValueTriArrayLoop values others remaining depth inspectNumeric false
+
+@category "engine-internal"
+deepEqValueTriArrayLoop : (values: List a) -> (others: List b) -> (remaining: Number) -> (depth: Number) -> (inspectNumeric: Bool) -> (sawNothing: Bool) -> ({ verdict: Maybe Bool, remaining: Number })
+deepEqValueTriArrayLoop values others remaining depth inspectNumeric sawNothing = case head values of
+  Nothing -> { verdict = if sawNothing then Nothing else Just true, remaining = remaining }
+  Just value -> case head others of
+    Nothing -> { verdict = Just false, remaining = remaining }
+    Just other ->
+      if remaining <= 0 then { verdict = Nothing, remaining = 0 }
+      else
+        let result = deepEqValueTriStep value other remaining depth inspectNumeric
+        case result.verdict of
+          Just false -> result
+          _ -> deepEqValueTriArrayLoop (fromMaybe [] (tail values)) (fromMaybe [] (tail others)) result.remaining depth inspectNumeric (sawNothing || eq result.verdict Nothing)
+
+@category "engine-internal"
+deepEqValueTriFields : (fields: List RepresentationOwnField) -> (others: List RepresentationOwnField) -> (remaining: Number) -> (depth: Number) -> (inspectNumeric: Bool) -> (sawNothing: Bool) -> ({ verdict: Maybe Bool, remaining: Number })
+deepEqValueTriFields fields others remaining depth inspectNumeric sawNothing = case head fields of
+  Nothing -> { verdict = if sawNothing then Nothing else Just true, remaining = remaining }
+  Just field ->
+    if remaining <= 0 then { verdict = Nothing, remaining = 0 }
+    else case find (\other -> other.name == field.name) others of
+      Nothing -> { verdict = Just false, remaining = remaining }
+      Just other ->
+        let result = deepEqValueTriStep field.value other.value remaining depth inspectNumeric
+        case result.verdict of
+          Just false -> result
+          _ -> deepEqValueTriFields (fromMaybe [] (tail fields)) others result.remaining depth inspectNumeric (sawNothing || eq result.verdict Nothing)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Dedupe (set semantics; O(n²) list dedupe acceptable v1).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Dedupe rows"
+@description "Deduplicate a row list by structural row equality (set semantics; O(n²) — acceptable v1), preserving first-seen order. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+dedupeRows : (rows: a) -> (acc: a) -> a
+dedupeRows rows acc =
+  case head rows of
+    Nothing -> acc
+    Just r ->
+      let acc2 = if rowMember r acc then acc else appendItem r acc
+      case tail rows of
+        Nothing -> acc2
+        Just rest -> dedupeRows rest acc2
+
+@label "Row member"
+@description "True when a row is structurally equal (rowEq) to some row already in the list. Internal helper for dedupeRows (std `eq` on lists is reference-shallow, so element-wise rowEq is required). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+rowMember : (r: a) -> (rows: a) -> Boolean
+rowMember r rows =
+  case head rows of
+    Nothing -> false
+    Just x ->
+      if rowEq r x then true
+      else
+        case tail rows of
+          Nothing -> false
+          Just rest -> rowMember r rest
+
+@label "Row eq"
+@description "Element-wise structural equality of two rows (deepEqValue per element — so a variant/record/list cell dedupes structurally, not reference-shallow; both lists must exhaust together). solver-extension Phase 5 swapped the per-element `eq` for `deepEqValue`. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13" "solver-extension" "phase-5"
+@category "engine-internal"
+rowEq : (r1: a) -> (r2: a) -> Boolean
+rowEq r1 r2 =
+  case head r1 of
+    Nothing ->
+      case head r2 of
+        Nothing -> true
+        Just b -> false
+    Just a ->
+      case head r2 of
+        Nothing -> false
+        Just b ->
+          if deepEqValue a b
+          then
+            let restA = case tail r1 of
+                          Nothing -> []
+                          Just r -> r
+            let restB = case tail r2 of
+                          Nothing -> []
+                          Just r -> r
+            rowEq restA restB
+          else false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Project the join onto the requested vars; dedupe.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Project tuple set"
+@description "Project a tuple-set onto the requested var list (dropping unfold-introduced join vars), deduping the resulting rows. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+projectTupleSet : (requestedVars: a) -> (ts: a) -> a
+projectTupleSet requestedVars ts =
+  let rows0 = projectRows ts.vars requestedVars ts.rows []
+  { vars = requestedVars, rows = dedupeRows rows0 [] }
+
+@label "Project rows"
+@description "Project each row of a tuple-set onto the requested vars (via zipBindings + extendRow). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+projectRows : (allVars: a) -> (requestedVars: a) -> (rows: a) -> (acc: a) -> a
+projectRows allVars requestedVars rows acc =
+  case head rows of
+    Nothing -> acc
+    Just r ->
+      let b = zipBindings allVars r []
+      let pr = extendRow requestedVars b []
+      let acc2 = appendItem pr acc
+      case tail rows of
+        Nothing -> acc2
+        Just rest -> projectRows allVars requestedVars rest acc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Residual filter — substitute the row's bindings, closed-term decide; keep
+-- only rows PROVEN to satisfy the predicate (proven-rows / under-approx).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Apply residuals"
+@description "Apply the residual conjuncts as one row filter: a row survives only if EVERY residual is proven true. The result keeps { vars, rows } and adds `undecided` — true when some dropped row was neither proven true nor refuted by any residual (an undecided closed term). A single witness may still use the proven rows; a complete answer may not (2026-11-06 completeness repair). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+applyResiduals : (residuals: a) -> (ts: a) -> a
+applyResiduals residuals ts =
+  if eq (length residuals) 0
+  then { vars = ts.vars, rows = ts.rows, undecided = false }
+  else
+    let r = filterByResiduals residuals ts.vars ts.rows [] false
+    { vars = ts.vars, rows = r.rows, undecided = r.undecided }
+
+@label "Filter by residuals"
+@description "Per row: substitute the row's bindings into the conjunction of the residuals and closedEval it once (closedAnd: any refuted conjunct ⇒ false; else any undecided conjunct ⇒ undecided; else proven). Proven rows are kept; refuted rows are dropped; an undecided row is dropped AND recorded in `undecided`. Returns { rows, undecided }. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+filterByResiduals : (conjuncts: a) -> (names: a) -> (pending: a) -> (kept: a) -> (sawUndecided: Bool) -> a
+filterByResiduals conjuncts names pending kept sawUndecided =
+  case head pending of
+    Nothing -> { rows = kept, undecided = sawUndecided }
+    Just r ->
+      let b = zipBindings names r []
+      let closed = substituteCaptures (ECall { fnId = "and", args = conjuncts }) b
+      let verdict = closedEval closed
+      let kept2 = case verdict of
+                   Just v -> if eq v true then appendItem r kept else kept
+                   Nothing -> kept
+      let undecided2 = case verdict of
+                         Just v -> sawUndecided
+                         Nothing -> true
+      case tail pending of
+        Nothing -> { rows = kept2, undecided = undecided2 }
+        Just rest -> filterByResiduals conjuncts names rest kept2 undecided2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The ANTIJOIN (decide-substrate Phase 4T Step C) — apply each negated atom
+-- as a row filter: a row SURVIVES iff the atom instantiated with the row's
+-- bindings has NO matching fact. Negation-as-failure over the CLOSED finite
+-- fact base (documented closed-world honesty: "not parentOf(y, x)" means "no
+-- such fact in the threaded env", not a claim about the open world). The
+-- fact-match REUSES matchArgs — the row's bindings are the starting env, so a
+-- grounded EVar is the 'already bound ⇒ require equal' arm and an ELit
+-- selects; safety (negArgsGrounded) guarantees no arg can spuriously BIND.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "rel-solve: applyNegAtoms"
+@description "decide-substrate Phase 4T Step C — fold the negated atoms as antijoin row filters over the tuple-set (a row survives every negAtom whose instantiation has NO matching fact). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+applyNegAtoms : (negAtoms: a) -> (ts: a) -> a
+applyNegAtoms negAtoms ts =
+  case head negAtoms of
+    Nothing -> ts
+    Just na ->
+      let rows2 = antijoinRows na ts.vars ts.rows []
+      let ts2 = { vars = ts.vars, rows = rows2 }
+      case tail negAtoms of
+        Nothing -> ts2
+        Just rest -> applyNegAtoms rest ts2
+
+@label "rel-solve: antijoinRows"
+@description "decide-substrate Phase 4T Step C — one negated atom over the rows: bind each row (zipBindings), keep it iff NO fact row matches the atom under those bindings (negAtomMatches). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+antijoinRows : (na: a) -> (vars: a) -> (rows: a) -> (acc: a) -> a
+antijoinRows na vars rows acc =
+  case head rows of
+    Nothing -> acc
+    Just r ->
+      let b = zipBindings vars r []
+      let acc2 = if negAtomMatches na.args na.rows b then acc else appendItem r acc
+      case tail rows of
+        Nothing -> acc2
+        Just rest -> antijoinRows na vars rest acc2
+
+@label "rel-solve: negAtomMatches"
+@description "decide-substrate Phase 4T Step C — true when SOME fact row matches the negated atom's args under the row's bindings (matchArgs — grounded vars require equality, literals select; deepEqValue cells). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-4"
+@category "engine-internal"
+negAtomMatches : (args: a) -> (factRows: a) -> (bindings: a) -> Boolean
+negAtomMatches args factRows bindings =
+  case head factRows of
+    Nothing -> false
+    Just fr ->
+      case matchArgs args fr bindings of
+        Just fin -> true
+        Nothing ->
+          case tail factRows of
+            Nothing -> false
+            Just rest -> negAtomMatches args rest bindings
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- closedEval — decide a CLOSED predicate Expr (Maybe Bool: Just true / Just
+-- false proven, Nothing undecided). Rides P12's affineOf "" constant-folder
+-- for numeric comparisons.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Closed eval"
+@description "Decide a CLOSED predicate Expr ⇒ Maybe Bool (Just true / Just false proven; Nothing undecided / out-of-language). ELit true/false leaves; and/or/not compositions; eq/lt/lte/gt/gte over closed affine numeric terms (via P12's affineOf \"\") or shallow eq on non-numeric ELit pairs. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+closedEval : (e: (Expr Any)) -> Maybe Boolean
+closedEval e =
+  case e of
+    ELit { value = v } ->
+      if eq v true then Just true else (if eq v false then Just false else Nothing)
+    ECall { fnId = f, args = args } -> closedCall f args
+    _ -> Nothing
+
+@label "Closed call"
+@description "Route a closed `ECall` head to its decider: and/or/not compositions, eq, and the four comparisons; any other head ⇒ Nothing (undecided). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+closedCall : (f: String) -> (args: a) -> Maybe Boolean
+closedCall f args =
+  if eq f "and" then closedAnd args { f = false, u = false }
+  else if eq f "or" then closedOr args { t = false, u = false }
+  else if eq f "not" then closedNot args
+  else if eq f "eq" then closedEq args
+  else if eq f "lt" then closedCompare "lt" args
+  else if eq f "lte" then closedCompare "lte" args
+  else if eq f "gt" then closedCompare "gt" args
+  else if eq f "gte" then closedCompare "gte" args
+  else Nothing
+
+@label "Closed and"
+@description "Tri-state `and` over closed children: any proven-false ⇒ Just false; else any undecided ⇒ Nothing; else Just true. Threads { f = false-seen, u = unknown-seen }. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+closedAnd : (args: a) -> (acc: a) -> Maybe Boolean
+closedAnd args acc =
+  case head args of
+    Nothing -> andVerdict acc
+    Just a ->
+      let acc2 = case closedEval a of
+                   Just b -> if eq b true then acc else { f = true, u = acc.u }
+                   Nothing -> { f = acc.f, u = true }
+      case tail args of
+        Nothing -> andVerdict acc2
+        Just rest -> closedAnd rest acc2
+
+@label "And verdict"
+@description "Final tri-state verdict for closedAnd: false-seen ⇒ Just false; else unknown-seen ⇒ Nothing; else Just true. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+andVerdict : (acc: a) -> Maybe Boolean
+andVerdict acc =
+  if acc.f then Just false else (if acc.u then Nothing else Just true)
+
+@label "Closed or"
+@description "Tri-state `or` over closed children: any proven-true ⇒ Just true; else any undecided ⇒ Nothing; else Just false. Threads { t = true-seen, u = unknown-seen }. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+closedOr : (args: a) -> (acc: a) -> Maybe Boolean
+closedOr args acc =
+  case head args of
+    Nothing -> orVerdict acc
+    Just a ->
+      let acc2 = case closedEval a of
+                   Just b -> if eq b true then { t = true, u = acc.u } else acc
+                   Nothing -> { t = acc.t, u = true }
+      case tail args of
+        Nothing -> orVerdict acc2
+        Just rest -> closedOr rest acc2
+
+@label "Or verdict"
+@description "Final tri-state verdict for closedOr: true-seen ⇒ Just true; else unknown-seen ⇒ Nothing; else Just false. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+orVerdict : (acc: a) -> Maybe Boolean
+orVerdict acc =
+  if acc.t then Just true else (if acc.u then Nothing else Just false)
+
+@label "Closed not"
+@description "Tri-state `not`: flip a proven child verdict; an undecided / empty operand ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+closedNot : (args: a) -> Maybe Boolean
+closedNot args =
+  case head args of
+    Nothing -> Nothing
+    Just a ->
+      case closedEval a of
+        Just b -> Just (if eq b true then false else true)
+        Nothing -> Nothing
+
+@label "Closed eq"
+@description "Decide a closed `eq`: numeric equality when BOTH sides constant-fold (affineOf \"\"); else structural deepEqValue when both are ELit (so a closed residual `eq status Active` over a variant/record/list cell decides correctly, not reference-shallow — solver-extension Phase 5 swapped the non-numeric fallback from shallow `eq` to `deepEqValue`); else Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13" "solver-extension" "phase-5"
+@category "engine-internal"
+closedEq : (args: a) -> Maybe Boolean
+closedEq args =
+  case twoArgs args of
+    Nothing -> Nothing
+    Just pair ->
+      case closedNum pair.a0 of
+        Just n0 ->
+          case closedNum pair.a1 of
+            Just n1 -> Just (eq n0 n1)
+            Nothing -> Nothing
+        Nothing ->
+          case exprAsLit pair.a0 of
+            Just l0 ->
+              case exprAsLit pair.a1 of
+                Just l1 -> Just (deepEqValue l0 l1)
+                Nothing -> Nothing
+            Nothing -> Nothing
+
+@label "Closed compare"
+@description "Decide a closed comparison (lt/lte/gt/gte): both sides must constant-fold to numbers (affineOf \"\"), then applyCompare; otherwise Nothing (undecided). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+closedCompare : (f: String) -> (args: a) -> Maybe Boolean
+closedCompare f args =
+  case twoArgs args of
+    Nothing -> Nothing
+    Just pair ->
+      case closedNum pair.a0 of
+        Just n0 ->
+          case closedNum pair.a1 of
+            Just n1 -> Just (applyCompare f n0 n1)
+            Nothing -> Nothing
+        Nothing -> Nothing
+
+@label "Apply compare"
+@description "Apply a comparison op to two numbers ⇒ Bool (lt / lte / gt / gte). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+applyCompare : (f: String) -> (n0: a) -> (n1: a) -> Boolean
+applyCompare f n0 n1 =
+  if eq f "lt" then lt n0 n1
+  else if eq f "lte" then lte n0 n1
+  else if eq f "gt" then gt n0 n1
+  else gte n0 n1
+
+@label "Closed num"
+@description "Constant-fold a closed Expr to a number via P12's affineOf \"\" (a var name that cannot match ⇒ any closed numeric term extracts as coeff 0, k = its value); Just k when ok and coeff 0, else Nothing (non-numeric / contains a var). Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-12" "phase-13"
+@category "engine-internal"
+closedNum : (e: (Expr Any)) -> Maybe a
+closedNum e =
+  let r = affineOf "" e
+  if r.ok then (if eq r.coeff 0 then Just r.k else Nothing) else Nothing
+
+@label "Two args"
+@description "Extract the first two elements of an arg list ⇒ Just { a0, a1 }; fewer than two ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "expr-substrate" "phase-13"
+@category "engine-internal"
+twoArgs : (args: a) -> Maybe a
+twoArgs args =
+  case head args of
+    Nothing -> Nothing
+    Just a0 ->
+      case tail args of
+        Nothing -> Nothing
+        Just rest ->
+          case head rest of
+            Nothing -> Nothing
+            Just a1 -> Just { a0 = a0, a1 = a1 }
+
+-- (witTuples is GONE — decide-substrate Phase 1 Stage B: relSolveSet emits
+-- the rows PRE-ZIPPED (rowsToBindings, above) inside a canonical `SeEnum`,
+-- so the first-row witness is just `inhabit`'s plain SeEnum arm.)
+
+-- ═════════════════════════════════════════════════════════════════════════
+-- 13b — STRATIFIED SEMI-NAIVE MATERIALIZATION (decide-substrate rel-solve
+-- 13b: recursion + stratified negation over derived relations + `or` inside
+-- rule bodies — the last Prolog-class piece).
+--
+-- TWO EVALUATION MODES, one query pipeline:
+--   • UNFOLD (top-down, the P13 path, byte-preserved) — a NON-recursive,
+--     NON-negated rule atom with an or-free body still macro-expands at
+--     classify time (expandOne). This keeps the caller's bindings
+--     restricting the rule body (context-safety: `big x = gt x 5` decides
+--     when the QUERY grounds x) — bottom-up materialization could not.
+--   • MATERIALIZE (bottom-up, NEW) — a reachable rule that is RECURSIVE
+--     (on a cycle of the predicate dependency graph), NEGATED anywhere
+--     (query or a reachable rule body), or whose body carries a
+--     REL-BEARING `or`, gets its full finite extension computed ONCE,
+--     bottom-up per stratum, by a semi-naive least fixpoint — then rides
+--     the pipeline as a plain RELATION ({ name, arity, rows } appended to
+--     facts.relations, which shadows the rule at expandOne/expandNot).
+--     Query-level `not` over a derived predicate and recursion thereby
+--     decide with ZERO changes to the join/antijoin machinery.
+--
+-- THE PASS (relMaterialize, called by relSolveSet before dnfBranches):
+--   1. relPredRefs walks the query EXACTLY as classification sees it
+--      (and/or recursed as conjunct trees; `not (derivedAtom)` = a
+--      NEGATIVE ref; atom ARGS not walked — an arg-buried rule call is
+--      invisible to expandOne and must stay invisible here, keeping
+--      verdicts aligned; a rel-bearing `or` sets the orRel trigger).
+--   2. relReachClose closes over rule bodies ⇒ the reachable derived set.
+--   3. relReachAllOf computes per-pred transitive reach; p is RECURSIVE
+--      iff p ∈ reach(p); SCC(p) = { q | q ∈ reach(p) ∧ p ∈ reach(q) }.
+--   4. STRATIFICATION: a rule-body negative edge p →¬ q with q reaching
+--      back to p (same SCC) ⇒ unstratifiable ⇒ Nothing (the honest fence
+--      — no locally-stratified / well-founded semantics this phase).
+--   5. The materialization set M (recursive ∨ negated ∨ orRel body)
+--      groups into SCCs, ordered dependencies-first (Kahn over the
+--      condensation, membership via the reach sets, defensively fueled).
+--   6. Per SCC: classify each rule body ONCE through dnfBranches (or-in-
+--      body = per-branch disjunctive rules, sharing the 64-branch cap) +
+--      the existing expandConjuncts (same-SCC preds enter as EMPTY
+--      placeholder relations whose rows re-resolve per round; lower
+--      strata as their completed extensions; non-M rules still unfold
+--      inline). Per-branch DATALOG SAFETY: every rule param grounded by a
+--      positive atom + negated args grounded — else Nothing (a
+--      context-safe-only rule cannot be materialized).
+--   7. SEMI-NAIVE FIXPOINT: seed = one full round against the empty
+--      interpretation; then per round, per rule branch, per same-SCC atom
+--      position, re-evaluate with THAT atom reading Δ and the others full
+--      I (the differential rewrite — only derivations using ≥1 new row
+--      fire); fresh = candidates ∖ I; stop at Δ = ∅. The immediate-
+--      consequence operator is MONOTONE (positive bodies; negation only
+--      over frozen lower strata) over a finite powerset lattice ⇒
+--      Knaster–Tarski least fixpoint, reached in finitely many rounds
+--      (finite Herbrand base: no function symbols in heads; derived-tuple
+--      constants ⊆ fact cells ∪ atom-arg literals). TCB ledger rows (same
+--      commit): rel.fixpoint (THEOREM) · rel.seminaive (PRESENTATION,
+--      pinned by the naive-vs-semi-naive differential relMaterializeScc ≡
+--      relMaterializeSccNaive) · rel.stratified-not (SIDE-CONDITIONED on
+--      the SCC gate) · rel.fuel (the exhaustion fence).
+--   8. FUEL (rel.fuel): rounds ≤ 1 + |preds|·|constants|^maxArity (each
+--      round adds ≥1 tuple), the constant count over-approximated by
+--      fact cells + atom-arg literal count, CAPPED at the inline 4096
+--      (the fence constant — same discipline as the 64-branch DNF cap).
+--      Exhaustion ⇒ Nothing, NEVER a partial Just.
+--
+-- The verdict channel is UNCHANGED: materialized extensions are ordinary
+-- relation rows; the emitted set stays `SeEnum { values = binding rows }`;
+-- the kernel witness rule ({w} ⊆ s) consumes it as before — NO new
+-- evidence kind, the TCB does not widen.
+-- ═════════════════════════════════════════════════════════════════════════
+
+@label "rel-solve: relIsDerived"
+@description "13b — true when a head name denotes a DERIVED predicate: a rule in the facts env NOT shadowed by a same-named relation (expandOne checks relations first; the analysis mirrors that order so verdicts align). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relIsDerived : (facts: a) -> (f: String) -> Boolean
+relIsDerived facts f =
+  case lookupRelation facts f of
+    Just r -> false
+    Nothing ->
+      case lookupRule facts f of
+        Just r -> true
+        Nothing -> false
+
+@label "rel-solve: relAddName"
+@description "13b — append a name to a name set unless already present (structural dedupe for predicate-name accumulators). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relAddName : (n: String) -> (names: a) -> a
+relAddName n names = if elem n names then names else appendItem n names
+
+@label "rel-solve: relAddAll"
+@description "13b — fold relAddName over a name list (deduped union of predicate-name sets). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relAddAll : (ns: a) -> (names: a) -> a
+relAddAll ns names =
+  case head ns of
+    Nothing -> names
+    Just n ->
+      let names2 = relAddName n names
+      case tail ns of
+        Nothing -> names2
+        Just rest -> relAddAll rest names2
+
+@label "rel-solve: relPredRefs"
+@description "13b — collect the DERIVED-predicate references of a query / rule-body Expr exactly as classification would see them: `and`/`or` recurse as conjunct trees (a rel-bearing `or` sets orRel — the or-in-body materialization trigger); a derived head ⇒ a POSITIVE ref; `not` routes through relPredRefsNot; relation atoms and everything else collect NOTHING (atom args are not walked — an arg-buried rule call is invisible to expandOne and must stay invisible here so old and new verdicts align). acc = { pos, neg, orRel }. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relPredRefs : (e: (Expr Any)) -> (facts: a) -> (acc: a) -> a
+relPredRefs e facts acc =
+  case e of
+    ECall { fnId = f, args = args } ->
+      if eq f "and" then relPredRefsList args facts acc
+      else if eq f "or"
+      then
+        let acc2 = if containsRelHead e facts then { pos = acc.pos, neg = acc.neg, orRel = true } else acc
+        relPredRefsList args facts acc2
+      else
+        case lookupRelation facts f of
+          Just r -> acc
+          Nothing ->
+            if relIsDerived facts f
+            then { pos = relAddName f acc.pos, neg = acc.neg, orRel = acc.orRel }
+            else if eq f "not" then relPredRefsNot args facts acc
+            else acc
+    _ -> acc
+
+@label "rel-solve: relPredRefsList"
+@description "13b — relPredRefs over an and/or operand list, threading the { pos, neg, orRel } accumulator. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relPredRefsList : (args: a) -> (facts: a) -> (acc: a) -> a
+relPredRefsList args facts acc =
+  case head args of
+    Nothing -> acc
+    Just a ->
+      let acc2 = relPredRefs a facts acc
+      case tail args of
+        Nothing -> acc2
+        Just rest -> relPredRefsList rest facts acc2
+
+@label "rel-solve: relPredRefsNot"
+@description "13b — the `not` arm of relPredRefs: a single-arg `not` over a DERIVED atom records a NEGATIVE ref (the stratification edge + the materialization trigger); every other `not` shape collects nothing (it classifies as a ground antijoin, a residual, or the rel-bearing fence — none of which reference a derived extension). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relPredRefsNot : (args: a) -> (facts: a) -> (acc: a) -> a
+relPredRefsNot args facts acc =
+  if eq (length args) 1
+  then
+    case head args of
+      Nothing -> acc
+      Just inner ->
+        case inner of
+          ECall { fnId = g, args = gargs } ->
+            if relIsDerived facts g
+            then { pos = acc.pos, neg = relAddName g acc.neg, orRel = acc.orRel }
+            else acc
+          _ -> acc
+  else acc
+
+@label "rel-solve: relRuleRefs"
+@description "13b — the { pos, neg, orRel } derived-reference summary of ONE rule's body (empty summary when the name has no rule — defensive). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relRuleRefs : (facts: a) -> (name: String) -> a
+relRuleRefs facts name =
+  case lookupRule facts name of
+    Nothing -> { pos = [], neg = [], orRel = false }
+    Just rule -> relPredRefs rule.body facts { pos = [], neg = [], orRel = false }
+
+@label "rel-solve: relReachClose"
+@description "13b — BFS closure of the derived-predicate dependency graph: pop a frontier name, skip if seen, else mark seen and push its rule body's pos+neg refs. Returns the reachable derived set (finite: names come from the finite rule env). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relReachClose : (facts: a) -> (frontier: a) -> (seen: a) -> a
+relReachClose facts frontier seen =
+  case head frontier of
+    Nothing -> seen
+    Just p ->
+      let rest = case tail frontier of
+                   Nothing -> []
+                   Just r -> r
+      if elem p seen
+      then relReachClose facts rest seen
+      else
+        let seen2 = appendItem p seen
+        let refs = relRuleRefs facts p
+        relReachClose facts (concat rest (concat refs.pos refs.neg)) seen2
+
+@label "rel-solve: relReachAllOf"
+@description "13b — per reachable predicate, its TRANSITIVE reach set (BFS from its body's direct refs — so p ∈ reach(p) iff p is on a dependency cycle, i.e. RECURSIVE). Produces the [{ name, reach }] table the SCC + stratification checks read. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relReachAllOf : (facts: a) -> (preds: a) -> (acc: a) -> a
+relReachAllOf facts preds acc =
+  case head preds of
+    Nothing -> acc
+    Just p ->
+      let refs = relRuleRefs facts p
+      let reach = relReachClose facts (concat refs.pos refs.neg) []
+      let acc2 = appendItem { name = p, reach = reach } acc
+      case tail preds of
+        Nothing -> acc2
+        Just rest -> relReachAllOf facts rest acc2
+
+@label "rel-solve: relReachOf"
+@description "13b — look a predicate's transitive reach set up in the [{ name, reach }] table ([] when absent — defensive). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relReachOf : (reachAll: a) -> (name: String) -> a
+relReachOf reachAll name =
+  case findByName reachAll name of
+    Just e -> e.reach
+    Nothing -> []
+
+@label "rel-solve: relNegRefsAll"
+@description "13b — the deduped union of every reachable rule body's NEGATIVE derived refs (the rule-side half of the materialization trigger; the query's own neg refs are unioned by the caller). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relNegRefsAll : (facts: a) -> (preds: a) -> (acc: a) -> a
+relNegRefsAll facts preds acc =
+  case head preds of
+    Nothing -> acc
+    Just p ->
+      let refs = relRuleRefs facts p
+      let acc2 = relAddAll refs.neg acc
+      case tail preds of
+        Nothing -> acc2
+        Just rest -> relNegRefsAll facts rest acc2
+
+@label "rel-solve: relStratOk"
+@description "13b — the STRATIFICATION gate: true when NO reachable rule carries a negative edge inside its own SCC (relStratNegsOk per rule). A negative edge p →¬ q with q reaching back to p makes the perfect-model semantics undefined ⇒ the caller fences to Nothing (rel.stratified-not's side condition — no locally-stratified / well-founded semantics this phase). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relStratOk : (facts: a) -> (reachAll: a) -> (preds: a) -> Boolean
+relStratOk facts reachAll preds =
+  case head preds of
+    Nothing -> true
+    Just p ->
+      let refs = relRuleRefs facts p
+      if relStratNegsOk reachAll p refs.neg
+      then
+        case tail preds of
+          Nothing -> true
+          Just rest -> relStratOk facts reachAll rest
+      else false
+
+@label "rel-solve: relStratNegsOk"
+@description "13b — one rule's negative refs against the SCC condition: a negated predicate q that transitively reaches BACK to the negating rule p (q and p share a cycle — includes self-negation) ⇒ false (unstratifiable). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relStratNegsOk : (reachAll: a) -> (p: String) -> (negs: a) -> Boolean
+relStratNegsOk reachAll p negs =
+  case head negs of
+    Nothing -> true
+    Just q ->
+      if elem p (relReachOf reachAll q)
+      then false
+      else
+        case tail negs of
+          Nothing -> true
+          Just rest -> relStratNegsOk reachAll p rest
+
+@label "rel-solve: relNeedsMat"
+@description "13b — the materialization trigger for one reachable predicate: RECURSIVE (p ∈ reach(p)) ∨ NEGATED anywhere (query or reachable rule bodies) ∨ its body has a rule-local variable (GP-12 review 2026-11-07: inline unfolding would capture it) ∨ its body carries a rel-bearing `or` (orRel). Everything else keeps the top-down unfold path. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relNeedsMat : (facts: a) -> (reachAll: a) -> (allNegs: a) -> (p: String) -> Boolean
+relNeedsMat facts reachAll allNegs p =
+  if elem p (relReachOf reachAll p) then true
+  else if elem p allNegs then true
+  else if relRuleHasLocals facts p then true
+  else
+    let refs = relRuleRefs facts p
+    refs.orRel
+
+@label "rel-solve: relRuleHasLocals"
+@description "True when a rule body mentions a variable that is not one of its parameters (a rule-local variable, existential in Datalog). Inline unfolding substitutes only the parameters, so such a local would be captured by a same-named variable of the query or of another unfolding of the same rule; these rules are materialized instead (their extension is computed on its own and projected onto the parameters). GP-12 review 2026-11-07. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "gp-12"
+@category "engine-internal"
+relRuleHasLocals : (facts: a) -> (p: String) -> Boolean
+relRuleHasLocals facts p =
+  case lookupRule facts p of
+    Nothing -> false
+    Just rule -> relAnyNotIn (collectFreeVars rule.body [] []) rule.params
+
+@label "rel-solve: relAnyNotIn"
+@description "True when some name of the first list is absent from the second. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "gp-12"
+@category "engine-internal"
+relAnyNotIn : (names: a) -> (known: a) -> Boolean
+relAnyNotIn names known =
+  case head names of
+    Nothing -> false
+    Just n ->
+      if elem n known
+      then
+        case tail names of
+          Nothing -> false
+          Just rest -> relAnyNotIn rest known
+      else true
+
+@label "rel-solve: relMatSet"
+@description "13b — filter the reachable predicates down to the materialization set M (relNeedsMat), preserving discovery order for determinism. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relMatSet : (facts: a) -> (reachAll: a) -> (allNegs: a) -> (preds: a) -> (acc: a) -> a
+relMatSet facts reachAll allNegs preds acc =
+  case head preds of
+    Nothing -> acc
+    Just p ->
+      let acc2 = if relNeedsMat facts reachAll allNegs p then appendItem p acc else acc
+      case tail preds of
+        Nothing -> acc2
+        Just rest -> relMatSet facts reachAll allNegs rest acc2
+
+@label "rel-solve: relSccMembers"
+@description "13b — the OTHER members of p's SCC: candidates from reach(p) that reach back to p (q ≠ p). The caller prepends p itself. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relSccMembers : (reachAll: a) -> (p: String) -> (cands: a) -> (acc: a) -> a
+relSccMembers reachAll p cands acc =
+  case head cands of
+    Nothing -> acc
+    Just q ->
+      let acc2 = if eq q p then acc else (if elem p (relReachOf reachAll q) then appendItem q acc else acc)
+      case tail cands of
+        Nothing -> acc2
+        Just rest -> relSccMembers reachAll p rest acc2
+
+@label "rel-solve: relInAnyGroup"
+@description "13b — true when a predicate name is a member of ANY group in a group list (SCC grouping dedupe + the Kahn blocked check). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relInAnyGroup : (p: String) -> (groups: a) -> Boolean
+relInAnyGroup p groups =
+  case head groups of
+    Nothing -> false
+    Just g ->
+      if elem p g then true
+      else
+        case tail groups of
+          Nothing -> false
+          Just rest -> relInAnyGroup p rest
+
+@label "rel-solve: relGroupSccs"
+@description "13b — group the materialization set into its SCCs: each not-yet-grouped predicate seeds a group [p] ++ relSccMembers (recursive SCCs arrive whole — every cycle member is recursive hence in M; negation/or-only singletons stay singleton groups). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relGroupSccs : (reachAll: a) -> (preds: a) -> (acc: a) -> a
+relGroupSccs reachAll preds acc =
+  case head preds of
+    Nothing -> acc
+    Just p ->
+      let acc2 = if relInAnyGroup p acc then acc else appendItem (concat (appendItem p []) (relSccMembers reachAll p (relReachOf reachAll p) [])) acc
+      case tail preds of
+        Nothing -> acc2
+        Just rest -> relGroupSccs reachAll rest acc2
+
+@label "rel-solve: relAnyNameInGroups"
+@description "13b — true when any name of a list is a member of any group (the reach-set vs remaining-groups intersection test for the Kahn scheduler). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relAnyNameInGroups : (names: a) -> (groups: a) -> Boolean
+relAnyNameInGroups names groups =
+  case head names of
+    Nothing -> false
+    Just n ->
+      if relInAnyGroup n groups then true
+      else
+        case tail names of
+          Nothing -> false
+          Just rest -> relAnyNameInGroups rest groups
+
+@label "rel-solve: relGroupBlocked"
+@description "13b — a group is BLOCKED when some member's transitive reach hits a predicate of ANOTHER remaining group (its dependencies are not yet materialized — reach crosses non-M rules transitively, so unfolded intermediates are handled). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relGroupBlocked : (reachAll: a) -> (g: a) -> (others: a) -> Boolean
+relGroupBlocked reachAll g others =
+  case head g of
+    Nothing -> false
+    Just p ->
+      if relAnyNameInGroups (relReachOf reachAll p) others then true
+      else
+        case tail g of
+          Nothing -> false
+          Just rest -> relGroupBlocked reachAll rest others
+
+@label "rel-solve: relRemoveGroup"
+@description "13b — remove the group whose FIRST member matches the given head name (groups are disjoint and nonempty, so the head identifies a group), preserving the others' order. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relRemoveGroup : (hg: String) -> (groups: a) -> (acc: a) -> a
+relRemoveGroup hg groups acc =
+  case head groups of
+    Nothing -> acc
+    Just g ->
+      let isIt = case head g of
+                   Nothing -> false
+                   Just h -> eq h hg
+      let rest = case tail groups of
+                   Nothing -> []
+                   Just r -> r
+      if isIt then concat acc rest
+      else relRemoveGroup hg rest (appendItem g acc)
+
+@label "rel-solve: relPickScc"
+@description "13b — pick the first candidate group not blocked by the remaining others (one Kahn step over the SCC condensation — a DAG, so a pick always exists; Nothing is the defensive impossibility arm). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relPickScc : (reachAll: a) -> (cands: a) -> (remaining: a) -> Maybe a
+relPickScc reachAll cands remaining =
+  case head cands of
+    Nothing -> Nothing
+    Just g ->
+      let hg = case head g of
+                 Nothing -> ""
+                 Just h -> h
+      if relGroupBlocked reachAll g (relRemoveGroup hg remaining [])
+      then
+        case tail cands of
+          Nothing -> Nothing
+          Just rest -> relPickScc reachAll rest remaining
+      else Just g
+
+@label "rel-solve: relOrderSccs"
+@description "13b — Kahn-order the SCC groups dependencies-first (repeatedly relPickScc an unblocked group). The condensation is a DAG so this terminates in |groups| picks; the fuel + the Nothing arm are defensive belts (a failed pick would mean a grouping bug, and the honest answer is Nothing, never a wrong order). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relOrderSccs : (reachAll: a) -> (remaining: a) -> (acc: a) -> (fuel: a) -> Maybe a
+relOrderSccs reachAll remaining acc fuel =
+  case head remaining of
+    Nothing -> Just acc
+    Just g0 ->
+      if lte fuel 0 then Nothing
+      else
+        case relPickScc reachAll remaining remaining of
+          Nothing -> Nothing
+          Just g ->
+            let hg = case head g of
+                       Nothing -> ""
+                       Just h -> h
+            relOrderSccs reachAll (relRemoveGroup hg remaining []) (appendItem g acc) (sub fuel 1)
+
+@label "rel-solve: relPlaceholders"
+@description "13b — the same-SCC placeholder relations for classification: one { name, arity = |params|, rows = [] } per SCC predicate, so expandOne classifies same-SCC atoms as RELATION atoms (arity-checked) whose rows the fixpoint re-resolves per round. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relPlaceholders : (facts: a) -> (sccPreds: a) -> (acc: a) -> a
+relPlaceholders facts sccPreds acc =
+  case head sccPreds of
+    Nothing -> acc
+    Just p ->
+      let acc2 = case lookupRule facts p of
+                   Nothing -> acc
+                   Just rule -> appendItem { name = p, arity = length rule.params, rows = [] } acc
+      case tail sccPreds of
+        Nothing -> acc2
+        Just rest -> relPlaceholders facts rest acc2
+
+@label "rel-solve: relClassifyEnv"
+@description "13b — the classification env for one SCC's rule bodies: base relations ++ lower-strata materialized extensions ++ same-SCC placeholders, rules unchanged (non-M rules still unfold inline; materialized names are relation-shadowed). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relClassifyEnv : (facts: a) -> (mats: a) -> (sccPreds: a) -> a
+relClassifyEnv facts mats sccPreds =
+  { relations = concat facts.relations (concat mats (relPlaceholders facts sccPreds [])), rules = facts.rules }
+
+@label "rel-solve: relClassifyBranches"
+@description "13b — classify one rule's DNF branches through the EXISTING expandConjuncts, then apply the per-branch DATALOG SAFETY conditions (every rule param grounded by a positive atom; negated args grounded). Any classification fence or safety failure ⇒ Nothing (a context-safe-only rule cannot be materialized — its finite extension does not exist standalone). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relClassifyBranches : (branches: a) -> (env: a) -> (params: a) -> (acc: a) -> Maybe a
+relClassifyBranches branches env params acc =
+  case head branches of
+    Nothing -> Just acc
+    Just b ->
+      let exp0 = expandConjuncts b env [] { ok = true, atoms = [], negAtoms = [], residuals = [] }
+      if exp0.ok
+      then
+        let grounded = groundedVars exp0.atoms []
+        if allGrounded params grounded
+        then
+          if negAtomsSafe exp0.negAtoms grounded
+          then
+            let acc2 = appendItem { atoms = exp0.atoms, negAtoms = exp0.negAtoms, residuals = exp0.residuals } acc
+            case tail branches of
+              Nothing -> Just acc2
+              Just rest -> relClassifyBranches rest env params acc2
+          else Nothing
+        else Nothing
+      else Nothing
+
+@label "rel-solve: relClassifyRules"
+@description "13b — classify every SCC predicate's rule ONCE for the fixpoint: dnfBranches over the body (or-in-body = per-branch disjunctive rules, sharing the 64-branch cap) then relClassifyBranches ⇒ { name, params, branches }. Same-SCC atoms carry placeholder rows (re-resolved per round); lower/base atom rows are FINAL. Any fence ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relClassifyRules : (facts: a) -> (mats: a) -> (sccPreds: a) -> (pending: a) -> (acc: a) -> Maybe a
+relClassifyRules facts mats sccPreds pending acc =
+  case head pending of
+    Nothing -> Just acc
+    Just p ->
+      case lookupRule facts p of
+        Nothing -> Nothing
+        Just rule ->
+          let env = relClassifyEnv facts mats sccPreds
+          case dnfBranches rule.body env of
+            Nothing -> Nothing
+            Just bs ->
+              case relClassifyBranches bs env rule.params [] of
+                Nothing -> Nothing
+                Just branches ->
+                  let acc2 = appendItem { name = p, params = rule.params, branches = branches } acc
+                  case tail pending of
+                    Nothing -> Just acc2
+                    Just rest -> relClassifyRules facts mats sccPreds rest acc2
+
+@label "rel-solve: relEvalAtoms"
+@description "13b — the shared per-branch evaluation pipeline over an already-row-resolved atom list: joinAll from the unit tuple-set → applyResiduals (proven-rows) → applyNegAtoms (antijoin, frozen lower strata) → projectTupleSet onto the rule params ⇒ positional extension rows. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relEvalAtoms : (atoms: a) -> (negAtoms: a) -> (residuals: a) -> (params: a) -> a
+relEvalAtoms atoms negAtoms residuals params =
+  let joined = joinAll atoms { vars = [], rows = appendItem [] [] }
+  let filtered = applyResiduals residuals joined
+  let anti = applyNegAtoms negAtoms filtered
+  let proj = projectTupleSet params anti
+  proj.rows
+
+@label "rel-solve: relSwapOne"
+@description "13b — re-resolve ONE atom's rows from a { name, rows } env when its head is present (same-SCC atoms read the current interpretation / delta; base and lower atoms keep their classified rows). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relSwapOne : (atom: a) -> (env: a) -> a
+relSwapOne atom env =
+  case findByName env atom.f of
+    Nothing -> atom
+    Just e -> { f = atom.f, args = atom.args, rows = e.rows }
+
+@label "rel-solve: relSwapAtoms"
+@description "13b — relSwapOne over an atom list (row re-resolution for one fixpoint evaluation). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relSwapAtoms : (atoms: a) -> (env: a) -> (acc: a) -> a
+relSwapAtoms atoms env acc =
+  case head atoms of
+    Nothing -> acc
+    Just a ->
+      let acc2 = appendItem (relSwapOne a env) acc
+      case tail atoms of
+        Nothing -> acc2
+        Just rest -> relSwapAtoms rest env acc2
+
+@label "rel-solve: relPrependAll"
+@description "13b — prepend one atom onto every atom list of a variant list (the recursive step of relDeltaVariants). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relPrependAll : (atom: a) -> (lists: a) -> (acc: a) -> a
+relPrependAll atom lists acc =
+  case head lists of
+    Nothing -> acc
+    Just l ->
+      let acc2 = appendItem (concat (appendItem atom []) l) acc
+      case tail lists of
+        Nothing -> acc2
+        Just rest -> relPrependAll atom rest acc2
+
+@label "rel-solve: relDeltaVariants"
+@description "13b — the SEMI-NAIVE differential rewrite of one branch's atom list: one variant per same-SCC atom position, that atom reading Δ while every other atom reads the full interpretation I. A branch with no same-SCC atom yields NO variants (it fired once at the seed round and can never derive new rows). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relDeltaVariants : (atoms: a) -> (fullEnv: a) -> (deltaEnv: a) -> a
+relDeltaVariants atoms fullEnv deltaEnv =
+  case head atoms of
+    Nothing -> []
+    Just h ->
+      let rest = case tail atoms of
+                   Nothing -> []
+                   Just r -> r
+      let subVariants = relDeltaVariants rest fullEnv deltaEnv
+      let withHFull = relPrependAll (relSwapOne h fullEnv) subVariants []
+      case findByName deltaEnv h.f of
+        Nothing -> withHFull
+        Just d ->
+          let hDelta = { f = h.f, args = h.args, rows = d.rows }
+          let restFull = relSwapAtoms rest fullEnv []
+          appendItem (concat (appendItem hDelta []) restFull) withHFull
+
+@label "rel-solve: relBranchFull"
+@description "13b — evaluate one branch with EVERY same-SCC atom reading the full interpretation (the seed round + the naive differential oracle). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relBranchFull : (b: a) -> (params: a) -> (env: a) -> a
+relBranchFull b params env =
+  relEvalAtoms (relSwapAtoms b.atoms env []) b.negAtoms b.residuals params
+
+@label "rel-solve: relBranchesFull"
+@description "13b — relBranchFull over a rule's branches, concatenating the derived rows (the caller dedupes). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relBranchesFull : (branches: a) -> (params: a) -> (env: a) -> (acc: a) -> a
+relBranchesFull branches params env acc =
+  case head branches of
+    Nothing -> acc
+    Just b ->
+      let acc2 = concat acc (relBranchFull b params env)
+      case tail branches of
+        Nothing -> acc2
+        Just rest -> relBranchesFull rest params env acc2
+
+@label "rel-solve: relVariantsEval"
+@description "13b — evaluate every delta variant of one branch (relEvalAtoms per variant atom list; negAtoms/residuals shared), concatenating the derived rows. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relVariantsEval : (variants: a) -> (b: a) -> (params: a) -> (acc: a) -> a
+relVariantsEval variants b params acc =
+  case head variants of
+    Nothing -> acc
+    Just atoms ->
+      let acc2 = concat acc (relEvalAtoms atoms b.negAtoms b.residuals params)
+      case tail variants of
+        Nothing -> acc2
+        Just rest -> relVariantsEval rest b params acc2
+
+@label "rel-solve: relBranchDelta"
+@description "13b — one branch's differential round: build the delta variants and evaluate them all. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relBranchDelta : (b: a) -> (params: a) -> (fullEnv: a) -> (deltaEnv: a) -> a
+relBranchDelta b params fullEnv deltaEnv =
+  relVariantsEval (relDeltaVariants b.atoms fullEnv deltaEnv) b params []
+
+@label "rel-solve: relBranchesDelta"
+@description "13b — relBranchDelta over a rule's branches, concatenating (the caller dedupes and subtracts I). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relBranchesDelta : (branches: a) -> (params: a) -> (fullEnv: a) -> (deltaEnv: a) -> (acc: a) -> a
+relBranchesDelta branches params fullEnv deltaEnv acc =
+  case head branches of
+    Nothing -> acc
+    Just b ->
+      let acc2 = concat acc (relBranchDelta b params fullEnv deltaEnv)
+      case tail branches of
+        Nothing -> acc2
+        Just rest -> relBranchesDelta rest params fullEnv deltaEnv acc2
+
+@label "rel-solve: relInitInterp"
+@description "13b — the empty interpretation: one { name, rows = [] } per SCC predicate. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relInitInterp : (preds: a) -> (acc: a) -> a
+relInitInterp preds acc =
+  case head preds of
+    Nothing -> acc
+    Just p ->
+      let acc2 = appendItem { name = p, rows = [] } acc
+      case tail preds of
+        Nothing -> acc2
+        Just rest -> relInitInterp rest acc2
+
+@label "rel-solve: relInterpRows"
+@description "13b — a predicate's current rows in a { name, rows } interpretation ([] when absent — defensive). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relInterpRows : (i: a) -> (name: String) -> a
+relInterpRows i name =
+  case findByName i name of
+    Just e -> e.rows
+    Nothing -> []
+
+@label "rel-solve: relRowsNotIn"
+@description "13b — the rows of a candidate list NOT already present in an existing row set (structural rowMember — the Δ = candidates ∖ I subtraction). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relRowsNotIn : (rows: a) -> (existing: a) -> (acc: a) -> a
+relRowsNotIn rows existing acc =
+  case head rows of
+    Nothing -> acc
+    Just r ->
+      let acc2 = if rowMember r existing then acc else appendItem r acc
+      case tail rows of
+        Nothing -> acc2
+        Just rest -> relRowsNotIn rest existing acc2
+
+@label "rel-solve: relSeedDeltas"
+@description "13b — the fixpoint SEED: one full evaluation of every rule against the EMPTY interpretation (branches without same-SCC atoms contribute their base rows; recursive branches contribute nothing yet), deduped per predicate — Δ⁰. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relSeedDeltas : (rules: a) -> (i0: a) -> (acc: a) -> a
+relSeedDeltas rules i0 acc =
+  case head rules of
+    Nothing -> acc
+    Just rule ->
+      let rows = dedupeRows (relBranchesFull rule.branches rule.params i0 []) []
+      let acc2 = appendItem { name = rule.name, rows = rows } acc
+      case tail rules of
+        Nothing -> acc2
+        Just rest -> relSeedDeltas rest i0 acc2
+
+@label "rel-solve: relRoundDeltas"
+@description "13b — one semi-naive round: per rule, evaluate the delta variants against (I, Δ), dedupe, subtract I ⇒ the fresh Δ′ rows per predicate. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relRoundDeltas : (rules: a) -> (i: a) -> (dPrev: a) -> (acc: a) -> a
+relRoundDeltas rules i dPrev acc =
+  case head rules of
+    Nothing -> acc
+    Just rule ->
+      let cand = dedupeRows (relBranchesDelta rule.branches rule.params i dPrev []) []
+      let fresh = relRowsNotIn cand (relInterpRows i rule.name) []
+      let acc2 = appendItem { name = rule.name, rows = fresh } acc
+      case tail rules of
+        Nothing -> acc2
+        Just rest -> relRoundDeltas rest i dPrev acc2
+
+@label "rel-solve: relMergeInterp"
+@description "13b — merge a round's fresh Δ rows into the interpretation (per-predicate concat; Δ is deduped and disjoint from I by construction). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relMergeInterp : (i: a) -> (d: a) -> (acc: a) -> a
+relMergeInterp i d acc =
+  case head i of
+    Nothing -> acc
+    Just e ->
+      let acc2 = appendItem { name = e.name, rows = concat e.rows (relInterpRows d e.name) } acc
+      case tail i of
+        Nothing -> acc2
+        Just rest -> relMergeInterp rest d acc2
+
+@label "rel-solve: relDeltaEmpty"
+@description "13b — true when every predicate's Δ rows are empty (the fixpoint has been reached). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relDeltaEmpty : (d: a) -> Boolean
+relDeltaEmpty d =
+  case head d of
+    Nothing -> true
+    Just e ->
+      if eq (length e.rows) 0
+      then
+        case tail d of
+          Nothing -> true
+          Just rest -> relDeltaEmpty rest
+      else false
+
+@label "rel-solve: relFixLoop"
+@description "13b — the semi-naive least-fixpoint driver: Δ = ∅ ⇒ Just I (the completed extensions — Knaster–Tarski over the finite powerset lattice, rel.fixpoint); fuel exhausted with Δ ≠ ∅ ⇒ Nothing (rel.fuel — NEVER a partial Just); else merge and iterate. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relFixLoop : (rules: a) -> (i: a) -> (d: a) -> (fuel: a) -> Maybe a
+relFixLoop rules i d fuel =
+  if relDeltaEmpty d then Just i
+  else if lte fuel 0 then Nothing
+  else
+    let d2 = relRoundDeltas rules i d []
+    let i2 = relMergeInterp i d2 []
+    relFixLoop rules i2 d2 (sub fuel 1)
+
+@label "rel-solve: relInterpToRels"
+@description "13b — project the completed interpretation into relation entries ({ name, arity = |params|, rows }) ready to append to facts.relations. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relInterpToRels : (rules: a) -> (i: a) -> (acc: a) -> a
+relInterpToRels rules i acc =
+  case head rules of
+    Nothing -> acc
+    Just rule ->
+      let acc2 = appendItem { name = rule.name, arity = length rule.params, rows = relInterpRows i rule.name } acc
+      case tail rules of
+        Nothing -> acc2
+        Just rest -> relInterpToRels rest i acc2
+
+@label "rel-solve: relPowNat"
+@description "13b — natural-number power (b^e by e-fold multiplication; e ≤ 0 ⇒ 1) for the fuel sizing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relPowNat : (b: a) -> (e: a) -> a
+relPowNat b e = if lte e 0 then 1 else mul b (relPowNat b (sub e 1))
+
+@label "rel-solve: relRowsCells"
+@description "13b — total cell count of a row list (an over-approximation of the distinct constants those rows contribute — sound for fuel sizing, which only needs an UPPER bound). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relRowsCells : (rows: a) -> (acc: a) -> a
+relRowsCells rows acc =
+  case head rows of
+    Nothing -> acc
+    Just r ->
+      let acc2 = add acc (length r)
+      case tail rows of
+        Nothing -> acc2
+        Just rest -> relRowsCells rest acc2
+
+@label "rel-solve: relRelsCells"
+@description "13b — relRowsCells over every relation of an env (the fact-cell half of the Herbrand constant over-approximation). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relRelsCells : (rels: a) -> (acc: a) -> a
+relRelsCells rels acc =
+  case head rels of
+    Nothing -> acc
+    Just re ->
+      let acc2 = relRowsCells re.rows acc
+      case tail rels of
+        Nothing -> acc2
+        Just rest -> relRelsCells rest acc2
+
+@label "rel-solve: relArgsLits"
+@description "13b — count the ELit args of one atom (the literal half of the Herbrand constant over-approximation: derived-tuple constants come only from fact cells and atom-arg literals — residuals filter, they never bind). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relArgsLits : (args: a) -> (acc: a) -> a
+relArgsLits args acc =
+  case head args of
+    Nothing -> acc
+    Just arg ->
+      let acc2 = case arg of
+                   ELit { value = v } -> add acc 1
+                   _ -> acc
+      case tail args of
+        Nothing -> acc2
+        Just rest -> relArgsLits rest acc2
+
+@label "rel-solve: relAtomsLits"
+@description "13b — relArgsLits over an atom list. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relAtomsLits : (atoms: a) -> (acc: a) -> a
+relAtomsLits atoms acc =
+  case head atoms of
+    Nothing -> acc
+    Just a ->
+      let acc2 = relArgsLits a.args acc
+      case tail atoms of
+        Nothing -> acc2
+        Just rest -> relAtomsLits rest acc2
+
+@label "rel-solve: relBranchesLits"
+@description "13b — atom-arg literal count over a rule's branches (positive + negated atoms). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relBranchesLits : (branches: a) -> (acc: a) -> a
+relBranchesLits branches acc =
+  case head branches of
+    Nothing -> acc
+    Just b ->
+      let acc2 = relAtomsLits b.negAtoms (relAtomsLits b.atoms acc)
+      case tail branches of
+        Nothing -> acc2
+        Just rest -> relBranchesLits rest acc2
+
+@label "rel-solve: relRulesLits"
+@description "13b — relBranchesLits over the classified SCC rules. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relRulesLits : (rules: a) -> (acc: a) -> a
+relRulesLits rules acc =
+  case head rules of
+    Nothing -> acc
+    Just rule ->
+      let acc2 = relBranchesLits rule.branches acc
+      case tail rules of
+        Nothing -> acc2
+        Just rest -> relRulesLits rest acc2
+
+@label "rel-solve: relRulesMaxArity"
+@description "13b — the maximum param count across the SCC rules (the exponent of the Herbrand bound). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relRulesMaxArity : (rules: a) -> (acc: a) -> a
+relRulesMaxArity rules acc =
+  case head rules of
+    Nothing -> acc
+    Just rule ->
+      let n = length rule.params
+      let acc2 = if gt n acc then n else acc
+      case tail rules of
+        Nothing -> acc2
+        Just rest -> relRulesMaxArity rest acc2
+
+@label "rel-solve: relFixpointFuel"
+@description "13b — the rel.fuel sizing: rounds ≤ 1 + |preds|·|constants|^maxArity (every round adds ≥ 1 tuple; tuples ≤ the Herbrand count), with |constants| over-approximated by fact cells + atom-arg literals, CAPPED at the inline 4096 fence constant (the same inline-cap discipline as the 64-branch DNF guard). Exhaustion at the driver ⇒ Nothing, never a partial Just. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relFixpointFuel : (rules: a) -> (rels: a) -> a
+relFixpointFuel rules rels =
+  let cells = add (relRelsCells rels 0) (relRulesLits rules 0)
+  let sized = add 1 (mul (length rules) (relPowNat cells (relRulesMaxArity rules 0)))
+  if lt sized 4096 then sized else 4096
+
+@label "rel-solve: relMaterializeScc"
+@description "13b — materialize ONE SCC bottom-up: classify its rules once (relClassifyRules — placeholders for same-SCC atoms, completed extensions for lower strata), seed with a full round against the empty interpretation, then run the SEMI-NAIVE least fixpoint (relFixLoop) under the rel.fuel bound ⇒ the completed { name, arity, rows } extensions. Any classification / safety / fuel fence ⇒ Nothing, and so does an undecided residual row over the final interpretation (relRulesUndecided — the extension would otherwise be incomplete). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relMaterializeScc : (facts: a) -> (mats: a) -> (sccPreds: a) -> Maybe a
+relMaterializeScc facts mats sccPreds =
+  case relClassifyRules facts mats sccPreds sccPreds [] of
+    Nothing -> Nothing
+    Just rules ->
+      let i0 = relInitInterp sccPreds []
+      let seed = relSeedDeltas rules i0 []
+      let i1 = relMergeInterp i0 seed []
+      let fuel = relFixpointFuel rules (concat facts.relations mats)
+      case relFixLoop rules i1 seed fuel of
+        Nothing -> Nothing
+        Just fin -> if relRulesUndecided rules fin then Nothing else Just (relInterpToRels rules fin [])
+
+@label "rel-solve: relRulesUndecided"
+@description "2026-11-06 completeness repair: re-join every rule branch of a materialized SCC over its FINAL interpretation and report whether any joined row's residual is undecided. Joins are monotone in their positive atoms, so every row a fixpoint round dropped as undecided is among these rows; when none is undecided the proven-rows fixpoint IS the least fixpoint, and a later `not` over it antijoins the completed extension (rel.stratified-not). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relRulesUndecided : (rules: a) -> (i: a) -> Bool
+relRulesUndecided rules i =
+  case head rules of
+    Nothing -> false
+    Just rule ->
+      if relBranchesUndecided rule.branches i then true
+      else
+        case tail rules of
+          Nothing -> false
+          Just rest -> relRulesUndecided rest i
+
+@label "rel-solve: relBranchesUndecided"
+@description "2026-11-06 completeness repair: true when some branch of one rule, joined over the given interpretation, has a row whose residual conditions are undecided. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relBranchesUndecided : (branches: a) -> (i: a) -> Bool
+relBranchesUndecided branches i =
+  case head branches of
+    Nothing -> false
+    Just b ->
+      let joined = joinAll (relSwapAtoms b.atoms i []) { vars = [], rows = appendItem [] [] }
+      let filtered = applyResiduals b.residuals joined
+      if filtered.undecided then true
+      else
+        case tail branches of
+          Nothing -> false
+          Just rest -> relBranchesUndecided rest i
+
+@label "rel-solve: relNaiveRound"
+@description "13b — one NAIVE round: re-derive every rule fully against the current interpretation and subtract I (the differential ORACLE for rel.seminaive — semi-naive is a presentation of this iteration, pinned by the relMaterializeScc ≡ relMaterializeSccNaive agreement test). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relNaiveRound : (rules: a) -> (i: a) -> (acc: a) -> a
+relNaiveRound rules i acc =
+  case head rules of
+    Nothing -> acc
+    Just rule ->
+      let rows = dedupeRows (relBranchesFull rule.branches rule.params i []) []
+      let fresh = relRowsNotIn rows (relInterpRows i rule.name) []
+      let acc2 = appendItem { name = rule.name, rows = fresh } acc
+      case tail rules of
+        Nothing -> acc2
+        Just rest -> relNaiveRound rest i acc2
+
+@label "rel-solve: relNaiveLoop"
+@description "13b — the NAIVE fixpoint driver (full re-derivation per round; same fuel fence, same Nothing-on-exhaustion honesty). The executable differential oracle for the rel.seminaive ledger row. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relNaiveLoop : (rules: a) -> (i: a) -> (fuel: a) -> Maybe a
+relNaiveLoop rules i fuel =
+  let d = relNaiveRound rules i []
+  if relDeltaEmpty d then Just i
+  else if lte fuel 0 then Nothing
+  else relNaiveLoop rules (relMergeInterp i d []) (sub fuel 1)
+
+@label "rel-solve: relMaterializeSccNaive"
+@description "13b — the NAIVE sibling of relMaterializeScc (same classification, same fuel, full re-derivation per round). NOT on the query path — it exists as the executable cross-face pin for the rel.fixpoint / rel.seminaive ledger rows (the naive-vs-semi-naive agreement differential). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relMaterializeSccNaive : (facts: a) -> (mats: a) -> (sccPreds: a) -> Maybe a
+relMaterializeSccNaive facts mats sccPreds =
+  case relClassifyRules facts mats sccPreds sccPreds [] of
+    Nothing -> Nothing
+    Just rules ->
+      let i0 = relInitInterp sccPreds []
+      let fuel = relFixpointFuel rules (concat facts.relations mats)
+      case relNaiveLoop rules i0 fuel of
+        Nothing -> Nothing
+        Just fin -> if relRulesUndecided rules fin then Nothing else Just (relInterpToRels rules fin [])
+
+@label "rel-solve: relMaterializeGroups"
+@description "13b — fold relMaterializeScc over the Kahn-ordered SCC groups, accumulating the materialized extensions (later strata classify against earlier ones). Any group's fence ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relMaterializeGroups : (facts: a) -> (groups: a) -> (mats: a) -> Maybe a
+relMaterializeGroups facts groups mats =
+  case head groups of
+    Nothing -> Just mats
+    Just g ->
+      case relMaterializeScc facts mats g of
+        Nothing -> Nothing
+        Just newRels ->
+          let mats2 = concat mats newRels
+          case tail groups of
+            Nothing -> Just mats2
+            Just rest -> relMaterializeGroups facts rest mats2
+
+@label "rel-solve: relMaterialize"
+@description "13b — THE materialization pass (called by relSolveSet before dnfBranches): collect the query's derived refs; when NONE, return the facts env VERBATIM (the byte-identical P13/4T path). Else close reachability, check STRATIFICATION (a negative edge inside an SCC ⇒ Nothing), compute the materialization set M (recursive ∨ negated ∨ rel-bearing-or body), group + Kahn-order the SCCs, materialize bottom-up, and return the facts env with the completed extensions APPENDED as relations (shadowing their rules at expandOne/expandNot — query-level recursion and `not` over derived predicates then ride the unchanged pipeline). M empty ⇒ the facts env verbatim (plain rules keep the top-down unfold). Internal helper."
+@tags "engine" "internal" "solve" "relational" "datalog" "decide-substrate" "phase-13b"
+@category "engine-internal"
+relMaterialize : (expr: (Expr Any)) -> (facts: a) -> Maybe a
+relMaterialize expr facts =
+  let qr = relPredRefs expr facts { pos = [], neg = [], orRel = false }
+  let seeds = concat qr.pos qr.neg
+  if eq (length seeds) 0 then Just facts
+  else
+    let reachable = relReachClose facts seeds []
+    let reachAll = relReachAllOf facts reachable []
+    if relStratOk facts reachAll reachable
+    then
+      let allNegs = relAddAll (relNegRefsAll facts reachable []) qr.neg
+      let mats0 = relMatSet facts reachAll allNegs reachable []
+      if eq (length mats0) 0 then Just facts
+      else
+        let groups = relGroupSccs reachAll mats0 []
+        case relOrderSccs reachAll groups [] (add (length groups) 1) of
+          Nothing -> Nothing
+          Just ordered ->
+            case relMaterializeGroups facts ordered [] of
+              Nothing -> Nothing
+              Just mats -> Just { relations = concat facts.relations mats, rules = facts.rules }
+    else Nothing

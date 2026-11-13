@@ -1,0 +1,401 @@
+module engine where
+
+-- =========================================================================
+-- invert.fenel — backward constraint propagation (abstract interpretation),
+-- the BACKWARD dual of `propagate`'s forward transfer.
+-- unified-static-analysis Phase 3b-2 (brief:
+-- `workstreams/unified-static-analysis/briefs/phase-3b-2-invert-backward-transfer.md`).
+--
+-- THE PORT (the inference hot-path, slice 2). Given `output = inputs[0] op
+-- inputs[1]` with all but `inputs[unknownIdx]` known, solve the unknown's
+-- constraint over the SetExpr lattice — equation solving. Binary arithmetic
+-- only (`inputs.length != 2` ⇒ $all); invertible only for + - * / (and the
+-- enum pointwise of those); % and every non-arith op ⇒ $all (uninvertible).
+-- Exact-integer interval admission widens numeric intervals beyond native
+-- numbers. Their endpoints no longer justify scalar arithmetic inverses, so
+-- interval branches abstain with SeAll; native-number enum inversion remains.
+--
+-- decide-substrate Phase 1 Stage E: the internal `Sm*` SetMarker vocabulary is
+-- RETIRED — this body reads / builds the canonical registered `$tag` `Se*`
+-- SetExpr directly (a real ADT a `.fenel` body pattern-matches on), reusing
+-- propagate.fenel's `seTag` / `loOf` / `hiOf` / `numBound` adapters (the old
+-- `.tag`-string dispatch + interval-nesting + marshalBound guard) and its
+-- interval/enum helpers. The TS delegate (`invert.ts`) now passes SetExpr
+-- through `setExprToTag` (dual-read normalize) instead of the deleted
+-- `marshalSet` round-trip; ~342 LOC of legacy backward-transfer decision logic
+-- was retired, Fenel up.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- REUSE OF propagate.fenel (the D-3b-1 "shared low-level helpers" north-star,
+-- realized — D-3b-2-2). `invert` is structurally a mirror of `propagate`:
+-- same interval/enum marker algebra, same Maybe-bound machinery. The interval
+-- inverse arms are propagate helpers verbatim:
+--   invertAdd      ≡ propSubIv output known        (output - known)
+--   invertSubLeft  ≡ propAddIv output known        (a = output + b)
+--   invertSubRight ≡ propSubIv known  output       (b = a - output)
+--   invertDivLeft  ≡ propBinaryArith "*" output known  (a = output * b — forward multiply)
+-- Only `invertMul` (the DIVISION corners output / known) is genuinely new, and
+-- it reuses propCornerMinMax / mkSmInterval / the propLoNeg/propHiPos/
+-- propZeroIncl zero-guards — only the corner VALUES (division, not
+-- multiplication) and the corner builder differ. The enum pointwise inverse
+-- (`invertSolveArith` / `invertEnum`) mirrors propArithVal / propEnumArith
+-- with the unknownIdx left/right asymmetry, reusing dedupeValues + the
+-- nested-loop shape.
+--
+-- ±INFINITY (the propagate precedent). Fenel has no infinity literal; bound
+-- arithmetic branches on Just / Nothing. A DIVISION corner output/known is
+-- finite ⟺ the output bound is present (Just) AND the known bound is either
+-- unbounded (Nothing ⇒ finite/∞ = 0) or a present NON-ZERO value (a zero
+-- divisor corner ⇒ ∞ ⇒ excluded, matching the legacy Number.isFinite filter —
+-- and Fenel `div x 0 = 0` not ∞, so the zero is caught explicitly). An
+-- output-unbounded corner is always non-finite ⇒ excluded (∞/x = ∞ or NaN).
+--
+-- SIGNED ZERO (the ONE documented divergence from the legacy byte-output). The
+-- legacy TS leaked IEEE signed zero into a bound value: `finite / -Infinity =
+-- -0`. Fenel has a SINGLE zero — the runtime's `num x = Number x || 0`
+-- canonicalizes −0 → +0 (−0 is falsy), and a typed `: Number` return collapses
+-- it — so the finite/±∞ corner is +0 here where the legacy carried −0. This is
+-- a JS-representation artifact, NOT a language-conceptual value (−0 === 0, so
+-- it is semantically identical and invisible to every downstream set
+-- operation); the parity test canonicalizes ±0 before comparing. Reproducing
+-- −0 faithfully is impossible without disabling the runtime's num-coercion, and
+-- would be the wrong call: the pure-ADT view of a numeric bound has one zero.
+--
+-- THE `known`-UNION DISTRIBUTION WRINKLE (the TS `withKnown(k)`): the top-level
+-- TS `invert` distributes over a `$union` not only in `output` (like the
+-- forward path) but also in `known`, REBUILDING the inputs array. Here the core
+-- recursion operates on (op, output, known, unknownIdx) directly — the UNKNOWN
+-- input is never read (only its index matters, for the idx asymmetry) — so the
+-- `withKnown` rebuild is subsumed by recursing with each union branch `k` as
+-- the new `known`. The arity/idx guards + the known-of-inputs extraction live
+-- in the dispatched `invert` entry.
+--
+-- NO ENTITY DECLS (the assignable.fenel / propagate.fenel audit-green
+-- invariant): the markers are plain records, reused from 3b-1 — entity + law
+-- count move +0, the audit stays exit-0. Engine FNS are safe (law +0, lock +0).
+-- =========================================================================
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- invert — the dispatched entry. Arity/idx guards, then the known extraction
+-- + the canonical SetExpr fold. The TS delegate canonicalizes output + the two
+-- inputs at the boundary and normalizes the canonical result.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Invert"
+@description "Backward type propagation (abstract interpretation): given `output = inputs[0] op inputs[1]` with all but `inputs[unknownIdx]` known, compute the constraint on the unknown input over the canonical SetExpr lattice. Binary only (inputs.length != 2 ⇒ SeAll); + - * / retain the native-number enum inverse with the unknownIdx left/right asymmetry for - and /. Interval branches abstain with SeAll because interval membership admits exact integer records that raw scalar arithmetic does not preserve. % and every non-arith op ⇒ SeAll. Consumes and authors the registered Se* ADT directly; the TS delegate only canonicalizes boundary inputs and applies the final normalize."
+@tags "engine" "invert" "inference" "unified-static-analysis" "phase-3b-2"
+invert : (op: String) -> (output: a) -> (inputs: b) -> (unknownIdx: Number) -> c
+invert op output inputs unknownIdx =
+  if invertBadArity inputs unknownIdx then SeAll
+  else invertCore op output (invertKnownOf inputs unknownIdx) unknownIdx
+
+@label "invert: bad arity?"
+@description "True when the inputs are not exactly a binary pair, or the unknownIdx is neither 0 nor 1 — the uninvertible-arity guard (⇒ SeAll). Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertBadArity : (inputs: a) -> (unknownIdx: Number) -> Bool
+invertBadArity inputs unknownIdx =
+  if neq (length inputs) 2 then True
+  else if propAnd (neq unknownIdx 0) (neq unknownIdx 1) then True
+  else False
+
+@label "invert: known of inputs"
+@description "The KNOWN input marker: inputs[1] when the unknown is index 0, else inputs[0] (the other side). Assumes a binary pair (the arity guard ran). Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertKnownOf : (inputs: a) -> (unknownIdx: Number) -> b
+invertKnownOf inputs unknownIdx =
+  case head inputs of
+    Nothing -> SeAll
+    Just in0 ->
+      case tail inputs of
+        Nothing -> SeAll
+        Just rest ->
+          case head rest of
+            Nothing -> SeAll
+            Just in1 -> if eq unknownIdx 0 then in1 else in0
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- invertCore — the marker fold over (output, known, unknownIdx). The UNKNOWN
+-- input is never read (only its index, for the - / / asymmetry), so the TS
+-- `withKnown` union-rebuild is subsumed by recursing with each branch as the
+-- new `known`. Keep absorption and union distribution before the carrier fence:
+-- $none absorb → $all output →
+-- distribute over $union in output → distribute over $union in known →
+-- interval in either operand ⇒ $all → enum×enum → $all.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "invert: core fold"
+@description "The backward-transfer marker fold over (output, known, unknownIdx): $none in either ⇒ $none; $all output ⇒ $all; distribute over a $union in output OR in known; any interval operand ⇒ $all (its inhabitants need not be native numbers); enum×enum ⇒ the pointwise inverse; otherwise $all. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertCore : (op: String) -> (output: a) -> (known: a) -> (unknownIdx: Number) -> b
+invertCore op output known unknownIdx =
+  if eq (seTag output) "SeNone" then SeNone
+  else if eq (seTag known) "SeNone" then SeNone
+  else if eq (seTag output) "SeAll" then SeAll
+  else if eq (seTag output) "SeUnion" then SeUnion { branches = map (\s -> invertCore op s known unknownIdx) output.branches }
+  else if eq (seTag known) "SeUnion" then SeUnion { branches = map (\k -> invertCore op output k unknownIdx) known.branches }
+  else if eq (seTag output) "SeInterval" then SeAll
+  else if eq (seTag known) "SeInterval" then SeAll
+  else if propAnd (eq (seTag output) "SeEnum") (eq (seTag known) "SeEnum") then invertEnum op output.values known.values unknownIdx
+  else SeAll
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- interval inverse — the backward transfer over Maybe bounds. + - * / reuse
+-- the propagate.fenel interval arithmetic where they coincide (the mirror
+-- identities above); only invertMul (division corners) is new.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "invert: interval inverse"
+@description "Interval inverse admission fence: SeAll for every op. Numeric endpoints do not restrict interval inhabitants to native numbers; admitted exact integer records do not follow the raw scalar arithmetic that the retained corner helpers model. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertIv : (op: String) -> (output: a) -> (known: a) -> (unknownIdx: Number) -> b
+invertIv op output known unknownIdx = SeAll
+
+@label "invert: interval mul-inverse (division corners)"
+@description "Multiplication's interval inverse admission fence: SeAll. The known interval can admit exact integer records that raw multiplication coerces to zero, so endpoint division cannot constrain the unknown soundly. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertMul : (output: a) -> (known: a) -> b
+invertMul output known = SeAll
+
+@label "invert: division corners"
+@description "The four division corners of output / known, in the order (oL/kL, oL/kH, oH/kL, oH/kH), keeping only the finite ones. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertMulCorners : (oLo: a) -> (oHi: a) -> (kLo: a) -> (kHi: a) -> b
+invertMulCorners oLo oHi kLo kHi =
+  let l1 = appendItem (invertDivCorner oLo kLo) []
+  let l2 = appendItem (invertDivCorner oLo kHi) l1
+  let l3 = appendItem (invertDivCorner oHi kLo) l2
+  let l4 = appendItem (invertDivCorner oHi kHi) l3
+  propCollectJusts l4 []
+
+@label "invert: division corner"
+@description "One division corner oBound / kBound: an unbounded output bound ⇒ Nothing (∞/x non-finite, excluded); a present output bound over an unbounded known bound ⇒ Just{ 0, exclusive } (finite/±∞ = ±0; the Fenel runtime canonicalizes to the single +0 — signed zero is a JS-repr artifact, `num x = Number x || 0` collapses −0, so the legacy IEEE −0 becomes +0 here, semantically identical since −0 === 0; the parity test canonicalizes ±0); over a zero known value ⇒ Nothing (finite/0 = ∞, excluded — Fenel `div` returns 0 on a zero divisor, so the zero is caught explicitly); over a present non-zero known value ⇒ Just{ quotient, both inclusive }. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertDivCorner : (oBound: a) -> (kBound: a) -> b
+invertDivCorner oBound kBound =
+  case oBound of
+    Nothing -> Nothing
+    Just o ->
+      case kBound of
+        Nothing -> Just { value = 0, inclusive = False }
+        Just k -> if eq k.value 0 then Nothing else Just { value = div o.value k.value, inclusive = propAnd o.inclusive k.inclusive }
+
+@label "invert: interval div-inverse right (b = a / output)"
+@description "Right-operand division's interval inverse admission fence: SeAll. Interval membership does not justify native-number endpoint division across its broader admitted carriers. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertDivRight : (output: a) -> (known: a) -> b
+invertDivRight output known = SeAll
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- enum (pointwise) inverse — the idx-asymmetric scalar solver + the nested
+-- loop + dedupe (mirrors propEnumArith).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "invert: enum inverse"
+@description "Pointwise enum inverse: for every numeric (o, k) solve the unknown via invertSolveArith (idx asymmetry), keeping defined + finite results, then dedupe (first-seen). Empty ⇒ SeNone. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertEnum : (op: String) -> (ovals: a) -> (kvals: a) -> (unknownIdx: Number) -> b
+invertEnum op ovals kvals unknownIdx =
+  let raw = invertEnumOuter op ovals kvals unknownIdx []
+  if eq (length raw) 0 then SeNone
+  else SeEnum { values = dedupeValues raw [] }
+
+@label "invert: enum inverse outer"
+@description "Outer loop of the enum×enum pointwise inverse — over the output values. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertEnumOuter : (op: String) -> (ovals: a) -> (kvals: a) -> (unknownIdx: Number) -> (acc: a) -> a
+invertEnumOuter op ovals kvals unknownIdx acc =
+  case head ovals of
+    Nothing -> acc
+    Just o ->
+      let acc2 = if isNumber o then invertEnumInner op o kvals unknownIdx acc else acc
+      case tail ovals of
+        Nothing -> acc2
+        Just rest -> invertEnumOuter op rest kvals unknownIdx acc2
+
+@label "invert: enum inverse inner"
+@description "Inner loop of the enum×enum pointwise inverse — over the known values for a fixed output value. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertEnumInner : (op: String) -> (o: a) -> (kvals: a) -> (unknownIdx: Number) -> (acc: a) -> a
+invertEnumInner op o kvals unknownIdx acc =
+  case head kvals of
+    Nothing -> acc
+    Just k ->
+      let acc2 = if isNumber k then invertEnumOne op o k unknownIdx acc else acc
+      case tail kvals of
+        Nothing -> acc2
+        Just rest -> invertEnumInner op o rest unknownIdx acc2
+
+@label "invert: enum inverse one"
+@description "Solve one (o, k) for the unknown, appending the result when defined (not ÷0 / %-undefined) and finite. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertEnumOne : (op: String) -> (o: a) -> (k: a) -> (unknownIdx: Number) -> (acc: a) -> a
+invertEnumOne op o k unknownIdx acc =
+  case invertSolveArith op o k unknownIdx of
+    Nothing -> acc
+    Just r -> if numberIsFinite r then appendItem r acc else acc
+
+@label "invert: scalar solve"
+@description "Solve `output = unknown op known` (idx 0) or `output = known op unknown` (idx 1) for the scalar unknown ⇒ Just result, undefined cases ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertSolveArith : (op: String) -> (output: a) -> (known: a) -> (unknownIdx: Number) -> b
+invertSolveArith op output known unknownIdx =
+  if eq unknownIdx 0 then invertSolveLeft op output known
+  else invertSolveRight op output known
+
+@label "invert: scalar solve (idx 0)"
+@description "Solve output = unknown op known: + ⇒ output - known; - ⇒ output + known; * ⇒ output / known (known 0 ⇒ Nothing); / ⇒ output * known; % and other ⇒ Nothing (not uniquely invertible). Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertSolveLeft : (op: String) -> (output: a) -> (known: a) -> b
+invertSolveLeft op output known =
+  if eq op "+" then Just (sub output known)
+  else if eq op "-" then Just (add output known)
+  else if eq op "*" then (if eq known 0 then Nothing else Just (div output known))
+  else if eq op "/" then Just (mul output known)
+  else Nothing
+
+@label "invert: scalar solve (idx 1)"
+@description "Solve output = known op unknown: + ⇒ output - known; - ⇒ known - output; * ⇒ output / known (known 0 ⇒ Nothing); / ⇒ known / output (output 0 ⇒ Nothing); % and other ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertSolveRight : (op: String) -> (output: a) -> (known: a) -> b
+invertSolveRight op output known =
+  if eq op "+" then Just (sub output known)
+  else if eq op "-" then Just (sub known output)
+  else if eq op "*" then (if eq known 0 then Nothing else Just (div output known))
+  else if eq op "/" then (if eq output 0 then Nothing else Just (div known output))
+  else Nothing
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- interval-output × enum-known distribution — each numeric known value as a
+-- point interval, transferred through the interval inverse, unioned. Empty ⇒
+-- SeAll (NOT SeNone — mirrors the TS `parts.length ? union : $all`).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "invert: interval × enum-known"
+@description "Interval-output × enum-known admission fence: SeAll. Point-lifting a native enum value does not restrict the output interval or unknown value to native-number carriers. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertIvEnumKnown : (op: String) -> (output: a) -> (kvals: a) -> (unknownIdx: Number) -> b
+invertIvEnumKnown op output kvals unknownIdx = SeAll
+
+@label "invert: interval × enum-known parts"
+@description "Build the union branches of the interval-output × enum-known distribution (the interval inverse applied to each numeric known value as a point interval). Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertIvEnumParts : (op: String) -> (output: a) -> (kvals: a) -> (unknownIdx: Number) -> (acc: a) -> a
+invertIvEnumParts op output kvals unknownIdx acc =
+  case head kvals of
+    Nothing -> acc
+    Just v ->
+      let acc2 = if isNumber v then appendItem (invertIv op output (propPointIv v) unknownIdx) acc else acc
+      case tail kvals of
+        Nothing -> acc2
+        Just rest -> invertIvEnumParts op output rest unknownIdx acc2
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- invertConfidence — arithmetic abstains because the API omits the desired
+-- output. The retained enum inverse computation is independent of this
+-- classifier; its candidate must still be checked against the actual output.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Invert confidence"
+@description "Classify a backward-propagation step from its known operand. Arithmetic confidence is unavailable: the API carries no desired output, which might be an interval requiring inverse abstention even when the known input is a finite native-number enum. Finite enum inverse computation remains available. Preserve approximate for an interval-free known union under the remaining non-arithmetic classifications; intervals, bad arity, % / cat, $all and unsupported known shapes are unavailable."
+@tags "engine" "invert" "inference" "unified-static-analysis" "phase-3b-2"
+invertConfidence : (op: String) -> (inputs: a) -> (unknownIdx: Number) -> String
+invertConfidence op inputs unknownIdx =
+  if invertBadArity inputs unknownIdx then "unavailable"
+  else if invertUninvertibleOp op then "unavailable"
+  else invertConfOf op (invertKnownOf inputs unknownIdx)
+
+@label "invert: uninvertible op?"
+@description "True for the ops invert never inverts: % (not uniquely invertible) and cat (string concat). Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertUninvertibleOp : (op: String) -> Bool
+invertUninvertibleOp op = if eq op "%" then True else eq op "cat"
+
+@label "invert: confidence of known"
+@description "Arithmetic ⇒ unavailable because the desired output is absent from this API. For the remaining classifications, $all or any interval branch ⇒ unavailable; an interval-free $union ⇒ approximate; otherwise unavailable. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertConfOf : (op: String) -> (known: a) -> String
+invertConfOf op known =
+  if propIsArith op then "unavailable"
+  else if eq (seTag known) "SeAll" then "unavailable"
+  else if invertHasInterval known then "unavailable"
+  else if eq (seTag known) "SeUnion" then "approximate"
+  else "unavailable"
+
+@label "invert: has interval branch?"
+@description "True for an interval or a union with an interval branch, recursively. Tracks the interval inverse admission fence through known unions without changing other confidence classifications. Internal helper."
+@tags "engine" "internal" "invert"
+@category "engine-internal"
+invertHasInterval : (known: a) -> Bool
+invertHasInterval known =
+  if eq (seTag known) "SeInterval" then True
+  else if eq (seTag known) "SeUnion" then gt (length (filter (\branch -> invertHasInterval branch) known.branches)) 0
+  else False
+
+@label "invert: confidence (interval/enum known)"
+@description "Interval/enum confidence admission fence: unavailable. Arithmetic inversion needs the desired output to justify its precision, and this API carries no output. The finite native-number enum inverse itself remains available. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertConfIvEnum : (op: String) -> (known: a) -> String
+invertConfIvEnum op known = "unavailable"
+
+@label "invert: is * or /?"
+@description "True for the multiplication / division ops (the zero-in-denominator guard applies to these). Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertIsMulDiv : (op: String) -> Bool
+invertIsMulDiv op = if eq op "*" then True else eq op "/"
+
+@label "invert: zero in denominator?"
+@description "True when the known operand admits zero: an interval whose lo ≤ 0 and hi ≥ 0 (unbounded counts as ∓∞), or an enum containing 0. Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertZeroDenom : (known: a) -> Bool
+invertZeroDenom known =
+  if eq (seTag known) "SeInterval" then propAnd (invertLoNonPos (loOf known)) (invertHiNonNeg (hiOf known))
+  else if eq (seTag known) "SeEnum" then valueMember 0 known.values
+  else False
+
+@label "invert: lo ≤ 0?"
+@description "True when a lo bound is ≤ 0 (unbounded ⇒ −∞ ⇒ True). Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertLoNonPos : (mb: a) -> Bool
+invertLoNonPos mb =
+  case mb of
+    Nothing -> True
+    Just x -> lte x.value 0
+
+@label "invert: hi ≥ 0?"
+@description "True when a hi bound is ≥ 0 (unbounded ⇒ +∞ ⇒ True). Internal helper."
+@tags "engine" "internal" "invert" "unified-static-analysis" "phase-3b-2"
+@category "engine-internal"
+invertHiNonNeg : (mb: a) -> Bool
+invertHiNonNeg mb =
+  case mb of
+    Nothing -> True
+    Just x -> gte x.value 0

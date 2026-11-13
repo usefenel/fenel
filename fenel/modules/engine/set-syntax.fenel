@@ -1,0 +1,1892 @@
+module engine where
+
+-- set-syntax — human-readable text ↔ SetExpr DSL.
+--
+-- Phase 7d port. Mirrors the TS oracle at
+-- implementations/typescript/engine/src/set-syntax.ts (now a thin shim
+-- over the dispatched wrappers for the ported entries).
+--
+-- Sub-step 1 lands the formatter half (~100 LOC). The TS marshaller
+-- walks SetExpr once and pre-resolves:
+--
+--   * `$named` → display name via the DISPLAY_NAMES table (Nat→ℕ etc.)
+--   * `$pattern` → regex repr via `patternToRegex` (now Fenel-bodied via
+--     `engine:rxhPatternToRegex` — regex-derivative-to-fenel Slice C; the TS
+--     is a shim, called here at the marshal boundary)
+--   * `$enum` values → pre-formatted reprStr via JSON.stringify-for-
+--     strings / String() fallback (the body has no equivalent primitive)
+--   * `$interval` bounds → reprStr + inclusive Bool (with JSON.stringify
+--     quoting + the `expr(…)` carve-out at marshaller)
+--   * The two-child `$intersect` of `$named` + `$interval` (named-range
+--     `Name[lo..hi]`) → detected TS-side and emitted as a dedicated
+--     `FmtNamedRange` variant; the body's `$intersect` arm doesn't
+--     re-detect.
+--
+-- The body emits the human-readable string via structural recursion +
+-- context-dependent parenthesization ($union inside $intersect/$unary
+-- gets parens) + separator-joining.
+--
+-- The parser half lands in sub-steps 2-4.
+--
+-- All internal helpers are prefixed `setSyntax…` to avoid collisions
+-- with like-named helpers already registered by other engine bodies.
+
+-- ---------------------------------------------------------------------------
+-- formatSetExpr — top-level entry. Walks the canonical `$tag` Se* ADT (the
+-- printSetExpr / json-schema / set-expr-sql harvest template) and emits the
+-- human-readable text DSL string.
+--
+-- containment-substrate Phase 1a (render-marshaller harvest): the TS
+-- marshaller `marshalSetExprForFmt` + the `FmtSetExpr` / `FmtBoundEntry` /
+-- `FmtIntervalAdt` marshalled-mirror ADTs are DELETED. `dispatchedFormatSetExpr`
+-- normalises its input to the canonical `$tag` form via `setExprToTag` and feeds
+-- it here; the body resolves each leaf inline:
+--   * SeRef    → display name (setSyntaxDisplayName — the DISPLAY_NAMES table)
+--   * SeEnum   → per-value repr (jsLit for strings, toString otherwise)
+--   * SeInterval bounds → repr with the `$expr` carve-out (read via `lookup` —
+--     `$`-prefixed keys ARE readable at runtime; only AUTHORING them is barred)
+--   * SePattern → `rxhPatternToRegex (rxhReadPat p)` (the already-Fenel regex
+--     serialiser the json-schema / set-expr-sql readers ride)
+-- The named-range short-form `Name[lo..hi]` (a SeIntersect of a SeRef + a
+-- SeInterval) is detected in the SeIntersect arm (formerly the marshaller's
+-- `tryNamedRange`). Context starts at "top".
+--
+-- §10.3 GLYPH SUBSUMPTION (Phase 2 Step 3 — DONE): the cross-base math glyphs
+-- (`∪` / `∩` / `¬` / `\`) are now ROUTED through the `Symbolable` projection via
+-- `setSyntaxSymbol` (= `getSymbol` over the former name), NOT inlined — the
+-- design §10.3 former-promotion subsumption. The glyph FACT lives in the
+-- `Symbolable` instances (fenel/std/dispatch-instances.fenel), keyed by former
+-- name; this formatter and `ExpressionDisplay.tsx` (the second emit surface) both
+-- resolve from it (the kill-2-birds — one projection, two clients). The
+-- non-glyph word forms (`U` for SeAll, `∅` for SeNone) stay inlined: they are NOT
+-- former glyphs (SeAll/SeNone are the lattice top/bottom rendered as words here;
+-- their forward-looking `⊤`/`⊥` Symbolable entries have no routing site here).
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: formatSetExpr"
+@description "containment-substrate Phase 1a — top-level formatter entry. Walks the canonical `$tag` Se* ADT (SeAll/SeNone/SeWhere/SeRef/SeEnum/SeInterval/SePattern/SeComplement/SeUnion/SeIntersect/SeDiff) and emits the human-readable text DSL string. Leaf resolutions inline (display name / enum value reprs / interval bounds with the $expr carve-out via `lookup` / regex via rxhPatternToRegex∘rxhReadPat); the named-range `Name[lo..hi]` short-form is detected in the SeIntersect arm. Math glyphs hardcoded (Phase-2 Symbolable flag). The TS marshaller marshalSetExprForFmt is deleted; dispatchedFormatSetExpr normalises to `$tag` via setExprToTag. Mirrors set-syntax.ts:formatSetExpr (now a thin shim)."
+@tags "engine" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+formatSetExpr : (set: SetExpr) -> String
+formatSetExpr set = setSyntaxFmtExpr set "top"
+
+-- setSyntaxFmtExpr — dispatch on the canonical Se* variant. `ctx` is the
+-- enclosing operator context ("top" | "union" | "intersect" | "unary")
+-- used to decide whether a SeUnion arm needs surrounding parens. The `_` arm
+-- is the unknown-shape fallback (matches the marshaller's `JSON.stringify(set)`).
+@label "set-syntax: fmtExpr"
+@description "containment-substrate Phase 1a — recursive formatter dispatcher over the canonical Se* ADT. `ctx` is the enclosing operator context (\"top\" | \"union\" | \"intersect\" | \"unary\") used to decide whether SeUnion arms need surrounding parens (precedence: union < intersect < complement). The `_` arm is the unknown-shape JSON fallback. Internal helper to formatSetExpr."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxFmtExpr : (set: SetExpr) -> (ctx: String) -> String
+setSyntaxFmtExpr set ctx = case set of
+  SeAll -> "U"
+  SeNone -> "∅"
+  SeWhere { pred = p } -> "$where(…)"
+  SeRef { handle = h } -> setSyntaxDisplayName h
+  SeEnum { values = vs } -> setSyntaxFmtEnumReprs (setSyntaxEnumReprs vs [])
+  SeInterval { interval = iv } -> setSyntaxFmtInterval iv
+  SePattern { pattern = p } -> setSyntaxFmtPatternRepr p
+  SeComplement { inner = i } -> concat (setSyntaxSymbol "complement") (setSyntaxFmtExpr i "unary")
+  SeUnion { branches = bs } -> setSyntaxFmtUnion bs ctx
+  SeIntersect { branches = bs } -> setSyntaxFmtIntersect bs
+  SeDiff { left = a, right = b } ->
+    concat (setSyntaxFmtExpr a "intersect") (concat (setSyntaxSpacedSymbol "diff") (setSyntaxFmtExpr b "unary"))
+  -- signature-substrate Phase 4 slice 3a — REDACTED constant. The `_` arm below
+  -- is `jsLit set` (= JSON.stringify), which would emit the rigid's scopeToken
+  -- and ordinal verbatim into a display string. A rigid has no text-DSL
+  -- spelling; the placeholder carries no token.
+  SeRigid {} -> "<rigid>"
+  _ -> jsLit set
+
+-- setSyntaxSymbol — resolve a former's display GLYPH through the `Symbolable`
+-- projection (containment-substrate Phase 2 Step 3, design §10.3). `getSymbol
+-- "union"` reads the `Symbolable "union"` instance → `Just "∪"`; the `Nothing`
+-- arm is unreachable for the registered formers (the global specRegistry always
+-- carries them — proven at the dispatch boundary) and degrades to "" rather than
+-- re-inlining a parallel glyph (the subsumption fence: ONE glyph source). Routes
+-- the formatter's `¬`/`∪`/`∩` glyphs off the hardcoded literals.
+@label "set-syntax: symbol"
+@description "containment-substrate Phase 2 Step 3 — resolve a former's display glyph via the Symbolable projection (`getSymbol former`); the Nothing arm degrades to \"\" (never re-inlines a parallel glyph). Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "symbolable" "containment-phase-2"
+@category "engine-internal"
+setSyntaxSymbol : (former: String) -> String
+setSyntaxSymbol former = case getSymbol former of
+  Just s -> s
+  Nothing -> ""
+
+-- setSyntaxSpacedSymbol — a former glyph wrapped in single spaces (` ∪ ` / ` \ `),
+-- the infix-separator shape the union/intersect/diff arms emit.
+@label "set-syntax: spacedSymbol"
+@description "containment-substrate Phase 2 Step 3 — a former glyph wrapped in single spaces (` ∪ ` / ` \\ `), the infix separator the union/intersect/diff arms emit. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "symbolable" "containment-phase-2"
+@category "engine-internal"
+setSyntaxSpacedSymbol : (former: String) -> String
+setSyntaxSpacedSymbol former = concat " " (concat (setSyntaxSymbol former) " ")
+
+-- setSyntaxDisplayName — named-set display aliases (the DISPLAY_NAMES table:
+-- Nat→ℕ / Int→ℤ / Rational→ℚ / Real→ℝ). The ℕ/ℤ/ℚ/ℝ identity entries fall
+-- through the `else` unchanged.
+@label "set-syntax: displayName"
+@description "containment-substrate Phase 1a — named-set display aliases (the DISPLAY_NAMES table: Nat→ℕ / Int→ℤ / Rational→ℚ / Real→ℝ; everything else verbatim). Internal helper (was the TS resolveDisplayName)."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxDisplayName : (name: String) -> String
+setSyntaxDisplayName name =
+  if eq name "Nat" then "ℕ"
+  else if eq name "Int" then "ℤ"
+  else if eq name "Rational" then "ℚ"
+  else if eq name "Real" then "ℝ"
+  else name
+
+-- setSyntaxEnumReprs — map each raw enum value to its repr (jsLit for strings
+-- = JSON.stringify; toString otherwise = String()), accumulating a List String
+-- in original order (the closure-free map idiom). Was the TS `fmtEnumValueRepr`.
+@label "set-syntax: enumReprs"
+@description "containment-substrate Phase 1a — map each raw enum value to its repr (jsLit for strings / toString otherwise), in original order. Was the TS fmtEnumValueRepr. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxEnumReprs : (vs: List Any) -> (acc: List String) -> List String
+setSyntaxEnumReprs vs acc = case head vs of
+  Nothing -> acc
+  Just v ->
+    let r = if isString v then jsLit v else if isNull v then "null" else toString v
+    let acc2 = appendItem r acc
+    case tail vs of
+      Nothing -> acc2
+      Just rest -> setSyntaxEnumReprs rest acc2
+
+-- setSyntaxFmtEnumReprs — assemble `{r0, r1, ...}` from the rendered value
+-- reprs (List String).
+@label "set-syntax: fmtEnumReprs"
+@description "containment-substrate Phase 1a — assemble `{r0, r1, ...}` from the rendered value reprs (List String). Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxFmtEnumReprs : (rs: List String) -> String
+setSyntaxFmtEnumReprs rs = concat "{" (concat (join rs ", ") "}")
+
+-- setSyntaxFmtPatternRepr — `/regex/` when the Pattern serialises to a regex
+-- (`rxhPatternToRegex (rxhReadPat p)` returns `{ ok, value }`); `$pattern(…)`
+-- placeholder when it does not (`ok = false`). The regex serialiser is the
+-- already-Fenel `engine:rxhPatternToRegex` (the json-schema / set-expr-sql
+-- readers ride the same `rxhPatternToRegex ∘ rxhReadPat` idiom). Takes the RAW
+-- legacy `.t`-Pattern (`rxhReadPat` dual-reads it).
+@label "set-syntax: fmtPatternRepr"
+@description "containment-substrate Phase 1a — render `/regex/` via `rxhPatternToRegex (rxhReadPat p)` (the already-Fenel regex serialiser, ok ⇒ the anchored regex); `$pattern(…)` placeholder when ok = false. Takes the raw legacy `.t`-Pattern. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxFmtPatternRepr : (p: Any) -> String
+setSyntaxFmtPatternRepr p =
+  let r = rxhPatternToRegex (rxhReadPat p)
+  if r.ok then concat "/" (concat r.value "/") else "$pattern(…)"
+
+-- setSyntaxFmtInterval — assemble the bracket pair `[lo..hi]` (or `(`
+-- / `)` for exclusive bounds; "-∞" / "∞" for unbounded). Mirrors the
+-- TS oracle's `loBracket + lo + ".." + hi + hiBracket`.
+@label "set-syntax: fmtInterval"
+@description "Phase 7d sub-step 1 — assemble `[lo..hi]` / `(lo..hi)` (or `-∞`/`∞` for unbounded sides) from a pre-marshalled FmtIntervalAdt. Brackets resolved by bound's `inclusive` Bool. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "phase-7d"
+@category "engine-internal"
+setSyntaxFmtInterval : (iv: { lo: Maybe ({ value: Any, inclusive: Boolean }), hi: Maybe ({ value: Any, inclusive: Boolean }) }) -> String
+setSyntaxFmtInterval iv =
+  let loB = setSyntaxFmtBoundOpen iv.lo
+  let loV = setSyntaxFmtBoundValueLo iv.lo
+  let hiV = setSyntaxFmtBoundValueHi iv.hi
+  let hiB = setSyntaxFmtBoundClose iv.hi
+  concat loB (concat loV (concat ".." (concat hiV hiB)))
+
+-- setSyntaxFmtBoundOpen — opening bracket for the lo side. Nothing →
+-- `(` (unbounded lo); Just inclusive → `[`; Just exclusive → `(`.
+@label "set-syntax: fmtBoundOpen"
+@description "Phase 7d sub-step 1 — opening bracket for the lo side: Nothing → `(`; Just inclusive → `[`; Just exclusive → `(`. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "phase-7d"
+@category "engine-internal"
+setSyntaxFmtBoundOpen : (mBound: Maybe ({ value: Any, inclusive: Boolean })) -> String
+setSyntaxFmtBoundOpen mBound = case mBound of
+  Nothing -> "("
+  Just b -> if b.inclusive then "[" else "("
+
+-- setSyntaxFmtBoundClose — closing bracket for the hi side. Nothing →
+-- `)` (unbounded hi); Just inclusive → `]`; Just exclusive → `)`.
+@label "set-syntax: fmtBoundClose"
+@description "Phase 7d sub-step 1 — closing bracket for the hi side: Nothing → `)`; Just inclusive → `]`; Just exclusive → `)`. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "phase-7d"
+@category "engine-internal"
+setSyntaxFmtBoundClose : (mBound: Maybe ({ value: Any, inclusive: Boolean })) -> String
+setSyntaxFmtBoundClose mBound = case mBound of
+  Nothing -> ")"
+  Just b -> if b.inclusive then "]" else ")"
+
+-- setSyntaxFmtBoundValueLo — rendered value or "-∞" sentinel.
+@label "set-syntax: fmtBoundValueLo"
+@description "containment-substrate Phase 1a — rendered lo-value repr or `-∞` sentinel for unbounded lo. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxFmtBoundValueLo : (mBound: Maybe ({ value: Any, inclusive: Boolean })) -> String
+setSyntaxFmtBoundValueLo mBound = case mBound of
+  Nothing -> "-∞"
+  Just b -> setSyntaxFmtBoundRepr b.value
+
+-- setSyntaxFmtBoundValueHi — rendered value or "∞" sentinel.
+@label "set-syntax: fmtBoundValueHi"
+@description "containment-substrate Phase 1a — rendered hi-value repr or `∞` sentinel for unbounded hi. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxFmtBoundValueHi : (mBound: Maybe ({ value: Any, inclusive: Boolean })) -> String
+setSyntaxFmtBoundValueHi mBound = case mBound of
+  Nothing -> "∞"
+  Just b -> setSyntaxFmtBoundRepr b.value
+
+-- setSyntaxFmtBoundRepr — render a raw interval-bound value. Was the TS
+-- `fmtBoundReprStr`: an `$expr`-typed bound (an object carrying the `$expr`
+-- key, read via `lookup`) → `expr(…)`; a string → jsLit (JSON.stringify);
+-- anything else → toString (String()). The string / number checks run FIRST so
+-- `lookup` only ever touches an object value.
+@label "set-syntax: fmtBoundRepr"
+@description "containment-substrate Phase 1a — render a raw interval-bound value: `$expr`-typed (object with the `$expr` key, via `lookup`) → `expr(…)`; string → jsLit; else → toString. Was the TS fmtBoundReprStr. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxFmtBoundRepr : (value: Any) -> String
+setSyntaxFmtBoundRepr value =
+  if isString value then jsLit value
+  else if isNumber value then toString value
+  else if isBoolean value then toString value
+  else case lookup value "$expr" of
+    Just _ -> "expr(…)"
+    Nothing -> toString value
+
+-- setSyntaxFmtUnion — render `a ∪ b ∪ c`. If the enclosing context is
+-- intersect-tighter or unary, wrap the whole result in parens
+-- (precedence: union < intersect < complement).
+@label "set-syntax: fmtUnion"
+@description "Phase 7d sub-step 1 — render `a ∪ b ∪ c`. Wraps in parens when the enclosing ctx is `intersect` or `unary` (precedence: union < intersect < complement). Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "phase-7d"
+@category "engine-internal"
+setSyntaxFmtUnion : (bs: List SetExpr) -> (ctx: String) -> String
+setSyntaxFmtUnion bs ctx =
+  let parts = setSyntaxFmtBranches bs "union" []
+  let body = join parts (setSyntaxSpacedSymbol "union")
+  if eq ctx "intersect"
+  then concat "(" (concat body ")")
+  else if eq ctx "unary"
+  then concat "(" (concat body ")")
+  else body
+
+-- setSyntaxFmtIntersect — render the named-range short-form `Name[lo..hi]`
+-- (a 2-branch intersect of a SeRef + a SeInterval, either order) when it
+-- applies, else the n-ary general case `a ∩ b ∩ c`. The named-range detection
+-- (formerly the marshaller's `tryNamedRange`) is now in-body.
+@label "set-syntax: fmtIntersect"
+@description "containment-substrate Phase 1a — render the named-range short-form `Name[lo..hi]` (a 2-branch SeIntersect of a SeRef + a SeInterval, either order) when it applies, else the n-ary general case `a ∩ b ∩ c`. The named-range detection was the TS `tryNamedRange`. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxFmtIntersect : (bs: List SetExpr) -> String
+setSyntaxFmtIntersect bs =
+  case setSyntaxNamedRange bs of
+    Just s -> s
+    Nothing ->
+      let parts = setSyntaxFmtBranches bs "intersect" []
+      join parts (setSyntaxSpacedSymbol "intersect")
+
+-- setSyntaxNamedRange — detect a 2-branch intersect that is a SeRef + a
+-- SeInterval (either order) → `Just "Name[lo..hi]"`; `Nothing` otherwise.
+-- Mirrors the marshaller's `tryNamedRangeMarshal(a,b) ?? tryNamedRangeMarshal(b,a)`.
+@label "set-syntax: namedRange"
+@description "containment-substrate Phase 1a — detect a 2-branch SeIntersect that is a SeRef + a SeInterval (either order) → Just \"Name[lo..hi]\"; Nothing otherwise. Was the TS tryNamedRange. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxNamedRange : (bs: List SetExpr) -> Maybe String
+setSyntaxNamedRange bs =
+  if eq (length bs) 2
+  then case head bs of
+    Nothing -> Nothing
+    Just a ->
+      case head (tailOr bs) of
+        Nothing -> Nothing
+        Just b ->
+          case setSyntaxNamedRangeOf a b of
+            Just s -> Just s
+            Nothing -> setSyntaxNamedRangeOf b a
+  else Nothing
+
+-- setSyntaxNamedRangeOf — `Just "Name[lo..hi]"` when `x` is a SeRef and `y` is
+-- a SeInterval (display name + interval body); `Nothing` otherwise.
+@label "set-syntax: namedRangeOf"
+@description "containment-substrate Phase 1a — `Just \"Name[lo..hi]\"` when x is a SeRef and y is a SeInterval (display name ++ interval body); Nothing otherwise. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setSyntaxNamedRangeOf : (x: SetExpr) -> (y: SetExpr) -> Maybe String
+setSyntaxNamedRangeOf x y = case x of
+  SeRef { handle = h } ->
+    case y of
+      SeInterval { interval = iv } ->
+        Just (concat (setSyntaxDisplayName h) (setSyntaxFmtInterval iv))
+      other -> Nothing
+  other -> Nothing
+
+-- setSyntaxFmtBranches — map setSyntaxFmtExpr over a list of branches
+-- with a fixed `ctx`. Equivalent to `branches.map(b => fmtExpr(b, ctx))`
+-- in TS; Fenel doesn't have a closure-friendly `map` so we recurse
+-- explicitly via head/tail.
+@label "set-syntax: fmtBranches"
+@description "Phase 7d sub-step 1 — map setSyntaxFmtExpr over a list of branches with a fixed ctx. Equivalent to `branches.map(b => fmtExpr(b, ctx))` in TS; the recursion threads an accumulator since Fenel doesn't have a closure-friendly `map` here. Internal helper."
+@tags "engine" "internal" "set-syntax" "formatter" "phase-7d"
+@category "engine-internal"
+setSyntaxFmtBranches : (bs: List SetExpr) -> (ctx: String) -> (acc: List String) -> List String
+setSyntaxFmtBranches bs ctx acc = case head bs of
+  Nothing -> acc
+  Just b ->
+    let s = setSyntaxFmtExpr b ctx
+    let accNext = appendItem s acc
+    case tail bs of
+      Nothing -> accNext
+      Just rest -> setSyntaxFmtBranches rest ctx accNext
+
+-- ---------------------------------------------------------------------------
+-- Phase 7d sub-step 2 — Parser leaves.
+--
+-- Pure recursive-descent parser primitives over a `ParseState`. State is
+-- threaded explicitly (Fenel is pure FP — no mutating `pos`). Each
+-- success-or-fail leaf returns a `Result String ParseSuccess`; each
+-- success-or-no-match leaf (`parseName`) returns `Maybe ParseSuccess`.
+--
+-- The TS oracle uses a mutating `Parser` class; the body's threading
+-- via ParseState produces equivalent semantics.
+--
+-- Sub-step 2 lands the pure-text leaves:
+--   * char-class predicates (isAlpha / isDigit / isAlnum / isMathLetter
+--     / isNameHeadChar / isNameBodyChar / isHexDigit / isOctalDigit /
+--     isBinaryDigit / isWs)
+--   * state helpers (ch / chAt / skipWs / matchLiteral / advance)
+--   * parseQuotedString — consume `"foo\""` or `'bar'` with `\`-escape
+--   * parseName — `[a-zA-Zℕℤℚℝ][a-zA-Z0-9:_-]*` identifier
+--   * parseRadixMagnitude — unsigned magnitude in given radix
+--   * parseNumber — decimal / hex / octal / binary with optional sign +
+--     exponent
+--   * parseBound — number | quoted-string | -∞/∞/empty
+--
+-- The atoms (sub-step 3) + top-level dispatchers (sub-step 4) build on
+-- top of these.
+-- ---------------------------------------------------------------------------
+
+-- ParseState — input + current position. The body threads this through
+-- every parser helper; the TS wrapper marshals `(input: String, pos: 0)`
+-- at top-level entry.
+ParseState = ParseState input: String pos: Number
+
+-- ParseSuccess — a successful parse's output. `newState` is the advanced
+-- ParseState; `value` is the parsed value (type varies per parser).
+ParseSuccess state value = ParseSuccess newState: state value: value
+
+-- SetSyntaxSignState — exact result of consuming an optional numeric sign.
+-- Keeping this handoff nominal gives parseNumber an exact record view under
+-- source-handle signature inference.
+SetSyntaxSignState = SetSyntaxSignState newState: ParseState value: Number
+
+-- ---------------------------------------------------------------------------
+-- Char-class predicates
+-- ---------------------------------------------------------------------------
+
+-- isAlpha c — `[a-zA-Z]` test via substring lookup in the alphabet.
+-- Explicit empty-string guard: `elem "" haystack` is `true` in JS
+-- (`String.includes("")` is always `true`), so we reject EOF up-front
+-- to avoid infinite consume-loops past the end of input.
+@label "set-syntax: isAlpha"
+@description "Phase 7d sub-step 2 — char-class predicate: `[a-zA-Z]`. Implemented via std:elem over the alphabet lookup string. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsAlpha : (c: String) -> Boolean
+setSyntaxIsAlpha c =
+  if eq c "" then false
+  else elem c "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+-- isDigit c — `[0-9]` test via substring lookup. Same empty-string guard.
+@label "set-syntax: isDigit"
+@description "Phase 7d sub-step 2 — char-class predicate: `[0-9]`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsDigit : (c: String) -> Boolean
+setSyntaxIsDigit c =
+  if eq c "" then false
+  else elem c "0123456789"
+
+-- isAlnum c — `[a-zA-Z0-9]` test.
+@label "set-syntax: isAlnum"
+@description "Phase 7d sub-step 2 — char-class predicate: `[a-zA-Z0-9]`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsAlnum : (c: String) -> Boolean
+setSyntaxIsAlnum c =
+  if setSyntaxIsAlpha c then true
+  else setSyntaxIsDigit c
+
+-- isMathLetter c — `[ℕℤℚℝ]` test via explicit string equality.
+@label "set-syntax: isMathLetter"
+@description "Phase 7d sub-step 2 — char-class predicate: `[ℕℤℚℝ]` (the named-set math letters used for hierarchy atom names). All four are BMP code points; string equality suffices. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsMathLetter : (c: String) -> Boolean
+setSyntaxIsMathLetter c =
+  if eq c "ℕ" then true
+  else if eq c "ℤ" then true
+  else if eq c "ℚ" then true
+  else eq c "ℝ"
+
+-- isNameHeadChar c — `[a-zA-Zℕℤℚℝ]` — alpha or math letter.
+@label "set-syntax: isNameHeadChar"
+@description "Phase 7d sub-step 2 — char-class predicate for the first char of a NAME: `[a-zA-Zℕℤℚℝ]`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsNameHeadChar : (c: String) -> Boolean
+setSyntaxIsNameHeadChar c =
+  if setSyntaxIsAlpha c then true
+  else setSyntaxIsMathLetter c
+
+-- isNameBodyChar c — `[a-zA-Z0-9:_-]` — name continuation chars.
+@label "set-syntax: isNameBodyChar"
+@description "Phase 7d sub-step 2 — char-class predicate for NAME continuation chars: `[a-zA-Z0-9:_-]`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsNameBodyChar : (c: String) -> Boolean
+setSyntaxIsNameBodyChar c =
+  if setSyntaxIsAlnum c then true
+  else if eq c ":" then true
+  else if eq c "_" then true
+  else eq c "-"
+
+-- isHexDigit c — `[0-9a-fA-F]`. Empty-string-guarded.
+@label "set-syntax: isHexDigit"
+@description "Phase 7d sub-step 2 — char-class predicate: `[0-9a-fA-F]`. Used by parseRadixMagnitude for `0x…` literals. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsHexDigit : (c: String) -> Boolean
+setSyntaxIsHexDigit c =
+  if eq c "" then false
+  else elem c "0123456789abcdefABCDEF"
+
+-- isOctalDigit c — `[0-7]`. Empty-string-guarded.
+@label "set-syntax: isOctalDigit"
+@description "Phase 7d sub-step 2 — char-class predicate: `[0-7]`. Used by parseRadixMagnitude for `0o…` literals. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsOctalDigit : (c: String) -> Boolean
+setSyntaxIsOctalDigit c =
+  if eq c "" then false
+  else elem c "01234567"
+
+-- isBinaryDigit c — `[01]`. Empty-string-guarded.
+@label "set-syntax: isBinaryDigit"
+@description "Phase 7d sub-step 2 — char-class predicate: `[01]`. Used by parseRadixMagnitude for `0b…` literals. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsBinaryDigit : (c: String) -> Boolean
+setSyntaxIsBinaryDigit c =
+  if eq c "" then false
+  else elem c "01"
+
+-- isWs c — whitespace (space, tab, newline, CR).
+@label "set-syntax: isWs"
+@description "Phase 7d sub-step 2 — whitespace predicate: space / tab / newline / CR. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsWs : (c: String) -> Boolean
+setSyntaxIsWs c =
+  if eq c " " then true
+  else if eq c "\t" then true
+  else if eq c "\n" then true
+  else eq c "\r"
+
+-- ---------------------------------------------------------------------------
+-- State helpers
+-- ---------------------------------------------------------------------------
+
+-- ch state — current char (empty string if past end). Uses `slice` over
+-- a fixed length-1 window since std:substr's Maybe-Number `len` param
+-- isn't honoured by the JS native (the toNum coerces the Maybe ADT to
+-- NaN→0, yielding empty substrings); `slice str start end` operates on
+-- raw numbers and gives the correct UTF-16-codeunit-bounded substring.
+@label "set-syntax: ch"
+@description "Phase 7d sub-step 2 — read the char at current pos; returns \"\" if past end. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxCh : (state: ParseState) -> String
+setSyntaxCh state =
+  if lt state.pos (length state.input)
+  then slice state.input state.pos (add state.pos 1)
+  else ""
+
+-- chAt state offset — char at pos+offset, with bounds check.
+@label "set-syntax: chAt"
+@description "Phase 7d sub-step 2 — read the char at pos+offset with bounds check; \"\" if out of range. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxChAt : (state: ParseState) -> (offset: Number) -> String
+setSyntaxChAt state offset =
+  let i = add state.pos offset
+  if lt i 0
+  then ""
+  else if lt i (length state.input)
+  then slice state.input i (add i 1)
+  else ""
+
+-- advance state n — return a new state with pos += n.
+@label "set-syntax: advance"
+@description "Phase 7d sub-step 2 — return a new ParseState with pos += n. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxAdvance : (state: ParseState) -> (n: Number) -> ParseState
+setSyntaxAdvance state n = ParseState { input = state.input, pos = add state.pos n }
+
+-- skipWs state — advance past whitespace chars; returns the new state.
+@label "set-syntax: skipWs"
+@description "Phase 7d sub-step 2 — advance past whitespace; returns the new ParseState. Recursive char-by-char loop. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxSkipWs : (state: ParseState) -> ParseState
+setSyntaxSkipWs state =
+  let c = setSyntaxCh state
+  if eq c "" then state
+  else if setSyntaxIsWs c
+  then setSyntaxSkipWs (setSyntaxAdvance state 1)
+  else state
+
+-- peek state — skipWs + return current char.
+@label "set-syntax: peek"
+@description "Phase 7d sub-step 2 — skipWs + return current char. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxPeek : (state: ParseState) -> String
+setSyntaxPeek state = setSyntaxCh (setSyntaxSkipWs state)
+
+-- matchLiteral state lit — skipWs + check if `lit` starts at the
+-- current pos. On match, advance past the literal and return Just
+-- state'. On no match, return Nothing (state untouched in semantics —
+-- the no-match path doesn't commit the whitespace skip; callers fall
+-- through and retry without the advance, mirroring the TS oracle's
+-- `match` returning false without committing the whitespace skip's
+-- pos advance is irrelevant since `match` is always called sequentially
+-- in alternatives — the skipWs is idempotent on the next call).
+@label "set-syntax: matchLiteral"
+@description "Phase 7d sub-step 2 — skipWs + check if `lit` starts at the current pos. On match, advance past the literal and return Just newState; on no match, return Nothing. Mirrors the TS oracle's `match(s)`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxMatchLiteral : (state: ParseState) -> (lit: String) -> Maybe ParseState
+setSyntaxMatchLiteral state lit =
+  let state1 = setSyntaxSkipWs state
+  let remaining = slice state1.input state1.pos (length state1.input)
+  if startsWith remaining lit
+  then Just (setSyntaxAdvance state1 (length lit))
+  else Nothing
+
+-- ---------------------------------------------------------------------------
+-- parseQuotedString — consume `"foo\""` or `'bar'` with `\`-escape.
+--
+-- Pre-condition: `state` points at the opening quote. Post-condition:
+-- newState points past the closing quote. Returns Err on unterminated
+-- quoted string (mirrors the TS oracle's `this.expect(quote)` throw).
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parseQuotedString"
+@description "Phase 7d sub-step 2 — consume a quoted string (`\"foo\"` or `'bar'`) with `\\`-escape. Pre-condition: `state` points at the opening quote. Returns `Result String ParseSuccess` (Err on unterminated). Internal helper to parseValue / parseBound (sub-step 3)."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseQuotedString : (state: ParseState) -> Result String (ParseSuccess ParseState String)
+setSyntaxParseQuotedString state =
+  let quote = setSyntaxCh state
+  let state1 = setSyntaxAdvance state 1
+  setSyntaxConsumeQuoted state1 quote ""
+
+-- consumeQuoted state quote acc — recursive char consumer. `acc` is
+-- the partial string built so far.
+@label "set-syntax: consumeQuoted"
+@description "Phase 7d sub-step 2 — recursive char consumer inside parseQuotedString. `acc` is the partial string built so far. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxConsumeQuoted : (state: ParseState) -> (quote: String) -> (acc: String) -> Result String (ParseSuccess ParseState String)
+setSyntaxConsumeQuoted state quote acc =
+  let c = setSyntaxCh state
+  if eq c ""
+  then Err ("Unterminated quoted string")
+  else if eq c quote
+  then Ok (ParseSuccess { newState = setSyntaxAdvance state 1, value = acc })
+  else if eq c "\\"
+  then
+    let state1 = setSyntaxAdvance state 1
+    let escaped = setSyntaxCh state1
+    let state2 = setSyntaxAdvance state1 1
+    setSyntaxConsumeQuoted state2 quote (concat acc escaped)
+  else setSyntaxConsumeQuoted (setSyntaxAdvance state 1) quote (concat acc c)
+
+-- ---------------------------------------------------------------------------
+-- parseName — `[a-zA-Zℕℤℚℝ][a-zA-Z0-9:_-]*` identifier.
+--
+-- Optional match — returns `Maybe ParseSuccess`. On no match, the state
+-- is unchanged. (skipWs is performed first; the no-match path doesn't
+-- formally commit the whitespace skip but callers always re-skipWs on
+-- the next attempt, so semantics match the TS oracle.)
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parseName"
+@description "Phase 7d sub-step 2 — `[a-zA-Zℕℤℚℝ][a-zA-Z0-9:_-]*` identifier. Optional match — returns `Maybe ParseSuccess`. Internal helper to parseAtom (sub-step 3)."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseName : (state: ParseState) -> Maybe (ParseSuccess ParseState String)
+setSyntaxParseName state =
+  let state1 = setSyntaxSkipWs state
+  let c = setSyntaxCh state1
+  if setSyntaxIsNameHeadChar c
+  then
+    let state2 = setSyntaxAdvance state1 1
+    let endState = setSyntaxConsumeNameBody state2
+    let name = slice state1.input state1.pos endState.pos
+    Just (ParseSuccess { newState = endState, value = name })
+  else Nothing
+
+-- consumeNameBody state — advance past name-body chars; returns the
+-- post-body state.
+@label "set-syntax: consumeNameBody"
+@description "Phase 7d sub-step 2 — advance past name-body chars. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxConsumeNameBody : (state: ParseState) -> ParseState
+setSyntaxConsumeNameBody state =
+  let c = setSyntaxCh state
+  if setSyntaxIsNameBodyChar c
+  then setSyntaxConsumeNameBody (setSyntaxAdvance state 1)
+  else state
+
+-- ---------------------------------------------------------------------------
+-- parseRadixMagnitude — unsigned magnitude in `radix` (16/8/2). The
+-- caller (parseNumber) has detected the prefix; `state` points AT the
+-- leading `0` of the radix prefix. Returns Err on empty-digits.
+--
+-- `isDigitFnId` is one of "setSyntaxIsHexDigit" / "setSyntaxIsOctalDigit"
+-- / "setSyntaxIsBinaryDigit" — selected by caller. The body dispatches
+-- via if-chain since Fenel can't pass function references as cleanly
+-- as TS regex objects (we could use higher-order parameters but a
+-- per-radix dispatch is clearer and the TS oracle's RegExp objects are
+-- equivalent to discrete predicates).
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parseRadixMagnitude"
+@description "Phase 7d sub-step 2 — unsigned magnitude in given radix (16/8/2). State points AT the leading `0` of the prefix; returns Err on empty-digits. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseRadixMagnitude : (state: ParseState) -> (radix: Number) -> Result String (ParseSuccess ParseState Number)
+setSyntaxParseRadixMagnitude state radix =
+  let prefixStart = state.pos
+  let state1 = setSyntaxAdvance state 2
+  let digitsStart = state1.pos
+  let endState = setSyntaxConsumeRadixDigits state1 radix
+  if eq endState.pos digitsStart
+  then Err (concat "Empty radix-" (concat (toString radix) (concat " literal at position " (toString prefixStart))))
+  else
+    let digits = slice state.input digitsStart endState.pos
+    Ok (ParseSuccess { newState = endState, value = setSyntaxParseRadixDigits digits radix 0 })
+
+-- consumeRadixDigits state radix — advance while current char matches
+-- the radix's digit predicate.
+@label "set-syntax: consumeRadixDigits"
+@description "Phase 7d sub-step 2 — advance while current char matches the radix's digit predicate. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxConsumeRadixDigits : (state: ParseState) -> (radix: Number) -> ParseState
+setSyntaxConsumeRadixDigits state radix =
+  let c = setSyntaxCh state
+  if setSyntaxIsRadixDigit c radix
+  then setSyntaxConsumeRadixDigits (setSyntaxAdvance state 1) radix
+  else state
+
+-- isRadixDigit c radix — dispatch on radix to the right predicate.
+@label "set-syntax: isRadixDigit"
+@description "Phase 7d sub-step 2 — dispatch on radix to the right digit predicate (hex/octal/binary). Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsRadixDigit : (c: String) -> (radix: Number) -> Boolean
+setSyntaxIsRadixDigit c radix =
+  if eq radix 16 then setSyntaxIsHexDigit c
+  else if eq radix 8 then setSyntaxIsOctalDigit c
+  else if eq radix 2 then setSyntaxIsBinaryDigit c
+  else false
+
+-- parseRadixDigits digits radix acc — fold a digit string into a number.
+-- `acc * radix + digitValue(c)` for each char.
+@label "set-syntax: parseRadixDigits"
+@description "Phase 7d sub-step 2 — fold a digit string into a number via `acc * radix + digitValue(c)`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseRadixDigits : (digits: String) -> (radix: Number) -> (acc: Number) -> Number
+setSyntaxParseRadixDigits digits radix acc =
+  case head digits of
+    Nothing -> acc
+    Just c ->
+      let d = setSyntaxRadixDigitValue c
+      let next = add (mul acc radix) d
+      case tail digits of
+        Nothing -> next
+        Just rest -> setSyntaxParseRadixDigits rest radix next
+
+-- radixDigitValue c — the numeric value of a hex / oct / bin digit char.
+-- Hex letters a-f / A-F decode to 10-15; digits 0-9 decode to 0-9.
+@label "set-syntax: radixDigitValue"
+@description "Phase 7d sub-step 2 — numeric value of a hex / oct / bin digit char (a-f / A-F → 10-15; 0-9 → 0-9). Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxRadixDigitValue : (c: String) -> Number
+setSyntaxRadixDigitValue c =
+  if eq c "0" then 0
+  else if eq c "1" then 1
+  else if eq c "2" then 2
+  else if eq c "3" then 3
+  else if eq c "4" then 4
+  else if eq c "5" then 5
+  else if eq c "6" then 6
+  else if eq c "7" then 7
+  else if eq c "8" then 8
+  else if eq c "9" then 9
+  else if eq c "a" then 10
+  else if eq c "A" then 10
+  else if eq c "b" then 11
+  else if eq c "B" then 11
+  else if eq c "c" then 12
+  else if eq c "C" then 12
+  else if eq c "d" then 13
+  else if eq c "D" then 13
+  else if eq c "e" then 14
+  else if eq c "E" then 14
+  else if eq c "f" then 15
+  else if eq c "F" then 15
+  else 0
+
+-- ---------------------------------------------------------------------------
+-- parseNumber — decimal / hex / octal / binary with optional sign +
+-- decimal point + exponent.
+--
+-- The TS oracle admits whitespace between the sign and the magnitude
+-- (per `parseSetForm` re-emission convention — `[-3.4e38..3.4e38]`
+-- arrives as `[ - 3.4e38 .. 3.4e38 ]`); the body mirrors this by
+-- skipping whitespace after the sign.
+--
+-- Sign is consumed separately so `parseRadixMagnitude` only sees the
+-- unsigned magnitude. Decimal: digits + optional `.digits` + optional
+-- `[eE][+-]?digits`. The `.` is NOT consumed if followed by `.` (the
+-- range separator `..`).
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parseNumber"
+@description "Phase 7d sub-step 2 — decimal / hex / octal / binary with optional sign + decimal point + exponent. Admits whitespace between sign and magnitude (per parseSetForm re-emission convention). Returns `Result String ParseSuccess`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseNumber : (state: ParseState) -> Result String (ParseSuccess ParseState Number)
+setSyntaxParseNumber state =
+  let state0 = setSyntaxSkipWs state
+  let mSignState = setSyntaxConsumeSign state0
+  let sign = mSignState.value
+  let state1 = setSyntaxSkipWs mSignState.newState
+  if setSyntaxIsRadixPrefix state1 "x"
+  then setSyntaxParseNumberWithSign state1 16 sign
+  else if setSyntaxIsRadixPrefix state1 "X"
+  then setSyntaxParseNumberWithSign state1 16 sign
+  else if setSyntaxIsRadixPrefix state1 "o"
+  then setSyntaxParseNumberWithSign state1 8 sign
+  else if setSyntaxIsRadixPrefix state1 "O"
+  then setSyntaxParseNumberWithSign state1 8 sign
+  else if setSyntaxIsRadixPrefix state1 "b"
+  then setSyntaxParseNumberWithSign state1 2 sign
+  else if setSyntaxIsRadixPrefix state1 "B"
+  then setSyntaxParseNumberWithSign state1 2 sign
+  else setSyntaxParseDecimal state1 sign
+
+-- consumeSign state — optionally consume `+` or `-`. Returns a record
+-- with `newState` (advanced past the sign if present) + `value` (the
+-- sign as 1 or -1).
+@label "set-syntax: consumeSign"
+@description "Phase 7d sub-step 2 — optionally consume `+` or `-`. Returns `{ newState, value: ±1 }`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxConsumeSign : (state: ParseState) -> SetSyntaxSignState
+setSyntaxConsumeSign state =
+  let c = setSyntaxCh state
+  if eq c "-"
+  then SetSyntaxSignState { newState = setSyntaxAdvance state 1, value = -1 }
+  else if eq c "+"
+  then SetSyntaxSignState { newState = setSyntaxAdvance state 1, value = 1 }
+  else SetSyntaxSignState { newState = state, value = 1 }
+
+-- isRadixPrefix state markChar — `0[xob]`-style prefix detection.
+@label "set-syntax: isRadixPrefix"
+@description "Phase 7d sub-step 2 — `0[xob]`-style prefix detection. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsRadixPrefix : (state: ParseState) -> (markChar: String) -> Boolean
+setSyntaxIsRadixPrefix state markChar =
+  if eq (setSyntaxCh state) "0"
+  then eq (setSyntaxChAt state 1) markChar
+  else false
+
+-- parseNumberWithSign — delegate to parseRadixMagnitude + apply sign.
+@label "set-syntax: parseNumberWithSign"
+@description "Phase 7d sub-step 2 — delegate to parseRadixMagnitude + apply sign. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseNumberWithSign : (state: ParseState) -> (radix: Number) -> (sign: Number) -> Result String (ParseSuccess ParseState Number)
+setSyntaxParseNumberWithSign state radix sign =
+  let r = setSyntaxParseRadixMagnitude state radix
+  case r of
+    Err e -> Err e
+    Ok success ->
+      Ok (ParseSuccess { newState = success.newState, value = mul sign success.value })
+
+-- parseDecimal state sign — consume decimal digits + optional fraction +
+-- optional exponent, then convert + apply sign. `toNumber` follows the
+-- TS oracle's `Number(numStr)` semantics — silently returns 0 for
+-- non-numeric inputs (matches the std oracle which suppresses NaN→0;
+-- the TS parser's explicit `isNaN` throw is a rare path in practice,
+-- since the consume-digits loops guarantee at least an empty-or-numeric
+-- prefix; in the empty case `Number("")` is 0 in JS, matching toNum).
+@label "set-syntax: parseDecimal"
+@description "Phase 7d sub-step 2 — consume decimal digits + optional fraction + optional exponent, convert via std:toNumber, apply sign. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseDecimal : (state: ParseState) -> (sign: Number) -> Result String (ParseSuccess ParseState Number)
+setSyntaxParseDecimal state sign =
+  let start = state.pos
+  let state1 = setSyntaxConsumeDecimalDigits state
+  let state2 = setSyntaxConsumeOptionalFraction state1
+  let state3 = setSyntaxConsumeOptionalExponent state2
+  let numStr = slice state.input start state3.pos
+  let n = toNumber numStr
+  Ok (ParseSuccess { newState = state3, value = mul sign n })
+
+-- consumeDecimalDigits — advance past `[0-9]+`.
+@label "set-syntax: consumeDecimalDigits"
+@description "Phase 7d sub-step 2 — advance past `[0-9]+`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxConsumeDecimalDigits : (state: ParseState) -> ParseState
+setSyntaxConsumeDecimalDigits state =
+  if setSyntaxIsDigit (setSyntaxCh state)
+  then setSyntaxConsumeDecimalDigits (setSyntaxAdvance state 1)
+  else state
+
+-- consumeOptionalFraction — if current char is `.` AND next is NOT `.`
+-- (range separator), consume `.` + digits. Otherwise no-op.
+@label "set-syntax: consumeOptionalFraction"
+@description "Phase 7d sub-step 2 — if current char is `.` AND next is NOT `.` (range separator), consume `.` + digits. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxConsumeOptionalFraction : (state: ParseState) -> ParseState
+setSyntaxConsumeOptionalFraction state =
+  if eq (setSyntaxCh state) "."
+  then
+    if eq (setSyntaxChAt state 1) "."
+    then state
+    else setSyntaxConsumeDecimalDigits (setSyntaxAdvance state 1)
+  else state
+
+-- consumeOptionalExponent — if current char is `e` or `E`, consume
+-- + optional sign + digits.
+@label "set-syntax: consumeOptionalExponent"
+@description "Phase 7d sub-step 2 — if current char is `e`/`E`, consume + optional sign + digits. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxConsumeOptionalExponent : (state: ParseState) -> ParseState
+setSyntaxConsumeOptionalExponent state =
+  let c = setSyntaxCh state
+  if eq c "e"
+  then setSyntaxConsumeExponentBody (setSyntaxAdvance state 1)
+  else if eq c "E"
+  then setSyntaxConsumeExponentBody (setSyntaxAdvance state 1)
+  else state
+
+-- consumeExponentBody — after the `e`/`E`, optionally consume `+`/`-`
+-- then digits.
+@label "set-syntax: consumeExponentBody"
+@description "Phase 7d sub-step 2 — after `e`/`E`, optionally consume `+`/`-` then digits. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxConsumeExponentBody : (state: ParseState) -> ParseState
+setSyntaxConsumeExponentBody state =
+  let c = setSyntaxCh state
+  if eq c "-"
+  then setSyntaxConsumeDecimalDigits (setSyntaxAdvance state 1)
+  else if eq c "+"
+  then setSyntaxConsumeDecimalDigits (setSyntaxAdvance state 1)
+  else setSyntaxConsumeDecimalDigits state
+
+-- ---------------------------------------------------------------------------
+-- parseBound — number | quoted-string | -∞ / ∞ / empty.
+--
+-- Returns `Result String ParseSuccess` where value is `Maybe (Number |
+-- String)` — Nothing for unbounded (any of -∞ / -inf / -Inf / ∞ / inf /
+-- Inf / `.` / `]` / `)` / EOF); otherwise Just the parsed scalar.
+--
+-- The TS oracle uses `null` for unbounded; the Fenel body uses `Just`/
+-- `Nothing` with the wrapper unmarshalling `Nothing` back to `null`.
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parseBound"
+@description "Phase 7d sub-step 2 — number / quoted-string / -∞ / ∞ / empty. Returns `Result String ParseSuccess` with value = `Maybe scalar` (Nothing for unbounded, Just for present). Internal helper to parseInterval (sub-step 3)."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseBound : (state: ParseState) -> Result String (ParseSuccess ParseState (Maybe Any))
+setSyntaxParseBound state =
+  let state0 = setSyntaxSkipWs state
+  case setSyntaxMatchLiteral state0 "-∞" of
+    Just s -> Ok (ParseSuccess { newState = s, value = Nothing })
+    Nothing ->
+      case setSyntaxMatchLiteral state0 "-inf" of
+        Just s -> Ok (ParseSuccess { newState = s, value = Nothing })
+        Nothing ->
+          case setSyntaxMatchLiteral state0 "-Inf" of
+            Just s -> Ok (ParseSuccess { newState = s, value = Nothing })
+            Nothing -> setSyntaxParseBoundPositive state0
+
+-- parseBoundPositive — sub-branch after the negative-infinity literals
+-- have been ruled out. Match positive infinity literals, then dispatch
+-- on the leading char (`.`/`]`/`)`/EOF → Nothing; `"` or `'` → quoted-
+-- string; otherwise → number).
+@label "set-syntax: parseBoundPositive"
+@description "Phase 7d sub-step 2 — sub-branch after negative-infinity literals ruled out. Match positive-infinity literals or dispatch to bound-value-or-empty. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseBoundPositive : (state: ParseState) -> Result String (ParseSuccess ParseState (Maybe Any))
+setSyntaxParseBoundPositive state =
+  case setSyntaxMatchLiteral state "∞" of
+    Just s -> Ok (ParseSuccess { newState = s, value = Nothing })
+    Nothing ->
+      case setSyntaxMatchLiteral state "inf" of
+        Just s -> Ok (ParseSuccess { newState = s, value = Nothing })
+        Nothing ->
+          case setSyntaxMatchLiteral state "Inf" of
+            Just s -> Ok (ParseSuccess { newState = s, value = Nothing })
+            Nothing -> setSyntaxParseBoundValueOrEmpty state
+
+-- parseBoundValueOrEmpty — the leading char selects:
+--   `.` / `]` / `)` / EOF → no bound (unbounded), no advance, value = Nothing
+--   `"` / `'`             → quoted string
+--   otherwise             → number
+@label "set-syntax: parseBoundValueOrEmpty"
+@description "Phase 7d sub-step 2 — leading char selects: `.`/`]`/`)`/EOF → unbounded; `\"`/`'` → quoted-string; otherwise → number. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseBoundValueOrEmpty : (state: ParseState) -> Result String (ParseSuccess ParseState (Maybe Any))
+setSyntaxParseBoundValueOrEmpty state =
+  let c = setSyntaxCh state
+  if eq c "." then Ok (ParseSuccess { newState = state, value = Nothing })
+  else if eq c "]" then Ok (ParseSuccess { newState = state, value = Nothing })
+  else if eq c ")" then Ok (ParseSuccess { newState = state, value = Nothing })
+  else if eq c "" then Ok (ParseSuccess { newState = state, value = Nothing })
+  else if eq c "\""
+  then setSyntaxParseBoundString state
+  else if eq c "'"
+  then setSyntaxParseBoundString state
+  else setSyntaxParseBoundNumber state
+
+-- parseBoundString — call parseQuotedString + wrap result's value in Just.
+@label "set-syntax: parseBoundString"
+@description "Phase 7d sub-step 2 — call parseQuotedString + wrap result's value in Just. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseBoundString : (state: ParseState) -> Result String (ParseSuccess ParseState (Maybe Any))
+setSyntaxParseBoundString state =
+  let r = setSyntaxParseQuotedString state
+  case r of
+    Err e -> Err e
+    Ok success ->
+      Ok (ParseSuccess { newState = success.newState, value = Just success.value })
+
+-- parseBoundNumber — call parseNumber + wrap result's value in Just.
+@label "set-syntax: parseBoundNumber"
+@description "Phase 7d sub-step 2 — call parseNumber + wrap result's value in Just. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseBoundNumber : (state: ParseState) -> Result String (ParseSuccess ParseState (Maybe Any))
+setSyntaxParseBoundNumber state =
+  let r = setSyntaxParseNumber state
+  case r of
+    Err e -> Err e
+    Ok success ->
+      Ok (ParseSuccess { newState = success.newState, value = Just success.value })
+
+-- ---------------------------------------------------------------------------
+-- Phase 7d sub-step 3 — Parser atoms.
+--
+-- These produce the intent-marker tree the TS wrapper unmarshals back
+-- to raw SetExpr. The body never builds `$`-prefixed objects — it
+-- emits `ParsedSetExpr` and `PsValue` markers.
+--
+-- Sub-step 3 lands:
+--   * setSyntaxExpectChar — assert a literal char + advance (used by
+--     bracket-pair consumption).
+--   * setSyntaxParseValue / parseBareWord — enum value dispatch
+--     (quoted-string / number / bare word / true / false / null).
+--   * setSyntaxParseEnumSet — `{` + comma-separated values + `}`.
+--   * setSyntaxParseInterval / parseClosingBracket — `[`-or-`(` open +
+--     parseBound + `..` + parseBound + `]`-or-`)` close.
+--   * setSyntaxIsIntervalStart — depth-0 `..` lookahead to
+--     disambiguate interval-bracket from grouped-expr-bracket.
+--   * setSyntaxParsePattern — `/regex/` with `\`-escape. Emits a
+--     `PsePattern { regexStr }` intent marker; the wrapper calls
+--     regexStringToPattern at unmarshal time.
+--   * setSyntaxParseAtom — leading-char dispatcher over `∅` / `U` /
+--     `(` / `[` / `{` / `/` / NAME. Returns ParsedSetExpr.
+--
+-- Mutual recursion with sub-step 4's parseExpr (grouped expressions
+-- inside `(...)` re-enter parseExpr); the references resolve at
+-- evaluator dispatch time once sub-step 4 lands.
+-- ---------------------------------------------------------------------------
+
+-- A parsed enum value. The TS oracle's parseValue returns a JS scalar
+-- (number / string / Bool / null); the body emits a typed PsValue
+-- marker so the wrapper can map back to native JS without needing
+-- inline `null` (which Fenel lacks).
+PsValue =
+  PsvNull
+  | PsvBool boolVal: Boolean
+  | PsvNumber numVal: Number
+  | PsvString strVal: String
+
+-- The intent-marker output of the parser atom + dispatchers. Mirrors
+-- the SetExpr shapes the TS oracle's parseAtom returns:
+--   PseAll → { $all: true }
+--   PseNone → { $none: true }
+--   PseEnum → { $enum: [...] }
+--   PseInterval → { $interval: { lo?, hi? } } — lo/hi are Maybe PsBound
+--   PseNamed → { $named: name }
+--   PsePattern → { $pattern: <regexStringToPattern(regexStr)> } — wrapper resolves
+--   PseNamedRange → { $intersect: [{$named}, {$interval}] } — pre-detected
+--   PseUnion → { $union: [...] }
+--   PseIntersect → { $intersect: [...] }
+--   PseComplement → { $complement: inner }
+ParsedSetExpr =
+  PseAll
+  | PseNone
+  | PseEnum reprs: List PsValue
+  | PseInterval lo: Maybe PsBound hi: Maybe PsBound
+  | PseNamed name: String
+  | PsePattern regexStr: String
+  | PseNamedRange name: String lo: Maybe PsBound hi: Maybe PsBound
+  | PseUnion branches: List ParsedSetExpr
+  | PseIntersect branches: List ParsedSetExpr
+  | PseComplement inner: ParsedSetExpr
+
+-- A parsed interval bound. `boundVal` is the raw scalar value
+-- (Number | String); `inclusive` is Bool.
+PsBound = PsBound boundVal: Any inclusive: Boolean
+
+-- ---------------------------------------------------------------------------
+-- setSyntaxExpectChar — skipWs + assert that current char equals `expected`
+-- + advance. Returns Err with the TS oracle's exact format if mismatched.
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: expectChar"
+@description "Phase 7d sub-step 3 — skipWs + assert that current char equals `expected` + advance. Returns Err with the TS oracle's exact format if mismatched. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxExpectChar : (state: ParseState) -> (expected: String) -> Result String (ParseSuccess ParseState String)
+setSyntaxExpectChar state expected =
+  let state1 = setSyntaxSkipWs state
+  if eq (setSyntaxCh state1) expected
+  then Ok (ParseSuccess { newState = setSyntaxAdvance state1 1, value = "" })
+  else
+    let chOrEof = if eq (setSyntaxCh state1) "" then "EOF" else setSyntaxCh state1
+    Err (concat "Expected '" (concat expected (concat "' at position " (concat (toString state1.pos) (concat ", got '" (concat chOrEof "'"))))))
+
+-- ---------------------------------------------------------------------------
+-- setSyntaxParseValue — enum-value dispatch.
+--   `"foo"` / `'bar'` → PsvString
+--   `[-+0-9]` → PsvNumber via parseNumber (with rollback on failure)
+--   `true` / `false` → PsvBool
+--   `null` → PsvNull
+--   anything-else (bare word until `,}` or whitespace) → PsvString
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parseValue"
+@description "Phase 7d sub-step 3 — enum value dispatch: quoted-string / signed-number / bare-word. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseValue : (state: ParseState) -> Result String (ParseSuccess ParseState PsValue)
+setSyntaxParseValue state =
+  let state0 = setSyntaxSkipWs state
+  let c = setSyntaxCh state0
+  if eq c "\""
+  then setSyntaxParseValueQuoted state0
+  else if eq c "'"
+  then setSyntaxParseValueQuoted state0
+  else if eq c "-"
+  then setSyntaxParseValueNumOrWord state0
+  else if eq c "+"
+  then setSyntaxParseValueNumOrWord state0
+  else if setSyntaxIsDigit c
+  then setSyntaxParseValueNumOrWord state0
+  else setSyntaxParseBareWord state0 ""
+
+-- parseValueQuoted — call parseQuotedString + wrap as PsvString.
+@label "set-syntax: parseValueQuoted"
+@description "Phase 7d sub-step 3 — call parseQuotedString + wrap as PsvString. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseValueQuoted : (state: ParseState) -> Result String (ParseSuccess ParseState PsValue)
+setSyntaxParseValueQuoted state =
+  let r = setSyntaxParseQuotedString state
+  case r of
+    Err e -> Err e
+    Ok success ->
+      Ok (ParseSuccess { newState = success.newState, value = PsvString { strVal = success.value } })
+
+-- parseValueNumOrWord — try parseNumber; on Err, fall through to
+-- parseBareWord at the original position (mirroring the TS oracle's
+-- `try/catch + this.pos = start` rollback).
+@label "set-syntax: parseValueNumOrWord"
+@description "Phase 7d sub-step 3 — try parseNumber; on Err, fall through to parseBareWord at the original position (mirrors the TS oracle's `try/catch + this.pos = start` rollback). Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseValueNumOrWord : (state: ParseState) -> Result String (ParseSuccess ParseState PsValue)
+setSyntaxParseValueNumOrWord state =
+  let rN = setSyntaxParseNumber state
+  case rN of
+    Ok success ->
+      Ok (ParseSuccess { newState = success.newState, value = PsvNumber { numVal = success.value } })
+    Err { _0 = _ } -> setSyntaxParseBareWord state ""
+
+-- parseBareWord — consume non-comma / non-`}` / non-whitespace chars
+-- into a word. `true` / `false` / `null` get recognised as their typed
+-- markers; anything else is PsvString of the word.
+@label "set-syntax: parseBareWord"
+@description "Phase 7d sub-step 3 — consume non-comma / non-`}` / non-whitespace chars into a word. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseBareWord : (state: ParseState) -> (acc: String) -> Result String (ParseSuccess ParseState PsValue)
+setSyntaxParseBareWord state acc =
+  let c = setSyntaxCh state
+  if eq c ""
+  then setSyntaxClassifyBareWord acc state
+  else if eq c ","
+  then setSyntaxClassifyBareWord acc state
+  else if eq c "}"
+  then setSyntaxClassifyBareWord acc state
+  else if setSyntaxIsWs c
+  then setSyntaxClassifyBareWord acc state
+  else setSyntaxParseBareWord (setSyntaxAdvance state 1) (concat acc c)
+
+-- classifyBareWord — true / false / null → typed markers; otherwise
+-- a PsvString of the accumulated word.
+@label "set-syntax: classifyBareWord"
+@description "Phase 7d sub-step 3 — true / false / null → typed PsValue markers; else PsvString of the accumulated word. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxClassifyBareWord : (word: String) -> (state: ParseState) -> Result String (ParseSuccess ParseState PsValue)
+setSyntaxClassifyBareWord word state =
+  if eq word "true"
+  then Ok (ParseSuccess { newState = state, value = PsvBool { boolVal = true } })
+  else if eq word "false"
+  then Ok (ParseSuccess { newState = state, value = PsvBool { boolVal = false } })
+  else if eq word "null"
+  then Ok (ParseSuccess { newState = state, value = PsvNull })
+  else Ok (ParseSuccess { newState = state, value = PsvString { strVal = word } })
+
+-- ---------------------------------------------------------------------------
+-- setSyntaxParseEnumSet — `{ v0, v1, ... }`. Returns
+-- `Result String ParseSuccess` where value is `PseEnum { reprs = [...] }`.
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parseEnumSet"
+@description "Phase 7d sub-step 3 — `{ v0, v1, ... }`. Returns Result String ParseSuccess where value is PseEnum { reprs }. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseEnumSet : (state: ParseState) -> (emptyList: List PsValue) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseEnumSet state emptyList =
+  let r = setSyntaxExpectChar state "{"
+  case r of
+    Err e -> Err e
+    Ok success -> setSyntaxParseEnumValuesLoop success.newState emptyList true
+
+-- parseEnumValuesLoop — fold values into the accumulator until `}` is
+-- reached. `isFirst` tracks whether to consume a leading `,` (every
+-- non-first value requires one).
+@label "set-syntax: parseEnumValuesLoop"
+@description "Phase 7d sub-step 3 — fold values into the accumulator until `}` is reached. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseEnumValuesLoop : (state: ParseState) -> (acc: List PsValue) -> (isFirst: Boolean) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseEnumValuesLoop state acc isFirst =
+  let stateP = setSyntaxSkipWs state
+  if eq (setSyntaxCh stateP) "}"
+  then Ok (ParseSuccess { newState = setSyntaxAdvance stateP 1, value = PseEnum { reprs = acc } })
+  else
+    if isFirst
+    then setSyntaxParseEnumValueStep stateP acc
+    else
+      let rC = setSyntaxExpectChar stateP ","
+      case rC of
+        Err e -> Err e
+        Ok sC -> setSyntaxParseEnumValueStep sC.newState acc
+
+-- parseEnumValueStep — parse one value + recurse.
+@label "set-syntax: parseEnumValueStep"
+@description "Phase 7d sub-step 3 — parse one value + recurse with the appended accumulator. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseEnumValueStep : (state: ParseState) -> (acc: List PsValue) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseEnumValueStep state acc =
+  let rV = setSyntaxParseValue state
+  case rV of
+    Err e -> Err e
+    Ok sV -> setSyntaxParseEnumValuesLoop sV.newState (appendItem sV.value acc) false
+
+-- ---------------------------------------------------------------------------
+-- setSyntaxParseInterval — `[` or `(` + bound + `..` + bound + `]` or `)`.
+-- Returns `Result String ParseSuccess` where value is `PseInterval { lo, hi }`
+-- with lo/hi as `Maybe PsBound` (Nothing for unbounded).
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parseInterval"
+@description "Phase 7d sub-step 3 — `[` or `(` + parseBound + `..` + parseBound + `]` or `)`. Returns Result String ParseSuccess where value is PseInterval. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseInterval : (state: ParseState) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseInterval state =
+  let state1 = setSyntaxSkipWs state
+  let openCh = setSyntaxCh state1
+  if eq openCh "["
+  then setSyntaxParseIntervalAfterOpen (setSyntaxAdvance state1 1) true
+  else if eq openCh "("
+  then setSyntaxParseIntervalAfterOpen (setSyntaxAdvance state1 1) false
+  else Err (join ["Expected '[' or '(' at position ", toString state1.pos] "")
+
+-- parseIntervalAfterOpen state loInclusive — bracket consumed; parse
+-- the lo bound, then ".." separator, then the hi bound, then closing
+-- bracket.
+@label "set-syntax: parseIntervalAfterOpen"
+@description "Phase 7d sub-step 3 — bracket consumed; parse the lo bound, then `..` separator, then the hi bound, then closing bracket. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseIntervalAfterOpen : (state: ParseState) -> (loInclusive: Boolean) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseIntervalAfterOpen state loInclusive =
+  let rLo = setSyntaxParseBound state
+  case rLo of
+    Err e -> Err e
+    Ok sLo ->
+      let rDot = setSyntaxExpectDoubleDot sLo.newState
+      case rDot of
+        Err e -> Err e
+        Ok sDot ->
+          let rHi = setSyntaxParseBound sDot.newState
+          case rHi of
+            Err e -> Err e
+            Ok sHi ->
+              setSyntaxFinishInterval sHi.newState loInclusive sLo.value sHi.value
+
+-- expectDoubleDot — assert `..` at current pos + advance 2.
+@label "set-syntax: expectDoubleDot"
+@description "Phase 7d sub-step 3 — assert `..` at current pos + advance 2. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxExpectDoubleDot : (state: ParseState) -> Result String (ParseSuccess ParseState String)
+setSyntaxExpectDoubleDot state =
+  let state1 = setSyntaxSkipWs state
+  let remaining = slice state1.input state1.pos (length state1.input)
+  if startsWith remaining ".."
+  then Ok (ParseSuccess { newState = setSyntaxAdvance state1 2, value = "" })
+  else Err (join ["Expected '..' at position ", toString state1.pos] "")
+
+-- finishInterval — consume closing bracket + assemble PseInterval with
+-- Maybe-wrapped bounds. The bound values from parseBound are already
+-- `Maybe scalar` (Nothing for unbounded); we wrap into PsBound when
+-- present and tag with the bracket's inclusive flag.
+@label "set-syntax: finishInterval"
+@description "Phase 7d sub-step 3 — consume closing bracket + assemble PseInterval with Maybe-wrapped bounds. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxFinishInterval : (state: ParseState) -> (loInclusive: Boolean) -> (loVal: Maybe Any) -> (hiVal: Maybe Any) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxFinishInterval state loInclusive loVal hiVal =
+  let state1 = setSyntaxSkipWs state
+  let closeCh = setSyntaxCh state1
+  if eq closeCh "]"
+  then setSyntaxEmitInterval (setSyntaxAdvance state1 1) loInclusive true loVal hiVal
+  else if eq closeCh ")"
+  then setSyntaxEmitInterval (setSyntaxAdvance state1 1) loInclusive false loVal hiVal
+  else Err (concat "Expected ']' or ')' at position " (toString state1.pos))
+
+-- emitInterval — assemble the PseInterval markers. The lo/hi value
+-- from parseBound is `Maybe scalar`; we map it through to `Maybe
+-- PsBound`.
+@label "set-syntax: emitInterval"
+@description "Phase 7d sub-step 3 — assemble the PseInterval markers from the lo/hi Maybe-bounds + their inclusive flags. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxEmitInterval : (state: ParseState) -> (loInclusive: Boolean) -> (hiInclusive: Boolean) -> (loVal: Maybe Any) -> (hiVal: Maybe Any) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxEmitInterval state loInclusive hiInclusive loVal hiVal =
+  let loBound = setSyntaxWrapBound loVal loInclusive
+  let hiBound = setSyntaxWrapBound hiVal hiInclusive
+  Ok (ParseSuccess { newState = state, value = PseInterval { lo = loBound, hi = hiBound } })
+
+-- wrapBound — `Maybe scalar` → `Maybe PsBound`. Nothing (unbounded)
+-- stays Nothing; Just x becomes Just (PsBound { boundVal = x,
+-- inclusive }).
+@label "set-syntax: wrapBound"
+@description "Phase 7d sub-step 3 — `Maybe scalar` → `Maybe PsBound`. Nothing stays Nothing; Just x becomes Just (PsBound { boundVal = x, inclusive }). Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxWrapBound : (mVal: Maybe Any) -> (inclusive: Boolean) -> Maybe PsBound
+setSyntaxWrapBound mVal inclusive = case mVal of
+  Nothing -> Nothing
+  Just v -> Just (PsBound { boundVal = v, inclusive = inclusive })
+
+-- ---------------------------------------------------------------------------
+-- setSyntaxIsIntervalStart — depth-tracked lookahead for `..` at depth 0,
+-- which distinguishes `[lo..hi]` (interval) from `(expr) ∪ (expr)` etc.
+-- Walks the input from `state.pos+1` and returns true if it finds `..`
+-- at depth 0 before any `]` / `)` (closing the bracket) or any alpha /
+-- math letter / `{` / `!` / `/` / `¬` / `∅` chars (which would
+-- indicate a grouped expression rather than an interval).
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: isIntervalStart"
+@description "Phase 7d sub-step 3 — depth-tracked lookahead for `..` at depth 0 to disambiguate `[lo..hi]` (interval) from `(expr) ∪ ...` (grouped expr). Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsIntervalStart : (state: ParseState) -> Boolean
+setSyntaxIsIntervalStart state =
+  let bracket = setSyntaxCh state
+  if eq bracket "["
+  then setSyntaxScanForDoubleDot (setSyntaxAdvance state 1) 0
+  else if eq bracket "("
+  then setSyntaxScanForDoubleDot (setSyntaxAdvance state 1) 0
+  else false
+
+-- scanForDoubleDot state depth — char-by-char lookahead. At depth 0:
+--   * `..` (with chAt 0 == "." AND chAt 1 == ".") → true (found interval)
+--   * `]` or `)` → false (closed without finding `..`)
+--   * alpha / math letter / `{` / `!` / `/` / `¬` / `∅` → false (grouped expr)
+-- Else: advance, tracking `(` / `[` (depth++) and `)` / `]` (depth--).
+@label "set-syntax: scanForDoubleDot"
+@description "Phase 7d sub-step 3 — char-by-char lookahead. At depth 0: check for `..`/closing-bracket/grouped-expr-marker. Otherwise track depth. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxScanForDoubleDot : (state: ParseState) -> (depth: Number) -> Boolean
+setSyntaxScanForDoubleDot state depth =
+  let c = setSyntaxCh state
+  if eq c ""
+  then false
+  else if eq depth 0
+  then setSyntaxScanDepthZero state c
+  else setSyntaxScanWithDepth state c depth
+
+-- scanDepthZero — at depth 0, check for `..` / closing-bracket /
+-- grouped-expr-marker; otherwise track bracket depth.
+@label "set-syntax: scanDepthZero"
+@description "Phase 7d sub-step 3 — at depth 0, check for `..` / closing-bracket / grouped-expr-marker; otherwise track bracket depth. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxScanDepthZero : (state: ParseState) -> (c: String) -> Boolean
+setSyntaxScanDepthZero state c =
+  if eq c "."
+  then
+    if eq (setSyntaxChAt state 1) "."
+    then true
+    else setSyntaxScanContinue state c 0
+  else if eq c "]"
+  then false
+  else if eq c ")"
+  then false
+  else if setSyntaxIsAlpha c
+  then false
+  else if setSyntaxIsMathLetter c
+  then false
+  else if eq c "{"
+  then false
+  else if eq c "!"
+  then false
+  else if eq c "/"
+  then false
+  else if eq c "¬"
+  then false
+  else if eq c "∅"
+  then false
+  else setSyntaxScanContinue state c 0
+
+-- scanWithDepth — at depth > 0, track bracket depth; only `[`/`(`
+-- (depth++) and `]`/`)` (depth--) affect depth at this level.
+@label "set-syntax: scanWithDepth"
+@description "Phase 7d sub-step 3 — at depth > 0, track bracket depth via continue. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxScanWithDepth : (state: ParseState) -> (c: String) -> (depth: Number) -> Boolean
+setSyntaxScanWithDepth state c depth =
+  setSyntaxScanContinue state c depth
+
+-- scanContinue — advance one char + adjust depth via the open/close
+-- bracket rules, then recurse.
+@label "set-syntax: scanContinue"
+@description "Phase 7d sub-step 3 — advance one char + adjust depth + recurse. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxScanContinue : (state: ParseState) -> (c: String) -> (depth: Number) -> Boolean
+setSyntaxScanContinue state c depth =
+  let nextDepth = setSyntaxAdjustDepth c depth
+  setSyntaxScanForDoubleDot (setSyntaxAdvance state 1) nextDepth
+
+-- adjustDepth — `[`/`(` increment; `]`/`)` decrement; else unchanged.
+@label "set-syntax: adjustDepth"
+@description "Phase 7d sub-step 3 — `[`/`(` increment depth; `]`/`)` decrement; else unchanged. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxAdjustDepth : (c: String) -> (depth: Number) -> Number
+setSyntaxAdjustDepth c depth =
+  if eq c "["
+  then add depth 1
+  else if eq c "("
+  then add depth 1
+  else if eq c "]"
+  then sub depth 1
+  else if eq c ")"
+  then sub depth 1
+  else depth
+
+-- ---------------------------------------------------------------------------
+-- setSyntaxParsePattern — `/regex/` with `\`-escape. Emits a
+-- `PsePattern { regexStr }` intent marker; the wrapper calls
+-- regexStringToPattern at unmarshal time and throws SyntaxError on
+-- compilation failure.
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parsePattern"
+@description "Phase 7d sub-step 3 — `/regex/` with `\\`-escape. Emits PsePattern { regexStr } intent marker; the wrapper calls regexStringToPattern at unmarshal time. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParsePattern : (state: ParseState) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParsePattern state =
+  let r = setSyntaxExpectChar state "/"
+  case r of
+    Err e -> Err e
+    Ok sOpen -> setSyntaxConsumePatternBody sOpen.newState ""
+
+-- consumePatternBody — consume regex chars (with `\` escape) until
+-- closing `/`. Both the escape char and the escaped char go into the
+-- accumulator (the regex engine will interpret them).
+@label "set-syntax: consumePatternBody"
+@description "Phase 7d sub-step 3 — consume regex chars with `\\`-escape until closing `/`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxConsumePatternBody : (state: ParseState) -> (acc: String) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxConsumePatternBody state acc =
+  let c = setSyntaxCh state
+  if eq c ""
+  then Err (concat "Unterminated pattern at position " (toString state.pos))
+  else if eq c "/"
+  then Ok (ParseSuccess { newState = setSyntaxAdvance state 1, value = PsePattern { regexStr = acc } })
+  else if eq c "\\"
+  then
+    let state1 = setSyntaxAdvance state 1
+    let escaped = setSyntaxCh state1
+    let state2 = setSyntaxAdvance state1 1
+    setSyntaxConsumePatternBody state2 (concat acc (concat "\\" escaped))
+  else setSyntaxConsumePatternBody (setSyntaxAdvance state 1) (concat acc c)
+
+-- ---------------------------------------------------------------------------
+-- setSyntaxParseAtom — leading-char dispatcher. Returns
+-- `Result String ParseSuccess` where value is `ParsedSetExpr`.
+--
+-- Dispatch table:
+--   `∅`               → PseNone
+--   `U` (not alnum-followed) → PseAll
+--   `(` (interval-start) → parseInterval
+--   `(` (grouped expr)   → consume `(` + parseExpr + consume `)`
+--                          [forward-ref to sub-step 4]
+--   `[`                  → parseInterval
+--   `{`                  → parseEnumSet
+--   `/`                  → parsePattern
+--   NAME                 → parseName; if followed by `[` or `(`
+--                          AND isIntervalStart, emit PseNamedRange
+--                          else PseNamed
+-- ---------------------------------------------------------------------------
+
+@label "set-syntax: parseAtom"
+@description "Phase 7d sub-step 3 — leading-char dispatcher over `∅`/`U`/`(`/`[`/`{`/`/`/NAME. Returns Result String ParseSuccess with value = ParsedSetExpr. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseAtom : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseAtom state emptyList =
+  let state0 = setSyntaxSkipWs state
+  case setSyntaxMatchLiteral state0 "∅" of
+    Just s -> Ok (ParseSuccess { newState = s, value = PseNone })
+    Nothing -> setSyntaxParseAtomAfterEmpty state0 emptyList
+
+-- parseAtomAfterEmpty — `∅` ruled out. Check for `U` (standalone).
+@label "set-syntax: parseAtomAfterEmpty"
+@description "Phase 7d sub-step 3 — `∅` ruled out; check for `U` (standalone universal set). Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseAtomAfterEmpty : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseAtomAfterEmpty state emptyList =
+  let c = setSyntaxCh state
+  if eq c "U"
+  then
+    let nextC = setSyntaxChAt state 1
+    if setSyntaxIsUFollower nextC
+    then setSyntaxParseAtomAfterU state emptyList
+    else Ok (ParseSuccess { newState = setSyntaxAdvance state 1, value = PseAll })
+  else setSyntaxParseAtomAfterU state emptyList
+
+-- isUFollower — `U` followed by alphanum / `:` / `_` / `-` is the
+-- start of a NAME (e.g. `UnicodeString`), NOT the universal-set
+-- shorthand. This guard matches the TS oracle's
+-- `/[a-zA-Z0-9:_-]/.test(this.chAt(1))`.
+@label "set-syntax: isUFollower"
+@description "Phase 7d sub-step 3 — `U` followed by alphanum / `:` / `_` / `-` is the start of a NAME (e.g. `UnicodeString`), NOT the universal-set shorthand. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxIsUFollower : (c: String) -> Boolean
+setSyntaxIsUFollower c =
+  if setSyntaxIsAlnum c then true
+  else if eq c ":" then true
+  else if eq c "_" then true
+  else eq c "-"
+
+-- parseAtomAfterU — `∅` / `U` ruled out. Dispatch on the leading char
+-- for `(` / `[` / `{` / `/` / NAME.
+@label "set-syntax: parseAtomAfterU"
+@description "Phase 7d sub-step 3 — `∅`/`U` ruled out; dispatch on the leading char for `(`/`[`/`{`/`/`/NAME. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseAtomAfterU : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseAtomAfterU state emptyList =
+  let stateP = setSyntaxSkipWs state
+  let c = setSyntaxCh stateP
+  if eq c "("
+  then setSyntaxParseAtomParen stateP emptyList
+  else if eq c "["
+  then setSyntaxParseInterval stateP
+  else if eq c "{"
+  then setSyntaxParseEnumSet stateP emptyList
+  else if eq c "/"
+  then setSyntaxParsePattern stateP
+  else setSyntaxParseAtomNamed stateP emptyList
+
+-- parseAtomParen — `(` could be either an interval lo-exclusive or a
+-- grouped expression. Use isIntervalStart to disambiguate.
+@label "set-syntax: parseAtomParen"
+@description "Phase 7d sub-step 3 — `(` could be either an interval lo-exclusive or a grouped expression. Use isIntervalStart to disambiguate. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseAtomParen : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseAtomParen state emptyList =
+  if setSyntaxIsIntervalStart state
+  then setSyntaxParseInterval state
+  else setSyntaxParseGroupedExpr state emptyList
+
+-- parseGroupedExpr — consume `(` + parseExpr (forward-ref to sub-step
+-- 4) + consume `)`. The forward-ref resolves at evaluator-dispatch
+-- time once sub-step 4 lands.
+@label "set-syntax: parseGroupedExpr"
+@description "Phase 7d sub-step 3 — consume `(` + setSyntaxParseExpr (forward-ref to sub-step 4) + consume `)`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseGroupedExpr : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseGroupedExpr state emptyList =
+  let rOpen = setSyntaxExpectChar state "("
+  case rOpen of
+    Err e -> Err e
+    Ok sOpen ->
+      let rExpr = setSyntaxParseExpr sOpen.newState emptyList
+      case rExpr of
+        Err e -> Err e
+        Ok sExpr ->
+          let rClose = setSyntaxExpectChar sExpr.newState ")"
+          case rClose of
+            Err e -> Err e
+            Ok sClose ->
+              Ok (ParseSuccess { newState = sClose.newState, value = sExpr.value })
+
+-- parseAtomNamed — consume a NAME + check for named-range shape
+-- (`Name[lo..hi]` or `Name(lo..hi]`).
+@label "set-syntax: parseAtomNamed"
+@description "Phase 7d sub-step 3 — consume a NAME + check for named-range shape (`Name[lo..hi]` or `Name(lo..hi]`). Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseAtomNamed : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseAtomNamed state emptyList =
+  case setSyntaxParseName state of
+    Nothing -> Err (concat "Unexpected '" (concat (setSyntaxOrEofChar (setSyntaxCh state)) (concat "' at position " (toString state.pos))))
+    Just success -> setSyntaxParseAtomNamedAfterName success.newState success.value
+
+-- orEofChar — render "" as "EOF" for error messages.
+@label "set-syntax: orEofChar"
+@description "Phase 7d sub-step 3 — render \"\" as \"EOF\" for error messages. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxOrEofChar : (c: String) -> String
+setSyntaxOrEofChar c = if eq c "" then "EOF" else c
+
+-- parseAtomNamedAfterName — name parsed; check if a named-range
+-- bracket follows.
+@label "set-syntax: parseAtomNamedAfterName"
+@description "Phase 7d sub-step 3 — name parsed; check if a named-range bracket follows. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseAtomNamedAfterName : (state: ParseState) -> (name: String) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseAtomNamedAfterName state name =
+  let stateP = setSyntaxSkipWs state
+  let nextC = setSyntaxCh stateP
+  if eq nextC "["
+  then setSyntaxTryNamedRange stateP name
+  else if eq nextC "("
+  then setSyntaxTryNamedRange stateP name
+  else Ok (ParseSuccess { newState = state, value = PseNamed { name = name } })
+
+-- tryNamedRange — the bracket might be a range OR the start of a
+-- grouped expression operator on a named set; use isIntervalStart.
+@label "set-syntax: tryNamedRange"
+@description "Phase 7d sub-step 3 — the bracket might be a range OR the start of a grouped expression operator on a named set; use isIntervalStart. Emits PseNamedRange or PseNamed. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxTryNamedRange : (state: ParseState) -> (name: String) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxTryNamedRange state name =
+  if setSyntaxIsIntervalStart state
+  then
+    let rI = setSyntaxParseInterval state
+    case rI of
+      Err e -> Err e
+      Ok sI ->
+        case sI.value of
+          PseInterval { lo = lo, hi = hi } ->
+            Ok (ParseSuccess { newState = sI.newState, value = PseNamedRange { name = name, lo = lo, hi = hi } })
+          _ -> Err ("internal: parseInterval emitted non-PseInterval")
+  else Ok (ParseSuccess { newState = state, value = PseNamed { name = name } })
+
+-- ---------------------------------------------------------------------------
+-- Phase 7d sub-step 4 — top-level dispatchers + parseSetExpr entry.
+--
+-- The grammar:
+--   expr      = union
+--   union     = intersect ( ("u" | "∪" | "|") intersect )*
+--   intersect = unary  ( ("n" | "∩" | "&") unary )*
+--   unary     = "!" atom | "¬" atom | atom
+--
+-- The body composes from sub-step 3's parseAtom + dispatchers built
+-- here. The TS wrapper at engine-bodies-dispatch.ts marshals the input
+-- string → ParseState, dispatches engine:parseSetExpr, unmarshals
+-- the ParsedSetExpr tree → raw SetExpr (resolving the regex carve-
+-- out marker via patternToRegex), and throws SyntaxError on Err.
+-- ---------------------------------------------------------------------------
+
+-- parseExpr — top of the grammar; delegates to parseUnion.
+@label "set-syntax: parseExpr"
+@description "Phase 7d sub-step 4 — top of the grammar; delegates to parseUnion. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseExpr : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseExpr state emptyList = setSyntaxParseUnion state emptyList
+
+-- parseUnion — `intersect ( union-op intersect )*`. Folds branches into
+-- a list; if the list has 1 element, returns it as-is (no PseUnion
+-- wrap); otherwise emits PseUnion { branches }.
+@label "set-syntax: parseUnion"
+@description "Phase 7d sub-step 4 — `intersect ( union-op intersect )*`. Folds branches; 1-child → single child as-is; ≥2 → PseUnion. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseUnion : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseUnion state emptyList =
+  let r1 = setSyntaxParseIntersect state emptyList
+  case r1 of
+    Err e -> Err e
+    Ok success1 ->
+      let acc1 = appendItem success1.value emptyList
+      setSyntaxParseUnionTail success1.newState acc1 emptyList
+
+-- parseUnionTail — consume `union-op intersect` pairs while the
+-- operator matches; otherwise emit the accumulated list.
+@label "set-syntax: parseUnionTail"
+@description "Phase 7d sub-step 4 — consume `union-op intersect` pairs while the operator matches. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseUnionTail : (state: ParseState) -> (acc: List ParsedSetExpr) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseUnionTail state acc emptyList =
+  case setSyntaxMatchUnionOp state of
+    Nothing -> setSyntaxBuildUnion state acc
+    Just s ->
+      let r = setSyntaxParseIntersect s emptyList
+      case r of
+        Err e -> Err e
+        Ok success ->
+          setSyntaxParseUnionTail success.newState (appendItem success.value acc) emptyList
+
+-- buildUnion — 1-child → return single child as-is; ≥2 → PseUnion.
+@label "set-syntax: buildUnion"
+@description "Phase 7d sub-step 4 — 1-child → return single child as-is (no PseUnion wrap); ≥2 → PseUnion { branches }. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxBuildUnion : (state: ParseState) -> (acc: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxBuildUnion state acc =
+  if eq (length acc) 1
+  then
+    case head acc of
+      Nothing -> Err ("internal: empty union acc")
+      Just single ->
+        Ok (ParseSuccess { newState = state, value = single })
+  else Ok (ParseSuccess { newState = state, value = PseUnion { branches = acc } })
+
+-- matchUnionOp — recognise `∪` / `u` (not followed by alnum) / `|`
+-- (not followed by `|`). Returns Just newState if matched (with the
+-- operator consumed), Nothing otherwise. Mirrors the TS oracle's
+-- `matchUnionOp`.
+@label "set-syntax: matchUnionOp"
+@description "Phase 7d sub-step 4 — recognise `∪` / `u` (not followed by alnum) / `|` (not followed by `|`). Returns Just newState if matched (with the operator consumed), Nothing otherwise. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxMatchUnionOp : (state: ParseState) -> Maybe ParseState
+setSyntaxMatchUnionOp state =
+  case setSyntaxMatchLiteral state "∪" of
+    Just s -> Just s
+    Nothing -> setSyntaxMatchUnionOpAscii state
+
+-- matchUnionOpAscii — ASCII alternatives: `u` followed by non-alnum;
+-- `|` followed by non-`|`.
+@label "set-syntax: matchUnionOpAscii"
+@description "Phase 7d sub-step 4 — ASCII alternatives for matchUnionOp: `u` followed by non-alnum; `|` followed by non-`|`. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxMatchUnionOpAscii : (state: ParseState) -> Maybe ParseState
+setSyntaxMatchUnionOpAscii state =
+  let state1 = setSyntaxSkipWs state
+  let c = setSyntaxCh state1
+  if eq c "u"
+  then
+    if setSyntaxIsAlnum (setSyntaxChAt state1 1)
+    then Nothing
+    else Just (setSyntaxAdvance state1 1)
+  else if eq c "|"
+  then
+    if eq (setSyntaxChAt state1 1) "|"
+    then Nothing
+    else Just (setSyntaxAdvance state1 1)
+  else Nothing
+
+-- parseIntersect — `unary ( intersect-op unary )*`. Same fold pattern
+-- as parseUnion.
+@label "set-syntax: parseIntersect"
+@description "Phase 7d sub-step 4 — `unary ( intersect-op unary )*`. Same fold pattern as parseUnion. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseIntersect : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseIntersect state emptyList =
+  let r1 = setSyntaxParseUnary state emptyList
+  case r1 of
+    Err e -> Err e
+    Ok success1 ->
+      let acc1 = appendItem success1.value emptyList
+      setSyntaxParseIntersectTail success1.newState acc1 emptyList
+
+-- parseIntersectTail — consume `intersect-op unary` pairs.
+@label "set-syntax: parseIntersectTail"
+@description "Phase 7d sub-step 4 — consume `intersect-op unary` pairs. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseIntersectTail : (state: ParseState) -> (acc: List ParsedSetExpr) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseIntersectTail state acc emptyList =
+  case setSyntaxMatchIntersectOp state of
+    Nothing -> setSyntaxBuildIntersect state acc
+    Just s ->
+      let r = setSyntaxParseUnary s emptyList
+      case r of
+        Err e -> Err e
+        Ok success ->
+          setSyntaxParseIntersectTail success.newState (appendItem success.value acc) emptyList
+
+-- buildIntersect — 1-child → return single child as-is; ≥2 → PseIntersect.
+@label "set-syntax: buildIntersect"
+@description "Phase 7d sub-step 4 — 1-child → single child as-is (no PseIntersect wrap); ≥2 → PseIntersect { branches }. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxBuildIntersect : (state: ParseState) -> (acc: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxBuildIntersect state acc =
+  if eq (length acc) 1
+  then
+    case head acc of
+      Nothing -> Err ("internal: empty intersect acc")
+      Just single ->
+        Ok (ParseSuccess { newState = state, value = single })
+  else Ok (ParseSuccess { newState = state, value = PseIntersect { branches = acc } })
+
+-- matchIntersectOp — recognise `∩` / `n` (not followed by alnum) /
+-- `&` (not followed by `&`). Same shape as matchUnionOp.
+@label "set-syntax: matchIntersectOp"
+@description "Phase 7d sub-step 4 — recognise `∩` / `n` (not followed by alnum) / `&` (not followed by `&`). Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxMatchIntersectOp : (state: ParseState) -> Maybe ParseState
+setSyntaxMatchIntersectOp state =
+  case setSyntaxMatchLiteral state "∩" of
+    Just s -> Just s
+    Nothing -> setSyntaxMatchIntersectOpAscii state
+
+@label "set-syntax: matchIntersectOpAscii"
+@description "Phase 7d sub-step 4 — ASCII alternatives for matchIntersectOp. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxMatchIntersectOpAscii : (state: ParseState) -> Maybe ParseState
+setSyntaxMatchIntersectOpAscii state =
+  let state1 = setSyntaxSkipWs state
+  let c = setSyntaxCh state1
+  if eq c "n"
+  then
+    if setSyntaxIsAlnum (setSyntaxChAt state1 1)
+    then Nothing
+    else Just (setSyntaxAdvance state1 1)
+  else if eq c "&"
+  then
+    if eq (setSyntaxChAt state1 1) "&"
+    then Nothing
+    else Just (setSyntaxAdvance state1 1)
+  else Nothing
+
+-- parseUnary — `!` atom | `¬` atom | atom. Emits PseComplement when
+-- the negation prefix is consumed.
+@label "set-syntax: parseUnary"
+@description "Phase 7d sub-step 4 — `!` atom | `¬` atom | atom. Emits PseComplement when the negation prefix is consumed. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseUnary : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseUnary state emptyList =
+  case setSyntaxMatchLiteral state "!" of
+    Just s -> setSyntaxParseUnaryComplement s emptyList
+    Nothing ->
+      case setSyntaxMatchLiteral state "¬" of
+        Just s -> setSyntaxParseUnaryComplement s emptyList
+        Nothing -> setSyntaxParseAtom state emptyList
+
+-- parseUnaryComplement — atom consumed after negation prefix; wrap in
+-- PseComplement.
+@label "set-syntax: parseUnaryComplement"
+@description "Phase 7d sub-step 4 — atom consumed after negation prefix; wrap in PseComplement. Internal helper."
+@tags "engine" "internal" "set-syntax" "parser" "phase-7d"
+@category "engine-internal"
+setSyntaxParseUnaryComplement : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseUnaryComplement state emptyList =
+  let r = setSyntaxParseAtom state emptyList
+  case r of
+    Err e -> Err e
+    Ok success ->
+      Ok (ParseSuccess { newState = success.newState, value = PseComplement { inner = success.value } })
+
+-- parseSetExpr — public entry. Parses an expression, then verifies all
+-- input was consumed (mirroring the TS oracle's
+-- `if (p.pos < p.src.length) throw new SyntaxError`).
+@label "set-syntax: parseSetExpr"
+@description "Phase 7d sub-step 4 — public entry. Parses an expression, then verifies all input was consumed (mirroring the TS oracle's `if (p.pos < p.src.length) throw new SyntaxError`). Boundary adapter; dispatched via `dispatchedParseSetExpr` in engine-bodies-dispatch.ts which marshals the input string into ParseState + unmarshals ParsedSetExpr → raw SetExpr. Mirrors implementations/typescript/engine/src/set-syntax.ts:parseSetExpr (now a thin shim)."
+@tags "engine" "set-syntax" "parser" "boundary" "phase-7d"
+setSyntaxParseSetExpr : (state: ParseState) -> (emptyList: List ParsedSetExpr) -> Result String (ParseSuccess ParseState ParsedSetExpr)
+setSyntaxParseSetExpr state emptyList =
+  let r = setSyntaxParseExpr state emptyList
+  case r of
+    Err e -> Err e
+    Ok success ->
+      let stateFinal = setSyntaxSkipWs success.newState
+      if lt stateFinal.pos (length stateFinal.input)
+      then
+        let ch = setSyntaxCh stateFinal
+        Err (concat "Unexpected '" (concat ch (concat "' at position " (toString stateFinal.pos))))
+      else Ok (ParseSuccess { newState = stateFinal, value = success.value })
+
+

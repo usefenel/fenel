@@ -1,0 +1,125 @@
+module engine where
+
+-- =========================================================================
+-- assignable.fenel — `checkAssignable`, the assignability decision (source ⊆
+-- target → a ProofResult). unified-static-analysis Phase 2 (brief:
+-- `workstreams/unified-static-analysis/briefs/phase-2-inference-unification-spike.md`).
+--
+-- THE PORT (D-A, the inference-unification spike). `checkAssignable` was the
+-- decision half of the ~1800-LOC legacy TS inference engine
+-- (`fenel-check.ts`). Its CORE — `isSubset` — is ALREADY Fenel
+-- (`set-algebra-deciders.fenel`); the TS wrapper only graded a confidence
+-- ladder around it. This module moves that GRADING + the `canAnalyze`
+-- predicate into Fenel; the TS delegate keeps ONLY the pre-computed
+-- set-algebra CALLS (the `kernel.ts` / `refine.fenel` discipline — D-A2).
+-- Net: TS decision logic retired, Fenel up.
+--
+-- floor-kernel Phase 4 removed the old `$`-key barrier for SetExpr itself:
+-- this body consumes the registered fourteen-case SetExpr ADT directly. The
+-- TS delegate (`checkAssignable` in fenel-check.ts) canonicalizes boundary
+-- inputs before this point and pre-computes one assignability fact plus the
+-- exact normalized gap evidence (D-A1 — a fresh minimal pair, narrower than
+-- refine's ladder):
+--   • subsetProven : Bool  — `source ⊆ target` decided through the KERNEL
+--       (PropSubset → DecidableSetResult → kernel:verify, part B). Equal to the
+--       legacy `isJustTrue (isSubset source target)` fast path (the proposer
+--       pre-computes the SAME `isSubset`), but now carries a kernel verdict
+--       (SolverChecked), not a hand-graded "proven".
+--   • gap : SetExpr        — normalized `SeDiff source target`; this body owns
+--       the SeNone case split (the legacy conservative-gap second chance).
+-- `canAnalyze` recursively classifies the canonical ADT. Deep formers and
+-- other unsupported leaves retain the conservative False fallback.
+--
+-- ProofResult marker (the body's output; the TS wrapper maps it back to the
+-- real `{ ok, gap?, confidence }`, attaching the pre-computed canonical gap
+-- SetExpr when `ok = False`):
+--   { ok = True,  confidence = "proven" }            — source ⊆ target proven
+--   { ok = False, confidence = "forward" }           — gap exists, both sides analyzable
+--   { ok = False, confidence = "unknown" }           — gap exists, a side is opaque
+-- (No `gap` field crosses the dispatch seam — the gap is meaningful only when
+--  `ok = False`, and the TS delegate already holds the pre-computed SetExpr.)
+--
+-- NO ENTITY DECLS (the refine.fenel / audit-green invariant): the markers are
+-- plain records, NOT registered ADTs — entity oracle + law count move +0, the
+-- audit stays exit-0 (a new entity re-opens law obligations). Engine FNS are
+-- safe (law +0, lock +0).
+-- =========================================================================
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- assignBoth — eager boolean conjunction over the finite marker walk. (Not
+-- short-circuit-as-a-keyword; `if x then y else False` keeps the fold free of
+-- the `and`-operator's lazy-arg structural form — the totality.fenel `totOr`
+-- precedent.)
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "assign: both"
+@description "Eager boolean conjunction used by the assignability marker walk. Returns True only when both operands are True."
+@tags "engine" "internal" "assignable" "unified-static-analysis" "phase-2"
+@category "engine-internal"
+assignBoth : (x: Bool) -> (y: Bool) -> Bool
+assignBoth x y = if x then y else False
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- canAnalyze — "can we meaningfully analyze this SetExpr?", the structural
+-- twin of the legacy `canAnalyze(set)`. Walks the canonical SetExpr tree:
+-- SeAll / SeNone / structural leaves are analyzable; SeUnion / SeIntersect
+-- need every branch analyzable; SeDiff needs both sides; opaque forms are not.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "assign: can analyze (branch list)"
+@description "True when EVERY canonical SetExpr in the list is analyzable (the SeUnion / SeIntersect arm — empty list ⇒ True, mirroring `[].every`). Internal helper."
+@tags "engine" "internal" "assignable" "unified-static-analysis" "phase-2"
+@category "engine-internal"
+canAnalyzeAll : (branches: a) -> Bool
+canAnalyzeAll branches =
+  case head branches of
+    Nothing -> True
+    Just b ->
+      if canAnalyze b
+        then
+          case tail branches of
+            Nothing -> True
+            Just rest -> canAnalyzeAll rest
+        else False
+
+@label "assign: can analyze"
+@description "Can this canonical SetExpr be meaningfully analyzed statically? SeAll / SeNone / SeInterval / SeEnum / SeRef ⇒ True; SeUnion / SeIntersect ⇒ every branch analyzable; SeDiff ⇒ both sides; SeWhere / SePattern / SeComplement / deep formers ⇒ False. floor-kernel Phase 4 retired the parallel TS SetMarker classifier."
+@tags "engine" "assignable" "unified-static-analysis" "phase-2"
+canAnalyze : (m: a) -> Bool
+canAnalyze m =
+  case m of
+    SeAll -> True
+    SeNone -> True
+    SeInterval {} -> True
+    SeEnum {} -> True
+    SeRef {} -> True
+    SeUnion { branches = bs } -> canAnalyzeAll bs
+    SeIntersect { branches = bs } -> canAnalyzeAll bs
+    SeDiff { left = l, right = r } -> assignBoth (canAnalyze l) (canAnalyze r)
+    _ -> False
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- checkAssignable — the assignability decision. Given subsetProven via the
+-- kernel, the exact normalized gap, and the canonical source / target SetExpr
+-- values, grade the ProofResult:
+--   subsetProven OR gap = SeNone ⇒ proven (source ⊆ target)
+--   otherwise                ⇒ a gap exists; confidence = "forward" when both
+--                              sides are analyzable, else "unknown".
+-- The DECISION (proven-vs-forward-vs-unknown + the canAnalyze predicate) lives
+-- here (Fenel-first); the TS delegate only dispatches + pre-computes evidence.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Check assignable"
+@description "The assignability decision: is `source` assignable to `target` (source ⊆ target)? Grades a ProofResult marker from subsetProven (source ⊆ target decided through the kernel: PropSubset → DecidableSetResult → kernel:verify), the exact normalized gap SetExpr, and the canonical source / target SetExpr values. subsetProven OR gap = SeNone ⇒ { ok = True, confidence = \"proven\" }; otherwise a gap exists ⇒ { ok = False, confidence = \"forward\" } when both sides are analyzable (canAnalyze), else \"unknown\". Fenel owns the gap-emptiness case split; the TS delegate only computes the normalized gap and attaches it to the real { ok, gap?, confidence } when ok = False. The port of fenel-check's checkAssignable onto the Fenel prover / set-algebra substrate. unified-static-analysis Phase 2."
+@tags "engine" "assignable" "inference" "unified-static-analysis" "phase-2"
+checkAssignable : (subsetProven: Bool) -> (gap: a) -> (source: b) -> (target: b) -> c
+checkAssignable subsetProven gap source target =
+  if subsetProven then { ok = True, confidence = "proven" }
+  else case gap of
+    SeNone -> { ok = True, confidence = "proven" }
+    _ ->
+      let conf = if assignBoth (canAnalyze source) (canAnalyze target) then "forward" else "unknown"
+      { ok = False, confidence = conf }

@@ -1,0 +1,277 @@
+module engine where
+
+-- decompose — `matchesShape` structural recogniser.
+--
+-- Phase 7a port — fourth port in the type-algebra arc. Mirrors the TS
+-- oracle at implementations/typescript/engine/src/decompose.ts (now a
+-- thin shim around `dispatchedMatchesShape`). The parser registry
+-- (`registerDecomposeParser` / `getDecomposeParser` / per-account
+-- variants) stays TS — parsers themselves are arbitrary JS functions
+-- (host-language IO leaves) and the registry is an in-process Map.
+--
+-- Field-identity Phase 3 cutover: TypeScript performs only the repository's
+-- shared descriptor-safe `$`-key -> TraversalType boundary conversion.  This
+-- body owns Maybe/List recognition, wrapper peeling, structural constructor
+-- selection, recursion, optional-field policy, and current-wire projection.
+-- DcValue remains the mechanical own-data snapshot of a heterogeneous host
+-- value.  No second type classifier crosses the boundary.
+--
+-- All helpers prefixed `decompose…` to avoid registry collisions.
+
+-- DcValue — typed view of a heterogeneous JSON input value. Same
+-- boundary pattern as the other host-value snapshots. DcvObject carries the
+-- own-data $tag/__case discriminator, enumerable own-data fields, and the
+-- exact empty-object fact used by Unit. DcvInvalid is an inert marker for an
+-- unsupported primitive, cycle, or malformed dense-array boundary.
+DcValue =
+  DcvNull
+  | DcvBool value: a
+  | DcvNumber value: a
+  | DcvString value: a
+  | DcvArray items: a
+  | DcvObject tag: a fields: a empty: Bool
+  | DcvInvalid
+
+-- DcvField — one entry in a DcvObject fields list.
+DcvField = DcvField name: String value: a
+
+-- ============================================================================
+-- matchesShape — top-level dispatch on type then value.
+-- ============================================================================
+
+@label "Matches shape"
+@description "Field-identity Phase 3 — best-effort structural recogniser over the shared identity-total TraversalType. Fenel owns exact Maybe/List recognition, wrapper peeling, constructor selection, recursion, optional fields, and current-wire projection. The TS adapter only snapshots own host data and crosses the ledgered `$`-key boundary."
+@tags "engine" "type" "decompose" "boundary" "field-identity" "phase-3"
+matchesShape : (value: DcValue) -> (type: TraversalType) -> (listHeadKey: FieldKey) -> Bool
+matchesShape value type listHeadKey =
+  case traversalSemanticSlotsError type of
+    Just message -> false
+    Nothing -> decomposeMatchesShapeHead value type listHeadKey
+
+@label "decompose: matchesShapeHead"
+@description "Field-identity Phase 3 — first half of the validated TraversalType shape dispatcher. Kept below the compiled-parser declaration budget; helper, tagged engine-internal."
+@tags "engine" "internal" "decompose" "field-identity" "phase-3"
+@category "engine-internal"
+decomposeMatchesShapeHead : (value: DcValue) -> (type: TraversalType) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesShapeHead value type listHeadKey =
+  case type of
+    TtVoid -> false
+    TtUnit -> decomposeMatchesUnit value
+    TtNamed -> true
+    TtVar -> true
+    TtRefined { base = base } -> decomposeMatchesShapeHead value base listHeadKey
+    TtOpaque { pure = pure } ->
+      case peelList type listHeadKey of
+        Just _ -> decomposeMatchesList value
+        Nothing -> decomposeMatchesShapeHead value pure listHeadKey
+    _ -> decomposeMatchesShapeTail value type listHeadKey
+
+@label "decompose: matchesShapeTail"
+@description "Field-identity Phase 3 — second half of the validated TraversalType shape dispatcher. Kept below the compiled-parser declaration budget; helper, tagged engine-internal."
+@tags "engine" "internal" "decompose" "field-identity" "phase-3"
+@category "engine-internal"
+decomposeMatchesShapeTail : (value: DcValue) -> (type: TraversalType) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesShapeTail value type listHeadKey =
+  case type of
+    TtMu -> decomposeMatchesMu value type listHeadKey
+    TtTagged { value = inner } -> decomposeMatchesShapeHead value inner listHeadKey
+    TtTuple { items = ts } -> decomposeMatchesTuple value ts listHeadKey
+    TtVariant { cases = cs } -> decomposeMatchesVariantType value cs listHeadKey
+    TtRecord { fields = fs } -> decomposeMatchesRecord value fs listHeadKey
+    TtMap -> decomposeMatchesMap value
+    _ -> true
+
+@label "decompose: matchesMu"
+@description "Field-identity Phase 3 — recognize canonical List μ-shapes after the root semantic-slot preflight. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "field-identity" "phase-3"
+@category "engine-internal"
+decomposeMatchesMu : (value: DcValue) -> (type: TraversalType) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesMu value type listHeadKey =
+  case peelList type listHeadKey of
+    Just _ -> decomposeMatchesList value
+    Nothing -> true
+
+@label "decompose: matchesVariantType"
+@description "Field-identity Phase 3 — distinguish canonical Maybe from ordinary variants after the root semantic-slot preflight. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "field-identity" "phase-3"
+@category "engine-internal"
+decomposeMatchesVariantType : (value: DcValue) -> (cases: List a) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesVariantType value cases listHeadKey =
+  case typeTraversalMaybeInner cases of
+    Just inner -> decomposeMatchesMaybe value inner listHeadKey
+    Nothing -> decomposeMatchesVariant value cases listHeadKey
+
+-- decomposeMatchesUnit — accept null OR DcvObject with empty fields.
+-- Mirrors the TS oracle's "null / undefined / empty record" cascade.
+@label "decompose: matchesUnit"
+@description "Phase 7a — accept null or empty record. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeMatchesUnit : (value: DcValue) -> Bool
+decomposeMatchesUnit value =
+  case value of
+    DcvNull -> true
+    DcvObject { empty = empty } -> empty
+    _ -> false
+
+-- decomposeMatchesMaybe — accept null OR match against inner type.
+@label "decompose: matchesMaybe"
+@description "Phase 7a — accept null OR recurse with inner type. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeMatchesMaybe : (value: DcValue) -> (innerT: TraversalType) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesMaybe value innerT listHeadKey =
+  case value of
+    DcvNull -> true
+    _ -> decomposeMatchesShapeHead value innerT listHeadKey
+
+-- decomposeMatchesList — accept any array.
+@label "decompose: matchesList"
+@description "Phase 7a — accept any array. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeMatchesList : (value: DcValue) -> Bool
+decomposeMatchesList value =
+  case value of
+    DcvArray -> true
+    _ -> false
+
+-- decomposeMatchesTuple — accept an array of the right length with
+-- per-element shape match.
+@label "decompose: matchesTuple"
+@description "Phase 7a — accept an array of the right length with per-element shape match. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeMatchesTuple : (value: DcValue) -> (types: List a) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesTuple value types listHeadKey =
+  case value of
+    DcvArray { items = xs } ->
+      if eq (length xs) (length types)
+      then decomposeMatchesTupleItems xs types listHeadKey
+      else false
+    _ -> false
+
+@label "decompose: matchesTupleItems"
+@description "Phase 7a — pairwise shape-match over items + declared types. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeMatchesTupleItems : (items: List a) -> (types: List a) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesTupleItems items types listHeadKey =
+  case head items of
+    Nothing -> true
+    Just it ->
+      case head types of
+        Nothing -> false
+        Just t ->
+          if decomposeMatchesShapeHead it t listHeadKey
+          then
+            case tail items of
+              Nothing -> true
+              Just ri ->
+                case tail types of
+                  Nothing -> true
+                  Just rt -> decomposeMatchesTupleItems ri rt listHeadKey
+          else false
+
+-- decomposeMatchesVariant — DcvObject with a tag matching a declared
+-- case; if the case has fields, the value must contain all required
+-- (non-Maybe) fields with matching shapes.
+@label "decompose: matchesVariant"
+@description "Phase 7a — DcvObject with a tag matching a declared case + per-case field shape check. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeMatchesVariant : (value: DcValue) -> (cases: List a) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesVariant value cases listHeadKey =
+  case value of
+    DcvObject { tag = t, fields = fs } ->
+      case t of
+        Nothing -> false
+        Just tagName ->
+          let matchedCase = decomposeFindCase cases tagName
+          case matchedCase of
+            Nothing -> false
+            Just c ->
+              if eq (length c.fields) 0
+              then true
+              else decomposeMatchesRecordFields fs c.fields listHeadKey
+    _ -> false
+
+@label "decompose: findCase"
+@description "Phase 7a — locate a variant case by name. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeFindCase : (cases: List a) -> (tagName: String) -> Maybe a
+decomposeFindCase cases tagName =
+  case head cases of
+    Nothing -> Nothing
+    Just c ->
+      if eq c.name tagName
+      then Just c
+      else case tail cases of
+        Nothing -> Nothing
+        Just rest -> decomposeFindCase rest tagName
+
+-- decomposeMatchesRecord — DcvObject + every declared field present
+-- (or Maybe-wrapped) + per-field shape match.
+@label "decompose: matchesRecord"
+@description "Field-identity Phase 3 — DcvObject + every declared current-wire field present (or exact canonical Maybe) + per-field shape match. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeMatchesRecord : (value: DcValue) -> (fields: List a) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesRecord value fields listHeadKey =
+  case value of
+    DcvObject { fields = vfs } -> decomposeMatchesRecordFields vfs fields listHeadKey
+    _ -> false
+
+-- decomposeMatchesRecordFields — for each declared field: if absent
+-- from the value, allow only when its TraversalType is exact Maybe; else recursively shape-
+-- match the value at that field.
+@label "decompose: matchesRecordFields"
+@description "Phase 7a — per-declared-field optional-detection + shape match. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeMatchesRecordFields : (valueFields: List a) -> (declaredFields: List a) -> (listHeadKey: FieldKey) -> Bool
+decomposeMatchesRecordFields valueFields declaredFields listHeadKey =
+  case head declaredFields of
+    Nothing -> true
+    Just df ->
+      let found = decomposeFindField valueFields df.wireName
+      let ok =
+            case found of
+              Nothing -> case peelMaybe df.type of
+                Nothing -> false
+                Just _ -> true
+              Just v -> decomposeMatchesShapeHead v df.type listHeadKey
+      if ok
+      then
+        case tail declaredFields of
+          Nothing -> true
+          Just rest ->
+            decomposeMatchesRecordFields valueFields rest listHeadKey
+      else false
+
+@label "decompose: findField"
+@description "Phase 7a — locate a DcvField by name; return value wrapped in Maybe. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeFindField : (vfs: List a) -> (name: String) -> Maybe a
+decomposeFindField vfs name =
+  case head vfs of
+    Nothing -> Nothing
+    Just vf ->
+      if eq vf.name name
+      then Just vf.value
+      else case tail vfs of
+        Nothing -> Nothing
+        Just rest -> decomposeFindField rest name
+
+-- decomposeMatchesMap — accept any non-null, non-array object.
+@label "decompose: matchesMap"
+@description "Phase 7a — accept any DcvObject. Helper; tagged engine-internal."
+@tags "engine" "internal" "decompose" "phase-7a"
+@category "engine-internal"
+decomposeMatchesMap : (value: DcValue) -> Bool
+decomposeMatchesMap value =
+  case value of
+    DcvObject -> true
+    _ -> false

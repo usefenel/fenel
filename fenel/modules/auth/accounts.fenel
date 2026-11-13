@@ -1,0 +1,205 @@
+-- =========================================================================
+-- module auth where — ACCOUNT SELECTION: the accounts a signed-in user can
+-- enter, and moving the session to one of them.
+--
+-- A file of the `auth` cross-file union (with `session.fenel`, `cookies.fenel`
+-- and `membership.fenel`). Unlike `membership.fenel` it IS on the
+-- authentication chain: both actions run through the privileged auth door
+-- (`core/src/auth.ts`), so the identity realm selects them by the `auth:`
+-- prefix like the rest of the session lifecycle.
+--
+-- WHO THE USER IS comes only from the request's own session token. Neither
+-- action takes a user id, so the door cannot be asked about another user. The
+-- membership listing it reaches (`state:listUserMemberships`) is an identity
+-- leaf for exactly that reason: it takes a user id and reads across accounts.
+--
+-- A switch REPLACES the session. The new one keeps the source's expiry, so a
+-- switch cannot extend a credential's life, and the source is revoked once the
+-- new one exists: a logout after a switch then leaves nothing behind.
+-- `state:createSession` rechecks the membership under a lock while it inserts,
+-- so a membership removed after the check below still issues nothing.
+--
+-- Ported 2026-09-23 from the TypeScript route (`api/src/routes/account-sessions.ts`
+-- now keeps HTTP framing only, and reads the clock). One behavioural
+-- difference: a membership removed in the instant between the check and the
+-- insert now fails the request instead of answering 403, because the insert's
+-- refusal is a throw that a Fenel body cannot catch. No session is issued
+-- either way.
+-- =========================================================================
+
+module auth where
+
+AccountChoice = AccountChoice accountId: String name: String slug: String role: String
+
+AccountChoices = AccountChoices currentAccountId: String accounts: List AccountChoice
+
+SwitchOutcome = Switched token: String userId: String accountId: String maxAgeSeconds: Maybe Number | SwitchRefused status: Number message: String
+
+@label "List accounts"
+@description "The accounts the signed-in user belongs to, for the account selector, read through the session the request authenticated with. Nothing when that session is no longer live. Runs through the privileged auth door."
+@tags "auth" "session" "account" "io"
+@ioAction "auth.list_accounts"
+listAccounts : String -> Maybe AccountChoices
+listAccounts rawToken =
+  case getSessionByHash (sha256Hex rawToken) of
+    Nothing -> Nothing
+    Just source -> Just (AccountChoices { currentAccountId = source.accountId, accounts = map authAccountChoice (listUserMemberships source.userId) })
+
+authAccountChoice : { accountId: String, name: String, slug: String, role: String } -> AccountChoice
+authAccountChoice row = AccountChoice { accountId = row.accountId, name = row.name, slug = row.slug, role = row.role }
+
+@label "Switch account"
+@description "Replace the signed-in session with one for another account the user belongs to, keeping the source session's expiry and revoking the source once the new session exists. Refuses an id that is not a UUID (400), a session that is no longer live (401) and an account the user does not belong to (403). Runs through the privileged auth door; nowMs is the host clock, read at the HTTP boundary."
+@tags "auth" "session" "account" "io"
+@ioAction "auth.switch_account"
+-- ⚠ A NATIVE CALL IS BOUND BY `let` BEFORE IT IS PASSED ON, the way
+-- `resolveToken` binds its hash. Written as an argument inside the `if`
+-- branch, `sha256Hex rawToken` reached the session leaf as null (measured
+-- 2026-09-23): that dispatch path does not carry the crypto natives.
+switchAccount : String -> String -> Number -> SwitchOutcome
+switchAccount rawToken accountId nowMs =
+  let tokenHash = sha256Hex rawToken
+  if isUuid accountId
+  then authSwitchFromSession tokenHash accountId nowMs
+  else SwitchRefused { status = 400, message = "A valid accountId is required" }
+
+-- A case whose scrutinee is an IO leaf names BOTH arms and no wildcard, the
+-- pattern `session.fenel` uses. The leaves honour their declared Maybe, so the
+-- two arms are exhaustive.
+authSwitchFromSession : String -> String -> Number -> SwitchOutcome
+authSwitchFromSession tokenHash target nowMs =
+  case getSessionByHash tokenHash of
+    Nothing -> SwitchRefused { status = 401, message = "Your session has expired. Please sign in again." }
+    Just source -> authSwitchIfMember tokenHash source target nowMs
+
+-- The session parameter names only the two fields these read; the row
+-- `state:getSessionByHash` returns has more.
+authSwitchIfMember : String -> { userId: String, expiresAt: Maybe String } -> String -> Number -> SwitchOutcome
+authSwitchIfMember tokenHash source target nowMs =
+  case getMembership source.userId target of
+    Nothing -> SwitchRefused { status = 403, message = "You no longer have access to this account." }
+    Just _membership -> authSwitchIssue tokenHash source target nowMs
+
+-- Issue first, then revoke: a failed issue leaves the user signed in where
+-- they were, never signed out of both. The parameter is `target`, not
+-- `accountId`, because a record literal whose field is named like an
+-- in-scope parameter evaluates to null.
+authSwitchIssue : String -> { userId: String, expiresAt: Maybe String } -> String -> Number -> SwitchOutcome
+authSwitchIssue tokenHash source target nowMs =
+  let issued = issueSession { userId = source.userId, accountId = target, label = Just "Account selection", expiresAt = source.expiresAt }
+  let _revoked = deleteSessionByHash tokenHash
+  let seconds = authSecondsLeft source.expiresAt nowMs
+  Switched { token = issued.token, userId = source.userId, accountId = target, maxAgeSeconds = seconds }
+
+-- The cookie's Max-Age: whole seconds until the session's expiry, never
+-- negative. Nothing for a session without an expiry (the cookie's default).
+authSecondsLeft : Maybe String -> Number -> Maybe Number
+authSecondsLeft expiresAt nowMs =
+  case expiresAt of
+    Nothing -> Nothing
+    Just iso -> authSecondsUntil iso nowMs
+
+authSecondsUntil : String -> Number -> Maybe Number
+authSecondsUntil iso nowMs =
+  let parsed = hostDateParse iso
+  case parsed of
+    Nothing -> Just 0
+    Just ms -> Just (max 0 (floor (div (sub ms nowMs) 1000)))
+
+
+-- Independent readers keep the login credential's principal while selecting
+-- a currently authorized partition. No session is issued, switched or revoked.
+ReaderAccountResult = ReaderAccountReady resolved: ResolvedSession | ReaderAccountRefused status: Number message: String
+PersonalAccountResult = PersonalAccountReady accountId: String | PersonalAccountRefused status: Number message: String
+
+resolveReaderAccount : String -> String -> ReaderAccountResult
+resolveReaderAccount rawToken target =
+  if isUuid target
+  then case resolveToken rawToken of
+    Nothing -> ReaderAccountRefused { status = 401, message = "Your session has expired. Please sign in again." }
+    Just source -> readerAccountFromSession source target
+  else ReaderAccountRefused { status = 400, message = "A valid reader accountId is required" }
+
+readerAccountFromSession : ResolvedSession -> String -> ReaderAccountResult
+readerAccountFromSession source target =
+  case getMembership source.userId target of
+    Nothing -> ReaderAccountRefused { status = 403, message = "You no longer have access to this account." }
+    Just member -> ReaderAccountReady { resolved = ResolvedSession { subject = User { accountId = target, userId = source.userId }, sessionId = source.sessionId, userId = source.userId, accountId = target, role = member.role, membershipId = member.id, profile = source.profile } }
+
+personalAccountForToken : String -> PersonalAccountResult
+personalAccountForToken rawToken =
+  case resolveToken rawToken of
+    Nothing -> PersonalAccountRefused { status = 401, message = "Your session has expired. Please sign in again." }
+    Just source -> personalAccountForUser source.userId
+
+personalAccountForUser : String -> PersonalAccountResult
+personalAccountForUser ownerId =
+  let candidateAccount = uuidV4 {}
+  let candidateMembership = uuidV4 {}
+  case state.ensurePersonalAccount ownerId candidateAccount candidateMembership of
+    Err problem -> PersonalAccountRefused { status = 409, message = problem }
+    Ok account -> PersonalAccountReady { accountId = account }
+
+-- These snapshots are read under the host transaction's row locks. The pure
+-- rules are called from the repository registry in a frame without IO; no
+-- account-authored planner executes at this identity boundary.
+PersonalIdentityUser = PersonalIdentityUser id: String personalAccountId: Maybe String
+PersonalMembership = PersonalMembership id: String userId: String accountId: String role: String
+PersonalAccountSnapshot = PersonalAccountSnapshot users: List PersonalIdentityUser members: List PersonalMembership
+PersonalAccountCreation = PersonalAccountCreation id: String slug: String name: String
+PersonalAccountPlan = UsePersonalAccount accountId: String | CreatePersonalAccount account: PersonalAccountCreation membership: PersonalMembership
+MembershipMutation = AddMembership userId: String role: String | SetMembershipRole userId: String role: String | RemoveMembership userId: String
+PersonalMembershipSnapshot = PersonalMembershipSnapshot owners: List String members: List PersonalMembership mutation: MembershipMutation
+
+planPersonalAccount : String -> String -> String -> PersonalAccountSnapshot -> Result String PersonalAccountPlan
+planPersonalAccount ownerId candidateAccount candidateMembership snapshot =
+  if length snapshot.users != 1
+  then Err "The authenticated user is unavailable."
+  else case head snapshot.users of
+    Nothing -> Err "The authenticated user is unavailable."
+    Just user -> personalAccountPlanForUser ownerId candidateAccount candidateMembership user snapshot.members
+
+personalAccountPlanForUser : String -> String -> String -> PersonalIdentityUser -> List PersonalMembership -> Result String PersonalAccountPlan
+personalAccountPlanForUser ownerId candidateAccount candidateMembership user members =
+  if user.id != ownerId
+  then Err "The personal account identity does not match the authenticated user."
+  else case user.personalAccountId of
+    Nothing -> Ok (CreatePersonalAccount { account = PersonalAccountCreation { id = candidateAccount, slug = concat "personal-" candidateAccount, name = "Personal workspace" }, membership = PersonalMembership { id = candidateMembership, userId = ownerId, accountId = candidateAccount, role = "personal" } })
+    Just linked ->
+      if personalMembershipIntact ownerId linked members
+      then Ok (UsePersonalAccount { accountId = linked })
+      else Err "The personal account membership changed. No access was restored automatically."
+
+personalMembershipIntact : String -> String -> List PersonalMembership -> Boolean
+personalMembershipIntact ownerId linked members =
+  if length members != 1
+  then false
+  else case head members of
+    Nothing -> false
+    Just member -> member.userId == ownerId && member.accountId == linked && member.role == "personal"
+
+personalMembershipDecision : PersonalMembershipSnapshot -> Result String Boolean
+personalMembershipDecision snapshot =
+  if length snapshot.owners == 0
+  then Ok true
+  else if length snapshot.owners != 1
+  then Err "The personal account has conflicting owner identities."
+  else case head snapshot.owners of
+    Nothing -> Err "The personal account owner is unavailable."
+    Just ownerId -> personalMembershipMutation ownerId snapshot.members snapshot.mutation
+
+personalMembershipMutation : String -> List PersonalMembership -> MembershipMutation -> Result String Boolean
+personalMembershipMutation ownerId members mutation =
+  if length members != 1
+  then Err "The personal account membership changed. No access was restored automatically."
+  else case head members of
+    Nothing -> Err "The personal account membership is unavailable."
+    Just member ->
+      if member.userId != ownerId || member.role != "personal"
+      then Err "The personal account membership changed. No access was restored automatically."
+      else case mutation of
+        SetMembershipRole { userId = who, role = requestedRole } ->
+          if who == ownerId && requestedRole == "personal"
+          then Ok true
+          else Err "A personal workspace cannot change its owner or grant broader access."
+        _ -> Err "A personal workspace cannot add or remove memberships."

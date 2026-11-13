@@ -1,0 +1,328 @@
+module engine where
+
+-- Editing explicitly declared binders never discovers or allocates a binder.
+-- The caller supplies identity/Kind. The source chooses capture-safe patches;
+-- the dollar-key boundary reattaches them to the original graph and sidecars.
+
+AuthoringGenericOccurrence = AuthoringGenericOccurrence name: String path: List String scope: List String application: Boolean annotation: Boolean args: List TraversalType
+AuthoringGenericRoot = AuthoringGenericRoot path: List String scope: List String type: TraversalType
+AuthoringGenericAnnotation = AuthoringGenericAnnotation path: List String scope: List String
+AuthoringGenericScanPlan = AuthoringGenericScanPlan ok: Boolean message: String annotations: List AuthoringGenericAnnotation
+AuthoringGenericApplication = AuthoringGenericApplication path: List String headVarId: String headRef: String kind: Kind args: List TraversalType
+AuthoringGenericEdit = AuthoringGenericEdit action: String id: String sourceName: String kind: Kind
+AuthoringGenericPlan = AuthoringGenericPlan ok: Boolean message: String action: String index: Number paths: List (List String)
+
+@category "engine-internal"
+agRefuse : (message: String) -> AuthoringGenericPlan
+agRefuse message = AuthoringGenericPlan { ok = false, message = message, action = "", index = 0, paths = [] }
+
+@category "engine-internal"
+agAccept : (action: String) -> (index: Number) -> (paths: List (List String)) -> AuthoringGenericPlan
+agAccept action index paths = AuthoringGenericPlan { ok = true, message = "", action = action, index = index, paths = paths }
+
+@category "engine-internal"
+agNameValid : (name: String) -> Boolean
+agNameValid name =
+  let characters = fold (\valid char -> and valid (isIdentCont char)) true (chars name)
+  and (and (not (eq name "")) (not (eq name "_"))) (and (and (isLowerInitName name) (eq (classifyTT name) "ident")) characters)
+
+@category "engine-internal"
+agKindValid : (kind: Kind) -> (fuel: Nat) -> Boolean
+agKindValid kind fuel =
+  if lte fuel 0 then false
+  else case kind of
+    KType -> true
+    KArrow { input = input, output = output } -> and (agKindValid input (sub fuel 1)) (agKindValid output (sub fuel 1))
+    _ -> false
+
+@category "engine-internal"
+agBindersValid : (variables: List SchemeVar) -> (ids: List String) -> (names: List String) -> Boolean
+agBindersValid variables ids names = case head variables of
+  Nothing -> true
+  Just variable ->
+    if or (or (eq variable.id "") (elem variable.id ids)) (or (not (agNameValid variable.sourceName)) (elem variable.sourceName names)) then false
+    else if not (agKindValid variable.kind 128) then false
+    else agBindersValid (tailOr variables) (appendItem variable.id ids) (appendItem variable.sourceName names)
+
+@category "engine-internal"
+agJoin : (left: Result String (List AuthoringGenericOccurrence)) -> (right: Result String (List AuthoringGenericOccurrence)) -> Result String (List AuthoringGenericOccurrence)
+agJoin left right = case left of
+  Err message -> Err message
+  Ok rows -> case right of
+    Err message -> Err message
+    Ok rest -> Ok (concat rows rest)
+
+@category "engine-internal"
+agScanListWith : (nominal: Boolean) -> (types: List TraversalType) -> (path: List String) -> (scope: List String) -> (index: Number) -> Result String (List AuthoringGenericOccurrence)
+agScanListWith nominal types path scope index = case head types of
+  Nothing -> Ok []
+  Just type -> agJoin (agScanWith nominal type (appendItem (toString index) path) scope) (agScanListWith nominal (tailOr types) path scope (add index 1))
+
+@category "engine-internal"
+agScanFieldsWith : (nominal: Boolean) -> (fields: List a) -> (path: List String) -> (scope: List String) -> (index: Number) -> Result String (List AuthoringGenericOccurrence)
+agScanFieldsWith nominal fields path scope index = case head fields of
+  Nothing -> Ok []
+  Just field -> agJoin (agScanWith nominal field.type (concat path [toString index, "type"]) scope) (agScanFieldsWith nominal (tailOr fields) path scope (add index 1))
+
+@category "engine-internal"
+agScanCasesWith : (nominal: Boolean) -> (cases: List TtVariantCase) -> (path: List String) -> (scope: List String) -> (index: Number) -> Result String (List AuthoringGenericOccurrence)
+agScanCasesWith nominal cases path scope index = case head cases of
+  Nothing -> Ok []
+  Just variantCase -> agJoin (agScanFieldsWith nominal variantCase.fields (concat path [toString index, "fields"]) scope 0) (agScanCasesWith nominal (tailOr cases) path scope (add index 1))
+
+@category "engine-internal"
+agPredicateAnnotations : (value: a) -> (path: List String) -> (scope: List String) -> List AuthoringGenericOccurrence
+agPredicateAnnotations value path scope =
+  if sourceTypePredicateScalar value then []
+  else if isArray value then agPredicateAnnotationItems value path scope 0
+  else case sourceTypePredicateAnnotation value of
+    Just pair ->
+      let annotation = AuthoringGenericOccurrence { name = "", path = concat path ["ann", "1"], scope = scope, application = false, annotation = true, args = [] }
+      concat [annotation] (agPredicateAnnotations (at pair 0) (concat path ["ann", "0"]) scope)
+    Nothing -> fold (\rows entry -> concat rows (agPredicateAnnotations entry.value (appendItem entry.key path) scope)) [] (entries value)
+
+@category "engine-internal"
+agPredicateAnnotationItems : (items: List a) -> (path: List String) -> (scope: List String) -> (index: Number) -> List AuthoringGenericOccurrence
+agPredicateAnnotationItems items path scope index = case head items of
+  Nothing -> []
+  Just item -> concat (agPredicateAnnotations item (appendItem (toString index) path) scope) (agPredicateAnnotationItems (tailOr items) path scope (add index 1))
+
+@category "engine-internal"
+agScanWith : (nominal: Boolean) -> (type: TraversalType) -> (path: List String) -> (scope: List String) -> Result String (List AuthoringGenericOccurrence)
+agScanWith nominal type path scope = case type of
+  TtVar { name = name } -> if nominal then Ok [] else Ok [AuthoringGenericOccurrence { name = name, path = appendItem "$var" path, scope = scope, application = false, annotation = false, args = [] }]
+  TtNamed { name = name, origin = origin } ->
+    if and nominal (eq origin "ref") then Ok [AuthoringGenericOccurrence { name = name, path = appendItem "$ref" path, scope = scope, application = false, annotation = false, args = [] }]
+    else Ok []
+  TtUnit -> Ok []
+  TtVoid -> Ok []
+  TtTypeUniverse -> Ok []
+  TtRecord { fields = fields } -> agScanFieldsWith nominal fields (concat path ["$record", "fields"]) scope 0
+  TtVariant { cases = cases } -> agScanCasesWith nominal cases (concat path ["$variant", "cases"]) scope 0
+  TtTuple { items = items } -> agScanListWith nominal items (appendItem "$tuple" path) scope 0
+  TtUnion { branches = branches } -> agScanListWith nominal branches (appendItem "$union" path) scope 0
+  TtIntersect { branches = branches } -> agScanListWith nominal branches (appendItem "$intersect" path) scope 0
+  TtComplement { inner = inner } -> agScanWith nominal inner (appendItem "$complement" path) scope
+  TtMap { keys = keys, values = values } -> agJoin (agScanWith nominal values (concat path ["$map", "values"]) scope) (Ok (agPredicateAnnotations keys (concat path ["$map", "keys"]) scope))
+  TtRefined { base = base, set = set } -> agJoin (agScanWith nominal base (concat path ["$refined", "base"]) scope) (Ok (agPredicateAnnotations set (concat path ["$refined", "set"]) scope))
+  TtMu { body = body, var = variable } -> agScanWith nominal body (concat path ["$mu", "body"]) (appendItem variable scope)
+  TtOpaque { name = name, pure = pure } -> agScanWith nominal pure (concat path ["$opaque", "pure"]) (if nominal then appendItem name scope else scope)
+  TtTagged { value = value, phantom = phantom } -> agJoin (agScanWith nominal value (concat path ["$tagged", "value"]) scope) (agScanWith nominal phantom (concat path ["$tagged", "phantom"]) scope)
+  TtArrow { params = params, returns = returns } -> agJoin (agScanFieldsWith nominal params (concat path ["$arrow", "params"]) scope 0) (agScanWith nominal returns (concat path ["$arrow", "returns"]) scope)
+  TtApp { head = name, args = args } ->
+    agJoin (Ok [AuthoringGenericOccurrence { name = name, path = path, scope = scope, application = true, annotation = false, args = args }]) (agScanListWith nominal args (concat path ["$el", "call"]) scope 1)
+  TtEl -> Err "A dependent type expression needs its established binder context before generic parameters can be edited."
+  TtUnknown -> Err "An incomplete, cyclic or malformed type cannot be used to edit generic parameters."
+
+@category "engine-internal"
+agScanList : (types: List TraversalType) -> (path: List String) -> (scope: List String) -> (index: Number) -> Result String (List AuthoringGenericOccurrence)
+agScanList types path scope index = agScanListWith false types path scope index
+
+@category "engine-internal"
+agScanFields : (fields: List a) -> (path: List String) -> (scope: List String) -> (index: Number) -> Result String (List AuthoringGenericOccurrence)
+agScanFields fields path scope index = agScanFieldsWith false fields path scope index
+
+@category "engine-internal"
+agScanCases : (cases: List TtVariantCase) -> (path: List String) -> (scope: List String) -> (index: Number) -> Result String (List AuthoringGenericOccurrence)
+agScanCases cases path scope index = agScanCasesWith false cases path scope index
+
+@category "engine-internal"
+agScan : (type: TraversalType) -> (path: List String) -> (scope: List String) -> Result String (List AuthoringGenericOccurrence)
+agScan type path scope = agScanWith false type path scope
+
+@category "engine-internal"
+agScanRoots : (roots: List AuthoringGenericRoot) -> Result String (List AuthoringGenericOccurrence)
+agScanRoots roots = case head roots of
+  Nothing -> Ok []
+  Just root -> agJoin (agScan root.type root.path root.scope) (agScanRoots (tailOr roots))
+
+@category "engine-internal"
+agArgsAgree : (left: List TraversalType) -> (right: List TraversalType) -> Boolean
+agArgsAgree left right = case head left of
+  Nothing -> eq (length right) 0
+  Just type -> case head right of
+    Nothing -> false
+    Just other -> and (eq type.raw other.raw) (agArgsAgree (tailOr left) (tailOr right))
+
+@category "engine-internal"
+agApplicationRow : (path: List String) -> (rows: List AuthoringGenericOccurrence) -> Maybe AuthoringGenericOccurrence
+agApplicationRow path rows = find (\row -> and row.application (eq row.path (concat ["scheme", "body"] path))) rows
+
+@category "engine-internal"
+agHasPath : (path: List String) -> (paths: List (List String)) -> Boolean
+agHasPath path paths = fold (\found candidate -> or found (eq path candidate)) false paths
+
+@category "engine-internal"
+agApplicationRows : (applications: List AuthoringGenericApplication) -> (rows: List AuthoringGenericOccurrence) -> (variables: List SchemeVar) -> (index: Number) -> (seen: List (List String)) -> Result String (List AuthoringGenericOccurrence)
+agApplicationRows applications rows variables index seen = case head applications of
+  Nothing -> Ok []
+  Just application ->
+    if agHasPath application.path seen then Err "Duplicate application sidecar paths make the binder context ambiguous."
+    else case agApplicationRow application.path rows of
+      Nothing -> Err "An application sidecar does not select a type application in the declaration."
+      Just row ->
+        if not (agArgsAgree row.args application.args) then Err "An application sidecar disagrees with its authored arguments."
+        else if not (agKindValid application.kind 128) then Err "An application sidecar has an invalid kind."
+        else
+          let bound = inferenceQuantifiedById application.headVarId variables
+          let validHead =
+                if eq application.headVarId "" then
+                  case inferenceQuantifiedByName row.name variables of
+                    Just variable -> false
+                    Nothing -> and (not (eq application.headRef "")) (eq row.name application.headRef)
+                else case bound of
+                  Nothing -> false
+                  Just variable -> and (eq application.headRef "") (and (eq row.name variable.sourceName) (and (not (elem row.name row.scope)) (inferenceKindEq variable.kind application.kind)))
+          if not validHead then Err "An application sidecar does not identify its declared head binder or nominal."
+          else agJoin (agScanList application.args ["scheme", "applications", toString index, "args"] row.scope 0) (agApplicationRows (tailOr applications) rows variables (add index 1) (appendItem application.path seen))
+
+@category "engine-internal"
+agFreeOccurrence : (name: String) -> (row: AuthoringGenericOccurrence) -> Boolean
+agFreeOccurrence name row = and (eq row.name name) (not (elem name row.scope))
+
+@category "engine-internal"
+agHasFree : (name: String) -> (rows: List AuthoringGenericOccurrence) -> Boolean
+agHasFree name rows = fold (\found row -> or found (agFreeOccurrence name row)) false rows
+
+@category "engine-internal"
+agOccurrencePath : (row: AuthoringGenericOccurrence) -> List String
+agOccurrencePath row = if row.application then concat row.path ["$el", "call", "0"] else row.path
+
+@category "engine-internal"
+agRowsBound : (rows: List AuthoringGenericOccurrence) -> (names: List String) -> Boolean
+agRowsBound rows names = fold (\valid row -> and valid (or row.annotation (or row.application (or (elem row.name row.scope) (elem row.name names))))) true rows
+
+@category "engine-internal"
+agBoundApplicationsCovered : (rows: List AuthoringGenericOccurrence) -> (names: List String) -> (applications: List AuthoringGenericApplication) -> Boolean
+agBoundApplicationsCovered rows names applications =
+  let paths = map (\application -> concat ["scheme", "body"] application.path) applications
+  fold (\valid row ->
+    if and row.application (and (eq (take 2 row.path) ["scheme", "body"]) (and (elem row.name names) (not (elem row.name row.scope))))
+    then and valid (agHasPath row.path paths)
+    else valid) true rows
+
+@category "engine-internal"
+agPendingAnnotations : (roots: List AuthoringGenericRoot) -> (rows: List AuthoringGenericOccurrence) -> List AuthoringGenericAnnotation
+agPendingAnnotations roots rows =
+  let paths = map (\root -> root.path) roots
+  map (\row -> AuthoringGenericAnnotation { path = row.path, scope = row.scope }) (filter (\row -> and row.annotation (not (agHasPath row.path paths))) rows)
+
+@label "Generic annotation traversal roots"
+@description "Select embedded predicate annotation types for the dollar-key boundary to marshal, retaining the enclosing recursive binder scope. Only paths are returned; the original graph stays with the caller."
+@tags "engine" "authoring" "signature"
+authoringGenericScanPlan : (roots: List AuthoringGenericRoot) -> (variables: List SchemeVar) -> (applications: List AuthoringGenericApplication) -> AuthoringGenericScanPlan
+authoringGenericScanPlan roots variables applications =
+  case agScanRoots roots of
+    Err message -> AuthoringGenericScanPlan { ok = false, message = message, annotations = [] }
+    Ok rows -> case agApplicationRows applications rows variables 0 [] of
+      Err message -> AuthoringGenericScanPlan { ok = false, message = message, annotations = [] }
+      Ok mirrors -> AuthoringGenericScanPlan { ok = true, message = "", annotations = agPendingAnnotations roots (concat rows mirrors) }
+
+@category "engine-internal"
+agBinderIndex : (id: String) -> (variables: List SchemeVar) -> (index: Number) -> Maybe Number
+agBinderIndex id variables index = case head variables of
+  Nothing -> Nothing
+  Just variable -> if eq variable.id id then Just index else agBinderIndex id (tailOr variables) (add index 1)
+
+@category "engine-internal"
+agEditChecked : (variables: List SchemeVar) -> (rows: List AuthoringGenericOccurrence) -> (edit: AuthoringGenericEdit) -> AuthoringGenericPlan
+agEditChecked variables rows edit =
+  let names = map (\variable -> variable.sourceName) variables
+  if eq edit.action "add" then
+    if not (agNameValid edit.sourceName) then agRefuse "Use a lowercase type parameter identifier."
+    else if or (eq edit.id "") (elem edit.id (map (\variable -> variable.id) variables)) then agRefuse "A new type parameter needs a fresh caller-supplied identity."
+    else if elem edit.sourceName names then agRefuse "That type parameter name is already declared."
+    else if not (agKindValid edit.kind 128) then agRefuse "The type parameter kind is malformed."
+    else if agHasFree edit.sourceName rows then agRefuse "Adding this parameter would capture an already free type variable or application head."
+    else if not (agRowsBound rows names) then agRefuse "The declaration contains a type variable without an established binder."
+    else agAccept "add" (length variables) []
+  else case inferenceQuantifiedById edit.id variables of
+    Nothing -> agRefuse "The type parameter identity is not declared here."
+    Just variable -> case agBinderIndex edit.id variables 0 of
+      Nothing -> agRefuse "The type parameter identity is not declared here."
+      Just index ->
+        if not (agRowsBound rows names) then agRefuse "The declaration contains a type variable without an established binder."
+        else if eq edit.action "remove" then
+          if agHasFree variable.sourceName rows then agRefuse "This type parameter is still used by the declaration."
+          else agAccept "remove" index []
+        else if eq edit.action "set-kind" then
+          if not (agKindValid edit.kind 128) then agRefuse "The type parameter kind is malformed."
+          else if inferenceKindEq variable.kind edit.kind then agAccept "set-kind" index []
+          else if agHasFree variable.sourceName rows then agRefuse "Remove this parameter's uses before changing its kind."
+          else agAccept "set-kind" index []
+        else if eq edit.action "rename" then
+          if not (agNameValid edit.sourceName) then agRefuse "Use a lowercase type parameter identifier."
+          else if and (not (eq variable.sourceName edit.sourceName)) (elem edit.sourceName names) then agRefuse "That type parameter name is already declared."
+          else if and (not (eq variable.sourceName edit.sourceName)) (agHasFree edit.sourceName rows) then agRefuse "Renaming this parameter would capture an already free type variable or application head."
+          else
+            let uses = filter (agFreeOccurrence variable.sourceName) rows
+            let captured = fold (\found row -> or found (elem edit.sourceName row.scope)) false uses
+            if captured then agRefuse "This name would capture a type variable beneath a recursive binder."
+            else agAccept "rename" index (map agOccurrencePath uses)
+        else agRefuse "Unknown type parameter edit."
+
+@label "Edit explicit generic parameters"
+@description "Check an explicit binder edit against the existing type traversal and application identity sidecars. Preserve caller-supplied identities/kinds; reject capture and used-parameter removal; return patches for the original declaration graph."
+@tags "engine" "authoring" "signature"
+authoringGenericEditPlan : (roots: List AuthoringGenericRoot) -> (variables: List SchemeVar) -> (applications: List AuthoringGenericApplication) -> (parameterNames: Maybe (List String)) -> (edit: AuthoringGenericEdit) -> AuthoringGenericPlan
+authoringGenericEditPlan roots variables applications parameterNames edit =
+  let names = map (\variable -> variable.sourceName) variables
+  let paramsAgree =
+    case parameterNames of
+      Nothing -> true
+      Just params -> eq params names
+  if not (agBindersValid variables [] []) then agRefuse "The existing generic binder identities, names or kinds are malformed or ambiguous."
+  else if not paramsAgree then agRefuse "Type constructor parameters disagree with the scheme binders."
+  else case agScanRoots roots of
+    Err message -> agRefuse message
+    Ok rows ->
+      if not (agBoundApplicationsCovered rows names applications) then agRefuse "A generic application needs its authoritative binder identity sidecar."
+      else case agApplicationRows applications rows variables 0 [] of
+        Err message -> agRefuse message
+        Ok mirrors ->
+          let allRows = concat rows mirrors
+          if gt (length (agPendingAnnotations roots allRows)) 0 then agRefuse "An embedded annotation needs its type-binder context before the declaration can be edited."
+          else agEditChecked variables allRows edit
+
+@category "engine-internal"
+agKindTypeMarker : (kind: Kind) -> a
+agKindTypeMarker kind = case kind of
+  KType -> { form = "type" }
+  KArrow { input = input, output = output } -> { form = "arrow", input = agKindTypeMarker input, output = agKindTypeMarker output }
+
+@label "Generic parameter kind as an editable Type"
+@description "Project the existing KType/KArrow vocabulary through ordinary Type and function type forms; no value parameter or new kind language is introduced."
+@tags "engine" "authoring" "signature"
+authoringGenericKindTypePlan : (kind: Kind) -> a
+authoringGenericKindTypePlan kind =
+  if agKindValid kind 128 then { ok = true, message = "", marker = agKindTypeMarker kind }
+  else { ok = false, message = "The type parameter kind is malformed." }
+
+@category "engine-internal"
+agTypeKind : (type: TraversalType) -> Maybe Kind
+agTypeKind type = case type of
+  TtTypeUniverse -> Just KType
+  TtArrow { params = params, returns = returns } ->
+    if eq (length params) 0 then Nothing
+    else case agTypeKind returns of
+      Nothing -> Nothing
+      Just result -> agTypeKindParams params result
+  _ -> Nothing
+
+@category "engine-internal"
+agTypeKindParams : (params: List TtArrowParam) -> (result: Kind) -> Maybe Kind
+agTypeKindParams params result = case head params of
+  Nothing -> Just result
+  Just param -> case agTypeKind param.type of
+    Nothing -> Nothing
+    Just input -> case agTypeKindParams (tailOr params) result of
+      Nothing -> Nothing
+      Just output -> Just (KArrow { input = input, output = output })
+
+@label "Editable Type to generic parameter kind"
+@description "Accept Type and nonempty function arrows between kinds. Ordinary value types such as Nat or String remain value parameter types, not generic binder kinds."
+@tags "engine" "authoring" "signature"
+authoringGenericKindFromTypePlan : (type: TraversalType) -> a
+authoringGenericKindFromTypePlan type = case agTypeKind type of
+  Nothing -> { ok = false, message = "A generic parameter accepts Type or a function between types. Use an ordinary function parameter for Nat, String or another value type." }
+  Just kind -> { ok = true, message = "", kind = kind }

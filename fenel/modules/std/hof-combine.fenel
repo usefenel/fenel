@@ -1,0 +1,189 @@
+module std where
+
+-- Higher-order std functions, part 2 — the combiners / groupers / orderers /
+-- combinators (takeWhile dropWhile zipWith partition groupBy sort compose
+-- flip + their
+-- recursion helpers). SPLIT from hof.fenel (which holds the doc ladder for the
+-- purity-gated perf-branch pattern, the body idiom, and the divergence notes —
+-- read it first): a single file holding all 17 trips a size-triggered
+-- cross-parse state leak in the INTERPRETED Fenel-parser harness (any prior
+-- parse in the same process + an input past ~8-12k chars ⇒ spurious parse
+-- failure; fresh-state parses fine — effect-visibility Phase 3 surprise, a
+-- parser-substrate follow-up). Two files keep each piece comfortably under
+-- the onset while the union loader merges them into the one std module.
+
+@label "Take while"
+@description "Take elements while predicate holds. ∀a. (a → Bool) → List a → List a"
+@tags "list" "slice" "predicate"
+takeWhile : (fn: (a -> Boolean)) -> (arr: List a) -> List a
+takeWhile fn arr =
+  case head arr of
+    Nothing -> []
+    Just h ->
+      let ok = fn h
+      if ok then concat [h] (takeWhile fn (fromMaybe [] (tail arr))) else []
+
+@label "Drop while"
+@description "Drop elements while predicate holds. ∀a. (a → Bool) → List a → List a"
+@tags "list" "slice" "predicate"
+dropWhile : (fn: (a -> Boolean)) -> (arr: List a) -> List a
+dropWhile fn arr =
+  case head arr of
+    Nothing -> []
+    Just h ->
+      let ok = fn h
+      if ok then dropWhile fn (fromMaybe [] (tail arr)) else arr
+
+@label "Zip with"
+@description "Combine corresponding pairs. ∀a b c. (a → b → c) → List a → List b → List c"
+@tags "list" "combine" "transform"
+zipWith : (fn: ((a, b) -> c)) -> (xs: List a) -> (ys: List b) -> List c
+zipWith fn xs ys =
+  case head xs of
+    Nothing -> []
+    Just x ->
+      case head ys of
+        Nothing -> []
+        Just y ->
+          let z = fn x y
+          let rest = zipWith fn (fromMaybe [] (tail xs)) (fromMaybe [] (tail ys))
+          concat [z] rest
+
+@label "Partition"
+@description "Split list into [matching, non-matching] by predicate. ∀a. (a → Bool) → List a → (List a, List a)"
+@tags "list" "split"
+partition : (fn: (a -> Boolean)) -> (arr: List a) -> List (List a)
+partition fn arr =
+  case head arr of
+    Nothing -> [[], []]
+    Just h ->
+      let ok = fn h
+      let rest = partition fn (fromMaybe [] (tail arr))
+      let yes = fromMaybe [] (head rest)
+      let no = fromMaybe [] (head (fromMaybe [] (tail rest)))
+      if ok then [concat [h] yes, no] else [yes, concat [h] no]
+
+@label "Group by (accumulate)"
+@description "Forward accumulator for groupBy: thread the groups record left-to-right so group keys appear in first-encounter order and elements append in list order — exactly the native's insertion-order semantics. Internal helper."
+@tags "list" "aggregate" "internal"
+groupByAcc : (key: (a -> b)) -> (arr: List a) -> (acc: {  }) -> {  }
+groupByAcc key arr acc = fromMaybe acc (groupFold key groupByRecordInsert arr acc)
+
+@label "Group by"
+@description "Group elements by key function. ∀a b. (a → b) → List a → Record b (List a)"
+@tags "list" "aggregate"
+groupBy : (key: (a -> b)) -> (arr: List a) -> {  }
+groupBy key arr = groupByAcc key arr {  }
+
+@label "Sort decorate"
+@description "Decorate every element with its sort key: { k = key x, v = x } per element, invoking the key exactly ONCE per element (as the native does). Internal helper for sort."
+@tags "list" "ordering" "internal"
+sortDecorate : (key: (a -> b)) -> (arr: List a) -> List p
+sortDecorate key arr =
+  let n = count arr
+  if eq n 0
+    then []
+    else if eq n 1
+      then
+        let h = at arr 0
+        let k = key h
+        [{ k = k, v = h }]
+      else
+        let half = floor (div n 2)
+        let left = sortDecorate key (take half arr)
+        let right = sortDecorate key (drop half arr)
+        concat left right
+
+@label "Sort merge head"
+@description "Consume one original head-to-head merge decision, leaving empty runs untouched. Internal helper for sort."
+@tags "list" "ordering" "internal"
+sortMergeHead : (xs: List ({ k: b, v: a })) -> (ys: List ({ k: b, v: a })) -> { prefix: List ({ k: b, v: a }), left: List ({ k: b, v: a }), right: List ({ k: b, v: a }) }
+sortMergeHead xs ys =
+  if or (eq (count xs) 0) (eq (count ys) 0)
+    then { prefix = [], left = xs, right = ys }
+    else
+      let x = at xs 0
+      let y = at ys 0
+      if lt y.k x.k
+        then { prefix = [y], left = xs, right = drop 1 ys }
+        else { prefix = [x], left = drop 1 xs, right = ys }
+
+-- Split the decision count; each decision takes the right head only when its
+-- key is strictly smaller (lt), so incomparable keys are a tie and keep
+-- encounter order. Thread each half's remaining runs onward.
+@label "Sort merge steps"
+@description "Consume at most the requested number of head-to-head merge decisions, returning the merged prefix and remaining runs. Binary steps keep authored recursion logarithmic without assuming a total key order. Internal helper for sort."
+@tags "list" "ordering" "internal"
+sortMergeSteps : (steps: Int) -> (xs: List ({ k: b, v: a })) -> (ys: List ({ k: b, v: a })) -> { prefix: List ({ k: b, v: a }), left: List ({ k: b, v: a }), right: List ({ k: b, v: a }) }
+sortMergeSteps steps xs ys =
+  if or (lt steps 1) (or (eq (count xs) 0) (eq (count ys) 0))
+    then { prefix = [], left = xs, right = ys }
+    else if eq steps 1
+      then sortMergeHead xs ys
+      else
+        let half = floor (div steps 2)
+        let first = sortMergeSteps half xs ys
+        let second = sortMergeSteps (sub steps half) first.left first.right
+        { prefix = concat first.prefix second.prefix, left = second.left, right = second.right }
+
+@label "Sort merge pairs"
+@description "Stable merge of two key-decorated runs: the right head goes first only when its key is lt the left head's; ties and incomparable keys keep encounter order (left first) — the stability half of the merge sort. Internal helper for sort."
+@tags "list" "ordering" "internal"
+sortMergePairs : (xs: List p) -> (ys: List p) -> List p
+sortMergePairs xs ys =
+  let steps = add (count xs) (count ys)
+  let merged = sortMergeSteps steps xs ys
+  concat merged.prefix (concat merged.left merged.right)
+
+@label "Sort pairs"
+@description "Stable merge sort over key-decorated pairs: split at half, recurse, merge (sortMergePairs). Internal helper for sort."
+@tags "list" "ordering" "internal"
+sortPairs : (xs: List p) -> List p
+sortPairs xs =
+  let n = count xs
+  if lt n 2
+    then xs
+    else
+      let half = floor (div n 2)
+      let left = sortPairs (take half xs)
+      let right = sortPairs (drop half xs)
+      sortMergePairs left right
+
+@label "Sort undecorate"
+@description "Recover sorted elements from decorated pairs with binary splits, keeping authored recursion logarithmic. Internal helper for sort."
+@tags "list" "ordering" "internal"
+sortUndecorate : (pairs: List ({ k: b, v: a })) -> List a
+sortUndecorate pairs =
+  let n = count pairs
+  if eq n 0
+    then []
+    else if eq n 1
+      then
+        let pair = at pairs 0
+        [pair.v]
+      else
+        let half = floor (div n 2)
+        let left = sortUndecorate (take half pairs)
+        let right = sortUndecorate (drop half pairs)
+        concat left right
+
+@label "Sort"
+@description "Sort list ascending by key function, stably. Keys std lt cannot compare (across types, Bools, records, NaN) are a tie and keep encounter order. ∀a b. (a → b) → List a → List a"
+@tags "list" "ordering"
+sort : (key: (a -> b)) -> (arr: List a) -> List a
+sort key arr =
+  let pairs = sortDecorate key arr
+  let sorted = sortPairs pairs
+  sortUndecorate sorted
+
+@label "Compose"
+@description "Compose two callables: (f ∘ g)(x) = f(g(x)). ∀a b c. (b → c) → (a → b) → (a → c)"
+@tags "function" "combinator" "higher-order"
+compose : (f: (b -> c)) -> (g: (a -> b)) -> r
+compose f g = \x -> f (g x)
+
+@label "Flip"
+@description "Swap argument order of a 2-arg function. ∀a b c. (a → b → c) → (b → a → c)"
+@tags "function" "combinator"
+flip : (fn: ((a, b) -> c)) -> r
+flip fn = \a b -> fn b a

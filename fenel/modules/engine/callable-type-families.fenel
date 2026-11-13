@@ -1,0 +1,208 @@
+module engine where
+
+-- A callable family is a projection of its existing type declaration. Its
+-- binders become data parameters; an ordinary function's forall never does.
+-- Applications retain the same nominal handle. Expansion is a separate,
+-- capture-aware substitution plan over that declaration, not type inference.
+
+@category "engine-internal"
+typeFamilyKindType : Kind -> a
+typeFamilyKindType kind = case kind of
+  KType -> { form = "type" }
+  KArrow { input = input, output = output } -> { form = "arrow", input = typeFamilyKindType input, output = typeFamilyKindType output }
+
+@category "engine-internal"
+typeFamilyKind : List Kind -> Kind
+typeFamilyKind kinds = case head kinds of
+  Nothing -> KType
+  Just kind -> KArrow { input = kind, output = typeFamilyKind (tailOr kinds) }
+
+@category "engine-internal"
+typeFamilyBodyArguments : List String -> Syntax Any
+typeFamilyBodyArguments names = buildList (map (\name -> SVar { name = name }) names)
+
+@label "Callable type family projection"
+@category "engine-internal"
+typeFamilyProjection : String -> List SchemeVar -> Maybe (List String) -> Result String a
+typeFamilyProjection identity variables parameterNames =
+  let names = map (\variable -> variable.sourceName) variables
+  let agree =
+    case parameterNames of
+      Nothing -> true
+      Just params -> eq params names
+  if or (eq identity "") (eq (length variables) 0) then Err "A callable type family needs an existing identity and declared parameters."
+  else if not (agBindersValid variables [] []) then Err "The type family's parameter identities, names or kinds are invalid."
+  else if not agree then Err "Type constructor parameters disagree with the declaration's binders."
+  else
+    let marker = SRecord { fields = [
+          { name = "family", value = mapSet (SVar { name = identity }) "identity" true },
+          { name = "arguments", value = typeFamilyBodyArguments names }
+        ] }
+    Ok {
+      names = names,
+      parameterTypes = map (\variable -> typeFamilyKindType variable.kind) variables,
+      body = SCall { fnId = "std:typeFamilyFromMarker", args = [marker] }
+    }
+
+@category "engine-internal"
+typeFamilyArgumentCheck : List Kind -> List (Maybe Kind) -> Result String Kind
+typeFamilyArgumentCheck expected actual = case head actual of
+  Nothing -> Ok (typeFamilyKind expected)
+  Just observed -> case head expected of
+    Nothing -> Err "The type family received too many arguments."
+    Just wanted -> case observed of
+      Nothing -> Err "The type family argument has no established Type or type-generator kind."
+      Just found ->
+        if inferenceKindEq wanted found then typeFamilyArgumentCheck (tailOr expected) (tailOr actual)
+        else Err "The type family argument has the wrong kind."
+
+@category "engine-internal"
+typeFamilyStructuralKind : TraversalType -> List a -> List String -> Maybe Kind
+typeFamilyStructuralKind type facts scope = case type of
+  TtUnknown -> Nothing
+  TtVar { name = name } -> if elem name scope then Just KType else Nothing
+  TtEl -> Nothing
+  TtApp { head = name, args = args } -> case find (\fact -> eq fact.name name) facts of
+    Nothing -> Nothing
+    Just fact -> typeFamilyApplyKind fact.kind (map (\arg -> typeFamilyStructuralKind arg facts scope) args)
+  TtNamed { name = name } ->
+    if elem name scope then Just KType
+    else case find (\fact -> eq fact.name name) facts of
+      Nothing -> Nothing
+      Just fact -> fact.kind
+  TtMu { var = name, body = body } -> typeFamilyProper (typeFamilyStructuralKind body facts (appendItem name scope))
+  TtOpaque { name = name, pure = pure } -> typeFamilyProper (typeFamilyStructuralKind pure facts (appendItem name scope))
+  TtRecord { fields = fields } -> typeFamilyAllProper (map (\field -> typeFamilyStructuralKind field.type facts scope) fields)
+  TtVariant { cases = cases } -> typeFamilyAllProper (map (\variant -> typeFamilyAllProper (map (\field -> typeFamilyStructuralKind field.type facts scope) variant.fields)) cases)
+  TtArrow { params = params, returns = returns } -> typeFamilyAllProper (appendItem (typeFamilyStructuralKind returns facts scope) (map (\param -> typeFamilyStructuralKind param.type facts scope) params))
+  TtTuple { items = items } -> typeFamilyAllProper (map (\item -> typeFamilyStructuralKind item facts scope) items)
+  TtUnion { branches = branches } -> typeFamilyAllProper (map (\item -> typeFamilyStructuralKind item facts scope) branches)
+  TtIntersect { branches = branches } -> typeFamilyAllProper (map (\item -> typeFamilyStructuralKind item facts scope) branches)
+  TtComplement { inner = inner } -> typeFamilyProper (typeFamilyStructuralKind inner facts scope)
+  TtTagged { value = value, phantom = phantom } -> typeFamilyAllProper [typeFamilyStructuralKind value facts scope, typeFamilyStructuralKind phantom facts scope]
+  TtMap { values = values } -> typeFamilyProper (typeFamilyStructuralKind values facts scope)
+  TtRefined { base = base } -> typeFamilyProper (typeFamilyStructuralKind base facts scope)
+  TtUnit -> Just KType
+  TtVoid -> Just KType
+  TtTypeUniverse -> Just KType
+
+@category "engine-internal"
+typeFamilyProper : Maybe Kind -> Maybe Kind
+typeFamilyProper kind = case kind of
+  Just KType -> Just KType
+  _ -> Nothing
+
+@category "engine-internal"
+typeFamilyAllProper : List (Maybe Kind) -> Maybe Kind
+typeFamilyAllProper kinds = case head kinds of
+  Nothing -> Just KType
+  Just kind -> case typeFamilyProper kind of
+    Nothing -> Nothing
+    Just proper -> typeFamilyAllProper (tailOr kinds)
+
+@category "engine-internal"
+typeFamilyApplyKind : Maybe Kind -> List (Maybe Kind) -> Maybe Kind
+typeFamilyApplyKind kind args = case head args of
+  Nothing -> kind
+  Just argument -> case kind of
+    Just (KArrow { input = input, output = output }) -> case argument of
+      Just actual -> if inferenceKindEq input actual then typeFamilyApplyKind (Just output) (tailOr args) else Nothing
+      Nothing -> Nothing
+    _ -> Nothing
+
+@category "engine-internal"
+typeFamilyCallableKind : TraversalType -> Maybe Kind
+typeFamilyCallableKind type = case type of
+  TtTypeUniverse -> Just KType
+  TtArrow { params = params, returns = returns } -> case typeFamilyCallableKind returns of
+    Nothing -> Nothing
+    Just output -> typeFamilyCallableParams params output
+  _ -> Nothing
+
+@category "engine-internal"
+typeFamilyCallableParams : List a -> Kind -> Maybe Kind
+typeFamilyCallableParams params output = case head params of
+  Nothing -> Just output
+  Just param -> case typeFamilyCallableKind param.type of
+    Nothing -> Nothing
+    Just input -> case typeFamilyCallableParams (tailOr params) output of
+      Nothing -> Nothing
+      Just rest -> Just (KArrow { input = input, output = rest })
+
+@category "engine-internal"
+typeFamilyApplicationHeadPlan : a -> List Anything -> Nat -> Result String b
+typeFamilyApplicationHeadPlan head arguments fuel =
+  if lte fuel 0 then Err "The type generator partial application is too deeply nested."
+  else if eq head.form "reference" then Ok { handle = head.handle, arguments = arguments }
+  else if eq head.form "partial" then typeFamilyApplicationHeadPlan head.target (concat head.collected arguments) (sub fuel 1)
+  else Err "This type generator application has no established callable reference."
+
+@category "engine-internal"
+typeFamilySubstitutionRows : List AuthoringGenericOccurrence -> List SchemeVar -> List a
+typeFamilySubstitutionRows rows variables =
+  let step = \patches row ->
+    case inferenceQuantifiedByName row.name variables of
+      Nothing -> patches
+      Just variable ->
+        if elem row.name row.scope then patches
+        else case agBinderIndex variable.id variables 0 of
+          Nothing -> patches
+          Just index -> appendItem { path = if row.application then concat row.path ["$el", "call", "0"] else row.path, index = index, application = row.application } patches
+  fold step [] rows
+
+@label "Specialize a declared type family"
+@category "engine-internal"
+typeFamilySpecializationPlan : List AuthoringGenericRoot -> List SchemeVar -> List AuthoringGenericApplication -> Maybe (List String) -> Result String (List a)
+typeFamilySpecializationPlan roots variables applications parameterNames = case head variables of
+  Nothing -> Err "A callable family needs declared parameters."
+  Just first ->
+    let checked = authoringGenericEditPlan roots variables applications parameterNames (AuthoringGenericEdit { action = "rename", id = first.id, sourceName = first.sourceName, kind = first.kind })
+    if not checked.ok then Err checked.message
+    else case agScanRoots roots of
+      Err message -> Err message
+      Ok rows -> Ok (typeFamilySubstitutionRows rows variables)
+
+@category "engine-internal"
+typeFamilyNominalRoots : List AuthoringGenericRoot -> List String -> Result String (List AuthoringGenericOccurrence)
+typeFamilyNominalRoots roots variables = case head roots of
+  Nothing -> Ok []
+  Just root -> agJoin (agScanWith true root.type root.path (concat variables root.scope)) (typeFamilyNominalRoots (tailOr roots) variables)
+
+@category "engine-internal"
+typeFamilyNominalOccurrence : AuthoringGenericOccurrence -> List a -> Result String b
+typeFamilyNominalOccurrence row nominals =
+  let nodePath = if row.application then row.path else fromMaybe [] (init row.path)
+  let relative = drop 2 nodePath
+  let explicit = filter (\nominal -> eq nominal.path relative) nominals
+  if gt (length explicit) 1 then Err "The type family has duplicate nominal identity evidence."
+  else
+    let identity = case head explicit of
+          Nothing -> ""
+          Just nominal -> nominal.identity
+    let agrees = case head explicit of
+          Nothing -> true
+          Just nominal -> eq nominal.publicName row.name
+    if not agrees then Err "The type family's nominal identity evidence disagrees with its source name."
+    else Ok { name = row.name, identity = identity, path = if row.application then concat row.path ["$el", "call", "0"] else row.path }
+
+@category "engine-internal"
+typeFamilyNominalOccurrences : List AuthoringGenericOccurrence -> List a -> Result String (List b)
+typeFamilyNominalOccurrences rows nominals = case head rows of
+  Nothing -> Ok []
+  Just row ->
+    if or row.annotation (elem row.name row.scope) then typeFamilyNominalOccurrences (tailOr rows) nominals
+    else case typeFamilyNominalOccurrence row nominals of
+      Err message -> Err message
+      Ok occurrence -> case typeFamilyNominalOccurrences (tailOr rows) nominals of
+        Err message -> Err message
+        Ok rest -> Ok (concat [occurrence] rest)
+
+@label "Type family owner nominal projection"
+@category "engine-internal"
+typeFamilyNominalScanPlan : List AuthoringGenericRoot -> List SchemeVar -> List a -> Result String b
+typeFamilyNominalScanPlan roots variables nominals =
+  case typeFamilyNominalRoots roots (map (\variable -> variable.sourceName) variables) of
+    Err message -> Err message
+    Ok rows -> case typeFamilyNominalOccurrences rows nominals of
+      Err message -> Err message
+      Ok occurrences -> Ok { annotations = agPendingAnnotations roots rows, occurrences = occurrences }

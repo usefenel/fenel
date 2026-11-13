@@ -1,0 +1,1406 @@
+module engine where
+
+-- =========================================================================
+-- propagate.fenel — forward type propagation (abstract interpretation), the
+-- transfer functions `inferExprType` / `invert` compose on.
+-- unified-static-analysis Phase 3b-1 (brief:
+-- `workstreams/unified-static-analysis/briefs/phase-3b-1-propagate-and-setmarker-roundtrip.md`).
+--
+-- THE PORT (the inference hot-path, slice 1). Phase 2's latency verdict came
+-- back Fenel-fast-enough (~1.5× TS, ~50× under the 16 ms per-keystroke
+-- budget), green-lighting the Fenel-first port of the inference engine.
+-- `propagate(op, ...inputs) -> SetExpr` is the LEAF: pure forward abstract
+-- interpretation over the SetExpr lattice (top = $all, bottom = $none, join =
+-- $union, meet = $intersect). This module moves the transfer functions into
+-- Fenel; the TS delegate (`propagate.ts`) keeps ONLY the `setExprToTag`
+-- dual-read normalize on the inputs + the final `normalize` post-step (the
+-- `assignable.fenel` / `refine.fenel` discipline). Net: ~459 LOC of legacy TS
+-- decision logic retired, Fenel up.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- Se* DIRECT (decide-substrate Phase 1 Stage E). The Sm* plain-record marker
+-- vocabulary is RETIRED: this body now reads / builds the canonical
+-- registered `$tag` `Se*` SetExpr directly — a real ADT the body
+-- pattern-matches on (SeAll / SeNone / SeEnum { values } / SeInterval
+-- { interval = { lo, hi } } with lo/hi = Maybe { value, inclusive } (Nothing
+-- = unbounded) / SeRef { handle } / SeUnion { branches } / SeIntersect
+-- { branches } / …). The `seTag` / `loOf` / `hiOf` / `numBound` adapters
+-- (below) carry what the old representation encoded: `seTag` = the old
+-- `.tag`-string dispatch (now a pattern match over the constructors), `loOf`
+-- / `hiOf` = the SeInterval `interval` nesting + the old TS `marshalBound`
+-- guard (`numBound`: an object/expression bound value collapses to
+-- unbounded). The TS delegate (`propagate.ts`) now passes SetExpr through
+-- `setExprToTag` (the dual-read normalize) instead of the deleted
+-- `marshalSet` SetExpr↔SetMarker round-trip, and still runs the ONE final
+-- `normalize` on the result.
+--
+-- ±INFINITY (decision — the Fenel-idiomatic form, brief): the legacy TS reads
+-- bounds via `numLo`/`numHi` returning ±Infinity sentinels for the unbounded
+-- (Nothing) side. Fenel has no infinity literal — so the bound arithmetic
+-- branches on Just / Nothing directly: an unbounded operand bound makes the
+-- result bound unbounded (add/sub), excludes a multiplication corner (the TS
+-- finite-filter: a corner aX·bY is finite ⟺ both factors finite ⟺ both Just,
+-- which also captures 0·∞ = NaN), and orders as −∞ (a lo bound) / +∞ (a hi
+-- bound) in the comparison / min-max extremes.
+--
+-- D-3b-1 (share vs sibling) — SIBLING. `propagate` is the FORWARD dual of
+-- `solve`/`refine`'s BACKWARD `comprehend`; both walk the same SetExpr
+-- lattice, but the solver's interval machinery is intersection-TIGHTENING
+-- (tighterLo / tighterHi / seIntervalFold — inhabit.fenel), not the forward interval
+-- ARITHMETIC (add/sub/mul-corners/div-reciprocal/mod) this needs — no helper
+-- cleanly factors, so the forward transfer is built fresh here. SHARED: the
+-- `Maybe { value, inclusive }` bound shape + the scalar dedupe
+-- (`dedupeValues` / `valueMember`, reused from `enumerate.fenel`). The deep
+-- collapse onto `solve` is the north-star (the directions are duals, not
+-- copies — forcing one body to serve both risks incoherence); deferred.
+--
+-- D-3b-3 (namedArith vs the numeric tower) — `propNamedArith` is the
+-- TYPE-LEVEL closure (what named set does `a op b` inhabit over the
+-- ℕ⊂ℤ⊂ℚ⊂ℝ widening lattice), ORTHOGONAL to the planned numeric-tower arc's
+-- value-level pure-ADT arithmetic ops. No cross-arc coupling here.
+--
+-- NO ENTITY DECLS (the assignable.fenel / refine.fenel audit-green
+-- invariant): this file declares NO entities — the Se* SetExpr ADT it reads /
+-- builds is the already-registered entity, declared elsewhere — so the entity
+-- oracle + law count move +0, the audit stays exit-0 (a new entity would
+-- re-open law obligations and flip CI red). Engine FNS are safe (law +0,
+-- lock +0).
+--
+-- Exact-integer carrier fence: numeric intervals also admit boxed / pure
+-- Nat and Int values. Their endpoints do not certify raw Number operands:
+-- std arithmetic coerces such records to zero, and raw ordering returns
+-- False. Interval arithmetic / negation / min-max therefore widen to SeAll;
+-- numeric interval ordering keeps only proven-False separation. A String
+-- endpoint excludes the integer carriers, preserving the string-order face.
+-- =========================================================================
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- propAnd — eager boolean conjunction (the assignable.fenel `assignBoth`
+-- precedent: avoid the lazy `and`-operator structural form inside folds).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: and"
+@description "Eager boolean conjunction used throughout the propagate transfer functions (avoids the lazy `and`-operator structural form — the assignable.fenel assignBoth precedent). Returns True only when both operands are True. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propAnd : (x: Bool) -> (y: Bool) -> Bool
+propAnd x y = if x then y else False
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Se* adapters (decide-substrate Phase 1 Stage E — the Sm* marker vocabulary
+-- is RETIRED; the body reads / builds the canonical registered `$tag` `Se*`
+-- SetExpr directly). `seTag` is the old `.tag`-string dispatch, now reading a
+-- constructor's tag by pattern match (a `.fenel` body cannot field-access
+-- `.$tag`). `loOf` / `hiOf` return a full SeInterval's LO / HI bound cleaned
+-- through `numBound` — encapsulating BOTH the SeInterval `interval` nesting AND
+-- the old TS `marshalBound` guard (an object/expression bound value collapses
+-- to unbounded, the legacy ±Infinity read on the unsupported fragment).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: seTag"
+@description "The Se* discriminator tag as a String — the port of the old `.tag`-string dispatch to the registered `$tag` Se* ADT (a `.fenel` body reads a constructor tag by pattern match, not `.$tag` access). Internal helper."
+@tags "engine" "internal" "propagate" "decide-substrate" "phase-1"
+@category "engine-internal"
+seTag : (s: SetExpr) -> String
+seTag s =
+  case s of
+    SeAll -> "SeAll"
+    SeNone -> "SeNone"
+    SeEnum {} -> "SeEnum"
+    SeInterval {} -> "SeInterval"
+    SeRef {} -> "SeRef"
+    SePattern {} -> "SePattern"
+    SeWhere {} -> "SeWhere"
+    SeCtor {} -> "SeCtor"
+    SeMu {} -> "SeMu"
+    SeArrow {} -> "SeArrow"
+    -- signature-substrate Phase 4 slice 3a. Every `eq (seTag s) "…"` consumer
+    -- fences on its `else`, so naming the rigid here does not widen any
+    -- fragment; it makes the rigid VISIBLE to the fences that must reject it
+    -- (setAlgebraSearchable's allow-list default is the one that needed it).
+    SeRigid {} -> "SeRigid"
+    SeUnion {} -> "SeUnion"
+    SeIntersect {} -> "SeIntersect"
+    SeDiff {} -> "SeDiff"
+    SeComplement {} -> "SeComplement"
+    _ -> "SeOther"
+
+@label "propagate: numBound"
+@description "The marshalBound guard in Fenel: a numeric or string bound value carries; an object/expression bound value collapses to unbounded (Nothing) — the legacy numLo/numHi ±Infinity read on the unsupported fragment. Internal helper."
+@tags "engine" "internal" "propagate" "decide-substrate" "phase-1"
+@category "engine-internal"
+numBound : (mb: a) -> a
+numBound mb =
+  case mb of
+    Nothing -> Nothing
+    Just b ->
+      if isNumber b.value then Just { value = b.value, inclusive = b.inclusive }
+      else if isString b.value then Just { value = b.value, inclusive = b.inclusive }
+      else Nothing
+
+@label "propagate: loOf"
+@description "The LO bound of a full SeInterval marker, cleaned through numBound (encapsulates the SeInterval `interval` nesting + the marshalBound guard). Nothing for a non-interval (defensive). Internal helper."
+@tags "engine" "internal" "propagate" "decide-substrate" "phase-1"
+@category "engine-internal"
+loOf : (s: SetExpr) -> a
+loOf s =
+  case s of
+    SeInterval { interval = iv } -> numBound iv.lo
+    _ -> Nothing
+
+@label "propagate: hiOf"
+@description "The HI bound of a full SeInterval marker, cleaned through numBound. Nothing for a non-interval (defensive). Internal helper."
+@tags "engine" "internal" "propagate" "decide-substrate" "phase-1"
+@category "engine-internal"
+hiOf : (s: SetExpr) -> a
+hiOf s =
+  case s of
+    SeInterval { interval = iv } -> numBound iv.hi
+    _ -> Nothing
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- propagate — the public entry. Dispatches by arity + op-class over the input
+-- SetExpr list: 1 input ⇒ unary; min/max ⇒ variadic interval reduce; ≥2 ⇒
+-- arith / compare / cat. The TS delegate passes the SetExprs through
+-- `setExprToTag` (dual-read normalize) in + normalizes the result out.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Propagate"
+@description "Forward type propagation (abstract interpretation): compute an output SetExpr containing the operator's results from its input SetExprs, over the set lattice. Works over the canonical registered Se* SetExpr directly; the TS delegate canonicalizes inputs and normalizes the result. Unary negate/not distribute over unions; min/max and arithmetic interval transfers widen because interval endpoints do not certify scalar carriers. Arithmetic retains enum-pointwise and named-tower transfers; comparison retains enum-pointwise results and interval false proofs, with true interval proofs restricted to String carriers. cat uses a string-enum product or widens to String."
+@tags "engine" "propagate" "inference" "unified-static-analysis" "phase-3b-1"
+propagate : (op: String) -> (inputs: a) -> b
+propagate op inputs =
+  if eq (length inputs) 1 then propUnaryHead op inputs
+  else if propIsMinMax op then propMinMax op inputs
+  else if gte (length inputs) 2 then propBinaryHead op inputs
+  else SeAll
+
+@label "propagate: unary head"
+@description "Apply the unary transfer to the single input marker (head of the list). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propUnaryHead : (op: String) -> (inputs: a) -> b
+propUnaryHead op inputs =
+  case head inputs of
+    Nothing -> SeAll
+    Just a -> propUnary op a
+
+@label "propagate: binary head"
+@description "Apply the binary transfer to the first two input markers: arithmetic (+ - * / %), comparison (> >= < <= == != === !==), or cat (variadic, folds the whole list); any other op ⇒ SeAll. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propBinaryHead : (op: String) -> (inputs: a) -> b
+propBinaryHead op inputs =
+  case head inputs of
+    Nothing -> SeAll
+    Just a ->
+      case tail inputs of
+        Nothing -> SeAll
+        Just rest ->
+          case head rest of
+            Nothing -> SeAll
+            Just b ->
+              if propIsArith op then propBinaryArith op a b
+              else if propIsCmp op then propBinaryCompare op a b
+              else if eq op "cat" then propCatFold inputs
+              else SeAll
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- op-class predicates.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: is arith op"
+@description "True for the binary arithmetic operators + - * / %. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIsArith : (op: String) -> Bool
+propIsArith op =
+  if eq op "+" then True
+  else if eq op "-" then True
+  else if eq op "*" then True
+  else if eq op "/" then True
+  else if eq op "%" then True
+  else False
+
+@label "propagate: is compare op"
+@description "True for the binary comparison operators > >= < <= == != === !==. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIsCmp : (op: String) -> Bool
+propIsCmp op =
+  if eq op ">" then True
+  else if eq op ">=" then True
+  else if eq op "<" then True
+  else if eq op "<=" then True
+  else if eq op "==" then True
+  else if eq op "!=" then True
+  else if eq op "===" then True
+  else if eq op "!==" then True
+  else False
+
+@label "propagate: is min/max op"
+@description "True for the variadic interval-reduce operators min / max. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIsMinMax : (op: String) -> Bool
+propIsMinMax op = if eq op "min" then True else eq op "max"
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- bound + interval constructors.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: bound is Just"
+@description "True when an interval bound marker is a present (Just) bound; Nothing = unbounded. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+boundIsJust : (mb: a) -> Bool
+boundIsJust mb =
+  case mb of
+    Just x -> True
+    Nothing -> False
+
+@label "propagate: make interval"
+@description "Build an interval marker from two Maybe bounds; both unbounded (Nothing) ⇒ SeAll (the lattice top — mirrors the legacy mkInterval's both-Nothing collapse). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+mkSmInterval : (lo: a) -> (hi: a) -> b
+mkSmInterval lo hi =
+  if boundIsJust lo then SeInterval { interval = { lo = lo, hi = hi } }
+  else if boundIsJust hi then SeInterval { interval = { lo = lo, hi = hi } }
+  else SeAll
+
+@label "propagate: point interval"
+@description "The point interval [v, v] (inclusive both ends) — the enum-value-as-interval lift used by the enum×interval distribution. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propPointIv : (v: a) -> b
+propPointIv v = SeInterval { interval = { lo = Just { value = v, inclusive = True }, hi = Just { value = v, inclusive = True } } }
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- interval arithmetic — the forward transfer over Maybe bounds.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: interval op"
+@description "Conservatively widen interval arithmetic to SeAll. Numeric endpoints also admit exact Nat/Int records, whose raw arithmetic coercion is not interval arithmetic; no scalar-only input provenance is carried here. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIvOp : (op: String) -> (a: a) -> (b: a) -> b
+propIvOp op a b = SeAll
+
+@label "propagate: add bounds"
+@description "Add two bounds (Just{value,inclusive}): present ⟺ both present; value = sum, inclusive = both inclusive; either unbounded ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propAddBounds : (ma: a) -> (mb: a) -> b
+propAddBounds ma mb =
+  case ma of
+    Nothing -> Nothing
+    Just a ->
+      case mb of
+        Nothing -> Nothing
+        Just b -> Just { value = add a.value b.value, inclusive = propAnd a.inclusive b.inclusive }
+
+@label "propagate: sub bounds"
+@description "Subtract two bounds: present ⟺ both present; value = difference, inclusive = both inclusive; either unbounded ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propSubBounds : (ma: a) -> (mb: a) -> b
+propSubBounds ma mb =
+  case ma of
+    Nothing -> Nothing
+    Just a ->
+      case mb of
+        Nothing -> Nothing
+        Just b -> Just { value = sub a.value b.value, inclusive = propAnd a.inclusive b.inclusive }
+
+@label "propagate: add intervals"
+@description "Interval addition [aL,aH]+[bL,bH] = [aL+bL, aH+bH] (an unbounded operand bound makes the result bound unbounded). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propAddIv : (a: a) -> (b: a) -> b
+propAddIv a b = mkSmInterval (propAddBounds (loOf a) (loOf b)) (propAddBounds (hiOf a) (hiOf b))
+
+@label "propagate: sub intervals"
+@description "Interval subtraction [aL,aH]-[bL,bH] = [aL-bH, aH-bL] (cross bounds). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propSubIv : (a: a) -> (b: a) -> b
+propSubIv a b = mkSmInterval (propSubBounds (loOf a) (hiOf b)) (propSubBounds (hiOf a) (loOf b))
+
+@label "propagate: mul intervals"
+@description "Interval multiplication via the four corner products [aL,aH]·[bL,bH], keeping only the FINITE corners (a corner is finite ⟺ both factors are present bounds — which also drops the 0·∞ = NaN case), then the min / max of those corners (exclusive-on-tie unless an inclusive corner matches). No finite corner ⇒ SeAll. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propMulIv : (a: a) -> (b: a) -> b
+propMulIv a b = propMulIvBounds (loOf a) (hiOf a) (loOf b) (hiOf b)
+
+@label "propagate: mul interval bounds"
+@description "The interval-multiplication kernel over explicit lo/hi bounds (reused by div via the reciprocal). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propMulIvBounds : (aLo: a) -> (aHi: a) -> (bLo: a) -> (bHi: a) -> b
+propMulIvBounds aLo aHi bLo bHi =
+  let corners = propMulCorners aLo aHi bLo bHi
+  if eq (length corners) 0 then SeAll
+  else
+    let mm = propCornerMinMax corners
+    mkSmInterval (Just { value = mm.minV, inclusive = mm.minI }) (Just { value = mm.maxV, inclusive = mm.maxI })
+
+@label "propagate: mul corners"
+@description "The four corner products of two intervals, in the order (aL·bL, aL·bH, aH·bL, aH·bH), keeping only the finite ones (both factor bounds present). Each kept corner carries { value, inclusive }. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propMulCorners : (aLo: a) -> (aHi: a) -> (bLo: a) -> (bHi: a) -> b
+propMulCorners aLo aHi bLo bHi =
+  let l1 = appendItem (propCorner aLo bLo) []
+  let l2 = appendItem (propCorner aLo bHi) l1
+  let l3 = appendItem (propCorner aHi bLo) l2
+  let l4 = appendItem (propCorner aHi bHi) l3
+  propCollectJusts l4 []
+
+@label "propagate: corner"
+@description "One corner product of two bounds: Just{ value = product, inclusive = both inclusive } when both present, else Nothing (the non-finite corner — excluded by the finite-filter). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCorner : (ma: a) -> (mb: a) -> b
+propCorner ma mb =
+  case ma of
+    Nothing -> Nothing
+    Just a ->
+      case mb of
+        Nothing -> Nothing
+        Just b -> Just { value = mul a.value b.value, inclusive = propAnd a.inclusive b.inclusive }
+
+@label "propagate: collect Justs"
+@description "Collect the Just payloads of a Maybe list, preserving order (drops the Nothing entries — the non-finite corners). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCollectJusts : (xs: a) -> (acc: a) -> a
+propCollectJusts xs acc =
+  case head xs of
+    Nothing -> acc
+    Just m ->
+      let acc2 = propAppendIfJust m acc
+      case tail xs of
+        Nothing -> acc2
+        Just rest -> propCollectJusts rest acc2
+
+@label "propagate: append if Just"
+@description "Append a Maybe's payload to the accumulator when Just; leave it unchanged when Nothing. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propAppendIfJust : (m: a) -> (acc: a) -> a
+propAppendIfJust m acc =
+  case m of
+    Just v -> appendItem v acc
+    Nothing -> acc
+
+@label "propagate: corner min/max"
+@description "Fold the finite corner list to { minV, minI, maxV, maxI } — the value range with exclusive-on-tie inclusivity (an inclusive corner at the extreme makes the bound inclusive). Seeds from the first corner. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCornerMinMax : (corners: a) -> b
+propCornerMinMax corners =
+  case head corners of
+    Nothing -> { minV = 0, minI = False, maxV = 0, maxI = False }
+    Just c0 ->
+      let acc0 = { minV = c0.value, minI = c0.inclusive, maxV = c0.value, maxI = c0.inclusive }
+      case tail corners of
+        Nothing -> acc0
+        Just rest -> propCornerFold rest acc0
+
+@label "propagate: corner fold"
+@description "Accumulator-threaded fold of the remaining corners into the running { minV, minI, maxV, maxI }. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCornerFold : (corners: a) -> (acc: a) -> a
+propCornerFold corners acc =
+  case head corners of
+    Nothing -> acc
+    Just c ->
+      let acc2 = propCornerStep acc c
+      case tail corners of
+        Nothing -> acc2
+        Just rest -> propCornerFold rest acc2
+
+@label "propagate: corner step"
+@description "Fold one corner into the running min/max accumulator. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCornerStep : (acc: a) -> (c: a) -> a
+propCornerStep acc c =
+  let mn = propUpdMin acc c
+  let mx = propUpdMax acc c
+  { minV = mn.minV, minI = mn.minI, maxV = mx.maxV, maxI = mx.maxI }
+
+@label "propagate: update min"
+@description "Update the running min by one corner: strictly-smaller value replaces it (taking that corner's inclusivity); an equal-valued inclusive corner promotes the bound to inclusive. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propUpdMin : (acc: a) -> (c: a) -> b
+propUpdMin acc c =
+  if lt c.value acc.minV then { minV = c.value, minI = c.inclusive }
+  else if propAnd (eq c.value acc.minV) c.inclusive then { minV = acc.minV, minI = True }
+  else { minV = acc.minV, minI = acc.minI }
+
+@label "propagate: update max"
+@description "Update the running max by one corner: strictly-larger value replaces it (taking that corner's inclusivity); an equal-valued inclusive corner promotes the bound to inclusive. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propUpdMax : (acc: a) -> (c: a) -> b
+propUpdMax acc c =
+  if gt c.value acc.maxV then { maxV = c.value, maxI = c.inclusive }
+  else if propAnd (eq c.value acc.maxV) c.inclusive then { maxV = acc.maxV, maxI = True }
+  else { maxV = acc.maxV, maxI = acc.maxI }
+
+@label "propagate: div intervals"
+@description "Interval division a / b: a divisor straddling zero (or with an inclusive-zero endpoint) ⇒ SeAll (unbounded); otherwise the reciprocal of b (flip + swap bounds, 1/±∞ = 0) multiplied by a. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propDivIv : (a: a) -> (b: a) -> b
+propDivIv a b =
+  if propDivUnbounded (loOf b) (hiOf b) then SeAll
+  else propMulIvBounds (loOf a) (hiOf a) (propRecipFromHi (hiOf b)) (propRecipFromLo (loOf b))
+
+@label "propagate: div unbounded?"
+@description "True when the divisor interval forces an unbounded quotient: it straddles zero (lo < 0 and hi > 0, with an unbounded side counting as ∓∞), or has an inclusive-zero endpoint. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propDivUnbounded : (bLo: a) -> (bHi: a) -> Bool
+propDivUnbounded bLo bHi =
+  if propAnd (propLoNeg bLo) (propHiPos bHi) then True
+  else if propZeroIncl bLo then True
+  else if propZeroIncl bHi then True
+  else False
+
+@label "propagate: lo < 0?"
+@description "True when a lo bound is below zero (unbounded ⇒ −∞ ⇒ True). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propLoNeg : (bLo: a) -> Bool
+propLoNeg bLo =
+  case bLo of
+    Nothing -> True
+    Just x -> lt x.value 0
+
+@label "propagate: hi > 0?"
+@description "True when a hi bound is above zero (unbounded ⇒ +∞ ⇒ True). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propHiPos : (bHi: a) -> Bool
+propHiPos bHi =
+  case bHi of
+    Nothing -> True
+    Just x -> gt x.value 0
+
+@label "propagate: inclusive zero?"
+@description "True when a bound is exactly zero AND inclusive (the division-by-zero guard). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propZeroIncl : (mb: a) -> Bool
+propZeroIncl mb =
+  case mb of
+    Nothing -> False
+    Just x -> propAnd (eq x.value 0) x.inclusive
+
+@label "propagate: reciprocal lo (from hi)"
+@description "The reciprocal interval's LO bound, 1/bHi: an unbounded bHi (+∞) ⇒ 0 exclusive; a zero-valued bHi ⇒ ∞ ⇒ unbounded (Nothing) — matching the legacy 1/0 = ∞ corner-filter (Fenel `div` returns 0, not ∞, on a zero divisor, so the zero is caught explicitly); otherwise 1/value. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propRecipFromHi : (bHi: a) -> b
+propRecipFromHi bHi =
+  case bHi of
+    Nothing -> Just { value = 0, inclusive = False }
+    Just x -> propReciprocal x.value x.inclusive
+
+@label "propagate: reciprocal hi (from lo)"
+@description "The reciprocal interval's HI bound, 1/bLo: an unbounded bLo (−∞) ⇒ 0 exclusive; a zero-valued bLo ⇒ ∞ ⇒ unbounded (Nothing); otherwise 1/value. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propRecipFromLo : (bLo: a) -> b
+propRecipFromLo bLo =
+  case bLo of
+    Nothing -> Just { value = 0, inclusive = False }
+    Just x -> propReciprocal x.value x.inclusive
+
+@label "propagate: reciprocal bound"
+@description "1/value as a bound: a zero value ⇒ ∞ ⇒ Nothing (unbounded — the legacy 1/0 = ∞ corner-filter, since Fenel `div` returns 0 on a zero divisor); otherwise Just{1/value, inclusive} (1/finite-nonzero is always finite). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propReciprocal : (v: a) -> (inc: Bool) -> b
+propReciprocal v inc =
+  if eq v 0 then Nothing else Just { value = div 1 v, inclusive = inc }
+
+@label "propagate: mod intervals"
+@description "Interval modulo a % b: an unbounded divisor ⇒ SeAll; otherwise the magnitude maxB = max(|bLo|,|bHi|) bounds the result — [0, maxB) when the dividend lo is ≥ 0, else (-maxB, maxB). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propModIv : (a: a) -> (b: a) -> b
+propModIv a b =
+  if propModUnbounded (loOf b) (hiOf b) then SeAll
+  else
+    let mb = propModMaxB (loOf b) (hiOf b)
+    if propAlNonNeg (loOf a)
+    then mkSmInterval (Just { value = 0, inclusive = True }) (Just { value = mb, inclusive = False })
+    else mkSmInterval (Just { value = negate mb, inclusive = False }) (Just { value = mb, inclusive = False })
+
+@label "propagate: mod unbounded?"
+@description "True when either divisor bound is unbounded (⇒ |bound| = ∞ ⇒ maxB non-finite ⇒ SeAll). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propModUnbounded : (bLo: a) -> (bHi: a) -> Bool
+propModUnbounded bLo bHi =
+  if boundIsJust bLo then (if boundIsJust bHi then False else True) else True
+
+@label "propagate: mod maxB"
+@description "max(|bLo|, |bHi|) for a bounded divisor interval (both bounds present here). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propModMaxB : (bLo: a) -> (bHi: a) -> Number
+propModMaxB bLo bHi = max (abs (propJustVal bLo)) (abs (propJustVal bHi))
+
+@label "propagate: just value"
+@description "Extract a present bound's value (Nothing ⇒ 0 — only called on present bounds). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propJustVal : (mb: a) -> Number
+propJustVal mb =
+  case mb of
+    Nothing -> 0
+    Just x -> x.value
+
+@label "propagate: dividend lo ≥ 0?"
+@description "True when the dividend interval's lo bound is ≥ 0 (unbounded ⇒ −∞ ⇒ False) — selects the [0,maxB) vs (-maxB,maxB) mod range. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propAlNonNeg : (aLo: a) -> Bool
+propAlNonNeg aLo =
+  case aLo of
+    Nothing -> False
+    Just x -> gte x.value 0
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- enum (pointwise) arithmetic.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: enum arith"
+@description "Pointwise arithmetic over two enum value lists: for every numeric (va, vb) compute va OP vb, dropping ÷0 / %0 and non-finite results, then dedupe (first-seen). Empty ⇒ SeNone. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumArith : (op: String) -> (avals: a) -> (bvals: a) -> b
+propEnumArith op avals bvals =
+  let raw = propEnumArithOuter op avals bvals []
+  if eq (length raw) 0 then SeNone
+  else SeEnum { values = dedupeValues raw [] }
+
+@label "propagate: enum arith outer"
+@description "Outer loop of the enum×enum pointwise arithmetic — over the left values. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumArithOuter : (op: String) -> (avals: a) -> (bvals: a) -> (acc: a) -> a
+propEnumArithOuter op avals bvals acc =
+  case head avals of
+    Nothing -> acc
+    Just va ->
+      let acc2 = if isNumber va then propEnumArithInner op va bvals acc else acc
+      case tail avals of
+        Nothing -> acc2
+        Just rest -> propEnumArithOuter op rest bvals acc2
+
+@label "propagate: enum arith inner"
+@description "Inner loop of the enum×enum pointwise arithmetic — over the right values for a fixed left value. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumArithInner : (op: String) -> (va: a) -> (bvals: a) -> (acc: a) -> a
+propEnumArithInner op va bvals acc =
+  case head bvals of
+    Nothing -> acc
+    Just vb ->
+      let acc2 = if isNumber vb then propEnumArithOne op va vb acc else acc
+      case tail bvals of
+        Nothing -> acc2
+        Just rest -> propEnumArithInner op va rest acc2
+
+@label "propagate: enum arith one"
+@description "Compute one va OP vb, appending the result when defined (not ÷0 / %0) and finite. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumArithOne : (op: String) -> (va: a) -> (vb: a) -> (acc: a) -> a
+propEnumArithOne op va vb acc =
+  case propArithVal op va vb of
+    Nothing -> acc
+    Just r -> if numberIsFinite r then appendItem r acc else acc
+
+@label "propagate: scalar arith"
+@description "Scalar arithmetic va OP vb ⇒ Just result; ÷0 and %0 ⇒ Nothing (the undefined cases dropped from the enum). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propArithVal : (op: String) -> (va: a) -> (vb: a) -> b
+propArithVal op va vb =
+  if eq op "+" then Just (add va vb)
+  else if eq op "-" then Just (sub va vb)
+  else if eq op "*" then Just (mul va vb)
+  else if eq op "/" then (if eq vb 0 then Nothing else Just (div va vb))
+  else if eq op "%" then (if eq vb 0 then Nothing else Just (mod va vb))
+  else Nothing
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- enum × interval distribution.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: enum × interval"
+@description "Distribute an enum over an interval: each numeric enum value becomes a point interval, transferred through the op, unioned. Empty ⇒ SeNone. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumIvDist : (op: String) -> (avals: a) -> (bIv: a) -> b
+propEnumIvDist op avals bIv =
+  let parts = propEnumIvParts op avals bIv []
+  if eq (length parts) 0 then SeNone else SeUnion { branches = parts }
+
+@label "propagate: enum × interval parts"
+@description "Build the union branches of the enum×interval distribution (op applied to each numeric enum value as a point interval, on the left). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumIvParts : (op: String) -> (avals: a) -> (bIv: a) -> (acc: a) -> a
+propEnumIvParts op avals bIv acc =
+  case head avals of
+    Nothing -> acc
+    Just va ->
+      let acc2 = if isNumber va then appendItem (propIvOp op (propPointIv va) bIv) acc else acc
+      case tail avals of
+        Nothing -> acc2
+        Just rest -> propEnumIvParts op rest bIv acc2
+
+@label "propagate: interval × enum"
+@description "Distribute an interval over an enum: each numeric enum value becomes a point interval on the RIGHT, transferred through the op, unioned. Empty ⇒ SeNone. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIvEnumDist : (op: String) -> (aIv: a) -> (bvals: a) -> b
+propIvEnumDist op aIv bvals =
+  let parts = propIvEnumParts op aIv bvals []
+  if eq (length parts) 0 then SeNone else SeUnion { branches = parts }
+
+@label "propagate: interval × enum parts"
+@description "Build the union branches of the interval×enum distribution (op applied to the interval and each numeric enum value as a point interval, on the right). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIvEnumParts : (op: String) -> (aIv: a) -> (bvals: a) -> (acc: a) -> a
+propIvEnumParts op aIv bvals acc =
+  case head bvals of
+    Nothing -> acc
+    Just vb ->
+      let acc2 = if isNumber vb then appendItem (propIvOp op aIv (propPointIv vb)) acc else acc
+      case tail bvals of
+        Nothing -> acc2
+        Just rest -> propIvEnumParts op aIv rest acc2
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- named-set (number-tower) closure — `propNamedArith` (D-3b-3).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: named arith"
+@description "The type-level closure: what named set does `a op b` inhabit over the ℕ⊂ℤ⊂ℚ⊂ℝ widening lattice? + * % ⇒ the wider of the two; - ⇒ the wider, widened ℕ→ℤ (subtraction leaves ℕ); / ⇒ the wider, widened ℕ/ℤ→ℚ (division leaves the integers). A non-tower name ⇒ SeAll. Orthogonal to the numeric-tower arc's value-level ops (D-3b-3). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNamedArith : (op: String) -> (aName: String) -> (bName: String) -> b
+propNamedArith op aName bName =
+  if propAnd (propInCanonical aName) (propInCanonical bName)
+  then propNamedArithOp op (propWiderName aName bName)
+  else SeAll
+
+@label "propagate: named arith op"
+@description "Map the op + the widened tower symbol to the result named-set ref: + * % ⇒ w; - ⇒ ℤ if w is ℕ else w; / ⇒ ℚ if w is ℕ/ℤ else w. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNamedArithOp : (op: String) -> (w: String) -> b
+propNamedArithOp op w =
+  if eq op "+" then propRefMarker w
+  else if eq op "*" then propRefMarker w
+  else if eq op "%" then propRefMarker w
+  else if eq op "-" then propRefMarker (if eq w "ℕ" then "ℤ" else w)
+  else if eq op "/" then propRefMarker (if eq w "ℕ" then "ℚ" else if eq w "ℤ" then "ℚ" else w)
+  else SeAll
+
+@label "propagate: ref marker"
+@description "A named-set reference marker (an `SeRef`). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propRefMarker : (n: String) -> b
+propRefMarker n = SeRef { handle = n }
+
+@label "propagate: in number tower?"
+@description "True when a name is one of the number-tower sets (ℕ/Nat, ℤ/Int, ℚ/Rational, ℝ/Real). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propInCanonical : (name: String) -> Bool
+propInCanonical name =
+  if eq name "ℕ" then True
+  else if eq name "Nat" then True
+  else if eq name "ℤ" then True
+  else if eq name "Int" then True
+  else if eq name "ℚ" then True
+  else if eq name "Rational" then True
+  else if eq name "ℝ" then True
+  else if eq name "Real" then True
+  else False
+
+@label "propagate: canonical tower symbol"
+@description "Canonicalise a tower name to its symbol (Nat→ℕ, Int→ℤ, Rational→ℚ, Real→ℝ; the symbols map to themselves). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCanonicalOf : (name: String) -> String
+propCanonicalOf name =
+  if eq name "Nat" then "ℕ"
+  else if eq name "Int" then "ℤ"
+  else if eq name "Rational" then "ℚ"
+  else if eq name "Real" then "ℝ"
+  else name
+
+@label "propagate: tower index"
+@description "The ℕ⊂ℤ⊂ℚ⊂ℝ ordinal of a tower symbol (ℕ=0, ℤ=1, ℚ=2, ℝ=3). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propOrderIndex : (sym: String) -> Number
+propOrderIndex sym =
+  if eq sym "ℕ" then 0
+  else if eq sym "ℤ" then 1
+  else if eq sym "ℚ" then 2
+  else 3
+
+@label "propagate: tower symbol of index"
+@description "The tower symbol for an ordinal (0→ℕ, 1→ℤ, 2→ℚ, else ℝ). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propOrderName : (i: Number) -> String
+propOrderName i =
+  if eq i 0 then "ℕ"
+  else if eq i 1 then "ℤ"
+  else if eq i 2 then "ℚ"
+  else "ℝ"
+
+@label "propagate: wider name"
+@description "The wider of two tower names (the larger ℕ⊂ℤ⊂ℚ⊂ℝ ordinal), as a symbol. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propWiderName : (a: String) -> (b: String) -> String
+propWiderName a b = propOrderName (max (propOrderIndex (propCanonicalOf a)) (propOrderIndex (propCanonicalOf b)))
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- binary arithmetic dispatch (recursive over unions / intersections).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: binary arith"
+@description "Binary arithmetic transfer over two Se* SetExprs: $all/$none absorb; distribute over unions and intersections; raw interval arithmetic widens to SeAll because endpoints do not certify scalar carriers; enum×enum ⇒ pointwise; enum×interval ⇒ distribute the fenced interval transfer; named×named ⇒ the tower closure; named×(interval|enum) ⇒ widen to the named set; otherwise SeAll. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propBinaryArith : (op: String) -> (a: a) -> (b: a) -> b
+propBinaryArith op a b =
+  if eq (seTag a) "SeAll" then SeAll
+  else if eq (seTag b) "SeAll" then SeAll
+  else if eq (seTag a) "SeNone" then SeNone
+  else if eq (seTag b) "SeNone" then SeNone
+  else if eq (seTag a) "SeUnion" then SeUnion { branches = map (\s -> propBinaryArith op s b) a.branches }
+  else if eq (seTag b) "SeUnion" then SeUnion { branches = map (\s -> propBinaryArith op a s) b.branches }
+  else if eq (seTag a) "SeIntersect" then SeIntersect { branches = map (\s -> propBinaryArith op s b) a.branches }
+  else if eq (seTag b) "SeIntersect" then SeIntersect { branches = map (\s -> propBinaryArith op a s) b.branches }
+  else if propAnd (eq (seTag a) "SeInterval") (eq (seTag b) "SeInterval") then propIvOp op a b
+  else if propAnd (eq (seTag a) "SeEnum") (eq (seTag b) "SeEnum") then propEnumArith op a.values b.values
+  else if propAnd (eq (seTag a) "SeEnum") (eq (seTag b) "SeInterval") then propEnumIvDist op a.values b
+  else if propAnd (eq (seTag a) "SeInterval") (eq (seTag b) "SeEnum") then propIvEnumDist op a b.values
+  else if propAnd (eq (seTag a) "SeRef") (eq (seTag b) "SeRef") then propNamedArith op a.handle b.handle
+  else if propAnd (eq (seTag a) "SeRef") (propIsIvOrEnum b) then propNamedSelf op a.handle
+  else if propAnd (eq (seTag b) "SeRef") (propIsIvOrEnum a) then propNamedSelf op b.handle
+  else SeAll
+
+@label "propagate: is interval/enum?"
+@description "True when a marker is an interval or an enum (the named×other widening guard). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIsIvOrEnum : (m: a) -> Bool
+propIsIvOrEnum m = if eq (seTag m) "SeInterval" then True else eq (seTag m) "SeEnum"
+
+@label "propagate: named self-widen"
+@description "Conservatively widen a named-tower set against a non-named operand: the tower closure of the name with itself (a non-tower name ⇒ SeAll). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNamedSelf : (op: String) -> (name: String) -> b
+propNamedSelf op name =
+  if propInCanonical name then propNamedArith op name name else SeAll
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- binary comparison dispatch → boolean set (proven true / false / either).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@description "An actual String endpoint restricts every interval inhabitant to the raw string carrier. Numeric endpoints do not restrict inhabitants to raw numbers, since exact Nat/Int records also inhabit numeric intervals. Internal transfer fence."
+@tags "engine" "internal" "propagate" "interval"
+@category "engine-internal"
+propIvStringOnly : (s: SetExpr) -> Bool
+propIvStringOnly s = case s of
+  SeInterval { interval = iv } ->
+    let loString = case iv.lo of
+                     Nothing -> False
+                     Just bound -> isString bound.value
+    let hiString = case iv.hi of
+                     Nothing -> False
+                     Just bound -> isString bound.value
+    or loString hiString
+  _ -> False
+
+@label "propagate: binary compare"
+@description "Binary comparison transfer over two Se* SetExprs: $none absorbs; distribute over unions; interval×interval ⇒ bound-ordering decision (proven [true] / [false] / [true,false]); enum×enum ⇒ pointwise (a single distinct result narrows, else [true,false]); otherwise [true,false]. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propBinaryCompare : (op: String) -> (a: a) -> (b: a) -> b
+propBinaryCompare op a b =
+  if eq (seTag a) "SeNone" then SeNone
+  else if eq (seTag b) "SeNone" then SeNone
+  else if eq (seTag a) "SeUnion" then SeUnion { branches = map (\s -> propBinaryCompare op s b) a.branches }
+  else if eq (seTag b) "SeUnion" then SeUnion { branches = map (\s -> propBinaryCompare op a s) b.branches }
+  else if propAnd (eq (seTag a) "SeInterval") (eq (seTag b) "SeInterval") then propCompareIv op a b
+  else if propAnd (eq (seTag a) "SeEnum") (eq (seTag b) "SeEnum") then propEnumCompare op a.values b.values
+  else propEnumTF op
+
+@label "propagate: bool both"
+@description "The undecided boolean set { true, false } — the comparison join when neither truth value is proven. Takes an ignored argument (a nullary body resolves to a function ref rather than its value — the bare-reference idiom; pass any in-scope value). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumTF : (u: a) -> b
+propEnumTF u = SeEnum { values = appendItem false (appendItem true []) }
+
+@label "propagate: bool singleton"
+@description "A proven boolean set { v }. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnum1 : (v: Bool) -> a
+propEnum1 v = SeEnum { values = appendItem v [] }
+
+@label "propagate: compare intervals"
+@description "Decide an interval comparison from the bound ordering: proven [true] / [false] when the intervals are bound-separated, else the undecided [true,false]. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCompareIv : (op: String) -> (a: a) -> (b: a) -> b
+propCompareIv op a b =
+  if eq op ">" then propCmpGt a b
+  else if eq op ">=" then propCmpGe a b
+  else if eq op "<" then propCmpLt a b
+  else if eq op "<=" then propCmpLe a b
+  else propEnumTF op
+
+@label "propagate: compare >"
+@description "a > b on intervals: aLo > bHi proves true only for String-restricted operands; numeric intervals retain both results because integer records compare False. Proven false when aHi < bLo (or equal with an exclusive touch); else undecided. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCmpGt : (a: a) -> (b: a) -> b
+propCmpGt a b =
+  if propGtLoHi (loOf a) (hiOf b)
+  then if propAnd (propIvStringOnly a) (propIvStringOnly b) then propEnum1 true else propEnumTF a
+  else if propGtFalse (hiOf a) (loOf b) then propEnum1 false
+  else propEnumTF a
+
+@label "propagate: compare >="
+@description "a >= b on intervals: aLo > bHi (or equal with both inclusive) proves true only for String-restricted operands; numeric intervals retain both results. Proven false when aHi < bLo; else undecided. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCmpGe : (a: a) -> (b: a) -> b
+propCmpGe a b =
+  if propGeTrue (loOf a) (hiOf b)
+  then if propAnd (propIvStringOnly a) (propIvStringOnly b) then propEnum1 true else propEnumTF a
+  else if propLtHiLo (hiOf a) (loOf b) then propEnum1 false
+  else propEnumTF a
+
+@label "propagate: compare <"
+@description "a < b on intervals: aHi < bLo proves true only for String-restricted operands; numeric intervals retain both results. Proven false when aLo > bHi (or equal with both inclusive); else undecided. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCmpLt : (a: a) -> (b: a) -> b
+propCmpLt a b =
+  if propLtHiLo (hiOf a) (loOf b)
+  then if propAnd (propIvStringOnly a) (propIvStringOnly b) then propEnum1 true else propEnumTF a
+  else if propGeTrue (loOf a) (hiOf b) then propEnum1 false
+  else propEnumTF a
+
+@label "propagate: compare <="
+@description "a <= b on intervals: aHi < bLo (or equal with both inclusive) proves true only for String-restricted operands; numeric intervals retain both results. Proven false when aLo > bHi; else undecided. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCmpLe : (a: a) -> (b: a) -> b
+propCmpLe a b =
+  if propLeTrue (hiOf a) (loOf b)
+  then if propAnd (propIvStringOnly a) (propIvStringOnly b) then propEnum1 true else propEnumTF a
+  else if propGtLoHi (loOf a) (hiOf b) then propEnum1 false
+  else propEnumTF a
+
+@label "propagate: aLo > bHi?"
+@description "Bound ordering aLo > bHi (unbounded lo ⇒ −∞, unbounded hi ⇒ +∞, both make it false). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propGtLoHi : (aLo: a) -> (bHi: a) -> Bool
+propGtLoHi aLo bHi =
+  case aLo of
+    Nothing -> False
+    Just a ->
+      case bHi of
+        Nothing -> False
+        Just b -> gt a.value b.value
+
+@label "propagate: aHi < bLo?"
+@description "Bound ordering aHi < bLo (unbounded hi ⇒ +∞, unbounded lo ⇒ −∞, both make it false). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propLtHiLo : (aHi: a) -> (bLo: a) -> Bool
+propLtHiLo aHi bLo =
+  case aHi of
+    Nothing -> False
+    Just a ->
+      case bLo of
+        Nothing -> False
+        Just b -> lt a.value b.value
+
+@label "propagate: aHi == bLo?"
+@description "Bound value equality aHi == bLo (both must be present/finite). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEqHiLo : (aHi: a) -> (bLo: a) -> Bool
+propEqHiLo aHi bLo =
+  case aHi of
+    Nothing -> False
+    Just a ->
+      case bLo of
+        Nothing -> False
+        Just b -> eq a.value b.value
+
+@label "propagate: aLo == bHi?"
+@description "Bound value equality aLo == bHi (both must be present/finite). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEqLoHi : (aLo: a) -> (bHi: a) -> Bool
+propEqLoHi aLo bHi =
+  case aLo of
+    Nothing -> False
+    Just a ->
+      case bHi of
+        Nothing -> False
+        Just b -> eq a.value b.value
+
+@label "propagate: inclusive of"
+@description "A bound's inclusivity (unbounded ⇒ exclusive). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIncOf : (mb: a) -> Bool
+propIncOf mb =
+  case mb of
+    Nothing -> False
+    Just x -> x.inclusive
+
+@label "propagate: >= proven-true / < proven-false"
+@description "aLo > bHi, or aLo == bHi with both bounds inclusive — the shared condition of `>=` proven-true and `<` proven-false. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propGeTrue : (aLo: a) -> (bHi: a) -> Bool
+propGeTrue aLo bHi =
+  if propGtLoHi aLo bHi then True
+  else if propEqLoHi aLo bHi then propAnd (propIncOf aLo) (propIncOf bHi)
+  else False
+
+@label "propagate: > proven-false"
+@description "aHi < bLo, or aHi == bLo with at least one exclusive touch — the `>` proven-false condition. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propGtFalse : (aHi: a) -> (bLo: a) -> Bool
+propGtFalse aHi bLo =
+  if propLtHiLo aHi bLo then True
+  else if propEqHiLo aHi bLo then propNotBothInc (propIncOf aHi) (propIncOf bLo)
+  else False
+
+@label "propagate: <= proven-true"
+@description "aHi < bLo, or aHi == bLo with both bounds inclusive — the `<=` proven-true condition. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propLeTrue : (aHi: a) -> (bLo: a) -> Bool
+propLeTrue aHi bLo =
+  if propLtHiLo aHi bLo then True
+  else if propEqHiLo aHi bLo then propAnd (propIncOf aHi) (propIncOf bLo)
+  else False
+
+@label "propagate: not both inclusive"
+@description "True when at least one of two inclusivity flags is exclusive (¬(x ∧ y)). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNotBothInc : (x: Bool) -> (y: Bool) -> Bool
+propNotBothInc x y = if propAnd x y then False else True
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- enum × enum comparison.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: enum compare"
+@description "Pointwise comparison over two enum value lists: collect the defined boolean results for every numeric (va, vb); exactly one distinct result narrows to { it }, else the undecided { true, false }. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumCompare : (op: String) -> (avals: a) -> (bvals: a) -> b
+propEnumCompare op avals bvals =
+  let rs = propEnumCmpOuter op avals bvals []
+  let distinct = dedupeValues rs []
+  if eq (length distinct) 1 then SeEnum { values = distinct }
+  else propEnumTF op
+
+@label "propagate: enum compare outer"
+@description "Outer loop of the enum×enum comparison — over the left values. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumCmpOuter : (op: String) -> (avals: a) -> (bvals: a) -> (acc: a) -> a
+propEnumCmpOuter op avals bvals acc =
+  case head avals of
+    Nothing -> acc
+    Just va ->
+      let acc2 = propEnumCmpInner op va bvals acc
+      case tail avals of
+        Nothing -> acc2
+        Just rest -> propEnumCmpOuter op rest bvals acc2
+
+@label "propagate: enum compare inner"
+@description "Inner loop of the enum×enum comparison — over the right values for a fixed left value. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumCmpInner : (op: String) -> (va: a) -> (bvals: a) -> (acc: a) -> a
+propEnumCmpInner op va bvals acc =
+  case head bvals of
+    Nothing -> acc
+    Just vb ->
+      let acc2 = propEnumCmpOne op va vb acc
+      case tail bvals of
+        Nothing -> acc2
+        Just rest -> propEnumCmpInner op va rest acc2
+
+@label "propagate: enum compare one"
+@description "Compare one numeric (va, vb), appending the boolean result; non-numeric operands are skipped. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propEnumCmpOne : (op: String) -> (va: a) -> (vb: a) -> (acc: a) -> a
+propEnumCmpOne op va vb acc =
+  if propAnd (isNumber va) (isNumber vb)
+  then
+    case propCompareBool op va vb of
+      Nothing -> acc
+      Just r -> appendItem r acc
+  else acc
+
+@label "propagate: scalar compare"
+@description "Scalar comparison va OP vb ⇒ Just bool over > >= < <= == === != !== (== / === and != / !== coincide on numbers); any other op ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCompareBool : (op: String) -> (va: a) -> (vb: a) -> b
+propCompareBool op va vb =
+  if eq op ">" then Just (gt va vb)
+  else if eq op ">=" then Just (gte va vb)
+  else if eq op "<" then Just (lt va vb)
+  else if eq op "<=" then Just (lte va vb)
+  else if eq op "==" then Just (eq va vb)
+  else if eq op "===" then Just (eq va vb)
+  else if eq op "!=" then Just (neq va vb)
+  else if eq op "!==" then Just (neq va vb)
+  else Nothing
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- unary operators (negate / not), distributing over unions.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: unary"
+@description "Unary transfer over an Se* SetExpr: $none absorbs; distribute over unions; negate (- / negate) ⇒ interval flip / enum map / named-tower widen (−ℕ ⊂ ℤ); not (! / not) ⇒ enum boolean flip, else { true, false }; otherwise SeAll. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propUnary : (op: String) -> (a: a) -> b
+propUnary op a =
+  if eq (seTag a) "SeNone" then SeNone
+  else if eq (seTag a) "SeUnion" then SeUnion { branches = map (\s -> propUnary op s) a.branches }
+  else if propIsNeg op then propNegate a
+  else if propIsNot op then propNot a
+  else SeAll
+
+@label "propagate: is negate op"
+@description "True for the negation operators - / negate. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIsNeg : (op: String) -> Bool
+propIsNeg op = if eq op "-" then True else eq op "negate"
+
+@label "propagate: is not op"
+@description "True for the boolean-negation operators ! / not. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propIsNot : (op: String) -> Bool
+propIsNot op = if eq op "!" then True else eq op "not"
+
+@label "propagate: negate"
+@description "Negate an Se* SetExpr: intervals widen to SeAll because their exact-integer record carriers use raw numeric coercion; an enum maps numbers to their negatives (non-numbers pass through); a named-tower set widens (−ℕ ⊂ ℤ, others keep their name); a non-tower ref / anything else ⇒ SeAll. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNegate : (a: a) -> b
+propNegate a =
+  if eq (seTag a) "SeInterval" then SeAll
+  else if eq (seTag a) "SeEnum" then SeEnum { values = map propNegVal a.values }
+  else if eq (seTag a) "SeRef" then propNegRef a.handle
+  else SeAll
+
+@label "propagate: negate bound"
+@description "Negate an interval bound (value ↦ −value, inclusivity preserved; unbounded stays unbounded). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNegBound : (mb: a) -> b
+propNegBound mb =
+  case mb of
+    Nothing -> Nothing
+    Just x -> Just { value = negate x.value, inclusive = x.inclusive }
+
+@label "propagate: negate value"
+@description "Negate an enum value when numeric, else pass through. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNegVal : (v: a) -> a
+propNegVal v = if isNumber v then negate v else v
+
+@label "propagate: negate named"
+@description "Negate a named-tower set: ℕ widens to ℤ (negatives leave ℕ); the other tower sets keep their name; a non-tower name ⇒ SeAll. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNegRef : (name: String) -> b
+propNegRef name =
+  if propInCanonical name
+  then (if eq (propCanonicalOf name) "ℕ" then propRefMarker "ℤ" else propRefMarker name)
+  else SeAll
+
+@label "propagate: not"
+@description "Boolean negation of an Se* SetExpr: an enum maps each value to its boolean negation (JS truthiness); anything else ⇒ the undecided { true, false }. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNot : (a: a) -> b
+propNot a =
+  if eq (seTag a) "SeEnum" then SeEnum { values = map propNotVal a.values }
+  else propEnumTF a
+
+@label "propagate: not value"
+@description "Boolean negation of one value (JS truthiness: falsy ↦ True, truthy ↦ False). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propNotVal : (v: a) -> Bool
+propNotVal v = if v then False else True
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- min / max (variadic interval reduce).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: min/max"
+@description "Variadic min / max: empty ⇒ SeNone; one non-interval input ⇒ itself; interval inputs widen to SeAll because their integer record carriers use raw numeric coercion. A mixed input set also widens. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propMinMax : (op: String) -> (inputs: a) -> b
+propMinMax op inputs =
+  if eq (length inputs) 0 then SeNone
+  else if eq (length inputs) 1
+  then
+    let first = propFirstOf inputs
+    if eq (seTag first) "SeInterval" then SeAll else first
+  else if propAllIntervals inputs then propMinMaxIv op inputs
+  else SeAll
+
+@label "propagate: min/max intervals"
+@description "Conservatively widen interval min/max to SeAll: interval endpoints do not certify raw Number carriers, and exact integer records are coerced to zero by raw min/max. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propMinMaxIv : (op: String) -> (inputs: a) -> b
+propMinMaxIv op inputs = SeAll
+
+@label "propagate: first of"
+@description "The first marker of a list (empty ⇒ SeNone). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propFirstOf : (inputs: a) -> b
+propFirstOf inputs =
+  case head inputs of
+    Nothing -> SeNone
+    Just m -> m
+
+@label "propagate: all intervals?"
+@description "True when every marker in the list is an interval (the min/max numeric-reduce guard). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propAllIntervals : (inputs: a) -> Bool
+propAllIntervals inputs =
+  case head inputs of
+    Nothing -> True
+    Just m ->
+      if eq (seTag m) "SeInterval"
+      then
+        case tail inputs of
+          Nothing -> True
+          Just rest -> propAllIntervals rest
+      else False
+
+@label "propagate: reduce bounds"
+@description "Fold a non-empty bound list keeping the bound the comparator prefers (the min/max-value selection, ties to the later element — mirrors the legacy `reduce` with no seed). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propReduceBounds : (cmp: a) -> (bounds: a) -> b
+propReduceBounds cmp bounds =
+  case head bounds of
+    Nothing -> Nothing
+    Just b0 ->
+      case tail bounds of
+        Nothing -> b0
+        Just rest -> propReduceBoundsGo cmp b0 rest
+
+@label "propagate: reduce bounds go"
+@description "Accumulator-threaded fold for propReduceBounds: keep `acc` when the comparator prefers it over the next bound, else take the next. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propReduceBoundsGo : (cmp: a) -> (acc: a) -> (bounds: a) -> b
+propReduceBoundsGo cmp acc bounds =
+  case head bounds of
+    Nothing -> acc
+    Just b ->
+      let acc2 = if cmp acc b then acc else b
+      case tail bounds of
+        Nothing -> acc2
+        Just rest -> propReduceBoundsGo cmp acc2 rest
+
+@label "propagate: lo-value <"
+@description "value(a) < value(b) for two LO bounds (unbounded ⇒ −∞): min-of-los selector. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propLtLoVal : (a: a) -> (b: a) -> Bool
+propLtLoVal a b =
+  case a of
+    Nothing -> (case b of
+      Nothing -> False
+      Just y -> True)
+    Just x ->
+      case b of
+        Nothing -> False
+        Just y -> lt x.value y.value
+
+@label "propagate: hi-value <"
+@description "value(a) < value(b) for two HI bounds (unbounded ⇒ +∞): min-of-his selector. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propLtHiVal : (a: a) -> (b: a) -> Bool
+propLtHiVal a b =
+  case a of
+    Nothing -> False
+    Just x ->
+      case b of
+        Nothing -> True
+        Just y -> lt x.value y.value
+
+@label "propagate: lo-value >"
+@description "value(a) > value(b) for two LO bounds (unbounded ⇒ −∞): max-of-los selector. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propGtLoVal : (a: a) -> (b: a) -> Bool
+propGtLoVal a b =
+  case a of
+    Nothing -> False
+    Just x ->
+      case b of
+        Nothing -> True
+        Just y -> gt x.value y.value
+
+@label "propagate: hi-value >"
+@description "value(a) > value(b) for two HI bounds (unbounded ⇒ +∞): max-of-his selector. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propGtHiVal : (a: a) -> (b: a) -> Bool
+propGtHiVal a b =
+  case a of
+    Nothing -> (case b of
+      Nothing -> False
+      Just y -> True)
+    Just x ->
+      case b of
+        Nothing -> False
+        Just y -> gt x.value y.value
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- cat — variadic string concatenation.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "propagate: cat fold"
+@description "Variadic string concatenation: left-fold the inputs through concatSets (enum×enum string product, else the String set). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCatFold : (inputs: a) -> b
+propCatFold inputs =
+  case head inputs of
+    Nothing -> SeAll
+    Just i0 ->
+      case tail inputs of
+        Nothing -> i0
+        Just rest -> propCatFoldGo i0 rest
+
+@label "propagate: cat fold go"
+@description "Accumulator-threaded fold of the remaining cat inputs through concatSets. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propCatFoldGo : (acc: a) -> (inputs: a) -> b
+propCatFoldGo acc inputs =
+  case head inputs of
+    Nothing -> acc
+    Just s ->
+      let acc2 = propConcatSets acc s
+      case tail inputs of
+        Nothing -> acc2
+        Just rest -> propCatFoldGo acc2 rest
+
+@label "propagate: concat sets"
+@description "String concatenation of two Se* SetExprs: enum×enum ⇒ the cartesian product of string values concatenated (empty ⇒ SeNone), anything else ⇒ the String set (SeRef \"String\"). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propConcatSets : (a: a) -> (b: a) -> b
+propConcatSets a b =
+  if propAnd (eq (seTag a) "SeEnum") (eq (seTag b) "SeEnum")
+  then
+    let r = propConcatOuter a.values b.values []
+    if eq (length r) 0 then SeNone else SeEnum { values = r }
+  else propRefMarker "String"
+
+@label "propagate: concat outer"
+@description "Outer loop of the enum×enum string product — over the left values. Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propConcatOuter : (avals: a) -> (bvals: a) -> (acc: a) -> a
+propConcatOuter avals bvals acc =
+  case head avals of
+    Nothing -> acc
+    Just va ->
+      let acc2 = propConcatInner va bvals acc
+      case tail avals of
+        Nothing -> acc2
+        Just rest -> propConcatOuter rest bvals acc2
+
+@label "propagate: concat inner"
+@description "Inner loop of the enum×enum string product — append va++vb for each string vb (non-string operands skipped). Internal helper."
+@tags "engine" "internal" "propagate" "unified-static-analysis" "phase-3b-1"
+@category "engine-internal"
+propConcatInner : (va: a) -> (bvals: a) -> (acc: a) -> a
+propConcatInner va bvals acc =
+  case head bvals of
+    Nothing -> acc
+    Just vb ->
+      let acc2 = if propAnd (isString va) (isString vb) then appendItem (concat va vb) acc else acc
+      case tail bvals of
+        Nothing -> acc2
+        Just rest -> propConcatInner va rest acc2

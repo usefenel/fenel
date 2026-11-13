@@ -1,0 +1,824 @@
+module engine where
+
+-- field-render-plan — Fenel-owned editor planning for FieldRenderer.
+--
+-- TypeScript supplies boundary facts that are genuinely outside a pure Fenel
+-- body today: raw FieldDef/FenelType wires, already-canonicalized LocaleString
+-- slots, registry-derived widget hints/defaults, enum option facts, and ref
+-- default filters. This module owns the pure decision of which editor plan the
+-- UI should render from those facts.
+
+FieldEditType =
+  FtNamed name: String raw: a
+  | FtRefined base: a set: a raw: a
+  | FtOpaque name: String pure: a raw: a
+  | FtMaybe value: a raw: a
+  | FtList elem: a raw: a
+  | FtRecord fields: a raw: a
+  | FtVariant cases: a discriminator: String raw: a
+  | FtMap keys: a values: a raw: a
+  | FtTagged value: FieldEditType phantom: FieldEditType phantomTypeName: String entityType: String raw: a
+  | FtArrow params: a returns: a raw: a
+  | FtType raw: a
+  | FtEl resolved: Maybe a raw: a
+  | FtOther kind: String raw: a
+
+@category "engine-internal"
+fieldTypeRaw : (t: FieldEditType) -> a
+fieldTypeRaw t = case t of
+  FtNamed { raw = r } -> r
+  FtRefined { raw = r } -> r
+  FtOpaque { raw = r } -> r
+  FtMaybe { raw = r } -> r
+  FtList { raw = r } -> r
+  FtRecord { raw = r } -> r
+  FtVariant { raw = r } -> r
+  FtMap { raw = r } -> r
+  FtTagged { raw = r } -> r
+  FtArrow { raw = r } -> r
+  FtType { raw = r } -> r
+  FtEl { raw = r } -> r
+  FtOther { raw = r } -> r
+
+@category "engine-internal"
+fieldStructuralBase : (t: FieldEditType) -> FieldEditType
+fieldStructuralBase t = case t of
+  FtRefined { base = b } -> fieldStructuralBase b
+  FtOpaque { pure = p } -> fieldStructuralBase p
+  FtNamed {} -> t
+  FtMaybe {} -> t
+  FtList {} -> t
+  FtRecord {} -> t
+  FtVariant {} -> t
+  FtMap {} -> t
+  FtTagged { value = value } -> if fieldTaggedReferenceBase value then t else fieldStructuralBase value
+  FtArrow {} -> t
+  FtType {} -> t
+  FtEl {} -> t
+  FtOther {} -> t
+
+@category "engine-internal"
+fieldTypeSet : (t: FieldEditType) -> Maybe a
+fieldTypeSet t = case t of
+  FtRefined { base = b, set = s } ->
+    case fieldTypeSet b of
+      Nothing -> Just s
+      Just prior -> Just (SeIntersect { branches = [prior, s] })
+  FtOpaque { pure = p } -> fieldTypeSet p
+  FtTagged { value = value } -> fieldTypeSet value
+  _ -> Nothing
+
+@category "engine-internal"
+fieldTaggedReferenceBase : (t: FieldEditType) -> Bool
+fieldTaggedReferenceBase t = case t of
+  FtNamed { name = name } -> or (eq name "Id") (eq name "GeoPath")
+  FtRefined { base = base } -> fieldTaggedReferenceBase base
+  FtOpaque { name = name } -> or (eq name "Id") (eq name "GeoPath")
+  _ -> false
+
+@category "engine-internal"
+fieldNominalTypeNamePlan : (t: FieldEditType) -> String
+fieldNominalTypeNamePlan t = case t of
+  FtNamed { name = name } -> name
+  FtOpaque { name = name } -> name
+  FtRefined { base = base } -> fieldNominalTypeNamePlan base
+  _ -> ""
+
+@category "engine-internal"
+fieldNativeAtomNamePlan : (t: TraversalType) -> Maybe String
+fieldNativeAtomNamePlan t = case t of
+  TtNamed { name = name, origin = origin } ->
+    if eq origin "ref" then fieldNativeAtomForName name else Nothing
+  TtOpaque { name = name } ->
+    if elem name ["Rational", "Nat", "Int"] then
+      let canonical = canonicalRepresentationName t
+      if eq canonical "" then Nothing else Just canonical
+    else fieldNativeAtomForName name
+  _ -> Nothing
+
+@category "engine-internal"
+fieldNativeAtomForName : (name: String) -> Maybe String
+fieldNativeAtomForName name =
+  if or (eq name "Bool") (eq name "Boolean") then Just "Boolean"
+  else if or (eq name "String") (eq name "Char") then Just "String"
+  else if elem name ["Nat", "Int", "Rational", "Number"] then Just name
+  else if eq name "Real" then Just "Number"
+  else Nothing
+
+@category "engine-internal"
+fieldMaybeString : (m: Maybe String) -> String
+fieldMaybeString m = case m of
+  Just s -> s
+  Nothing -> ""
+
+@category "engine-internal"
+fieldMaybeNumber : (m: Maybe Number) -> Maybe Number
+fieldMaybeNumber m = m
+
+@category "engine-internal"
+fieldDisplayName : (name: String) -> (label: String) -> String
+fieldDisplayName name label =
+  if eq label "" then humanizeCodeName name else label
+
+@category "engine-internal"
+fieldPreviewNames : (items: List a) -> (count: Number) -> (sep: String) -> String
+fieldPreviewNames items count sep =
+  if lte count 0 then ""
+  else case head items of
+    Nothing -> ""
+    Just item ->
+      let restText = case tail items of
+        Nothing -> ""
+        Just rest ->
+          if lte count 1
+          then if gt (length rest) 0 then concat sep "..." else ""
+          else
+            let tailText = fieldPreviewNames rest (sub count 1) sep
+            if eq tailText "" then "" else concat sep tailText
+      concat item.name restText
+
+@category "engine-internal"
+fieldTypeLabelOr : (t: FieldEditType) -> (fallback: String) -> String
+fieldTypeLabelOr t fallback =
+  let label = fieldTypeLabelPlan t
+  if eq label "" then fallback else label
+
+@label "field-render: type label plan"
+@description "Fenel-owned display label for field editor type badges. Mirrors the value editor's user-facing structural labels for named, refined, Maybe/List, record, variant, arrow, dependent, and fallback types."
+@tags "engine" "field-render" "edit-plan" "ux-parity" "phase-14"
+fieldTypeLabelPlan : (t: FieldEditType) -> String
+fieldTypeLabelPlan t = case t of
+  FtNamed { name = n } -> n
+  FtRefined { base = b } -> fieldTypeLabelOr b "$refined"
+  FtMaybe { value = v } ->
+    let inner = fieldTypeLabelPlan v
+    if eq inner "" then "Maybe" else concat inner "?"
+  FtList { elem = e } ->
+    let inner = fieldTypeLabelPlan e
+    if eq inner "" then "List" else concat "List<" (concat inner ">")
+  FtOpaque { name = n } -> if eq n "" then "Opaque" else n
+  FtRecord { fields = fs } ->
+    if eq (length fs) 0 then "{}"
+    else concat "{" (concat (fieldPreviewNames fs 3 ", ") "}")
+  FtVariant { cases = cs } ->
+    if eq (length cs) 0 then "|"
+    else fieldPreviewNames cs 3 " | "
+  FtArrow { params = ps, returns = r } ->
+    let params = fieldArrowParamsLabel ps
+    let ret = fieldTypeLabelPlan r
+    concat "(" (concat params (concat ") -> " ret))
+  FtMap {} -> "Map"
+  FtTagged { value = value, entityType = e } ->
+    if fieldTaggedReferenceBase value then if eq e "" then "Ref" else concat "Ref<" (concat e ">")
+    else fieldTypeLabelPlan value
+  FtType {} -> "Type"
+  FtEl { resolved = mb } -> case mb of
+    Just t2 -> fieldTypeLabelPlan t2
+    Nothing -> "<expr>"
+  FtOther { kind = k } -> k
+
+@category "engine-internal"
+fieldArrowParamsLabel : (params: List a) -> String
+fieldArrowParamsLabel params = case head params of
+  Nothing -> ""
+  Just p ->
+    let one = concat p.name (concat ": " (fieldTypeLabelPlan p.typeWire))
+    case tail params of
+      Nothing -> one
+      Just rest ->
+        let restText = fieldArrowParamsLabel rest
+        if eq restText "" then one else concat one (concat ", " restText)
+
+@category "engine-internal"
+fieldSetHas : (set: Maybe a) -> (name: String) -> Bool
+fieldSetHas set name = case set of
+  Nothing -> false
+  Just s -> hasNamed s name
+
+@category "engine-internal"
+fieldTextFormatPlan : (set: Maybe a) -> a
+fieldTextFormatPlan set =
+  if fieldSetHas set "format:email"
+  then { inputType = "email", icon = Just "mail", prefix = Nothing, placeholder = Just "user@example.com", validationFormat = Just "email" }
+  else if fieldSetHas set "format:url"
+  then { inputType = "url", icon = Just "link", prefix = Nothing, placeholder = Just "https://...", validationFormat = Just "url" }
+  else if fieldSetHas set "format:phone"
+  then { inputType = "tel", icon = Just "phone", prefix = Nothing, placeholder = Just "+1 555 123 4567", validationFormat = Just "phone" }
+  else if fieldSetHas set "format:handle"
+  then { inputType = "text", icon = Just "user", prefix = Just "@", placeholder = Just "username", validationFormat = Just "handle" }
+  else { inputType = "text", icon = Nothing, prefix = Nothing, placeholder = Nothing, validationFormat = Nothing }
+
+@category "engine-internal"
+fieldTextPlan : (input: a) -> (set: Maybe a) -> a
+fieldTextPlan input set =
+  let fmt = fieldTextFormatPlan set
+  let widget = fieldMaybeString input.ui.widget
+  { kind = "text"
+  , rawType = fieldTypeRaw input.type
+  , set = set
+  , widget = if eq widget "" then "text" else widget
+  , inputType = if eq widget "password" then "password" else fmt.inputType
+  , icon = fmt.icon
+  , prefix = case input.ui.prefix of
+      Just p -> Just p
+      Nothing -> fmt.prefix
+  , suffix = input.ui.suffix
+  , placeholder = case input.ui.placeholder of
+      Just p -> Just p
+      Nothing -> fmt.placeholder
+  , validationFormat = fmt.validationFormat
+  }
+
+@category "engine-internal"
+fieldNumBound : (mb: Maybe a) -> a
+fieldNumBound mb = case mb of
+  Nothing -> { finite = false, value = 0 }
+  Just b ->
+    if isNumber b.value
+    then { finite = numberIsFinite b.value, value = b.value }
+    else { finite = false, value = 0 }
+
+@category "engine-internal"
+fieldBoundsFromInterval : (set: a) -> (iv: a) -> Maybe a
+fieldBoundsFromInterval set iv =
+  let lo = fieldNumBound iv.lo
+  let hi = fieldNumBound iv.hi
+  if and lo.finite hi.finite
+  then
+    let range = sub hi.value lo.value
+    if and (gte range 0) (lte range 10000)
+    then
+      let integer = impliesInteger set
+      Just { lo = lo.value, hi = hi.value, integer = integer, step = if integer then 1 else div range 100 }
+    else Nothing
+  else Nothing
+
+@category "engine-internal"
+fieldBoundsFromSet : (set: Maybe a) -> Maybe a
+fieldBoundsFromSet set = case set of
+  Nothing -> Nothing
+  Just s -> case extractInterval s of
+    Nothing -> Nothing
+    Just iv -> fieldBoundsFromInterval s iv
+
+@category "engine-internal"
+fieldNumberPlan : (input: a) -> (set: Maybe a) -> a
+fieldNumberPlan input set =
+  let numericTypeName = fieldNumericTypeNamePlan input.type
+  let representation = if eq numericTypeName "Rational" then "rational" else "number"
+  let textCodec = fieldNumericTextCodecPlan numericTypeName
+  let bounds = case textCodec of
+        Just _ -> Nothing
+        Nothing -> fieldBoundsFromSet set
+  let hintWidget = fieldMaybeString input.widgetHint.widget
+  let widget = case bounds of
+    Just b -> "slider"
+    Nothing -> "number-input"
+  { kind = "number"
+  , rawType = fieldTypeRaw input.type
+  , representation = representation
+  , numericTypeName = numericTypeName
+  , textCodec = textCodec
+  , set = set
+  , widget = if eq hintWidget "" then widget else hintWidget
+  , bounds = bounds
+  , integer = if elem numericTypeName ["Nat", "Int"] then true else case bounds of
+      Just b -> b.integer
+      Nothing -> case set of Just s -> impliesInteger s; Nothing -> false
+  , prefix = input.ui.prefix
+  , suffix = input.ui.suffix
+  , placeholder = input.ui.placeholder
+  }
+
+@category "engine-internal"
+fieldNumericTypeNamePlan : (type: FieldEditType) -> String
+fieldNumericTypeNamePlan type = case fieldStructuralBase type of
+  FtNamed { name = name } -> fieldCanonicalNumericName name
+  _ -> ""
+
+@category "engine-internal"
+fieldCanonicalNumericName : (name: String) -> String
+fieldCanonicalNumericName name =
+  if eq name "ℕ" then "Nat"
+  else if eq name "ℤ" then "Int"
+  else if eq name "ℚ" then "Rational"
+  else if eq name "ℝ" then "Number"
+  else name
+
+@category "engine-internal"
+fieldNumericTextCodecPlan : (name: String) -> Maybe ({ decode: Any, encode: Any })
+fieldNumericTextCodecPlan name =
+  let canonical = fieldCanonicalNumericName name
+  if eq canonical "Nat" then Just { decode = std.decodeNatText, encode = std.encodeNatText }
+  else if eq canonical "Int" then Just { decode = std.decodeIntText, encode = std.encodeIntText }
+  else if eq canonical "Rational" then Just { decode = std.decodeRationalText, encode = std.encodeRationalText }
+  else Nothing
+
+@category "engine-internal"
+fieldUnionBranchSelectionPlan : (admitted: List Bool) -> Maybe Number
+fieldUnionBranchSelectionPlan admitted = fieldUnionFirstAdmitted admitted 0
+
+@category "engine-internal"
+fieldUnionFirstAdmitted : (admitted: List Bool) -> (index: Number) -> Maybe Number
+fieldUnionFirstAdmitted admitted index = case head admitted of
+  Nothing -> Nothing
+  Just decision -> if std.boolToNative decision then Just index else fieldUnionFirstAdmitted (tailOr admitted) (index + 1)
+
+@category "engine-internal"
+fieldDateInputType : (input: a) -> (set: Maybe a) -> String
+fieldDateInputType input set =
+  let hintWidget = fieldMaybeString input.widgetHint.widget
+  if eq hintWidget "datetime-picker" then "datetime-local"
+  else if eq hintWidget "month-picker" then "month"
+  else if eq hintWidget "year-picker" then "number"
+  else
+    let fmt = fieldMaybeString input.ui.format
+    if eq fmt "datetime" then "datetime-local"
+    else if eq fmt "time" then "time"
+    else if fieldSetHas set "format:datetime" then "datetime-local"
+    else if fieldSetHas set "format:time" then "time"
+    else "date"
+
+@category "engine-internal"
+fieldDatePlan : (input: a) -> (set: Maybe a) -> a
+fieldDatePlan input set =
+  let inputType = fieldDateInputType input set
+  { kind = "date"
+  , rawType = fieldTypeRaw input.type
+  , set = set
+  , inputType = inputType
+  , min = if eq inputType "number" then Just "1900" else Nothing
+  , max = if eq inputType "number" then Just "2100" else Nothing
+  , placeholder = if eq inputType "number" then Just "YYYY" else input.ui.placeholder
+  }
+
+@category "engine-internal"
+fieldSelectPlan : (input: a) -> (options: List a) -> a
+fieldSelectPlan input options =
+  let hintWidget = fieldMaybeString input.widgetHint.widget
+  { kind = "select"
+  , rawType = fieldTypeRaw input.type
+  , options = options
+  , radio = if eq hintWidget "radio" then true else false
+  , multi = false
+  , placeholder = input.ui.placeholder
+  }
+
+-- Choices contain the original inhabitants. Labels and browser handles are
+-- presentation only; enumeration and equality reuse the existing substrate.
+@category "engine-internal"
+fieldFiniteChoiceValuesPlan : (t: FieldEditType) -> Maybe (List a)
+fieldFiniteChoiceValuesPlan t = case fieldTypeSet t of
+  Nothing -> Nothing
+  Just set -> enumerateSet set
+
+@category "engine-internal"
+fieldChoiceOptionsPlan : (provided: Maybe (List a)) -> (derived: Maybe (List a)) -> Maybe (List a)
+fieldChoiceOptionsPlan provided derived = case provided of
+  Just options -> if gt (length options) 0 then Just options else derived
+  Nothing -> derived
+
+-- The reader captures an existing Encodable String method. Source owns the
+-- fallible text projection; an unavailable or unreadable result keeps the
+-- ordinary structural label without changing the choice's inhabitant.
+@category "engine-internal"
+fieldChoiceLabelPlan : (value: a) -> (encoder: Maybe Any) -> (fallback: String) -> String
+fieldChoiceLabelPlan value encoder fallback = case encoder of
+  Nothing -> fallback
+  Just encode -> case presentationSourceCall encode [value] of
+    Nothing -> fallback
+    Just result -> case result of
+      Ok text -> if isString text then if text == "" then fallback else text else fallback
+      _ -> fallback
+
+@category "engine-internal"
+fieldChoiceSelectionIndex : (options: List a) -> (value: b) -> (index: Number) -> Maybe Number
+fieldChoiceSelectionIndex options value index = case head options of
+  Nothing -> Nothing
+  Just option ->
+    case deepEqValueTri option.value value of
+      Just true -> Just index
+      _ -> case tail options of
+        Nothing -> Nothing
+        Just rest -> fieldChoiceSelectionIndex rest value (add index 1)
+
+@category "engine-internal"
+fieldChoiceSelectionPlan : (options: List a) -> (value: b) -> a
+fieldChoiceSelectionPlan options value =
+  { selectedIndex = fieldChoiceSelectionIndex options value 0 }
+
+-- A list presentation never changes its inhabitants. Ordinary chips are
+-- occurrences: append retains multiplicity and remove addresses one position.
+-- Set gestures require the live reader's independently checked canonical
+-- refinement, not a type name or a saved CheckedRecipeDomain-shaped record.
+FieldListChipsAction = FieldListAppendChoice index: Number expected: Any
+  | FieldListRemoveOccurrence index: Number expected: Any
+  | FieldListToggleChoice index: Number expected: Any
+
+@category "engine-internal"
+fieldNullaryListChoiceValuesPlan : FieldEditType -> Maybe (List a)
+fieldNullaryListChoiceValuesPlan t = case t of
+  FtVariant { cases = cases } ->
+    if length cases > 0 && length cases <= 16 && all cases (\choice -> length choice.fields == 0) && length (unique (map (\choice -> choice.name) cases)) == length cases
+    then Just (map (\choice -> choice.defaultValue) cases)
+    else Nothing
+  FtNamed { name = name } -> if name == "Boolean" then Just [false, true] else Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+fieldListChipsSelectionPlan : List a -> List b -> c
+fieldListChipsSelectionPlan options values =
+  let present = if isArray values then values else []
+  { occurrences = map (\value -> fieldChoiceSelectionIndex options value 0) present
+  , selected = map (\option -> case fieldChoiceSelectionIndex (map (\value -> { value = value }) present) option.value 0 of Just index -> true; Nothing -> false) options
+  }
+
+@category "engine-internal"
+fieldListCanonicalPlan : Maybe a -> Maybe Bool -> Maybe (List b)
+fieldListCanonicalPlan observation currentAdmission = case currentAdmission of
+  Just true -> case observation of
+    Nothing -> Nothing
+    Just observed -> case checkRecipeDomain observed.snapshot of
+      Ok checked -> case deepEqValueTri observed.declaration checked.source.pantryType of
+        Just true -> Just checked.foods
+        _ -> Nothing
+      _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+fieldListChoicesMatchDomain : List a -> List b -> Bool
+fieldListChoicesMatchDomain options foods =
+  length options == length foods && all options (\option -> std.some foods (\food -> case deepEqValueTri option.value food.value of Just true -> true; _ -> false)) && all foods (\food -> std.some options (\option -> case deepEqValueTri option.value food.value of Just true -> true; _ -> false))
+
+@category "engine-internal"
+fieldListValuesMatchDomain : List a -> List b -> Bool
+fieldListValuesMatchDomain values foods =
+  isArray values && all values (\value -> std.some foods (\food -> case deepEqValueTri value food.value of Just true -> true; _ -> false))
+
+@category "engine-internal"
+fieldListCanonicalChoicesPlan : List a -> Maybe b -> Maybe Bool -> List c -> Maybe (List d)
+fieldListCanonicalChoicesPlan options observation currentAdmission values = case fieldListCanonicalPlan observation currentAdmission of
+  Just foods -> if fieldListChoicesMatchDomain options foods && fieldListValuesMatchDomain values foods then Just foods else Nothing
+  Nothing -> Nothing
+
+@category "engine-internal"
+fieldListChoiceAt : List a -> Number -> Maybe a
+fieldListChoiceAt values index =
+  if index < 0 || floor index != index then Nothing
+  else case head values of
+    Nothing -> Nothing
+    Just value -> if index == 0 then Just value else fieldListChoiceAt (fromMaybe [] (tail values)) (index - 1)
+
+@category "engine-internal"
+fieldListRemoveOccurrence : List a -> Number -> Number -> List a -> List a
+fieldListRemoveOccurrence values target ordinal kept = case head values of
+  Nothing -> kept
+  Just value -> fieldListRemoveOccurrence (fromMaybe [] (tail values)) target (ordinal + 1) (if ordinal == target then kept else appendItem value kept)
+
+@category "engine-internal"
+fieldListFoodRank : List a -> b -> Maybe Number
+fieldListFoodRank foods value = case head foods of
+  Nothing -> Nothing
+  Just food -> case deepEqValueTri food.value value of
+    Just true -> Just food.rank
+    _ -> fieldListFoodRank (fromMaybe [] (tail foods)) value
+
+@category "engine-internal"
+fieldListCanonicalInsert : List a -> List b -> a -> Number -> List a -> Result String (List a)
+fieldListCanonicalInsert values foods chosen rank kept = case head values of
+  Nothing -> Ok (appendItem chosen kept)
+  Just value -> case fieldListFoodRank foods value of
+    Nothing -> Err "This list contains data outside its checked choices."
+    Just existing ->
+      if rank < existing then Ok (concat (appendItem chosen kept) values)
+      else fieldListCanonicalInsert (fromMaybe [] (tail values)) foods chosen rank (appendItem value kept)
+
+@category "engine-internal"
+fieldListToggleChoice : List a -> List b -> c -> Result String (List a)
+fieldListToggleChoice values foods chosen = case fieldListFoodRank foods chosen of
+  Nothing -> Err "This choice is outside the checked canonical list."
+  Just rank -> case fieldChoiceSelectionIndex (map (\value -> { value = value }) values) chosen 0 of
+    Just index -> Ok (fieldListRemoveOccurrence values index 0 [])
+    Nothing -> fieldListCanonicalInsert values foods chosen rank []
+
+@category "engine-internal"
+fieldListChipsCandidate : List a -> List b -> FieldListChipsAction -> Maybe c -> Maybe Bool -> Result String (List b)
+fieldListChipsCandidate options values action observation currentAdmission =
+  if not (isArray values) then Err "Complete this list before changing its chips."
+  else case action of
+    FieldListAppendChoice { index = index, expected = expected } -> case fieldListChoiceAt options index of
+      Nothing -> Err "This choice is no longer available."
+      Just chosen -> case deepEqValueTri chosen.value expected of
+        Just true -> Ok (appendItem chosen.value values)
+        _ -> Err "This choice changed. Try its current chip."
+    FieldListRemoveOccurrence { index = index, expected = expected } -> case fieldListChoiceAt values index of
+      Nothing -> Err "This list item is no longer available."
+      Just value -> case deepEqValueTri value expected of
+        Just true -> Ok (fieldListRemoveOccurrence values index 0 [])
+        _ -> Err "This list item changed. Try its current chip."
+    FieldListToggleChoice { index = index, expected = expected } -> case fieldListCanonicalChoicesPlan options observation currentAdmission values of
+      Nothing -> Err "Set choices require a current checked canonical list."
+      Just foods -> case fieldListChoiceAt options index of
+        Nothing -> Err "This choice is no longer available."
+        Just chosen -> case deepEqValueTri chosen.value expected of
+          Just true -> fieldListToggleChoice values foods chosen.value
+          _ -> Err "This choice changed. Try its current chip."
+
+@category "engine-internal"
+fieldListChipsChoicesCandidate : Maybe (List a) -> b -> FieldListChipsAction -> Maybe c -> Maybe Bool -> Bool -> Result String (List d)
+fieldListChipsChoicesCandidate choices value action observation currentAdmission absent = case choices of
+  Nothing -> Err "These list choices are no longer available."
+  Just options -> fieldListChipsCandidate options (if absent then [] else value) action observation currentAdmission
+
+@category "engine-internal"
+fieldListChipsAdmission : Result String a -> Maybe Bool -> Result String a
+fieldListChipsAdmission candidate membership = case candidate of
+  Err issue -> Err issue
+  Ok value -> case membership of
+    Just true -> Ok value
+    Just false -> Err "This change does not fit the list's complete type."
+    _ -> Err "This list change could not be checked. Keep the current data and try again."
+
+-- The existing Telegram step API carries textual reply buttons. Refuse other
+-- inhabitants until its owner supports typed callback mapping; never stringify.
+@category "engine-internal"
+fieldTextChoiceOptionsPlan : (options: List a) -> Result String (List a)
+fieldTextChoiceOptionsPlan options =
+  if all options (\option -> isString option.value) then Ok options
+  else Err "Telegram finite choices currently require String values."
+
+@category "engine-internal"
+fieldRefFilterPlan : (input: a) -> a
+fieldRefFilterPlan input =
+  case input.ui.refFilter of
+    Just f -> { filter = Just f, source = "field-ui" }
+    Nothing -> case input.defaultRefFilter of
+      Just f -> { filter = Just f, source = "filterable-default" }
+      Nothing -> case input.legacyRefFilter of
+        Just f -> { filter = Just f, source = "legacy-meta" }
+        Nothing -> { filter = Nothing, source = "none" }
+
+@category "engine-internal"
+fieldRefPlan : (input: a) -> (entityType: String) -> a
+fieldRefPlan input entityType =
+  let filter = fieldRefFilterPlan input
+  { kind = "ref"
+  , rawType = fieldTypeRaw input.type
+  , entityType = if eq entityType "" then "unknown" else entityType
+  , filter = filter.filter
+  , filterSource = filter.source
+  , placeholder = input.ui.placeholder
+  }
+
+@category "engine-internal"
+fieldRowsFromEnumValues : (values: List a) -> (acc: List a) -> List a
+fieldRowsFromEnumValues values acc = case head values of
+  Nothing -> acc
+  Just v ->
+    let acc2 = if isString v then appendItem { key = v, label = v } acc else acc
+    case tail values of
+      Nothing -> acc2
+      Just rest -> fieldRowsFromEnumValues rest acc2
+
+@category "engine-internal"
+fieldMatrixRows : (keys: a) -> List a
+fieldMatrixRows keys = case extractEnum keys of
+  Nothing -> []
+  Just values -> fieldRowsFromEnumValues values []
+
+@category "engine-internal"
+fieldCompositePlan : (input: a) -> (base: FieldEditType) -> a
+fieldCompositePlan input base = case base of
+  FtList { elem = e } ->
+    let choices = input.listChoices
+    let canonical = case choices of
+          Just options -> case fieldListCanonicalChoicesPlan options input.canonicalListContext input.listMembership input.value of Just foods -> true; Nothing -> false
+          Nothing -> false
+    { kind = "list", rawType = fieldTypeRaw input.type, itemType = fieldTypeRaw e, itemTypeLabel = fieldTypeLabelPlan e, itemDefault = input.listItemDefault, choices = choices, canonical = canonical }
+  FtRecord { fields = fs } ->
+    { kind = if eq (length fs) 0 then "freeform-record" else "record", rawType = fieldTypeRaw input.type, fields = fs }
+  FtVariant { cases = cs, discriminator = d } ->
+    { kind = "variant", rawType = fieldTypeRaw input.type, discriminator = if eq d "" then "$tag" else d, cases = cs, toggle = lte (length cs) 5 }
+  FtMap { keys = keys, values = values } ->
+    let rows = fieldMatrixRows keys
+    if gt (length rows) 0
+    then
+      case fieldStructuralBase values of
+        FtRecord { fields = fs } ->
+          { kind = "matrix", rawType = fieldTypeRaw input.type, rows = rows, columns = fs }
+        _ -> { kind = "map", rawType = fieldTypeRaw input.type }
+    else { kind = "map", rawType = fieldTypeRaw input.type }
+  _ -> { kind = "unsupported", rawType = fieldTypeRaw input.type, reason = "unsupported composite" }
+
+@category "engine-internal"
+fieldSpecialWidgetPlan : (input: a) -> Maybe a
+fieldSpecialWidgetPlan input =
+  let widget = fieldMaybeString input.ui.widget
+  if eq widget "expression"
+  then Just { kind = "expression", rawType = fieldTypeRaw input.type }
+  else if eq widget "markup-expression"
+  then Just { kind = "markup", rawType = fieldTypeRaw input.type, expression = true }
+  else if eq widget "string-expression"
+  then Just { kind = "string-expression", rawType = fieldTypeRaw input.type, placeholder = input.ui.placeholder }
+  else if eq widget "terms"
+  then Just { kind = "expression", rawType = fieldTypeRaw input.type, leaf = "terms" }
+  else Nothing
+
+@category "engine-internal"
+fieldChannelPlan : (input: a) -> Maybe a
+fieldChannelPlan input = case input.channel of
+  Nothing -> Nothing
+  Just ch ->
+    if and (eq ch.kind "text") (eq ch.strategy "autocomplete-address")
+    then Just { kind = "custom", leaf = "address-autocomplete", rawType = fieldTypeRaw input.type, placeholder = input.ui.placeholder, channel = ch }
+    else if eq ch.kind "text"
+    then Nothing
+    else Just { kind = "unsupported", rawType = fieldTypeRaw input.type, reason = concat ch.kind " channel not yet available", channel = ch }
+
+@category "engine-internal"
+fieldEditorPlan : (input: a) -> a
+fieldEditorPlan input =
+  case fieldChannelPlan input of
+    Just chPlan -> chPlan
+    Nothing -> case fieldSpecialWidgetPlan input of
+      Just widgetPlan -> widgetPlan
+      Nothing -> case input.selectOptions of
+        Just options -> if gt (length options) 0 then fieldSelectPlan input options else fieldEditorPlanByType input
+        Nothing -> fieldEditorPlanByType input
+
+@category "engine-internal"
+fieldEditorPlanByType : (input: a) -> a
+fieldEditorPlanByType input =
+  let base = fieldStructuralBase input.type
+  let set = fieldTypeSet input.type
+  case base of
+    FtNamed { name = n } ->
+      if eq n "String" then fieldTextPlan input set
+      else if eq n "LocaleString" then { kind = "locale-string", rawType = fieldTypeRaw input.type }
+      else if eq n "Number" then fieldNumberPlan input set
+      else if eq n "Rational" then fieldNumberPlan input set
+      else if eq n "ℚ" then fieldNumberPlan input set
+      else if eq n "Int" then fieldNumberPlan input set
+      else if eq n "Nat" then fieldNumberPlan input set
+      else if eq n "ℝ" then fieldNumberPlan input set
+      else if eq n "ℤ" then fieldNumberPlan input set
+      else if eq n "ℕ" then fieldNumberPlan input set
+      else if eq n "Boolean" then { kind = "boolean", rawType = fieldTypeRaw input.type }
+      else if eq n "Date" then fieldDatePlan input set
+      else if eq n "File" then { kind = "file", rawType = fieldTypeRaw input.type }
+      else if eq n "Markup" then { kind = "markup", rawType = fieldTypeRaw input.type, set = set, expression = false }
+      else { kind = "unsupported", rawType = fieldTypeRaw input.type, reason = concat "No editor for named type " n }
+    FtTagged { entityType = entityType } -> fieldRefPlan input entityType
+    FtList {} -> fieldCompositePlan input base
+    FtRecord {} -> fieldCompositePlan input base
+    FtVariant {} -> fieldCompositePlan input base
+    FtMap {} -> fieldCompositePlan input base
+    FtArrow {} -> { kind = "arrow", rawType = fieldTypeRaw input.type }
+    FtType {} -> { kind = "type", rawType = fieldTypeRaw input.type }
+    FtEl { resolved = mb } -> case mb of
+      Just t2 -> { kind = "unsupported", rawType = fieldTypeRaw t2, reason = "Dependent type must be resolved at the wrapper boundary" }
+      Nothing -> { kind = "unsupported", rawType = fieldTypeRaw input.type, reason = "Dependent type is unresolved" }
+    FtMaybe {} -> fieldCompositePlan input base
+    FtRefined {} -> { kind = "unsupported", rawType = fieldTypeRaw input.type, reason = "unpeeled refined type" }
+    FtOpaque {} -> { kind = "unsupported", rawType = fieldTypeRaw input.type, reason = "unpeeled opaque type" }
+    FtOther { kind = k } -> { kind = "unsupported", rawType = fieldTypeRaw input.type, reason = concat "No editor for type " k }
+
+@label "field-render: edit plan"
+@description "Fenel-owned field editor dispatch plan. Consumes a FieldDef/type/UI/channel/catalog/default wire and returns ordinary plan data: label/type badge/help, editor kind, scalar attributes, select/ref facts, composite child fields, and default hints. Solid maps the plan to JSX and host editor leaves."
+@tags "engine" "field-render" "edit-plan" "ux-parity" "phase-14"
+fieldEditPlan : (input: a) -> a
+fieldEditPlan input =
+  let label = fieldDisplayName input.name input.label
+  { name = input.name
+  , label = label
+  , typeLabel = fieldTypeLabelPlan input.type
+  , required = input.required
+  , helpText = input.ui.helpText
+  , columns = input.ui.columns
+  , editor = fieldEditorPlan input
+  }
+
+-- Reader-level orchestration stays beside the editor owner. The host supplies
+-- descriptor-safe type/registry observations, never a selected UI channel or a
+-- pre-decided alias fallback. Channel ids denote this freshly resolved list.
+@category "engine-internal"
+fieldReaderInputableTargetPlan : Bool -> FieldEditType -> Maybe String
+fieldReaderInputableTargetPlan enabled type = if enabled then fieldReaderInputableTypeTarget type else Nothing
+
+@category "engine-internal"
+fieldReaderInputableTypeTarget : FieldEditType -> Maybe String
+fieldReaderInputableTypeTarget type = case type of
+  FtNamed { name = name } -> Just name
+  FtRefined { base = base } -> fieldReaderInputableTypeTarget base
+  FtMaybe { value = value } -> fieldReaderInputableTypeTarget value
+  FtOpaque { name = name, pure = pure } -> if name == "" then fieldReaderInputableTypeTarget pure else Just name
+  FtTagged { entityType = entityType } -> if entityType == "" then Nothing else Just entityType
+  _ -> Nothing
+
+@category "engine-internal"
+fieldReaderChannelSelectionPlan : Maybe Anything -> Maybe String -> Result String Anything
+fieldReaderChannelSelectionPlan observed requested =
+  let channels = fromMaybe [] observed
+  if not (isArray channels) then Err "This type's input channels could not be read."
+  else if not (all channels (\channel -> isString channel.id && channel.id != "")) then Err "Every input channel needs a stable id."
+  else if length (unique (map (\channel -> channel.id) channels)) != length channels then Err "This type has ambiguous input channel ids."
+  else
+    let selected = case requested of
+          Nothing -> head channels
+          Just identity -> case find (\channel -> channel.id == identity) channels of
+            Just channel -> Just channel
+            Nothing -> head channels
+    let identity = case selected of Nothing -> Nothing; Just channel -> Just channel.id
+    Ok { channels = channels, channel = selected, activeChannelId = identity }
+
+@category "engine-internal"
+fieldReaderRecordValuesPlan : FieldEditType -> Bool
+fieldReaderRecordValuesPlan type = case type of
+  FtEl {} -> false
+  _ -> true
+
+@category "engine-internal"
+fieldReaderDeclarationFallbackPlan : Anything -> List Anything -> TraversalType -> Maybe String
+fieldReaderDeclarationFallbackPlan requested channels type =
+  if requested.editor.kind != "unsupported" || length channels > 0 then Nothing
+  else case type of
+    TtNamed { name = name } -> Just name
+    _ -> Nothing
+
+@category "engine-internal"
+fieldReaderPlanResult : Anything -> Maybe Anything -> Anything -> Anything
+fieldReaderPlanResult requested fallback selection =
+  let plan = case fallback of
+        Nothing -> requested
+        Just resolved -> mapSet (mapSet requested "required" resolved.required) "editor" resolved.editor
+  { plan = plan, channels = selection.channels, activeChannelId = selection.activeChannelId }
+
+FieldRecordSlot = FieldRecordSlot wire: String value: Maybe Anything
+
+@category "engine-internal"
+fieldRecordDeclarationConflicts : (snapshot: RepresentationValueSnapshot) -> (names: List String) -> (ordinal: Number) -> Bool
+fieldRecordDeclarationConflicts snapshot names ordinal = case head names of
+  Nothing -> false
+  Just name ->
+    let positional = join ["_", toString ordinal] ""
+    let duplicate = if name == positional then false else case representationSnapshotField snapshot name of
+          Nothing -> false
+          Just value -> case representationSnapshotField snapshot positional of Just alternate -> true; Nothing -> false
+    duplicate || fieldRecordDeclarationConflicts snapshot (fromMaybe [] (tail names)) (ordinal + 1)
+
+@category "engine-internal"
+fieldRecordValidatePlan : (snapshot: RepresentationValueSnapshot) -> (declared: Maybe (List String)) -> Result String Bool
+fieldRecordValidatePlan snapshot declared = case snapshot of
+  SnapshotRecord fields -> case declared of
+    Nothing -> Ok true
+    Just names ->
+      if length (unique names) != length names then Err "This constructor has ambiguous field names"
+      else if fieldRecordDeclarationConflicts snapshot names 0 then Err "This data contains both spellings of one constructor field"
+      else Ok true
+  _ -> Err "This record cannot be read safely"
+
+@category "engine-internal"
+fieldRecordAdmittedSlotPlan : (snapshot: RepresentationValueSnapshot) -> (declared: Maybe (List String)) -> (field: String) -> Result String FieldRecordSlot
+fieldRecordAdmittedSlotPlan snapshot declared field = case snapshot of
+  SnapshotRecord fields -> case declared of
+    Nothing -> Ok (FieldRecordSlot { wire = field, value = representationSnapshotField snapshot field })
+    Just names ->
+      let ordinal = findIndex (\name -> name == field) names
+      if ordinal < 0 then Ok (FieldRecordSlot { wire = field, value = representationSnapshotField snapshot field })
+      else
+        let positional = join ["_", toString ordinal] ""
+        let direct = representationSnapshotField snapshot field
+        let alternate = representationSnapshotField snapshot positional
+        if field == positional then Ok (FieldRecordSlot { wire = field, value = direct })
+        else case direct of
+          Just value -> case alternate of
+            Just duplicate -> Err "This data contains both spellings of one constructor field"
+            Nothing -> Ok (FieldRecordSlot { wire = field, value = Just value })
+          Nothing -> case representationSnapshotConstructorField snapshot field ordinal of
+            Just value -> Ok (FieldRecordSlot { wire = positional, value = Just value })
+            Nothing -> Ok (FieldRecordSlot { wire = field, value = Nothing })
+  _ -> Err "This record cannot be read safely"
+
+@category "engine-internal"
+fieldRecordSlotPlan : (snapshot: RepresentationValueSnapshot) -> (declared: Maybe (List String)) -> (field: String) -> Result String FieldRecordSlot
+fieldRecordSlotPlan snapshot declared field = case fieldRecordValidatePlan snapshot declared of
+  Err message -> Err message
+  Ok _ -> fieldRecordAdmittedSlotPlan snapshot declared field
+
+@category "engine-internal"
+fieldRecordSlotsPlan : (snapshot: RepresentationValueSnapshot) -> (declared: Maybe (List String)) -> (fields: List String) -> List ({ field: String, slot: Result String FieldRecordSlot })
+fieldRecordSlotsPlan snapshot declared fields =
+  if length fields == 0 then []
+  else case fieldRecordValidatePlan snapshot declared of
+    Err message -> map (\field -> { field = field, slot = Err message }) fields
+    Ok _ -> map (\field -> { field = field, slot = fieldRecordAdmittedSlotPlan snapshot declared field }) fields
+
+@category "engine-internal"
+fieldRecordEditPlan : (snapshot: RepresentationValueSnapshot) -> (declared: Maybe (List String)) -> (field: String) -> (edited: Anything) -> Result String Anything
+fieldRecordEditPlan snapshot declared field edited = case fieldRecordSlotPlan snapshot declared field of
+  Err message -> Err message
+  Ok slot -> case snapshot of
+    SnapshotRecord fields ->
+      let record = fold (\acc own -> mapSet acc own.name own.value) {} fields
+      Ok (mapSet record slot.wire edited)
+    _ -> Err "This record cannot be read safely"

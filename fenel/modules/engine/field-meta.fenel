@@ -1,0 +1,337 @@
+module engine where
+
+-- field-meta — pure structural FenelType helpers for FieldDef metadata.
+--
+-- Phase 10c sub-step 1 port. Mirrors the TS oracle at
+-- implementations/typescript/engine/src/field-meta.ts (now a thin shim
+-- over the dispatched wrappers for the ported entries).
+--
+-- This sub-step ports the pure-structural helpers that DON'T depend on
+-- the typeclass registry. Legacy entries still use narrow boundary ADTs where
+-- noted. Field-identity Phase 3 moves every tagged-phantom reader onto the
+-- descriptor-safe shared TraversalType + canonical SetExpr view, so those
+-- bodies own constructor selection and semantic recognition end to end.
+--
+-- The remaining boundary carriers follow Phase 9's ResolvedAtomInput recipe;
+-- the phantom readers follow Phase 7c's shared TraversalType-style ADT view.
+--
+-- Ports in this sub-step:
+--
+--   variantDiscriminator(type)        — $variant.discriminator → Maybe String
+--   phantomEntityName(type)           — $tagged.phantom.$refined.set.$enum[0] → Maybe String
+--   refEntityTypeOf(f)                — delegation to phantomEntityName on f.type
+--   entitySchemaFields(spec)          — extract FieldDef[] from spec.type.$record
+--   entityRecordType(spec)            — extract Maybe FenelType from spec.type
+--   formDefinitionFields(def)         — mirror of entitySchemaFields for FormDefinitions
+--   subFieldDefs(f)                   — $record/$list/$maybe → List<FieldDef>
+--   variantFieldDefs(f)               — $variant.cases → List<{name, fields}>
+--
+-- DEFER-PROVISIONAL (pending Phase 10a registry port):
+--
+--   defaultValueFor / channelsFor     — depend on registry.resolve for
+--                                       atomic-type HasDefault/Inputable lookup.
+--                                       The recursive composite walks could
+--                                       port, but the leaves depend on the
+--                                       typeclass registry. Revisit when
+--                                       Phase 10a unlocks the registry-as-
+--                                       Fenel pattern.
+--
+-- DEFER (no-value-add micro ports):
+--
+--   fieldType(f) / fieldMeta(f)       — trivial single-line getters
+--                                       (return f.type / f.meta ?? {}).
+--                                       Net positive marshalling overhead
+--                                       with zero Fenel reasoning unlock.
+--   asFenelType(t)                    — internal validator narrowing a loose
+--                                       TypeSource to FenelType. Stays TS as
+--                                       a one-shot guard at the wrapper
+--                                       boundary.
+--   liftLegacyFields(raw)             — backfill adapter for un-migrated DB
+--                                       rows; one-shot legacy converter.
+--                                       Stays TS until DB layer ports.
+--
+-- All internal helpers are prefixed `fldMeta…` to avoid colliding with
+-- like-named helpers in other engine bodies.
+
+-- ---------------------------------------------------------------------------
+-- VdInput — pre-classified $variant.discriminator view for
+-- variantDiscriminator.
+--
+-- The TS wrapper checks `"$variant" in type` + extracts the optional
+-- discriminator string. Emits VdHasDisc when both $variant AND a
+-- non-empty string discriminator are present; VdNoDisc otherwise (non-
+-- $variant types, or $variant without a discriminator field).
+-- ---------------------------------------------------------------------------
+
+VdInput =
+  VdHasDisc disc: String
+  | VdNoDisc
+
+-- ---------------------------------------------------------------------------
+-- variantDiscriminator — read $variant.discriminator field.
+--
+-- Mirrors the TS oracle:
+--   if (type && typeof type === "object" && "$variant" in type) {
+--     return type.$variant.discriminator;
+--   }
+--   return undefined;
+--
+-- The wrapper pre-extracts the discriminator (Just for $variant with
+-- non-empty discriminator, Nothing otherwise). The body returns the
+-- pre-classified Maybe directly.
+-- ---------------------------------------------------------------------------
+
+@label "field-meta: variantDiscriminator"
+@description "Phase 10c sub-step 1 — read $variant.discriminator field on a FenelType. The TS wrapper pre-extracts the discriminator string into VdInput (VdHasDisc disc / VdNoDisc); the body returns the Maybe directly. Boundary adapter; dispatched via `dispatchedVariantDiscriminator`. Mirrors implementations/typescript/engine/src/field-meta.ts:variantDiscriminator."
+@tags "engine" "field-meta" "boundary" "phase-10c"
+variantDiscriminator : (input: VdInput) -> Maybe String
+variantDiscriminator input = case input of
+  VdHasDisc { disc = d } -> Just d
+  VdNoDisc -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- Tagged phantom readers — semantic recognition over TraversalType.
+--
+-- The TS boundary now supplies only an optional descriptor-safe TraversalType
+-- whose TtRefined node carries the raw set plus its canonical SetExpr view.
+-- Enum-first selection, entity-string recognition, and the GeoPath gate live
+-- here. No pre-classified Pew/Puw/Pgl carrier survives at the host seam.
+-- ---------------------------------------------------------------------------
+
+@label "field-meta: phantomEntityName"
+@description "Field-identity Phase 3 — extract the entity-name string from an optional shared TraversalType. Fenel owns TtTagged phantom selection, refined SeEnum-first recognition, and the string leaf check; TS supplies only descriptor-safe canonical boundary data. Dispatched via `dispatchedPhantomEntityName`."
+@tags "engine" "field-meta" "boundary" "field-identity" "phase-3"
+phantomEntityName : (input: Maybe TraversalType) -> Maybe String
+phantomEntityName input = case input of
+  Nothing -> Nothing
+  Just type -> typeTraversalPhantomEntityName type
+
+@label "field-meta: refEntityTypeOf"
+@description "Field-identity Phase 3 — derive a FieldDef typed-reference entity name by delegating over its optional shared TraversalType. All phantom-enum and string recognition remains Fenel-owned. Dispatched via `dispatchedRefEntityTypeOf`."
+@tags "engine" "field-meta" "boundary" "field-identity" "phase-3"
+refEntityTypeOf : (input: Maybe TraversalType) -> Maybe String
+refEntityTypeOf input = phantomEntityName input
+
+@label "field-meta: phantomUnitOf"
+@description "Extract a tagged value's typed MeasureExpr phantom independently of its base type. Ordinary reference or string phantoms do not describe units; the complete self-contained unit definition survives this projection."
+@tags "engine" "field-meta" "boundary" "field-identity" "phase-3"
+phantomUnitOf : (input: Maybe TraversalType) -> Maybe a
+phantomUnitOf input = case input of
+  Nothing -> Nothing
+  Just type -> case type of
+    TtTagged { phantom = phantom } -> case phantom of
+      TtRefined { base = base } -> case base of
+        TtNamed { name = phantomName } ->
+          if eq phantomName "MeasureExpr" then typeTraversalPhantomFirst type else Nothing
+        _ -> Nothing
+      _ -> Nothing
+    _ -> Nothing
+
+@label "field-meta: phantomGeoLevelOf"
+@description "Field-identity Phase 3 — extract the first refined phantom enum member only for a TtTagged whose value is named GeoPath. Fenel owns both the type gate and enum-first policy over the shared descriptor-safe TraversalType. Dispatched via `dispatchedPhantomGeoLevelOf`."
+@tags "engine" "field-meta" "boundary" "field-identity" "phase-3"
+phantomGeoLevelOf : (input: Maybe TraversalType) -> Maybe a
+phantomGeoLevelOf input = case input of
+  Nothing -> Nothing
+  Just type -> case type of
+    TtTagged { value = value } -> case value of
+      TtNamed { name = name } ->
+        if eq name "GeoPath" then typeTraversalPhantomFirst type else Nothing
+      _ -> Nothing
+    _ -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- EsfInput — pre-classified entity-schema-fields view for entitySchemaFields
+-- and formDefinitionFields.
+--
+-- The wrapper does asFenelType narrowing TS-side + legacy schema fallback
+-- (liftLegacyFields for un-migrated DB rows). Emits EsfRecord with the
+-- original FieldDef list opaquely when a $record type was found OR when the
+-- legacy schema array was lifted. EsfNone when neither path applies. These
+-- passthrough entries are deliberately `Any`: they are untagged host records
+-- whose auxiliary fields and object identity survive the round-trip.
+-- ---------------------------------------------------------------------------
+
+EsfInput =
+  EsfRecord fields: List Any
+  | EsfNone
+
+-- ---------------------------------------------------------------------------
+-- FldField — synthesized FieldDef shape for the field-meta bodies.
+--
+-- Existing FieldDefs never become this constructor: the TS seam passes their
+-- untagged records through opaquely so auxiliary fields and object identity are
+-- retained. Only synthesized FieldDef entries (subFieldDefs's list-item /
+-- maybe-value arms) are constructed as FldField here; the wrapper unmarshalls
+-- those fresh values to the canonical plain FieldDef shape.
+-- ---------------------------------------------------------------------------
+
+FldField = FldField name: String label: Any type: Any
+
+-- ---------------------------------------------------------------------------
+-- entitySchemaFields — extract FieldDef[] from spec.type.$record.
+--
+-- Mirrors the TS oracle:
+--   const t = asFenelType(spec.type);
+--   if (t && "$record" in t) return t.$record.fields;
+--   if (Array.isArray(spec.schema)) return liftLegacyFields(spec.schema);
+--   return [];
+--
+-- The wrapper does asFenelType + legacy schema fallback TS-side; the
+-- body's input is a pre-classified EsfInput. Body dispatches on the
+-- variant and returns the opaque original fields list (or empty list).
+-- ---------------------------------------------------------------------------
+
+@label "field-meta: entitySchemaFields"
+@description "Phase 10c sub-step 1 — extract FieldDef[] from spec.type.$record (or from a lifted legacy schema column for un-migrated DB rows). The TS wrapper does asFenelType narrowing + liftLegacyFields TS-side and emits EsfInput (EsfRecord fields / EsfNone); the body routes the original untagged FieldDef list opaquely. The wrapper returns those records unchanged, preserving auxiliary fields and object identity. Boundary adapter; dispatched via `dispatchedEntitySchemaFields`. Mirrors implementations/typescript/engine/src/field-meta.ts:entitySchemaFields."
+@tags "engine" "field-meta" "boundary" "phase-10c"
+entitySchemaFields : (input: EsfInput) -> List Any
+entitySchemaFields input = case input of
+  EsfRecord { fields = fs } -> fs
+  EsfNone -> []
+
+-- ---------------------------------------------------------------------------
+-- formDefinitionFields — mirror of entitySchemaFields for FormDefinitions.
+--
+-- Mirrors the TS oracle:
+--   const t = asFenelType(def.type);
+--   if (t && "$record" in t) return t.$record.fields;
+--   if (Array.isArray(def.fields)) return liftLegacyFields(def.fields);
+--   return [];
+--
+-- Same shape as entitySchemaFields — the wrapper takes the FormDefinition's
+-- `def.type` / `def.fields` (legacy column) and emits EsfInput. The body
+-- is the same dispatch as entitySchemaFields. Publish-surface fnId
+-- preserves a per-domain entry in the matrix + audit tooling.
+-- ---------------------------------------------------------------------------
+
+@label "field-meta: formDefinitionFields"
+@description "Phase 10c sub-step 1 — resolve a FormDefinition's input fields. Same shape as entitySchemaFields — the wrapper accepts def.type / def.fields (legacy column) and emits EsfInput; the body dispatches identically. Publish-surface fnId preserves a per-domain entry in the matrix. Boundary adapter; dispatched via `dispatchedFormDefinitionFields`. Mirrors implementations/typescript/engine/src/field-meta.ts:formDefinitionFields."
+@tags "engine" "field-meta" "boundary" "phase-10c"
+formDefinitionFields : (input: EsfInput) -> List Any
+formDefinitionFields input = case input of
+  EsfRecord { fields = fs } -> fs
+  EsfNone -> []
+
+-- ---------------------------------------------------------------------------
+-- ErtInput — pre-classified entity-record-type view for entityRecordType.
+--
+-- The wrapper does asFenelType narrowing + legacy schema fallback. Emits
+-- ErtSome with the FenelType (passthrough) when a type was resolved (from
+-- spec.type or lifted from the legacy schema column); ErtNone when no
+-- type could be resolved.
+-- ---------------------------------------------------------------------------
+
+ErtInput =
+  ErtSome resolvedType: Any
+  | ErtNone
+
+-- ---------------------------------------------------------------------------
+-- entityRecordType — resolve an EntitySpec's (or EntityRelation's)
+-- canonical FenelType.
+--
+-- Mirrors the TS oracle:
+--   const t = asFenelType(spec.type);
+--   if (t) return t;
+--   if (!Array.isArray(spec.schema)) return null;
+--   return { $record: { fields: liftLegacyFields(spec.schema) } };
+--
+-- The wrapper does the narrowing + legacy lifting TS-side and emits
+-- ErtInput. The body returns a Maybe FenelType.
+-- ---------------------------------------------------------------------------
+
+@label "field-meta: entityRecordType"
+@description "Phase 10c sub-step 1 — resolve an EntitySpec's canonical FenelType. The TS wrapper does asFenelType narrowing + legacy schema lifting TS-side and emits ErtInput (ErtSome resolvedType / ErtNone); the body returns Maybe FenelType. Boundary adapter; dispatched via `dispatchedEntityRecordType`. Mirrors implementations/typescript/engine/src/field-meta.ts:entityRecordType."
+@tags "engine" "field-meta" "boundary" "phase-10c"
+entityRecordType : (input: ErtInput) -> Maybe Any
+entityRecordType input = case input of
+  ErtSome { resolvedType = t } -> Just t
+  ErtNone -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- SfdInput — pre-classified subFieldDefs view.
+--
+-- The wrapper introspects f.type:
+--   - $record → SfdRecord with the original untagged FieldDef list
+--   - peelList match → SfdList with the elem FenelType (peeling via
+--     dispatchedPeelList — already Fenel-bodied per Phase 7c sub-step 2)
+--   - peelMaybe match → SfdMaybe with the value FenelType (peeling via
+--     dispatchedPeelMaybe — already Fenel-bodied per Phase 7c sub-step 1)
+--   - else → SfdNone
+-- ---------------------------------------------------------------------------
+
+SfdInput =
+  SfdRecord fields: List Any
+  | SfdList elemType: Any
+  | SfdMaybe valueType: Any
+  | SfdNone
+
+-- ---------------------------------------------------------------------------
+-- subFieldDefs — peel composite FenelType into sub-FieldDefs.
+--
+-- Mirrors the TS oracle:
+--   const t = f.type;
+--   if ("$record" in t) return t.$record.fields;
+--   const list = peelList(t);
+--   if (list) return [{ name: "item", label: "Item", type: list.elem }];
+--   const maybe = peelMaybe(t);
+--   if (maybe) return [{ name: "value", label: "Value", type: maybe.value }];
+--   return [];
+--
+-- The wrapper pre-classifies into SfdInput. The body dispatches on the
+-- variant: SfdRecord passes the opaque original fields through; SfdList /
+-- SfdMaybe synthesize a singleton list with the canonical "item" / "value"
+-- FldField. The wrapper unmarshalls to plain `{name, label, type}` JS objects.
+-- ---------------------------------------------------------------------------
+
+@label "field-meta: subFieldDefs"
+@description "Phase 10c sub-step 1 — peel composite FenelType into sub-FieldDefs. The TS wrapper pre-classifies f.type into SfdInput (SfdRecord fields / SfdList elemType / SfdMaybe valueType / SfdNone) using dispatchedPeelList + dispatchedPeelMaybe (already Fenel-bodied per Phase 7c sub-step 1+2). The body dispatches: SfdRecord passes the original untagged FieldDef records through opaquely; SfdList/SfdMaybe synthesize a singleton FldField list with canonical \"item\"/\"value\" name+label. The wrapper leaves passthrough records unchanged and unmarshalls only synthesized FldField values. Boundary adapter; dispatched via `dispatchedSubFieldDefs`. Mirrors implementations/typescript/engine/src/field-meta.ts:subFieldDefs."
+@tags "engine" "field-meta" "boundary" "phase-10c"
+subFieldDefs : (input: SfdInput) -> List Any
+subFieldDefs input = case input of
+  SfdRecord { fields = fs } -> fs
+  SfdList { elemType = t } ->
+    appendItem (FldField { name = "item", label = "Item", type = t }) []
+  SfdMaybe { valueType = t } ->
+    appendItem (FldField { name = "value", label = "Value", type = t }) []
+  SfdNone -> []
+
+-- ---------------------------------------------------------------------------
+-- VfdInput — pre-classified variantFieldDefs view.
+--
+-- The wrapper checks `"$variant" in f.type`; emits VfdVariant with the
+-- marshalled list of nominal VfdCase entries. Each case wrapper is tagged, but
+-- its `fields` slot carries the original untagged FieldDef list opaquely;
+-- VfdNone is emitted otherwise.
+-- ---------------------------------------------------------------------------
+
+VfdInput =
+  VfdVariant cases: List VfdCase
+  | VfdNone
+
+VfdCase = VfdCase name: String fields: List Any
+
+-- ---------------------------------------------------------------------------
+-- variantFieldDefs — record of per-variant payload FieldDefs.
+--
+-- Mirrors the TS oracle:
+--   const t = f.type;
+--   if (!("$variant" in t)) return {};
+--   const out: Record<string, FieldDef[]> = {};
+--   for (const c of t.$variant.cases) {
+--     out[c.name] = c.fields ?? [];
+--   }
+--   return out;
+--
+-- The wrapper pre-extracts the cases as a list of VfdCase entries; the
+-- body returns the list (the wrapper materializes the Record<string,
+-- FieldDef[]> output). Body returns Nil for non-variant inputs.
+-- ---------------------------------------------------------------------------
+
+@label "field-meta: variantFieldDefs"
+@description "Phase 10c sub-step 1 — record of per-variant payload FieldDefs from a $variant-typed FieldDef. The TS wrapper extracts $variant.cases and emits VfdInput (VfdVariant cases / VfdNone) with each nominal VfdCase carrying the variant name plus its original untagged FieldDef payload list. The body returns the VfdCase list passthrough; the wrapper materializes Record<string, FieldDef[]> while preserving each opaque field record. Boundary adapter; dispatched via `dispatchedVariantFieldDefs`. Mirrors implementations/typescript/engine/src/field-meta.ts:variantFieldDefs."
+@tags "engine" "field-meta" "boundary" "phase-10c"
+variantFieldDefs : (input: VfdInput) -> List VfdCase
+variantFieldDefs input = case input of
+  VfdVariant { cases = cs } -> cs
+  VfdNone -> []

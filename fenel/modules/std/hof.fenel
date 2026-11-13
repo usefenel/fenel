@@ -1,0 +1,163 @@
+module std where
+
+-- Higher-order std functions — Fenel bodies as the SOURCE OF TRUTH
+-- (effect-visibility Phase 3).
+--
+-- THE INTENTIONAL DUAL (the opaque-repr-for-functions pattern — the same
+-- ledger kind as the fenel-parser.ts perf branch): every fn in this file ALSO
+-- keeps its TS ctx-native impl in ffi/std-ffi.ts (`stdNativesCtx`). That is
+-- NOT the forbidden accidental shadow (AGENTS.md "Never add a TS native or shim
+-- beside a Fenel body") — here the dual is deliberate and the SELECTOR is explicit:
+--
+--   • The PURE evaluator (json-logic.ts `invokeFunction`) dispatches
+--     nativesCtx BEFORE spec.body — the TS native is the hot path. In the
+--     pure evaluator a HOF call is only ever reached inside a closure the
+--     structural purity gate already proved fully pure, so no selector and
+--     no new cost there.
+--   • The DURABLE turn (runtime/src/evaluator.ts `yieldsIO`) gates every
+--     CALLABLE argument (the `$arrow`-typed positions of the decl, read from
+--     the sig): ALL provably pure ⇒ the native runs inline (today's
+--     behavior); ANY not provably pure ⇒ the call yields to THESE bodies via
+--     the registerFenelBodyDispatchers durable path, where each `fn h`
+--     application sits in an explicit let/statement position and yields IO
+--     properly (the turn's var-head normalization resolves the callable and
+--     re-steps it as a call by name/ref).
+--
+-- Body idiom: `case head arr of Nothing/Just h` + `fromMaybe [] (tail arr)`
+-- recursion + `concat [x] rest` — the analyze.fenel / enumerate.fenel
+-- array-repr walking idiom. Deliberately NOT the illustrative
+-- `case xs of Nil | Cons h t` cons-matching: matchPattern has no
+-- Cons/Nil↔array-repr coercion (only Bool carries the B5 opaque-repr match
+-- branch), so cons patterns would never match runtime lists; head/tail reads
+-- and builds the native array repr directly, which is also what keeps these
+-- bodies value-parity-equal with the TS natives.
+--
+-- Known divergences vs the TS natives (documented, accepted):
+--   • String inputs: the natives special-case JS strings (map/filter over a
+--     String return a String); these bodies walk head/tail (which accept
+--     strings) but BUILD the List-Char array repr — the same pure value in
+--     the other Reprable view. Reachable only for an EFFECTFUL callable over
+--     a String (all-pure callables keep the native).
+--   • flatMap: the native tolerates non-array/null pieces (a JS-ism); the
+--     body assumes the declared typing (fn returns List b) and concats.
+--   • sort: the native is JS `Array.sort` over the key projection (TimSort,
+--     stable); the body is a stable merge sort over the same key comparison
+--     (number pair ⇒ numeric, else string compare) — same ordering contract.
+
+@label "Map"
+@description "Apply a function to each element. ∀a b. (a → b) → List a → List b"
+@tags "list" "transform"
+map : (fn: (a -> b)) -> (arr: List a) -> List b
+map fn arr =
+  case head arr of
+    Nothing -> []
+    Just h ->
+      let fh = fn h
+      let rest = map fn (fromMaybe [] (tail arr))
+      concat [fh] rest
+
+@label "Filter"
+@description "Keep elements where predicate is true. ∀a. (a → Bool) → List a → List a"
+@tags "list" "predicate"
+filter : (fn: (a -> Boolean)) -> (arr: List a) -> List a
+filter fn arr =
+  case head arr of
+    Nothing -> []
+    Just h ->
+      let keep = fn h
+      let rest = filter fn (fromMaybe [] (tail arr))
+      if keep then concat [h] rest else rest
+
+@label "Fold"
+@description "Reduce list to a single value (left fold). ∀a b. (b → a → b) → b → List a → b"
+@tags "list" "reduce"
+fold : (fn: ((b, a) -> b)) -> (init: b) -> (arr: List a) -> b
+fold fn init arr =
+  case head arr of
+    Nothing -> init
+    Just h ->
+      let acc2 = fn init h
+      fold fn acc2 (fromMaybe [] (tail arr))
+
+@label "Flat map"
+@description "Map then flatten. ∀a b. (a → List b) → List a → List b"
+@tags "list" "transform"
+flatMap : (fn: (a -> (List b))) -> (arr: List a) -> List b
+flatMap fn arr =
+  case head arr of
+    Nothing -> []
+    Just h ->
+      let piece = fn h
+      let rest = flatMap fn (fromMaybe [] (tail arr))
+      concat piece rest
+
+@label "Find"
+@description "First element matching predicate. Nothing if none match. ∀a. (a → Bool) → List a → Maybe a"
+@tags "list" "search"
+find : (fn: (a -> Boolean)) -> (arr: List a) -> Maybe a
+find fn arr =
+  case head arr of
+    Nothing -> Nothing
+    Just h ->
+      let hit = fn h
+      if hit then Just h else find fn (fromMaybe [] (tail arr))
+
+-- ---------------------------------------------------------------------------
+-- Slice 2 — the remaining higher-order fns. Same idiom; short-circuiting
+-- shapes (all / some / none / find / findIndex / takeWhile) recurse ONLY in
+-- the not-yet-decided branch so the effect COUNT matches the natives' early
+-- exit. `sort` decorates ONCE per element (the native re-invokes the key per
+-- comparison — the body is effect-thriftier for effectful keys, same values).
+-- groupBy threads a forward accumulator so its record key order matches the
+-- native's first-encounter insertion order exactly.
+-- ---------------------------------------------------------------------------
+
+@label "Find index (from)"
+@description "Index-threading helper for findIndex: the index of the first predicate match at or after position i, or -1. Internal recursion carrier — keeps findIndex's public signature clean while the recursion short-circuits like the native."
+@tags "list" "search" "internal"
+findIndexAt : (fn: (a -> Boolean)) -> (arr: List a) -> (i: Number) -> Int
+findIndexAt fn arr i =
+  case head arr of
+    Nothing -> 0 - 1
+    Just h ->
+      let hit = fn h
+      if hit then i else findIndexAt fn (fromMaybe [] (tail arr)) (add i 1)
+
+@label "Find index"
+@description "Index of the first element matching predicate, or -1 when no match. ∀a. (a → Bool) → List a → Int"
+@tags "list" "search"
+findIndex : (fn: (a -> Boolean)) -> (arr: List a) -> Int
+findIndex fn arr = findIndexAt fn arr 0
+
+@label "All"
+@description "Do all elements satisfy the predicate? True on the empty list. Short-circuits on the first failure. ∀a. List a → (a → Bool) → Bool"
+@tags "list" "predicate" "aggregate"
+all : (arr: List a) -> (pred: (a -> Boolean)) -> Boolean
+all arr pred =
+  case head arr of
+    Nothing -> True
+    Just h ->
+      let ok = pred h
+      if ok then all (fromMaybe [] (tail arr)) pred else False
+
+@label "Some"
+@description "Does any element satisfy the predicate? False on the empty list. Short-circuits on the first hit. ∀a. List a → (a → Bool) → Bool"
+@tags "list" "predicate" "aggregate"
+some : (arr: List a) -> (pred: (a -> Boolean)) -> Boolean
+some arr pred =
+  case head arr of
+    Nothing -> False
+    Just h ->
+      let ok = pred h
+      if ok then True else some (fromMaybe [] (tail arr)) pred
+
+@label "None"
+@description "Does no element satisfy the predicate? True on the empty list. Short-circuits on the first hit. ∀a. List a → (a → Bool) → Bool"
+@tags "list" "predicate" "aggregate"
+none : (arr: List a) -> (pred: (a -> Boolean)) -> Boolean
+none arr pred =
+  case head arr of
+    Nothing -> True
+    Just h ->
+      let ok = pred h
+      if ok then False else none (fromMaybe [] (tail arr)) pred

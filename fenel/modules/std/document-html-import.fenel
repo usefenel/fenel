@@ -1,0 +1,257 @@
+module std where
+
+-- GP-63: a pure importer for documentToHtml's bounded XHTML-style fragment,
+-- not a general HTML/XML parser. Structural tags/attributes use their exact
+-- lowercase exported spelling. No declarations, comments, implicit repairs,
+-- unknown attributes, inter-block text or active content are admitted.
+-- Source is limited to 8192 Unicode code points and traversal to 64 steps.
+-- Scan List Char throughout: String length and host slice use different units.
+-- Decode the five XML entities and decimal/hex scalar references exactly once.
+-- Literal CR, and literal attribute TAB/LF/CR, refuse because XML normalizes
+-- them. Numeric references preserve those characters as the exporter does.
+-- Normalize only adjacent/empty DocText nodes; keep every block/style/code and
+-- distinguish absent code language from an explicitly empty language.
+
+DocumentHtmlCursor = DocumentHtmlCursor remaining: List String offset: Nat
+DocumentHtmlLiteralParsed = DocumentHtmlLiteralParsed cursor: DocumentHtmlCursor value: String
+DocumentHtmlInlineParsed = DocumentHtmlInlineParsed cursor: DocumentHtmlCursor value: DocInline
+DocumentHtmlInlinesParsed = DocumentHtmlInlinesParsed cursor: DocumentHtmlCursor value: List DocInline
+DocumentHtmlBlockParsed = DocumentHtmlBlockParsed cursor: DocumentHtmlCursor value: DocBlock
+DocumentHtmlBlocksParsed = DocumentHtmlBlocksParsed cursor: DocumentHtmlCursor value: List DocBlock
+DocumentHtmlDecodeState = DocumentHtmlDecodeState offset: Nat entityStart: Nat entity: Maybe String output: List String failure: Maybe String
+
+@category "document-internal"
+documentHtmlImportError : (cursor: DocumentHtmlCursor) -> (category: String) -> Result String a
+documentHtmlImportError cursor category = Err (join ["Document HTML ", category, " at code-point ", toString cursor.offset] "")
+
+@category "document-internal"
+documentHtmlImportAdvance : (cursor: DocumentHtmlCursor) -> (count: Nat) -> DocumentHtmlCursor
+documentHtmlImportAdvance cursor count = DocumentHtmlCursor { remaining = drop count cursor.remaining, offset = add cursor.offset count }
+
+@category "document-internal"
+documentHtmlImportStarts : (cursor: DocumentHtmlCursor) -> (literal: String) -> Boolean
+documentHtmlImportStarts cursor literal = eq (join (take (length (chars literal)) cursor.remaining) "") literal
+
+@category "document-internal"
+documentHtmlImportExpect : (cursor: DocumentHtmlCursor) -> (literal: String) -> Result String DocumentHtmlCursor
+documentHtmlImportExpect cursor literal =
+  if documentHtmlImportStarts cursor literal then Ok (documentHtmlImportAdvance cursor (length (chars literal)))
+  else documentHtmlImportError cursor (join ["expected ", literal] "")
+
+@category "document-internal"
+documentHtmlImportDigit : (radix: Nat) -> (value: Result String Nat) -> (character: String) -> Result String Nat
+documentHtmlImportDigit radix value character = case value of
+  Err reason -> Err reason
+  Ok current ->
+    let code = charCode character
+    let digit = if and (gte code 48) (lte code 57) then sub code 48 else if and (gte code 65) (lte code 70) then sub code 55 else if and (gte code 97) (lte code 102) then sub code 87 else radix
+    let next = add (mul current radix) digit
+    if or (gte digit radix) (gt next 1114111) then Err "invalid numeric entity"
+    else Ok next
+
+@category "document-internal"
+documentHtmlImportNumericEntity : (radix: Nat) -> (digits: List String) -> Result String String
+documentHtmlImportNumericEntity radix digits =
+  if eq (length digits) 0 then Err "empty numeric entity"
+  else case fold (documentHtmlImportDigit radix) (Ok 0) digits of
+    Err reason -> Err reason
+    Ok code ->
+      let character = charFromCode code
+      if documentExportXmlCharacter character then Ok character
+      else Err "numeric entity outside the XML-safe fragment"
+
+@category "document-internal"
+documentHtmlImportEntity : (name: String) -> Result String String
+documentHtmlImportEntity name =
+  if eq name "amp" then Ok "&"
+  else if eq name "lt" then Ok "<"
+  else if eq name "gt" then Ok ">"
+  else if eq name "quot" then Ok "\""
+  else if eq name "apos" then Ok "'"
+  else if startsWith name "#x" then documentHtmlImportNumericEntity 16 (drop 2 (chars name))
+  else if startsWith name "#" then documentHtmlImportNumericEntity 10 (drop 1 (chars name))
+  else Err "unknown entity"
+
+@category "document-internal"
+documentHtmlImportDecodeStep : (state: DocumentHtmlDecodeState) -> (character: String) -> DocumentHtmlDecodeState
+documentHtmlImportDecodeStep state character =
+  let nextOffset = add state.offset 1
+  case state.failure of
+    Just _ -> DocumentHtmlDecodeState { offset = nextOffset, entityStart = state.entityStart, entity = state.entity, output = state.output, failure = state.failure }
+    Nothing -> case state.entity of
+      Just name ->
+        if eq character ";" then case documentHtmlImportEntity name of
+          Err reason -> DocumentHtmlDecodeState { offset = nextOffset, entityStart = state.entityStart, entity = Nothing, output = state.output, failure = Just (join [reason, " at code-point ", toString state.entityStart] "") }
+          Ok literal -> DocumentHtmlDecodeState { offset = nextOffset, entityStart = state.entityStart, entity = Nothing, output = appendItem literal state.output, failure = Nothing }
+        else DocumentHtmlDecodeState { offset = nextOffset, entityStart = state.entityStart, entity = Just (join [name, character] ""), output = state.output, failure = Nothing }
+      Nothing ->
+        if eq character "&" then DocumentHtmlDecodeState { offset = nextOffset, entityStart = state.offset, entity = Just "", output = state.output, failure = Nothing }
+        else DocumentHtmlDecodeState { offset = nextOffset, entityStart = state.entityStart, entity = Nothing, output = appendItem character state.output, failure = Nothing }
+
+@category "document-internal"
+documentHtmlImportLiteral : (cursor: DocumentHtmlCursor) -> (stop: String) -> Result String DocumentHtmlLiteralParsed
+documentHtmlImportLiteral cursor stop =
+  let run = takeWhile (\character -> not (eq character stop)) cursor.remaining
+  let raw = join run ""
+  let attributeWhitespace = and (eq stop "\"") (or (contains raw "\t") (contains raw "\n"))
+  if or (contains raw "\r") attributeWhitespace then documentHtmlImportError cursor "literal XML-normalized whitespace requires numeric references"
+  else if or (contains raw "]]>") (and (eq stop "\"") (contains raw "<")) then documentHtmlImportError cursor "invalid literal XML syntax"
+  else case documentExportText raw of
+    Err reason -> documentHtmlImportError cursor reason
+    Ok _ ->
+      let initial = DocumentHtmlDecodeState { offset = cursor.offset, entityStart = cursor.offset, entity = Nothing, output = [], failure = Nothing }
+      let decoded = fold documentHtmlImportDecodeStep initial run
+      case decoded.failure of
+        Just reason -> Err (join ["Document HTML ", reason] "")
+        Nothing -> case decoded.entity of
+          Just _ -> documentHtmlImportError (DocumentHtmlCursor { remaining = [], offset = decoded.entityStart }) "unclosed entity"
+          Nothing -> Ok (DocumentHtmlLiteralParsed { cursor = documentHtmlImportAdvance cursor (length run), value = join decoded.output "" })
+
+@category "document-internal"
+documentHtmlImportAppendInline : (content: List DocInline) -> (inline: DocInline) -> List DocInline
+documentHtmlImportAppendInline content inline = case inline of
+  DocText { text = value } ->
+    if eq value "" then content
+    else case last content of
+      Just (DocText { text = before }) -> appendItem (DocText { text = join [before, value] "" }) (fromMaybe [] (init content))
+      _ -> appendItem inline content
+  _ -> appendItem inline content
+
+@category "document-internal"
+documentHtmlImportInlines : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> (inLink: Boolean) -> (closing: String) -> (content: List DocInline) -> Result String DocumentHtmlInlinesParsed
+documentHtmlImportInlines cursor nesting inLink closing content =
+  if gt nesting 64 then documentHtmlImportError cursor "nesting exceeds 64 steps"
+  else if documentHtmlImportStarts cursor closing then Ok (DocumentHtmlInlinesParsed { cursor = documentHtmlImportAdvance cursor (length (chars closing)), value = content })
+  else if eq (length cursor.remaining) 0 then documentHtmlImportError cursor "unclosed inline element"
+  else if eq (fromMaybe "" (head cursor.remaining)) "<" then case documentHtmlImportInline cursor (add nesting 1) inLink of
+    Err reason -> Err reason
+    Ok parsed -> documentHtmlImportInlines parsed.cursor nesting inLink closing (documentHtmlImportAppendInline content parsed.value)
+  else if gte nesting 64 then documentHtmlImportError cursor "nesting exceeds 64 steps"
+  else case documentHtmlImportLiteral cursor "<" of
+    Err reason -> Err reason
+    Ok parsed -> documentHtmlImportInlines parsed.cursor nesting inLink closing (documentHtmlImportAppendInline content (DocText { text = parsed.value }))
+
+@category "document-internal"
+documentHtmlImportStyle : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> (inLink: Boolean) -> (strong: Boolean) -> Result String DocumentHtmlInlineParsed
+documentHtmlImportStyle cursor nesting inLink strong =
+  let opening = if strong then "<strong>" else "<em>"
+  let closing = if strong then "</strong>" else "</em>"
+  case documentHtmlImportInlines (documentHtmlImportAdvance cursor (length (chars opening))) nesting inLink closing [] of
+    Err reason -> Err reason
+    Ok parsed -> Ok (DocumentHtmlInlineParsed { cursor = parsed.cursor, value = if strong then DocStrong { content = parsed.value } else DocEmphasis { content = parsed.value } })
+
+@category "document-internal"
+documentHtmlImportCodeLiteral : (cursor: DocumentHtmlCursor) -> (closing: String) -> Result String DocumentHtmlLiteralParsed
+documentHtmlImportCodeLiteral cursor closing = case documentHtmlImportLiteral cursor "<" of
+  Err reason -> Err reason
+  Ok parsed -> case documentHtmlImportExpect parsed.cursor closing of
+    Err reason -> Err reason
+    Ok after -> Ok (DocumentHtmlLiteralParsed { cursor = after, value = parsed.value })
+
+@category "document-internal"
+documentHtmlImportAttribute : (cursor: DocumentHtmlCursor) -> Result String DocumentHtmlLiteralParsed
+documentHtmlImportAttribute cursor = case documentHtmlImportLiteral cursor "\"" of
+  Err reason -> Err reason
+  Ok parsed -> case documentHtmlImportExpect parsed.cursor "\">" of
+    Err reason -> Err reason
+    Ok after -> Ok (DocumentHtmlLiteralParsed { cursor = after, value = parsed.value })
+
+@category "document-internal"
+documentHtmlImportLink : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> Result String DocumentHtmlInlineParsed
+documentHtmlImportLink cursor nesting = case documentHtmlImportAttribute (documentHtmlImportAdvance cursor 9) of
+  Err reason -> Err reason
+  Ok attribute -> case documentExportLinkUrl attribute.value of
+    Err reason -> documentHtmlImportError cursor reason
+    Ok _ -> case documentHtmlImportInlines attribute.cursor nesting true "</a>" [] of
+      Err reason -> Err reason
+      Ok parsed -> Ok (DocumentHtmlInlineParsed { cursor = parsed.cursor, value = DocLink { url = attribute.value, content = parsed.value } })
+
+@category "document-internal"
+documentHtmlImportInline : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> (inLink: Boolean) -> Result String DocumentHtmlInlineParsed
+documentHtmlImportInline cursor nesting inLink =
+  if gt nesting 64 then documentHtmlImportError cursor "nesting exceeds 64 steps"
+  else if documentHtmlImportStarts cursor "<em>" then documentHtmlImportStyle cursor nesting inLink false
+  else if documentHtmlImportStarts cursor "<strong>" then documentHtmlImportStyle cursor nesting inLink true
+  else if documentHtmlImportStarts cursor "<code>" then case documentHtmlImportCodeLiteral (documentHtmlImportAdvance cursor 6) "</code>" of
+    Err reason -> Err reason
+    Ok parsed -> Ok (DocumentHtmlInlineParsed { cursor = parsed.cursor, value = DocInlineCode { code = parsed.value } })
+  else if documentHtmlImportStarts cursor "<a href=\"" then
+    if inLink then documentHtmlImportError cursor "nested links are refused"
+    else documentHtmlImportLink cursor nesting
+  else documentHtmlImportError cursor "unsupported or malformed inline element"
+
+@category "document-internal"
+documentHtmlImportBlocks : (cursor: DocumentHtmlCursor) -> (depth: Nat) -> (nesting: Nat) -> (closing: String) -> (blocks: List DocBlock) -> Result String DocumentHtmlBlocksParsed
+documentHtmlImportBlocks cursor depth nesting closing blocks =
+  if gt nesting 64 then documentHtmlImportError cursor "nesting exceeds 64 steps"
+  else if and (not (eq closing "")) (documentHtmlImportStarts cursor closing) then Ok (DocumentHtmlBlocksParsed { cursor = documentHtmlImportAdvance cursor (length (chars closing)), value = blocks })
+  else if eq (length cursor.remaining) 0 then
+    if eq closing "" then Ok (DocumentHtmlBlocksParsed { cursor = cursor, value = blocks })
+    else documentHtmlImportError cursor "unclosed block element"
+  else case documentHtmlImportBlock cursor depth (add nesting 1) of
+    Err reason -> Err reason
+    Ok parsed -> documentHtmlImportBlocks parsed.cursor depth nesting closing (appendItem parsed.value blocks)
+
+@category "document-internal"
+documentHtmlImportParagraph : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> Result String DocumentHtmlBlockParsed
+documentHtmlImportParagraph cursor nesting = case documentHtmlImportInlines (documentHtmlImportAdvance cursor 3) nesting false "</p>" [] of
+  Err reason -> Err reason
+  Ok parsed -> Ok (DocumentHtmlBlockParsed { cursor = parsed.cursor, value = DocParagraph { content = parsed.value } })
+
+@category "document-internal"
+documentHtmlImportBlockCode : (cursor: DocumentHtmlCursor) -> Result String DocumentHtmlBlockParsed
+documentHtmlImportBlockCode cursor =
+  if documentHtmlImportStarts cursor "<pre><code>" then case documentHtmlImportCodeLiteral (documentHtmlImportAdvance cursor 11) "</code></pre>" of
+    Err reason -> Err reason
+    Ok parsed -> Ok (DocumentHtmlBlockParsed { cursor = parsed.cursor, value = DocCode { language = Nothing, source = parsed.value } })
+  else if documentHtmlImportStarts cursor "<pre><code data-language=\"" then case documentHtmlImportAttribute (documentHtmlImportAdvance cursor 26) of
+    Err reason -> Err reason
+    Ok attribute -> case documentHtmlImportCodeLiteral attribute.cursor "</code></pre>" of
+      Err reason -> Err reason
+      Ok parsed -> Ok (DocumentHtmlBlockParsed { cursor = parsed.cursor, value = DocCode { language = Just attribute.value, source = parsed.value } })
+  else documentHtmlImportError cursor "unsupported or malformed block code"
+
+@category "document-internal"
+documentHtmlImportSection : (cursor: DocumentHtmlCursor) -> (depth: Nat) -> (nesting: Nat) -> Result String DocumentHtmlBlockParsed
+documentHtmlImportSection cursor depth nesting =
+  if gt depth 6 then documentHtmlImportError cursor "heading depth exceeds six"
+  else
+    let tag = join ["h", toString depth] ""
+    case documentHtmlImportExpect (documentHtmlImportAdvance cursor 9) (join ["<", tag, ">"] "") of
+      Err reason -> Err reason
+      Ok headingStart -> case documentHtmlImportInlines headingStart nesting false (join ["</", tag, ">"] "") [] of
+        Err reason -> Err reason
+        Ok heading -> case documentExportHeading (documentHtmlInlines nesting false heading.value) of
+          Err reason -> documentHtmlImportError headingStart reason
+          Ok _ -> case documentHtmlImportBlocks heading.cursor (add depth 1) nesting "</section>" [] of
+            Err reason -> Err reason
+            Ok parsed -> Ok (DocumentHtmlBlockParsed { cursor = parsed.cursor, value = DocSection { title = heading.value, blocks = parsed.value } })
+
+@category "document-internal"
+documentHtmlImportNote : (cursor: DocumentHtmlCursor) -> (depth: Nat) -> (nesting: Nat) -> Result String DocumentHtmlBlockParsed
+documentHtmlImportNote cursor depth nesting = case documentHtmlImportBlocks (documentHtmlImportAdvance cursor 29) depth nesting "</aside>" [] of
+  Err reason -> Err reason
+  Ok parsed -> Ok (DocumentHtmlBlockParsed { cursor = parsed.cursor, value = DocNote { blocks = parsed.value } })
+
+@category "document-internal"
+documentHtmlImportBlock : (cursor: DocumentHtmlCursor) -> (depth: Nat) -> (nesting: Nat) -> Result String DocumentHtmlBlockParsed
+documentHtmlImportBlock cursor depth nesting =
+  if gt nesting 64 then documentHtmlImportError cursor "nesting exceeds 64 steps"
+  else if documentHtmlImportStarts cursor "<p>" then documentHtmlImportParagraph cursor nesting
+  else if documentHtmlImportStarts cursor "<pre>" then documentHtmlImportBlockCode cursor
+  else if documentHtmlImportStarts cursor "<section>" then documentHtmlImportSection cursor depth nesting
+  else if documentHtmlImportStarts cursor "<aside class=\"document-note\">" then documentHtmlImportNote cursor depth nesting
+  else documentHtmlImportError cursor "unsupported or malformed block element"
+
+@label "Document from HTML"
+@description "Import the bounded lowercase XHTML-style fragment emitted by Document as HTML into the same typed Document. Accept paragraphs, composed emphasis/strong, code, safe links, nested sections and document-note asides, with the five XML entities and decimal/hex scalar references decoded once. Preserve text whitespace and explicit empty elements; CR and attribute TAB/LF/CR require numeric references to avoid XML normalization. Merge adjacent text nodes and remove empty text nodes. Unknown syntax, attributes, unsafe links, invalid characters, multiline headings, source over 8192 code points or traversal over 64 steps returns Err with a code-point location. This is not a general HTML/XML parser or a Markdown round-trip claim."
+@tags "document" "html" "conversion" "parse"
+documentFromHtml : (source: String) -> Result String RichDocument
+documentFromHtml source =
+  if not (isString source) then Err "Document HTML expects literal source at code-point 0"
+  else if gt (length source) 8192 then Err "Document HTML source exceeds 8192 code points at code-point 8192"
+  else
+    let cursor = DocumentHtmlCursor { remaining = chars source, offset = 0 }
+    case documentHtmlImportBlocks cursor 1 0 "" [] of
+      Err reason -> Err reason
+      Ok parsed -> Ok (RichDocument { blocks = parsed.value })

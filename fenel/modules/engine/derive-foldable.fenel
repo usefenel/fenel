@@ -1,0 +1,206 @@
+module engine where
+
+-- derive-foldable — the generic, schema-directed `foldr` (the Foldable half of
+-- the kinds-arc derivation, unified-static-analysis Phase 6c).
+--
+-- Any `* -> *` type WITHOUT an authored `Foldable` instance gets `foldr` for
+-- FREE: a single always-on structural `Foldable` instance keyed by
+-- `{$pattern:"engine:isUnaryConstructor"}` resolves through the SHIPPED
+-- `matchStructural` substrate, and its `foldr` is `engine:deriveFoldr` — a thin
+-- category-B reflection+marshal bridge (engine-bodies-dispatch.ts) that resolves
+-- the dispatched value's owning type, marshals its schema across the `$`-key
+-- barrier via `marshalTraversalType`, and delegates the DECISION to THIS body.
+-- The authored `Maybe`/`List`/`Result` instances keep nominal precedence
+-- (`resolveStructural` is the last fall-through), so this only fires for
+-- previously-uninstanced unary constructors (e.g. a user `Box a` / `Tree a`).
+--
+-- This is the `$tag`-correct, multi-param-SOUND Fenel successor to the stale
+-- `__case`-era TS `structuralFold` (engine/src/structural.ts): it classifies
+-- fields by the FUNCTOR-PARAM IDENTITY (`TtVar paramName`), recurses on
+-- self-recursive fields (`TtNamed typeName`), RE-DISPATCHES one-level nested
+-- foreign functors (`TtApp` whose args carry the param — D-6c closes the
+-- D-6b-5 fence), and SKIPS every other field — where `structuralFold` folded
+-- EVERY non-recursive field (wrong for `Result`'s `e`, `Pair2 e a`'s `e`, …).
+--
+-- RIGHT-FOLD ORDER. `foldr f z [x0,x1,x2] = f x0 (f x1 (f x2 z))` — the
+-- rightmost element touches the seed first. `deriveFoldrFields` recurses the
+-- TAIL first (building the folded-rest accumulator), then combines the HEAD
+-- field on top, so multi-field cases fold last-to-first (mirroring the `foldr`
+-- contract + `structuralFold`'s field order).
+--
+-- TOTALITY (D-6c-5 / D-6b-4): the recursion descends ONLY into self-recursive
+-- sub-values (`fieldVal` is a structural sub-term of `value`), strictly smaller
+-- each step; an unknown tag / non-record value / unrecognised field-type ⇒
+-- return the seed (never crash). The fold is its own dog-food for the totality
+-- checker this workstream builds.
+--
+-- FENCE (D-6c-2): COMPOUND nesting where the param sits TWO functors deep
+-- (`List (Box a)` ⇒ the inner `TtApp` arg is itself a `TtApp`, not a bare
+-- `TtVar paramName`) needs `foldr (foldr ..)` composition — NOT closed by v1;
+-- such a field is SKIPPED (treated like any non-param field), documented here,
+-- never silently mis-folded. The common cases (`List a`, `Maybe a` fields) ARE
+-- closed by the one-level re-dispatch.
+--
+-- `$map`-FIELD DESCENT (D-6c-3 CLOSED, array-substrate Phase 1a). A `TtMap` field
+-- whose VALUES carry the functor param (`Map String a`) is FOLDED by `mapFoldr f
+-- acc` over the field value — the `Foldable (Map k)` operation (folds the map's
+-- values into the threaded accumulator). A direct call, NOT a `Foldable.foldr`
+-- re-dispatch (a bare map field has no `$tag` to dispatch on — the Phase-1a
+-- Step-0 fact). COMPOUND map values (`Map String (Box a)`) stay SKIPPED (D-6c-2).
+--
+-- The continuation `f` is the BINARY binop closure-valued PARAM; applying it to
+-- two args is `(f $ elem) $ acc` — `$` (`($) f x = f x`) is right-associative,
+-- so the explicit parens force left-application (`f $ elem` curries to `b -> b`,
+-- then `$ acc` applies). std fns (`mapGet`/`eq`/`head`/`tail`) are called by
+-- bare codeName (the engine-body idiom). All helpers are prefixed
+-- `deriveFoldr…` to avoid registry collisions with derive-functor.fenel's
+-- `deriveFmap…` family.
+
+-- deriveFoldrFold — the entry. `f` the binop, `seed` the fold seed, `value` the
+-- runtime functor value, `schemaView` the dispatched type's schema marshalled to
+-- TraversalType, `paramName` the functor type-param name (the type's LAST
+-- declared param), `typeName` the owning type-constructor name (for
+-- self-recursion detection). Peels the schema wrappers to the variant/record,
+-- finds the matching case, folds its fields. The `typeName` arg mirrors
+-- `deriveFmapFold`'s build-time amendment — self-recursion is `TtNamed typeName`.
+@label "Derive foldr (generic fold)"
+@description "Phase 6c — the generic schema-directed `foldr`: any `* -> *` type without an authored Foldable instance gets foldr free. Folds the functor-param leaves (TtVar paramName) into the seed with the binop, recurses self-recursive fields (TtNamed typeName), re-dispatches one-level nested foreign functors (TtApp carrying the param), skips the rest (multi-param sound, the structuralFold repair). The decision half of the derived Foldable instance; the engine:deriveFoldr bridge supplies (f, seed, value, schemaView, paramName, typeName). Right-fold order; total: descends only into strictly-smaller self-recursive sub-values."
+@tags "engine" "foldable" "derive" "kinds" "phase-6c"
+deriveFoldrFold : (f: a) -> (seed: b) -> (value: c) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> b
+deriveFoldrFold f seed value schemaView paramName typeName =
+  case schemaView of
+    TtOpaque { pure = p } -> deriveFoldrFold f seed value p paramName typeName
+    TtRefined { base = bse } -> deriveFoldrFold f seed value bse paramName typeName
+    TtMu { body = bdy } -> deriveFoldrFold f seed value bdy paramName typeName
+    TtRecord { fields = fs } ->
+      deriveFoldrFields f seed value fs schemaView paramName typeName
+    TtVariant { cases = cs } ->
+      case mapGet value "$tag" of
+        Nothing -> seed
+        Just tag ->
+          case deriveFoldrFindCase cs tag of
+            Nothing -> seed
+            Just c -> deriveFoldrFields f seed value c.fields schemaView paramName typeName
+    _ -> seed
+
+-- deriveFoldrFindCase — locate the variant case whose name matches the value's
+-- `$tag`. Internal helper; head/tail recursion (the array-repr List idiom).
+@label "derive-foldable: findCase"
+@description "Phase 6c — locate the TtVariantCase matching the value's $tag. Helper; tagged engine-internal."
+@tags "engine" "internal" "foldable" "phase-6c"
+@category "engine-internal"
+deriveFoldrFindCase : (cases: List a) -> (tag: String) -> Maybe a
+deriveFoldrFindCase cases tag =
+  case head cases of
+    Nothing -> Nothing
+    Just c ->
+      if eq c.name tag
+        then Just c
+        else case tail cases of
+          Nothing -> Nothing
+          Just rest -> deriveFoldrFindCase rest tag
+
+-- deriveFoldrFields — the RIGHT-fold over a case's declared fields. Recurse the
+-- TAIL first (the folded-rest accumulator), then combine the HEAD field on top,
+-- so fields fold last-to-first (the foldr contract). Internal helper.
+@label "derive-foldable: foldFields"
+@description "Phase 6c — right-fold over a case's declared fields: recurse the tail to a folded-rest accumulator, then step the head field on top (last-to-first). Helper; tagged engine-internal."
+@tags "engine" "internal" "foldable" "phase-6c"
+@category "engine-internal"
+deriveFoldrFields : (f: a) -> (seed: b) -> (value: c) -> (fields: List d) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> b
+deriveFoldrFields f seed value fields schemaView paramName typeName =
+  case head fields of
+    Nothing -> seed
+    Just fld ->
+      case tail fields of
+        Nothing ->
+          deriveFoldrStepField f seed value fld schemaView paramName typeName
+        Just rest ->
+          let restAcc = deriveFoldrFields f seed value rest schemaView paramName typeName
+          deriveFoldrStepField f restAcc value fld schemaView paramName typeName
+
+-- deriveFoldrStepField — one field step. A field absent from the value (a partial
+-- record) leaves the accumulator untouched; else classify+fold it. Split out to
+-- avoid a `case`-in-`let` (the analyze.fenel/totality.fenel idiom).
+@label "derive-foldable: stepField"
+@description "Phase 6c — one field: read the value's field (absent ⇒ leave acc untouched), classify+fold onto acc. Helper; tagged engine-internal."
+@tags "engine" "internal" "foldable" "phase-6c"
+@category "engine-internal"
+deriveFoldrStepField : (f: a) -> (acc: b) -> (value: c) -> (fld: d) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> b
+deriveFoldrStepField f acc value fld schemaView paramName typeName =
+  case mapGet value fld.name of
+    Nothing -> acc
+    Just fieldVal ->
+      deriveFoldrFoldField f acc fieldVal fld.type schemaView paramName typeName
+
+-- deriveFoldrFoldField — CLASSIFY one field by its marshalled TraversalType:
+--   element        — `TtVar paramName`   ⇒ combine into acc with the binop.
+--   self-recursive — `TtNamed typeName`  ⇒ recurse `deriveFoldrFold` (thread acc).
+--   nested functor — `TtApp` whose args carry `TtVar paramName` ⇒ RE-DISPATCH
+--                    `Foldable.foldr f acc fieldVal` (the nested functor folds
+--                    its OWN elements with the same binop into the threaded
+--                    accumulator — nominal for `List`/`Maybe`, derived for a
+--                    user functor). D-6c closes the D-6b-5 fence (one level).
+--   map-field      — `TtMap` whose values carry the param ⇒ `mapFoldr f acc` over
+--                    the map's values (D-6c-3, closed Phase 1a — a direct call,
+--                    the bare map field has no `$tag` to re-dispatch on).
+--   otherwise (a different type-var `e`, a fixed `Int`, an unrelated named type,
+--             a compound-nested `TtApp`/`TtMap`) ⇒ LEAVE acc unchanged.
+-- D-6c-5: classification is by FUNCTOR-PARAM IDENTITY — the multi-param
+-- soundness over the legacy `structuralFold`.
+@label "derive-foldable: foldField"
+@description "Phase 6c/1a — classify a field by its TraversalType: TtVar paramName ⇒ fold into acc (the functor param); TtNamed typeName ⇒ recurse (self-recursive); TtApp carrying the param ⇒ re-dispatch Foldable.foldr on the nested functor value (D-6b-5, one level); TtMap whose values carry the param ⇒ mapFoldr f acc over the map values (D-6c-3, closed Phase 1a); else leave (other vars / fixed types / compound nesting). Helper; tagged engine-internal."
+@tags "engine" "internal" "foldable" "phase-6c"
+@category "engine-internal"
+deriveFoldrFoldField : (f: a) -> (acc: b) -> (fieldVal: c) -> (ft: TraversalType) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> b
+deriveFoldrFoldField f acc fieldVal ft schemaView paramName typeName =
+  case ft of
+    TtVar { name = vn } ->
+      if eq vn paramName
+        then (f $ fieldVal) $ acc
+        else acc
+    TtNamed { name = nn } ->
+      if eq nn typeName
+        then deriveFoldrFold f acc fieldVal schemaView paramName typeName
+        else acc
+    TtApp { args = as } ->
+      if deriveFoldrAppHasParam as paramName
+        then foldr f acc fieldVal
+        else acc
+    TtMap { values = vs } ->
+      if deriveFoldrArgIsParam vs paramName
+        then mapFoldr f acc fieldVal
+        else acc
+    _ -> acc
+
+-- deriveFoldrAppHasParam — does this applied-type's arg list carry the functor
+-- param DIRECTLY as one of its args (`Con .. a ..`)? Only a bare `TtVar
+-- paramName` at the top of the arg list counts — a nested `TtApp` arg (compound
+-- nesting, `List (Box a)`) does NOT, so it falls to the SKIP branch (D-6c-2
+-- fence). Internal helper; head/tail recursion.
+@label "derive-foldable: appHasParam"
+@description "Phase 6c — does an applied-type's arg list carry the functor param directly (one-level nesting)? A nested TtApp arg (compound nesting) does NOT count — D-6c-2 fence. Helper; tagged engine-internal."
+@tags "engine" "internal" "foldable" "phase-6c"
+@category "engine-internal"
+deriveFoldrAppHasParam : (args: List a) -> (paramName: String) -> Bool
+deriveFoldrAppHasParam args paramName =
+  case head args of
+    Nothing -> false
+    Just a ->
+      if deriveFoldrArgIsParam a paramName
+        then true
+        else case tail args of
+          Nothing -> false
+          Just rest -> deriveFoldrAppHasParam rest paramName
+
+-- deriveFoldrArgIsParam — is this single TraversalType arg the functor param
+-- (`TtVar paramName`)? Internal helper.
+@label "derive-foldable: argIsParam"
+@description "Phase 6c — is a single TraversalType arg the functor param (TtVar paramName)? Helper; tagged engine-internal."
+@tags "engine" "internal" "foldable" "phase-6c"
+@category "engine-internal"
+deriveFoldrArgIsParam : (a: TraversalType) -> (paramName: String) -> Bool
+deriveFoldrArgIsParam a paramName =
+  case a of
+    TtVar { name = vn } -> eq vn paramName
+    _ -> false

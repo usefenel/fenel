@@ -1,0 +1,338 @@
+-- =========================================================================
+-- Inventory FSM bodies — reserve_spot + release_spot.
+--
+-- Phase 12d sub-step 3 of the ts-elimination workstream. Lifts
+-- core/actions/inventory.ts:{reserveSpotHandler, releaseSpotHandler}
+-- from ~80 LOC of TS orchestration to thin TS Zod-parse wrappers around
+-- 2 Fenel C-bodies. The capacity decision (hard-cap rejection vs.
+-- proceed) and the reservation lifecycle (idempotent release-or-reject)
+-- both port cleanly to case-arm / if-else compositions.
+--
+-- module-substrate Phase 3a (2026-05-30) — FIRST FenelModule → `module …
+-- where` migration. This file is now the SOURCE OF TRUTH for the module's
+-- signatures + identity (it grew the `module inventory where` header, the
+-- per-function `name : Type` sigs, and the `@label`/`@description`/`@tags`/
+-- `@ioAction` facet directives that the loader lifts into the same
+-- Codeable/Labelable/Describable/Categorizable/Taggable/IOInvokable
+-- ClassInstances the retired `engine/src/modules/inventory.ts` defineFunction
+-- specs used to emit). The header keeps the LEGACY lowercase `inventory:`
+-- id-prefix + `inventory` category byte-identical (no fnId rename here — that
+-- PascalCase canonicalisation is a deferred coordinated sweep). The TS spec
+-- wrapper shrank to a thin `loadFenelModule` seam.
+--
+-- ADTs declared: none (per brief Decisions A/B/G — enforce stays string,
+-- reservation lifecycle stays presence-of-releasedAt check, InventoryStatus
+-- stays plain Record).
+--
+-- Substrate consumed:
+--   - state:findInventoryBySlug (new this sub-step) — Maybe<Inventory>
+--   - state:getInventoryStatus  (new this sub-step) — Maybe<InventoryStatus>
+--   - state:getInstance "reservation" id — generic Maybe<Record> lookup
+--   - state:tryCreateInstanceByName "reservation" data — {ok, value, error}
+--   - state:updateInstance id patch — patch merge (Nothing-as-clear)
+--   - state:appendEvent type payload — write-only event log append
+--   - time:nowIso (new this sub-step) — ISO 8601 timestamp
+--   - std:truthy / std:and / std:eq / std:sub / std:ifElse
+--
+-- Decisions resolved (per the brief):
+--   A: `enforce` stays string discriminator — no EnforceMode ADT migration
+--   B: reservation lifecycle stays presence-of-releasedAt check — no
+--      ReservationState ADT
+--   C: Result {Err e, Ok a} sentinel — wrapper unwraps
+--      and throws on Err. Sister of codec/decoders.fenel error chains.
+--   D: time:nowIso added as a sync TS native (didn't exist pre-sub-step)
+--   E: state:getInventoryStatus returns full status shape directly
+--   F: state:findInventoryBySlug is a dedicated slug-keyed primitive
+--      (sister of state:findFormBySlug from 12c-routes-3)
+--   G: InventoryStatus stays plain Record — no ADT
+--   H: body Ok-payload includes inventoryId for wrapper aggregateId
+--   I: invokeIOAction async (body has HasStateIO requires)
+--   J: single .fenel file housing both reserve + release + shared helpers
+--
+-- Event provenance: backfilled in Phase 13a sub-step 2 — the
+-- state:appendEvent substrate gained optional Maybe<String> aggregateType
+-- / aggregateId / profileId params in 13a-1, and the 13a-2 backfill
+-- threads inv.id / reservation.inventoryId + profileId through the chain
+-- to restore pre-12d audit-trail completeness.
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line (12a-3/4/7 surprise pattern; 12d-2 reaffirmed).
+-- =========================================================================
+
+module inventory where
+
+-- NOTE (action-subsumption Phase 3, 2026-06-08): the `EnforceMode` enum the
+-- `create_inventory` action validates against is declared in fenel/modules/items/
+-- items.fenel, NOT here. `inventory` is an oracle-backed MIGRATED module —
+-- module-migrate-inventory.test.ts freezes `inventoryModule.entities` to `[]`
+-- (migration parity), so a type-decl here would drift its identity (the
+-- entity-analog of the Phase-2 `"action"`-tag oracle break). The global catalog
+-- resolves `{$ref:"EnforceMode"}` from any module's sig, so createInventory's
+-- `enforce : Maybe EnforceMode` works with the type hosted in items (the
+-- cross-module shared-refinement host, cf. `Uuid`).
+
+-- isFullHardCap — pure D helper. True iff available is at-or-below 0
+-- AND the inventory's enforce mode is hard. Soft-cap inventories never
+-- reject reservations (overflow is tracked but allowed); hard-cap
+-- inventories reject when capacity is exhausted.
+isFullHardCap : Number -> String -> Boolean
+@label "Is full (hard cap)"
+@description "Phase 12d sub-step 3 — pure D helper. True iff available <= 0 AND enforce is 'hard'. Soft-cap inventories never reject reservations (overflow tracked but allowed); hard-cap inventories reject when capacity is exhausted."
+@tags "inventory" "capacity" "pure" "phase-12d"
+isFullHardCap available enforce =
+  let full = available <= 0
+  let hardCap = eq enforce "hard"
+  full and hardCap
+
+-- remainingAfter — pure D helper. The spot_reserved event payload reports
+-- the post-reserve remaining count; clamp at 0 so soft-cap overflow
+-- doesn't surface negative numbers downstream.
+remainingAfter : Number -> Number
+@label "Remaining after"
+@description "Phase 12d sub-step 3 — pure D helper. Available minus one, clamped at 0. The spot_reserved event payload reports post-reserve remaining; clamping keeps soft-cap overflow from surfacing negatives downstream."
+@tags "inventory" "capacity" "pure" "phase-12d"
+remainingAfter available =
+  let raw = available - 1
+  ifElse (raw < 0) 0 raw
+
+-- reserveSpot — main C-body. Returns Result {code, message} {reservationId,
+-- inventorySlug, inventoryId}. Branches on findInventoryBySlug; the
+-- known-inventory arm delegates to reserveSpotKnown. entitlementId is
+-- Maybe<String> — Nothing omits the field from the reservation data
+-- (matches pre-port behavior: `entitlementId: undefined` spreads into
+-- the data object but JSON.stringify drops undefined keys).
+-- action-subsumption Phase 3 (2026-06-08) — reserveSpot IS the public
+-- reserve_spot action now (D1 COLLAPSE): the `entitlementIdMaybe` marshalling
+-- name drops to the public `entitlementId`; the refinements reserve_spot_params
+-- mirrored ride the sig (inventorySlug : NonEmptyStr, profileId : Uuid,
+-- entitlementId : Maybe Uuid). `accountId` stays a body formal but is
+-- context-injected (CONTEXT_INJECTED_PARAMS — excluded from the public form,
+-- supplied by the dispatcher, sibling of adapter). The capacity FSM residual
+-- stays body-side. The TS handler is deleted; `adapter` stays a param (D4).
+reserveSpot : String -> NonEmptyStr -> Uuid -> Maybe Uuid -> String -> ActionResult
+@label "Reserve spot"
+@description "Phase 13a sub-step 1 / action-subsumption Phase 3 — the public reserve_spot action (no separate TS handler). accountId is context-injected; the public params are inventorySlug / profileId / entitlementId?. Entry-point lifts the inner Result to ActionResult ADT (ActionOk { data, aggregateType = Just 'inventory', aggregateId = Just inventoryId, profileId = Just profileId } | ActionErr { message }). The capacity FSM residual stays body-side."
+@tags "inventory" "reserve" "phase-13a"
+@ioAction "inventory.reserve_spot"
+reserveSpot accountId inventorySlug profileId entitlementId adapter =
+  let r = reserveSpotInner accountId inventorySlug profileId entitlementId adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { reservationId = ok.reservationId, inventorySlug = ok.inventorySlug }, aggregateType = Just "inventory", aggregateId = Just ok.inventoryId, profileId = Just profileId }
+
+-- reserveSpotInner — pre-13a-1 entry-point logic; returns Result. The new
+-- reserveSpot entry-point lifts this to ActionResult ADT at the top.
+reserveSpotInner : String -> String -> String -> Maybe String -> String -> {}
+@label "Reserve spot (inner — Result)"
+@description "Phase 12d sub-step 3 — pre-13a entry-point logic; returns Result {code, message} {reservationId, inventorySlug, inventoryId}. Composes state:findInventoryBySlug + state:getInventoryStatus + isFullHardCap decision + state:tryCreateInstanceByName + state:appendEvent. The new reserveSpot entry-point lifts this to ActionResult ADT at the top."
+@tags "inventory" "reserve" "phase-13a"
+reserveSpotInner accountId inventorySlug profileId entitlementIdMaybe adapter =
+  case findInventoryBySlug accountId inventorySlug of
+    Nothing -> Err { code = "inventory_not_found", message = `Inventory not found: ${inventorySlug}` }
+    Just inv -> reserveSpotKnown accountId inv inventorySlug profileId entitlementIdMaybe adapter
+
+-- reserveSpotKnown — after findInventoryBySlug succeeded. Fetches status,
+-- computes available (treating Nothing as 0 — defensive; getInventoryStatus
+-- returning Nothing after findInventoryBySlug succeeded shouldn't happen
+-- but matches pre-port `status?.available ?? 0` fallback). Branches on
+-- the hard-cap rule via if-then-else.
+reserveSpotKnown : String -> {} -> String -> String -> Maybe String -> String -> {}
+@label "Reserve spot (inventory known)"
+@description "Phase 12d sub-step 3 — case-arm extraction from reserveSpot. After findInventoryBySlug succeeded: fetches status, computes available (Nothing → 0 fallback matching pre-port `status?.available ?? 0`), branches on isFullHardCap."
+@tags "inventory" "reserve" "phase-12d"
+reserveSpotKnown accountId inv inventorySlug profileId entitlementIdMaybe adapter =
+  let statusMaybe = getInventoryStatus accountId inventorySlug
+  let available = case statusMaybe of
+    Nothing -> 0
+    Just s -> s.available
+  if isFullHardCap available inv.enforce
+  then Err { code = "inventory_full", message = `Inventory "${inventorySlug}" is full (hard cap)` }
+  else reserveSpotProceed inv available inventorySlug profileId entitlementIdMaybe adapter
+
+-- reserveSpotProceed — after hard-cap check passed. Creates the
+-- reservation row; on tryCreateInstanceByName failure surfaces a
+-- create_failed Err with the underlying message; on success delegates
+-- to reserveSpotEmit for the post-create event + Ok return. The data
+-- record's entitlementId field is conditionally included via
+-- mergeRecords when Maybe is Just (mirrors pre-port: `entitlementId:
+-- undefined` spreads but JSON.stringify drops undefined keys, so the
+-- effective stored data omits the field when there's no entitlement).
+reserveSpotProceed : {} -> Number -> String -> String -> Maybe String -> String -> {}
+@label "Reserve spot (proceed)"
+@description "Phase 12d sub-step 3 — if-else arm extraction from reserveSpotKnown. After hard-cap check passed: builds reservation data, invokes state:tryCreateInstanceByName, branches on r.ok (failure → create_failed Err; success → reserveSpotEmit)."
+@tags "inventory" "reserve" "phase-12d"
+reserveSpotProceed inv available inventorySlug profileId entitlementIdMaybe adapter =
+  let baseData = { inventoryId = inv.id, profileId = profileId, reservedAt = nowIso }
+  let data = case entitlementIdMaybe of
+    Nothing -> baseData
+    Just id -> mergeRecords baseData { entitlementId = id }
+  let r = tryCreateInstanceByName "reservation" data
+  if r.ok
+  then reserveSpotEmit inv available inventorySlug r.value profileId adapter
+  else Err { code = "create_failed", message = r.error }
+
+-- reserveSpotEmit — successful-reserve tail. Writes the spot_reserved
+-- event with the remaining count + adapter; returns Ok payload including
+-- inventoryId so the wrapper can thread it to ActionResult.aggregateId
+-- (Decision H). Phase 13a sub-step 2: backfills aggregateType/aggregateId/
+-- profileId provenance via the extended state:appendEvent substrate.
+reserveSpotEmit : {} -> Number -> String -> String -> String -> String -> {}
+@label "Reserve spot (emit)"
+@description "Phase 12d sub-step 3 — successful-reserve tail. Writes the spot_reserved event with the remaining count + adapter via state:appendEvent. Phase 13a-2 backfills aggregateType=Just \"inventory\" + aggregateId=Just inv.id + profileId=Just profileId via the extended state:appendEvent substrate. Returns Ok payload including inventoryId so the wrapper threads it to ActionResult.aggregateId (Decision H)."
+@tags "inventory" "reserve" "phase-12d"
+reserveSpotEmit inv available inventorySlug reservationId profileId adapter =
+  let remaining = remainingAfter available
+  let payload = { inventorySlug = inventorySlug, reservationId = reservationId, remaining = remaining, adapter = adapter }
+  let _emitted = appendEvent "spot_reserved" payload (Just "inventory") (Just inv.id) (Just profileId)
+  Ok { reservationId = reservationId, inventorySlug = inventorySlug, inventoryId = inv.id }
+
+-- releaseSpot — main C-body. Returns Result {code, message} {reservationId,
+-- inventoryId, profileId}. Branches on state:getInstance "reservation" id;
+-- the known-reservation arm delegates to releaseSpotKnown.
+-- action-subsumption Phase 2 (2026-06-08) — releaseSpot IS the public
+-- release_spot action now (D1 COLLAPSE; no marshalling to drop). The
+-- `format:uuid` refinement release_spot_params mirrored rides the sig:
+-- reservationId : Uuid. The TS handler is deleted; `adapter` stays a param (D4).
+releaseSpot : Uuid -> String -> ActionResult
+@label "Release spot"
+@description "Phase 13a sub-step 1 / action-subsumption Phase 2 — the public release_spot action (no separate TS handler). Entry-point lifts the inner Result to ActionResult ADT (ActionOk { data, aggregateType = Just 'inventory', aggregateId = Just inventoryId, profileId = Just profileId } | ActionErr { message })."
+@tags "inventory" "release" "phase-13a"
+@ioAction "inventory.release_spot"
+releaseSpot reservationId adapter =
+  let r = releaseSpotInner reservationId adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { reservationId = ok.reservationId }, aggregateType = Just "inventory", aggregateId = Just ok.inventoryId, profileId = Just ok.profileId }
+
+-- releaseSpotInner — pre-13a-1 entry-point logic; returns Result. The new
+-- releaseSpot entry-point lifts this to ActionResult ADT at the top.
+releaseSpotInner : String -> String -> {}
+@label "Release spot (inner — Result)"
+@description "Phase 12d sub-step 3 — pre-13a entry-point logic; returns Result. Composes state:getInstance + idempotency guard (presence-of-releasedAt) + state:updateInstance + state:appendEvent."
+@tags "inventory" "release" "phase-13a"
+releaseSpotInner reservationId adapter =
+  case getInstance "reservation" reservationId of
+    Nothing -> Err { code = "reservation_not_found", message = `Reservation not found: ${reservationId}` }
+    Just reservation -> releaseSpotKnown reservation reservationId adapter
+
+-- releaseSpotKnown — after reservation lookup succeeded. Idempotency
+-- guard: a truthy releasedAt field means the reservation was already
+-- released; surface an already_released Err (the wrapper throws so
+-- repeat-release surfaces as a 4xx).
+releaseSpotKnown : {} -> String -> String -> {}
+@label "Release spot (reservation known)"
+@description "Phase 12d sub-step 3 — case-arm extraction from releaseSpot. After state:getInstance succeeded: idempotency guard via truthy reservation.releasedAt (presence-of-field check per Decision B — no ReservationState ADT for a 2-state machine)."
+@tags "inventory" "release" "phase-12d"
+releaseSpotKnown reservation reservationId adapter =
+  if truthy reservation.releasedAt
+  then Err { code = "already_released", message = `Reservation already released: ${reservationId}` }
+  else releaseSpotProceed reservation reservationId adapter
+
+-- releaseSpotProceed — after idempotency check passed. Patches the
+-- reservation row with releasedAt = nowIso (the existing fields are
+-- preserved by state:updateInstance's merge semantics — only the new
+-- field lands); emits the spot_released event; returns Ok payload
+-- including inventoryId + profileId (sourced from the reservation row)
+-- for the wrapper's ActionResult composition.
+releaseSpotProceed : {} -> String -> String -> {}
+@label "Release spot (proceed)"
+@description "Phase 12d sub-step 3 — if-else arm extraction from releaseSpotKnown. After idempotency check passed: patches the reservation with releasedAt=nowIso via state:updateInstance (merge semantics preserve existing fields); writes spot_released event; returns Ok payload including inventoryId + profileId sourced from the reservation row."
+@tags "inventory" "release" "phase-12d"
+releaseSpotProceed reservation reservationId adapter =
+  let _u = updateInstance reservationId { releasedAt = nowIso }
+  let payload = { reservationId = reservationId, adapter = adapter }
+  let _emitted = appendEvent "spot_released" payload (Just "inventory") (Just reservation.inventoryId) (Just reservation.profileId)
+  Ok { reservationId = reservationId, inventoryId = reservation.inventoryId, profileId = reservation.profileId }
+
+-- =========================================================================
+-- ts-elimination-completion Phase 2 (inventory residual) — the two
+-- entity_instances-backed `(E)` handlers in core/actions/inventory.ts
+-- (createInventoryHandler / getInventoryStatusHandler), ported from live TS
+-- orchestration (createEntityInstance + Object.assign config-merge +
+-- appendEvent; getInventoryStatus read + not-found throw) to Fenel bodies
+-- over state:*. The reserve_spot / release_spot bodies above were ported in
+-- module-substrate Phase 3a; these two complete the module. No new
+-- substrate — create uses generic state:tryCreateInstanceByName; status
+-- reuses the existing state:getInventoryStatus leaf.
+-- =========================================================================
+
+-- buildInventoryData — pre-port `{slug, capacity, enforce}` base +
+-- right-biased config merge (Object.assign(data, config ?? {})). enforce is
+-- already defaulted by the caller.
+buildInventoryData : String -> Number -> String -> Maybe ({}) -> {}
+@label "Build inventory data"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the inventory data record: {slug, capacity, enforce} base + right-biased config merge (pre-port Object.assign(data, config ?? {}))."
+@tags "inventory" "pure" "ts-elimination"
+buildInventoryData slug capacity enforce configM =
+  let base = { slug = slug, capacity = capacity, enforce = enforce }
+  case configM of
+    Nothing -> base
+    Just config -> mergeRecords base config
+
+-- createInventoryEmit — successful-create tail. Writes inventory_created +
+-- returns Ok.
+createInventoryEmit : String -> String -> Number -> String -> String -> ActionResult
+@label "Create inventory (emit)"
+@description "ts-elimination-completion Phase 2 — successful-create tail of createInventory. Writes inventory_created ({slug, capacity, enforce, adapter}; aggregateType=Just 'inventory', aggregateId=Just inventoryId, profileId=Nothing) and returns ActionOk { data = {inventoryId, slug} }."
+@tags "inventory" "create" "ts-elimination"
+createInventoryEmit inventoryId slug capacity enforce adapter =
+  let payload = { slug = slug, capacity = capacity, enforce = enforce, adapter = adapter }
+  let _e = appendEvent "inventory_created" payload (Just "inventory") (Just inventoryId) Nothing
+  ActionOk { data = { inventoryId = inventoryId, slug = slug }, aggregateType = Just "inventory", aggregateId = Just inventoryId, profileId = Nothing }
+
+-- createInventory — main body. Defaults enforce, builds data, persists,
+-- emits inventory_created.
+-- action-subsumption Phase 3 (2026-06-08) — createInventory IS the public
+-- create_inventory action now (D1 COLLAPSE): the `enforceM`/`configM`
+-- marshalling names drop to public `enforce`/`config`; the refinements
+-- create_inventory_params mirrored ride the sig (slug : NonEmptyStr, enforce :
+-- Maybe EnforceMode). The `enforce ?? "soft"` default stays body-side (now over
+-- the public-named `enforce` Maybe). The TS handler is deleted; `adapter` stays a
+-- param (D4).
+--
+-- `capacity : PositiveNat`. RE-TIGHTENED (action-subsumption tail, 2026-06-10):
+-- the deleted `create_inventory_params` carried `{$ref:"PositiveNat"}`, and the
+-- port temporarily dropped it to `Number` because PositiveNat was a NON-RESOLVING
+-- substrate gap — `.fenel`-authored (foundation.fenel) yet absent from the entity
+-- catalog, so `getEntityTypeByName("PositiveNat")` → undefined → validate()
+-- returned "Unknown field type". That gap is now CLOSED: PositiveNat / NonNegInt
+-- are registered into `systemEntities` (the `NonEmptyStr` 1b recipe — top-level
+-- `foundationTemplates()` presets that sat in neither the `.entities` nor `.paths`
+-- bucket), so the public contract's `>= 1` capacity refinement is restored.
+createInventory : NonEmptyStr -> PositiveNat -> Maybe EnforceMode -> Maybe ({}) -> String -> ActionResult
+@label "Create inventory"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 3 — the public create_inventory action (no separate TS handler). Params ARE the public contract (slug, capacity, enforce?, config?, adapter). Defaults enforce (?? 'soft'), builds the inventory data (buildInventoryData), persists via state:tryCreateInstanceByName, emits inventory_created, returns ActionOk { data = {inventoryId, slug} }. Insert failure → ActionErr."
+@tags "inventory" "create" "ts-elimination"
+@ioAction "inventory.create_inventory"
+createInventory slug capacity enforce config adapter =
+  let enf = case enforce of
+    Nothing -> "soft"
+    Just e -> e
+  let data = buildInventoryData slug capacity enf config
+  let r = tryCreateInstanceByName "inventory" data
+  if r.ok
+  then createInventoryEmit r.value slug capacity enf adapter
+  else ActionErr { message = r.error }
+
+-- getInventoryStatusAction — read-only status query. Reuses the existing
+-- state:getInventoryStatus leaf; Nothing → ActionErr (pre-port throw);
+-- Just status → ActionOk with the status record as data (no event, no
+-- aggregate provenance). Named *Action to avoid the state:getInventoryStatus
+-- codeName clash.
+-- action-subsumption Phase 2 (2026-06-08) — getInventoryStatusAction IS the
+-- public get_inventory_status action now (D1 COLLAPSE; read-only). The public
+-- contract is `inventorySlug : NonEmptyStr` only; `accountId` is a
+-- context-injected param (in dispatch's CONTEXT_INJECTED_PARAMS, supplied from
+-- ActionContext, never validated as user input — sibling of `adapter`), so it
+-- stays a formal here without becoming part of the public form. The TS handler
+-- is deleted.
+getInventoryStatusAction : String -> NonEmptyStr -> ActionResult
+@label "Get inventory status (action)"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 2 — the public get_inventory_status action (no separate TS handler; read-only, no event). accountId is context-injected; inventorySlug is the public param. Reuses state:getInventoryStatus; Nothing → ActionErr 'Inventory not found' (pre-port throw); Just status → ActionOk { data = status, aggregate* = Nothing }."
+@tags "inventory" "status" "read-only" "ts-elimination"
+@ioAction "inventory.get_inventory_status"
+getInventoryStatusAction accountId inventorySlug =
+  case getInventoryStatus accountId inventorySlug of
+    Nothing -> ActionErr { message = `Inventory not found: ${inventorySlug}` }
+    Just status -> ActionOk { data = status, aggregateType = Nothing, aggregateId = Nothing, profileId = Nothing }

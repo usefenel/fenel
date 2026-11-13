@@ -1,0 +1,313 @@
+module telegram where
+
+-- ============================================================================
+-- form-fill-cores — the Tier-1 value-matcher (`formatValue`) + the Tier-2 pure
+-- decision/render cores for the Telegram conversational read(T) / form-fill UX.
+--
+-- ts-elimination-completion Phase 7b (2026-06-02). These nine public bodies
+-- were inline JSON-Logic `body: {` literals in engine/src/modules/telegram.ts.
+-- This file finishes Phase 7 — telegram's spec module reaches ZERO inline
+-- `body: {` literals (100% `.fenel`-bodied), draining the ts-elimination PORT
+-- surface. Companion to form-type-reflection.fenel (the Tier-0 raw-FenelType
+-- peelers); the peelers it composes (`innerType` / `isOptionalField` /
+-- `typeHint` / `enumValues` / `isBooleanType`) live there.
+--
+-- DECISION C (from Phase 7 — the `.fenel` parser has no `$`-headed `case`
+-- pattern path): read the raw `$`-keyed type fields via `std:lookup`. Used here
+-- by `resolveTypeRefDecision` (`lookup row.type "$record"`) and `formatValue`
+-- (`lookup v "$tag"` / `"value"` / `"__case"` / `"handle"` / `"platform"`).
+--
+-- THE (B) FIX — RATIFIED by Rom 2026-06-02. The cluster's result ADTs are
+-- declared with NAMED fields (types.fenel: `Parsed value` / `ParseFailed error`
+-- / `TypeNotFound typeId` / `NotRecordType|ResolvedFields typeName`), but the
+-- retired inline bodies CONSTRUCTED them POSITIONALLY (`{construct:["Parsed",
+-- v]}` → `{$tag:"Parsed", _0: v}`). Every consumer reads by NAME (wrapDraftField
+-- / defaultFieldHandling / the telegram-form.ts + telegram-collector.ts shims /
+-- routeStrictReply) and `matchPattern` does NOT reconcile `_0`↔`value`, so the
+-- `_0` form is a latent producer/consumer wire DEFECT (5 red parseFieldInput
+-- tests; draft mode always-Left). This file CONSTRUCTS NAMED — `Parsed { value
+-- = v }` etc. — fixing the wire (Phase-6 precedent: port to the documented
+-- intent, not the broken original). See notes/phase-7-telegram-reflection-
+-- cluster.md §6 for the full consumer-surface confirmation + shape probes.
+--
+-- Authoring gotchas (catalogued in the Step-0 note) worked around here:
+--   * `and`/`or` are infix-only (`(x) and (y)`), `.$tag` does not parse (branch
+--     via `case … of Ctor` instead), `(expr).field` parses `.` as compose so
+--     field access is var-path-only, multi-field record literals must be ONE
+--     line, `null`/`[]` are valid expressions, `at xs oob` → null.
+--   * Backtick `` `${a}${b}` `` interpolation parses to `{cat:[…]}` — the exact
+--     operator form the inline `promptForField` used (byte-identical output).
+--
+-- Helpers are `formCore…`-prefixed, Codeable-ONLY (directive-free — the
+-- telegram-union 3j default; +1 law each, no Labelable/Describable/Taggable).
+-- ============================================================================
+
+-- ---------------------------------------------------------------------------
+-- Tier-2 — fieldLabel (faithful). Prefer field.label (LocaleString →
+-- canonical), fall back to field.name.
+-- ---------------------------------------------------------------------------
+@label "Field label"
+@description "Render a FieldDef's user-facing label. Prefers field.label (LocaleString → canonical) and falls back to field.name when no label is set."
+@tags "telegram" "form" "render"
+@category "telegram"
+fieldLabel : (field: {}) -> String
+fieldLabel field =
+  std.canonical (if field.label then field.label else field.name)
+
+-- ---------------------------------------------------------------------------
+-- Tier-2 — promptForField (faithful). `${label}${hint}${optional}`. The inline
+-- body used the `cat` operator (no separator); the backtick interpolation below
+-- parses to the same `{cat:[…]}` form.
+-- ---------------------------------------------------------------------------
+@label "Prompt for field"
+@description "Build the prompt text shown when asking the user for a field's value. Combines the field label, a type-driven hint suffix, and an optional-skip suffix when the field is wrapped in Maybe."
+@tags "telegram" "form" "render"
+@category "telegram"
+promptForField : (field: {}) -> String
+promptForField field =
+  let lbl = fieldLabel field
+  let hint = typeHint field.type
+  let opt = if isOptionalField field then " (optional — type 'skip' to skip)" else ""
+  `${lbl}${hint}${opt}`
+
+-- ---------------------------------------------------------------------------
+-- Tier-2 — keyboardForField (faithful). Enum row (when 1..8 values), Boolean
+-- Yes/No row, optional Skip row; returns `{inline_keyboard: rows}` or null when
+-- empty. Returns a raw record-or-null (NOT Just/Nothing) — mirrors the inline
+-- body's loose Maybe contract exactly.
+-- ---------------------------------------------------------------------------
+@label "Keyboard for field"
+@description "Build the inline-keyboard payload for a FieldDef's prompt: enum values become a row of buttons (when ≤ 8), Boolean fields get Yes/No, optional fields get a Skip row. Returns the full sendMessage `reply_markup` record (e.g. `{inline_keyboard: [[...]]}`) or Nothing when no buttons apply."
+@tags "telegram" "form" "render" "keyboard"
+@category "telegram"
+keyboardForField : (field: {}) -> Maybe ({})
+keyboardForField field =
+  let enums = enumValues field.type
+  let isBool = isBooleanType field.type
+  let isOpt = isOptionalField field
+  let enumRow = if ((length enums) > 0) and ((length enums) <= 8)
+                then [map (\v -> { text = v, callback_data = format "field:{v}" { v = v } }) enums]
+                else []
+  let boolRow = if isBool then [[{ text = "Yes", callback_data = "field:yes" }, { text = "No", callback_data = "field:no" }]] else []
+  let skipRow = if isOpt then [[{ text = "Skip", callback_data = "field:skip" }]] else []
+  let rows = concat (concat enumRow boolRow) skipRow
+  if (length rows) > 0 then { inline_keyboard = rows } else null
+
+-- ---------------------------------------------------------------------------
+-- Tier-1 — formatValue (faithful, self-recursive). Confirmation-summary value
+-- renderer. Arms, in order: null → "(skipped)"; True/False → "Yes"/"No"; any
+-- {$tag, value} → recurse on value; {__case} → toString; {handle[,platform]} →
+-- "@h" / "p/h"; any other object/array → jsonEncode; primitive → toString.
+-- The arm order is preserved via the helper cascade (gotcha 5: the inline `{}`
+-- arm matched any object/array, `_` matched primitives).
+-- ---------------------------------------------------------------------------
+@label "Format value for display"
+@description "Render a value as a user-facing display string for the confirmation-summary step. Handles null/undefined (skipped), Boolean (Yes/No), typed-variant unwrap ({$tag, value}), legacy $variant ({__case}), the format:handle shape ({handle, platform} → `platform/handle` or `@handle`), and falls back to JSON encoding for arbitrary objects/arrays. Primitives go through toString."
+@tags "telegram" "form" "render" "display"
+@category "telegram"
+formatValue : (v: a) -> String
+formatValue v =
+  if eq v null
+  then "(skipped)"
+  else case v of
+    True -> "Yes"
+    False -> "No"
+    _ -> formCoreFormatObj v
+
+-- ---------------------------------------------------------------------------
+-- Tier-2 — finalizeConversationView (faithful). Pure completion-path decision:
+-- the thank-you message (+ a `(note: could not save…)` suffix on persistence
+-- failure) and the telegram.form.completed event payload.
+-- ---------------------------------------------------------------------------
+@label "Finalize conversation view"
+@description "Pure decision for the form-fill completion path. Composes the user-facing thank-you message (with an optional `(note: could not save…)` suffix when persistence failed) and the telegram.form.completed event payload. Side effects (sendText, appendEvent, processEvent, markCompleted) are run by the TS interpreter against the returned record."
+@tags "telegram" "form" "completion"
+@category "telegram"
+finalizeConversationView : (values: {}) -> (instanceTypeName: Maybe String) -> (instanceId: Maybe String) -> (instanceError: Maybe String) -> (completionMsgOverride: Maybe String) -> (botId: String) -> (chatId: Int) -> (userId: Int) -> (formId: String) -> {}
+finalizeConversationView values instanceTypeName instanceId instanceError completionMsgOverride botId chatId userId formId =
+  let baseMsg = if completionMsgOverride then completionMsgOverride else "Got it — submitted!"
+  let label = if instanceTypeName then instanceTypeName else "instance"
+  let msgWithNote = if instanceError
+                    then format "{base}\n\n(note: could not save as {label} — {err})" { base = baseMsg, label = label, err = instanceError }
+                    else baseMsg
+  let eventPayload = { botId = botId, chatId = chatId, userId = userId, formId = formId, values = values, instanceId = instanceId, instanceError = instanceError }
+  { finalMsg = msgWithNote, eventPayload = eventPayload }
+
+-- ---------------------------------------------------------------------------
+-- Tier-2 — parseFieldInput ((B)-FIXED: named Parsed/ParseFailed). Dispatch:
+--   1. "skip" + optional field → Parsed null
+--   2. Boolean field → tryParseBoolean → Parsed b | ParseFailed
+--   3. "/cancel" → ParseFailed "Cancelled."
+--   4. parseInput → validateValue → Parsed value | ParseFailed error
+-- Divergence (documented, a Fenel-idiom improvement): the original matched
+-- `innerType field.type` against `{$named:"Boolean"}`; this composes the ported
+-- `isBooleanType` peeler instead (`if isBooleanType field.type`). tryParseBoolean
+-- returns `Just _0` (positional); parseInput/validateValue return plain
+-- `{ok,value,error}` records.
+-- ---------------------------------------------------------------------------
+@label "Parse field input"
+@description "Parse a raw user reply against a FieldDef and validate the result against the field's declared type. Returns FieldParseResult. Recognises `skip` for optional fields, the canonical Boolean variants (yes/no/y/n/true/false/1/0/ok/yep/yeah/nope/nah), the `/cancel` escape word. On parse failure or validation failure (refinement / enum / Id<X> mismatch), returns ParseFailed so the routing layer reprompts the user before advancing."
+@tags "telegram" "form" "parse" "validate"
+@category "telegram"
+parseFieldInput : (raw: String) -> (field: {}) -> FieldParseResult
+parseFieldInput raw field =
+  if ((lower (trim raw)) == "skip") and (isOptionalField field)
+  then Parsed { value = null }
+  else if isBooleanType field.type
+  then
+    case tryParseBoolean raw of
+      Nothing -> ParseFailed { error = "Please answer with 'yes' or 'no'." }
+      Just b -> Parsed { value = b }
+  else if (lower (trim raw)) == "/cancel"
+  then ParseFailed { error = "Cancelled." }
+  else
+    let parseResult = parseInput raw field.type
+    if not parseResult.ok
+    then ParseFailed { error = parseResult.error }
+    else
+      let validateResult = validateValue field.type parseResult.value
+      if not validateResult.ok
+      then ParseFailed { error = validateResult.error }
+      else Parsed { value = parseResult.value }
+
+-- ---------------------------------------------------------------------------
+-- Tier-0/dec — resolveTypeRefDecision ((B)-FIXED: named ctors). Structural
+-- decision for typeId → (typeName, fields). `lookup row.type "$record"` (C)
+-- replaces the inline `match row.type` against `{$record}` (unauthorable). The
+-- TS collector wrapper reads `.typeId` / `.typeName` by name (confirmed).
+-- ---------------------------------------------------------------------------
+@label "Resolve type ref decision"
+@description "Structural decision for resolving a typeId to its (typeName, fields) pair. Given the wrapper-pre-resolved Maybe<TypeRow>, returns one of three variants: TypeNotFound (the typeId didn't resolve to any row), NotRecordType (the row's type isn't a $record so form-fields can't be derived), or ResolvedFields (the row is a record type — wrapper follows up with formDefinitionFields). No IO; the wrapper handles the throw / formDefinitionFields lookup."
+@tags "telegram" "form" "type" "decision"
+@category "telegram"
+resolveTypeRefDecision : (typeId: String) -> (maybeTypeRow: Maybe ({})) -> ResolveTypeRefDecision
+resolveTypeRefDecision typeId maybeTypeRow =
+  case maybeTypeRow of
+    Nothing -> TypeNotFound { typeId = typeId }
+    Just row ->
+      case lookup row.type "$record" of
+        Just _ -> ResolvedFields { typeName = row.name }
+        Nothing -> NotRecordType { typeName = row.name }
+
+-- ---------------------------------------------------------------------------
+-- Tier-2 — dispatchUserReply ((B)-affected). Pure form-fill-loop decision →
+-- `{kind, …}` records the TS router runs side effects from. `case parsed of
+-- Parsed {value=pv} / ParseFailed {error=e}` replaces the unparseable
+-- `parsed.$tag` reads; output keys (kind/newPartial/prevIndex/prevField/
+-- nextIndex/nextField/error/label) match routeStrictReply.
+-- ---------------------------------------------------------------------------
+@label "Dispatch user reply"
+@description "Pure decision function for the form-fill loop. Given the raw user reply and the current conversation state (fields + index + partialValue), returns a record describing what should happen next: `{kind: cancel | back_edge | back_invalid | next_field | confirm | reprompt | done_empty}` plus payload. The TS routeTelegramMessage executes the side effects implied by the result."
+@tags "telegram" "form" "dispatch"
+@category "telegram"
+dispatchUserReply : (raw: String) -> (fields: List ({})) -> (currentFieldIndex: Int) -> (partialValue: {}) -> {}
+dispatchUserReply raw fields currentFieldIndex partialValue =
+  let low = lower (trim raw)
+  if low == "/cancel"
+  then { kind = "cancel" }
+  else if low == "/back"
+  then
+    if (currentFieldIndex <= 0) or (currentFieldIndex > (length fields))
+    then { kind = "back_invalid" }
+    else
+      let prevIdx = currentFieldIndex - 1
+      let prevField = at fields prevIdx
+      let newPartial = mapDelete partialValue prevField.name
+      { kind = "back_edge", prevIndex = prevIdx, prevField = prevField, newPartial = newPartial }
+  else
+    if (currentFieldIndex < 0) or (currentFieldIndex >= (length fields))
+    then { kind = "done_empty" }
+    else
+      let currentField = at fields currentFieldIndex
+      let parsed = parseFieldInput raw currentField
+      case parsed of
+        Parsed { value = pv } ->
+          let nextIdx = currentFieldIndex + 1
+          let nextValue = mapSet partialValue currentField.name pv
+          if nextIdx < (length fields)
+          then { kind = "next_field", nextIndex = nextIdx, newPartial = nextValue, nextField = at fields nextIdx }
+          else { kind = "confirm", newPartial = nextValue }
+        ParseFailed { error = e } ->
+          { kind = "reprompt", error = e, label = fieldLabel currentField }
+        _ ->
+          { kind = "reprompt", error = "Parse failed.", label = fieldLabel currentField }
+
+-- ---------------------------------------------------------------------------
+-- Tier-2 — interpretCollectorAction ((B)-affected). Maps an onField-hook
+-- CollectorAction (Continue | SendAndContinue | SkipTo | Abort) + the parse
+-- result onto a `{kind, …}` record. `case action of …` replaces the
+-- unparseable `action.$tag` reads; `case parsed of Parsed {value=pv}` gates the
+-- skip_to partial. Output keys (kind/nextIndex/newPartial/nextField/message)
+-- match the with-hook router.
+-- ---------------------------------------------------------------------------
+@label "Interpret collector action"
+@description "Pure decision for the onField hook routing. Maps a CollectorAction (Continue | SendAndContinue | SkipTo | Abort) plus the current parse result into a record describing the side effect to run: `{kind: abort | send_then_default | skip_to | fall_through}` plus payload. SkipTo's target lookup and partial-value update are computed here so the TS interpreter just switches on kind."
+@tags "telegram" "form" "dispatch" "hook"
+@category "telegram"
+interpretCollectorAction : (action: CollectorAction) -> (currentField: {}) -> (parsed: FieldParseResult) -> (fields: List ({})) -> (currentFieldIndex: Int) -> (partialValue: {}) -> {}
+interpretCollectorAction action currentField parsed fields currentFieldIndex partialValue =
+  case action of
+    Abort -> { kind = "abort" }
+    SendAndContinue { message = m } -> { kind = "send_then_default", message = m }
+    SkipTo { fieldName = fn } ->
+      let targetIdx = findIndex (\f -> f.name == fn) fields
+      case parsed of
+        Parsed { value = pv } ->
+          if targetIdx >= 0
+          then { kind = "skip_to", nextIndex = targetIdx, newPartial = mapSet partialValue currentField.name pv, nextField = at fields targetIdx }
+          else { kind = "fall_through" }
+        _ -> { kind = "fall_through" }
+    _ -> { kind = "fall_through" }
+
+-- ============================================================================
+-- Helpers — Codeable-ONLY (directive-free). All pure; `formCore…`-prefixed.
+-- ============================================================================
+
+-- formCoreFormatObj — the formatValue tail for non-null, non-Bool values: any
+-- {$tag, value} → recurse on value; else {__case} → toString; else the handle/
+-- json/primitive cascade. (`$tag` AND `value` both required — formCoreTagValue.)
+-- These formatters deliberately accept arbitrary runtime values. Their
+-- lookup/type-test/length leaves are dynamically overloaded, so the source
+-- scheme—not nominal `Any` or an invented structural row—is authoritative.
+formCoreFormatObj : a -> String
+formCoreFormatObj v =
+  case formCoreTagValue v of
+    Just inner -> formatValue inner
+    Nothing ->
+      case lookup v "__case" of
+        Just c -> toString c
+        Nothing -> formCoreFormatHandle v
+
+-- formCoreTagValue — Just <value> iff `v` carries BOTH a `$tag` and a `value`
+-- key (the inline arm-4 `{$tag:_, value: inner}` requires both); else Nothing.
+-- The extracted dynamic payload is explicitly `Any`; an independent quantified
+-- result variable would falsely promise the caller's arbitrary chosen type.
+formCoreTagValue : a -> Maybe Any
+formCoreTagValue v =
+  case lookup v "$tag" of
+    Nothing -> Nothing
+    Just _ -> lookup v "value"
+
+-- formCoreFormatHandle — the {handle[,platform]} arms then the json/primitive
+-- fallback. `length null = 0` so a null platform renders as `@handle`.
+formCoreFormatHandle : a -> String
+formCoreFormatHandle v =
+  case lookup v "handle" of
+    Nothing -> formCoreFormatJson v
+    Just h ->
+      case lookup v "platform" of
+        Nothing -> format "@{h}" { h = h }
+        Just p ->
+          if (length p) > 0
+          then format "{p}/{h}" { p = p, h = h }
+          else format "@{h}" { h = h }
+
+-- formCoreFormatJson — primitive → toString; any object/array → jsonEncode
+-- (pre-wrapped via wrapJsonValue; the Ok payload is positional `_0`).
+formCoreFormatJson : a -> String
+formCoreFormatJson v =
+  if (isString v) or ((isNumber v) or (isBoolean v))
+  then toString v
+  else case jsonEncode (wrapJsonValue v) of
+    Ok s -> s
+    _ -> "(value)"

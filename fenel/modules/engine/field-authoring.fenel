@@ -1,0 +1,1380 @@
+module engine where
+
+-- Field occurrence authoring and persistence planning (field-identity Phase
+-- 2b).  TypeScript supplies entropy and executes the returned IO plan; every
+-- classification, liveness, facet, and diff choice is made here.
+
+FieldEditAction = NewField field: FieldRef | ReuseField field: FieldRef | ResurrectField field: FieldRef
+
+DesiredFieldFacets = DesiredFieldFacets label: Maybe a description: Maybe String icon: Maybe String display: Maybe a
+
+FieldOccurrenceDraft = FieldOccurrenceDraft draftId: String owner: FieldOwner action: FieldEditAction codeName: String occurrenceType: a facets: DesiredFieldFacets contextualOverride: Maybe FieldPresentationOverride
+
+NormalizedFieldOccurrenceDraft = NormalizedFieldOccurrenceDraft draftId: String field: FieldRef codeName: String occurrenceType: a facets: DesiredFieldFacets contextualOverride: Maybe FieldPresentationOverride
+
+AccountFieldStatus = FieldLive | FieldTombstoned
+
+FieldReuseVisibility = FieldOwnerOnly | FieldAccountReusable | FieldRepositoryReusable
+
+DurableFieldRealm = DurableAccountField | DurableRepositoryField
+
+DurableFieldEntity = DurableFieldEntity id: FieldRef currentCodeName: String status: AccountFieldStatus realm: DurableFieldRealm reuseVisibility: FieldReuseVisibility origin: Maybe FieldOrigin
+
+@label "Durable Field storage data"
+@description "Project a durable Field entity to the ordinary entity_instances data value. The row id carries the UUID; the Field value carries the retained Codeable/lifecycle/reuse facts."
+@tags "engine" "field-identity" "storage" "phase-2b"
+durableFieldStorageData : (field: DurableFieldEntity) -> Field
+durableFieldStorageData field = Field { currentCodeName = field.currentCodeName, status = field.status, realm = field.realm, reuseVisibility = field.reuseVisibility, origin = field.origin }
+
+@label "Durable Field from storage data"
+@description "Attach an entity_instances row UUID to its typed Field data value."
+@tags "engine" "field-identity" "storage" "phase-2b"
+durableFieldFromStorageData : (id: FieldRef) -> (data: Field) -> DurableFieldEntity
+durableFieldFromStorageData id data =
+  case data of
+    Field { currentCodeName = currentCodeName, status = status, realm = realm, reuseVisibility = reuseVisibility, origin = origin } -> DurableFieldEntity { id = id, currentCodeName = currentCodeName, status = status, realm = realm, reuseVisibility = reuseVisibility, origin = origin }
+
+DesiredFieldEntity = DesiredFieldEntity id: FieldRef currentCodeName: String origin: Maybe FieldOrigin
+
+FieldFacetValue = FieldFacetValue rowId: Maybe String field: FieldRef typeName: String methods: a scope: String priority: Number storageCanonical: Bool
+
+DesiredFieldFacet = DesiredFieldFacet field: FieldRef typeName: String methods: a
+
+FieldOwnerDefinition = FieldOwnerDefinition ownerKey: String kind: String storageName: String storageId: Maybe String definition: a
+
+FieldOwnerMutation = UpsertFieldOwner owner: FieldOwnerDefinition | DeleteFieldOwner ownerKey: String kind: String storageName: String
+
+FieldStorageIssue = FieldStorageIssue ownerKind: String storageName: String rowIds: List String reason: String
+
+FieldAuthoringPlanInput = FieldAuthoringPlanInput currentOwners: List FieldOwnerDefinition desiredOwners: List FieldOwnerDefinition currentFields: List DurableFieldEntity desiredFields: List DesiredFieldEntity currentFacets: List FieldFacetValue desiredFacets: List DesiredFieldFacet replaceFacetFields: List FieldRef storageIssues: List FieldStorageIssue
+
+FieldPersistenceSnapshot = FieldPersistenceSnapshot owners: List FieldOwnerDefinition fields: List DurableFieldEntity facets: List FieldFacetValue
+
+@category "engine-internal"
+fieldSnapshotRowMatches : (keyOf: a -> String) -> (current: List a) -> (expected: List a) -> (row: a) -> Bool
+fieldSnapshotRowMatches keyOf current expected row =
+  let currentMatches = filter (\candidate -> eq (keyOf candidate) (keyOf row)) current
+  let expectedMatches = filter (\candidate -> eq (keyOf candidate) (keyOf row)) expected
+  if and (eq (length currentMatches) 1) (eq (length expectedMatches) 1)
+  then case head currentMatches of
+    Just candidate -> eufValEq candidate row
+    Nothing -> false
+  else false
+
+@category "engine-internal"
+fieldSnapshotRowsMatch : (keyOf: a -> String) -> (current: List a) -> (expected: List a) -> Bool
+fieldSnapshotRowsMatch keyOf current expected =
+  and (eq (length current) (length expected)) (all expected (fieldSnapshotRowMatches keyOf current expected))
+
+@label "Match definition draft baseline"
+@description "Compare a draft's complete opening definition graph with the graph reloaded under the existing account write lock. Row order is irrelevant; duplicates, changed definitions, Fields and facets refuse. This compares stored data, not semantic type equivalence."
+@tags "engine" "field-identity" "draft" "snapshot"
+fieldPersistenceSnapshotMatches : (current: FieldPersistenceSnapshot) -> (expected: FieldPersistenceSnapshot) -> Bool
+fieldPersistenceSnapshotMatches current expected =
+  let ownersMatch = fieldSnapshotRowsMatch (\owner -> owner.ownerKey) current.owners expected.owners
+  let fieldsMatch = fieldSnapshotRowsMatch (\field -> field.id.handle) current.fields expected.fields
+  let facetsMatch = fieldSnapshotRowsMatch (\facet -> concat facet.field.handle (concat "/" facet.typeName)) current.facets expected.facets
+  and ownersMatch (and fieldsMatch facetsMatch)
+
+@label "Check public root binding"
+@description "Refuse a public type read when its account identity or exact declaration no longer matches the coherent Field graph. Repository roots require the same repository declaration and no new account shadow. This compares captured data versions, not semantic type equivalence."
+@tags "engine" "field-identity" "public" "snapshot"
+publicFieldRootBindingMatches : (binding: Maybe ({ origin: String, id: String, name: String })) -> (typeName: String) -> (type: Type) -> (owners: List FieldOwnerDefinition) -> (repositoryType: Maybe Type) -> (primitiveType: Type) -> Bool
+publicFieldRootBindingMatches binding typeName type owners repositoryType primitiveType =
+  case binding of
+    Nothing -> false
+    Just expected ->
+      if not (eq expected.name typeName)
+      then false
+      else
+        let matching = filter (\owner -> and (eq owner.kind "type") (eq owner.storageName typeName)) owners
+        if eq expected.origin "account"
+        then
+          if not (eq (length matching) 1)
+          then false
+          else case head matching of
+            Nothing -> false
+            Just owner ->
+              if not (eq owner.ownerKey (concat "type:" typeName))
+              then false
+              else if not (eq owner.definition.id typeName)
+              then false
+              else case owner.storageId of
+                Nothing -> false
+                Just id -> and (eq id expected.id) (eufValEq owner.definition.type type)
+        else if eq expected.origin "repository"
+        then
+          if not (eq (length matching) 0)
+          then false
+          else case repositoryType of
+            Just declaration -> eufValEq declaration type
+            Nothing -> and (validationPrimitiveName typeName) (eufValEq primitiveType type)
+        else false
+
+FieldPersistencePlan = FieldPersistencePlan ownerUpserts: List FieldOwnerDefinition ownerDeletes: List FieldOwnerDefinition fieldUpserts: List DurableFieldEntity fieldTombstones: List DurableFieldEntity facetUpserts: List FieldFacetValue facetDeletes: List FieldFacetValue retainedFacets: List FieldFacetValue snapshot: FieldPersistenceSnapshot
+
+FieldAuthoringError =
+  InvalidFieldDraftId message: String
+  | InvalidFieldDraftUuid message: String handle: String
+  | InvalidFieldCodeName message: String codeName: String
+  | MissingReusedField message: String handle: String
+  | TombstonedFieldReuse message: String handle: String
+  | FieldReuseNotVisible message: String handle: String
+  | ReservedFieldCodeName message: String codeName: String
+  | DuplicateOwnerMutation message: String ownerKey: String
+  | MissingOwnerMutationTarget message: String ownerKey: String
+  | InvalidOwnerStorageIdentity message: String ownerKey: String reason: String
+  | AmbiguousOwnerStorage message: String ownerKind: String storageName: String
+  | DuplicateDesiredField message: String handle: String
+  | DuplicateDesiredFacet message: String handle: String typeName: String
+  | DuplicateFacetReplacement message: String handle: String
+  | InvalidFacetReplacement message: String handle: String reason: String
+  | UnlistedDesiredFacet message: String handle: String typeName: String
+  | InvalidFieldFacetFamily message: String typeName: String
+  | ImmutableFieldCodeableFacet message: String handle: String
+  | InvalidFieldFacetMethods message: String typeName: String expected: String
+  | InvalidFieldFacetScope message: String scope: String
+  | InvalidFieldFacetTarget message: String handle: String
+  | ImmutableRepositoryFieldFacet message: String handle: String
+  | LegacyFieldMigrationMissingId message: String qualifiedName: String
+  | LegacyFieldMigrationAmbiguous message: String qualifiedName: String
+  | NonCanonicalFieldPresentation message: String qualifiedName: String
+  | DuplicateFieldResurrection message: String handle: String
+  | InvalidFieldResurrection message: String handle: String reason: String
+  | UnusedFieldResurrection message: String handle: String
+  | FieldResurrectionNotVisible message: String handle: String
+  | FieldIdentityKindConflict message: String handle: String priorKind: String
+
+FieldIdentityKindBinding = FieldIdentityKindBinding handle: String kind: String
+
+FieldAuthoringInventory = FieldAuthoringInventory currentAvailable: List DurableFieldEntity desiredAvailable: List DurableFieldEntity accountTombstones: List DurableFieldEntity repositoryIds: List FieldRef mutableCodeables: List FieldRef identityKinds: List FieldIdentityKindBinding
+
+FieldResurrectionCandidate = FieldResurrectionCandidate field: FieldRef codeName: String
+
+FieldReconcilePrior = FieldReconcilePrior index: Number field: FieldRef codeName: String
+
+FieldReconcileParsed = FieldReconcileParsed index: Number codeName: String
+
+FieldReconcileAction = KeepReconciledField parsedIndex: Number priorIndex: Number field: FieldRef | MintReconciledField parsedIndex: Number
+
+FieldDeclarationPresentation = FieldDeclarationPresentation qualifiedName: String label: Maybe a display: Maybe b
+
+@category "engine-internal"
+fieldAuthoringActionRef : (action: FieldEditAction) -> FieldRef
+fieldAuthoringActionRef action =
+  case action of
+    NewField { field = field } -> field
+    ReuseField { field = field } -> field
+    ResurrectField { field = field } -> field
+
+@category "engine-internal"
+fieldAuthoringFindDurable : (handle: String) -> (fields: List DurableFieldEntity) -> Maybe DurableFieldEntity
+fieldAuthoringFindDurable handle fields = find (\field -> eq field.id.handle handle) fields
+
+@category "engine-internal"
+fieldAuthoringLiveField : (field: DurableFieldEntity) -> Bool
+fieldAuthoringLiveField field = case field.status of FieldLive -> true; FieldTombstoned -> false
+
+@category "engine-internal"
+fieldAuthoringAccountTombstone : (field: DurableFieldEntity) -> Bool
+fieldAuthoringAccountTombstone field =
+  case field.realm of
+    DurableRepositoryField -> false
+    DurableAccountField -> case field.status of FieldLive -> false; FieldTombstoned -> true
+
+@category "engine-internal"
+fieldAuthoringRepositoryField : (field: DurableFieldEntity) -> Bool
+fieldAuthoringRepositoryField field = case field.realm of DurableRepositoryField -> true; DurableAccountField -> false
+
+@category "engine-internal"
+fieldAuthoringLiveAccountField : (field: DurableFieldEntity) -> Bool
+fieldAuthoringLiveAccountField field =
+  case field.realm of
+    DurableRepositoryField -> false
+    DurableAccountField -> fieldAuthoringLiveField field
+
+@category "engine-internal"
+fieldAuthoringKindByHandle : (handle: String) -> (kinds: List FieldIdentityKindBinding) -> Maybe FieldIdentityKindBinding
+fieldAuthoringKindByHandle handle kinds = find (\binding -> eq binding.handle handle) kinds
+
+@category "engine-internal"
+fieldAuthoringAddFieldKind : (state: a) -> (field: DurableFieldEntity) -> a
+fieldAuthoringAddFieldKind state field =
+  case state.error of
+    Just _ -> state
+    Nothing ->
+      case fieldAuthoringKindByHandle field.id.handle state.kinds of
+        Nothing -> { kinds = appendItem (FieldIdentityKindBinding { handle = field.id.handle, kind = "field" }) state.kinds, error = Nothing }
+        Just prior ->
+          if eq prior.kind "field"
+          then state
+          else { kinds = state.kinds, error = Just (FieldIdentityKindConflict { message = concat "field-authoring: UUID is already reserved as a non-field identity: " field.id.handle, handle = field.id.handle, priorKind = prior.kind }) }
+
+@label "Prepare field authoring inventory"
+@description "Classify live normalization inputs, account tombstone reservations, repository identities, and UUID kinds before the host invokes the field-identity B3 bridge. Liveness/realm/kind policy is entirely Fenel-owned."
+@tags "engine" "field-identity" "authoring" "liveness" "realm" "phase-2b"
+prepareFieldAuthoringInventory : (currentFields: List DurableFieldEntity) -> (repositoryFields: List DurableFieldEntity) -> (identityKinds: List FieldIdentityKindBinding) -> Result FieldAuthoringError FieldAuthoringInventory
+prepareFieldAuthoringInventory currentFields repositoryFields identityKinds =
+  let allFields = concat currentFields repositoryFields
+  let classifiedKinds = fold fieldAuthoringAddFieldKind { kinds = identityKinds, error = Nothing } allFields
+  case classifiedKinds.error of
+    Just err -> Err err
+    Nothing ->
+      let live = filter fieldAuthoringLiveField allFields
+      let tombstones = filter fieldAuthoringAccountTombstone currentFields
+      let repositoryIds = map (\field -> field.id) (filter fieldAuthoringRepositoryField repositoryFields)
+      let mutableCodeables = map (\field -> field.id) (filter fieldAuthoringLiveAccountField currentFields)
+      Ok (FieldAuthoringInventory {
+        currentAvailable = live,
+        desiredAvailable = concat live tombstones,
+        accountTombstones = tombstones,
+        repositoryIds = repositoryIds,
+        mutableCodeables = mutableCodeables,
+        identityKinds = classifiedKinds.kinds
+      })
+
+@label "Project committed account registry inputs"
+@description "Classify the live external Field roster, tombstone-inclusive UUID reservations, and live-target account facets for registry hydration. This is the sole liveness policy for committed snapshots; host adapters only marshal the result."
+@tags "engine" "field-identity" "authoring" "registry" "liveness" "phase-2b"
+projectCommittedAccountFieldRegistryInputs : (fields: List DurableFieldEntity) -> (facets: List FieldFacetValue) -> Result FieldAuthoringError a
+projectCommittedAccountFieldRegistryInputs fields facets =
+  case prepareFieldAuthoringInventory fields [] [] of
+    Err err -> Err err
+    Ok inventory ->
+      let live = inventory.currentAvailable
+      Ok {
+        liveFields = live,
+        identityKinds = inventory.identityKinds,
+        liveFacets = filter (fieldAuthoringFacetTargetsLive live) facets
+      }
+
+@label "Project local registry inputs"
+@description "Reuse committed snapshot liveness for tab-local definitions. Their strict transient declaration already supplies the canonical Field Codeable, so retain only optional facets in the private contextual index."
+projectLocalFieldRegistryInputs : (fields: List DurableFieldEntity) -> (facets: List FieldFacetValue) -> Result FieldAuthoringError a
+projectLocalFieldRegistryInputs fields facets =
+  case projectCommittedAccountFieldRegistryInputs fields facets of
+    Err err -> Err err
+    Ok projected -> Ok {
+      liveFields = projected.liveFields,
+      identityKinds = projected.identityKinds,
+      liveFacets = filter (\facet -> not (eq facet.typeName "Codeable")) projected.liveFacets
+    }
+
+@category "engine-internal"
+fieldAuthoringNotRepositoryEntity : (repositoryIds: List FieldRef) -> (field: FieldEntity) -> Bool
+fieldAuthoringNotRepositoryEntity repositoryIds field = not (elem field.id.handle (map (\ref -> ref.handle) repositoryIds))
+
+@category "engine-internal"
+fieldAuthoringDesiredAccountField : (field: FieldEntity) -> DesiredFieldEntity
+fieldAuthoringDesiredAccountField field = DesiredFieldEntity { id = field.id, currentCodeName = field.currentCodeName, origin = field.origin }
+
+@label "Select desired account fields"
+@description "Remove immutable repository identities from a normalized desired field collection and project the durable account Field rows."
+@tags "engine" "field-identity" "authoring" "realm" "phase-2b"
+selectDesiredAccountFields : (fields: List FieldEntity) -> (repositoryIds: List FieldRef) -> List DesiredFieldEntity
+selectDesiredAccountFields fields repositoryIds = map fieldAuthoringDesiredAccountField (filter (fieldAuthoringNotRepositoryEntity repositoryIds) fields)
+
+@category "engine-internal"
+fieldAuthoringSameOwner : (owner: FieldOwner) -> (field: DurableFieldEntity) -> Bool
+fieldAuthoringSameOwner owner field =
+  case field.origin of
+    Nothing -> false
+    Just origin -> fieldAuthoringOwnerWithin origin.owner owner
+
+@category "engine-internal"
+fieldAuthoringNameReserved : (owner: FieldOwner) -> (codeName: String) -> (field: DurableFieldEntity) -> Bool
+fieldAuthoringNameReserved owner codeName field =
+  case field.status of
+    FieldLive -> false
+    FieldTombstoned -> and (eq field.currentCodeName codeName) (fieldAuthoringSameOwner owner field)
+
+@category "engine-internal"
+fieldAuthoringReuseVisible : (owner: FieldOwner) -> (field: DurableFieldEntity) -> Bool
+fieldAuthoringReuseVisible owner field =
+  case field.reuseVisibility of
+    FieldRepositoryReusable -> true
+    FieldAccountReusable ->
+      case field.realm of
+        DurableAccountField -> true
+        DurableRepositoryField -> false
+    FieldOwnerOnly -> fieldAuthoringSameOwner owner field
+
+@label "Normalize field occurrence draft"
+@description "Validate a stable-id field draft. Entropy is supplied once by the host; this body distinguishes mint from explicit reuse and rejects missing/tombstoned reuse without ever minting."
+@tags "engine" "field-identity" "authoring" "phase-2b"
+normalizeFieldOccurrenceDraft : (draft: FieldOccurrenceDraft) -> (available: List DurableFieldEntity) -> Result FieldAuthoringError NormalizedFieldOccurrenceDraft
+normalizeFieldOccurrenceDraft draft available =
+  let field = fieldAuthoringActionRef draft.action
+  if eq draft.draftId ""
+  then Err (InvalidFieldDraftId { message = "field-authoring: draftId must be stable and non-empty" })
+  else if not (fieldIdentityIsUuid field.handle)
+  then Err (InvalidFieldDraftUuid { message = concat "field-authoring: field id is not an RFC-4122 UUID: " field.handle, handle = field.handle })
+  else if eq draft.codeName ""
+  then Err (InvalidFieldCodeName { message = "field-authoring: named field codeName must be non-empty", codeName = draft.codeName })
+  else
+    case fieldIdentityPositionName draft.codeName of
+      CanonicalFieldPosition -> Err (InvalidFieldCodeName { message = concat "field-authoring: named field codeName cannot use reserved _n syntax: " draft.codeName, codeName = draft.codeName })
+      InvalidFieldPosition { message = message } -> Err (InvalidFieldCodeName { message = message, codeName = draft.codeName })
+      NotFieldPosition ->
+        case draft.action of
+          NewField ->
+            if gt (length (filter (fieldAuthoringNameReserved draft.owner draft.codeName) available)) 0
+            then Err (ReservedFieldCodeName { message = concat "field-authoring: retired owner-local field name is reserved; explicitly resurrect its UUID: " draft.codeName, codeName = draft.codeName })
+            else case fieldAuthoringFindDurable field.handle available of
+              Just prior -> Err (InvalidFieldDraftUuid { message = concat "field-authoring: new field UUID is already reserved: " field.handle, handle = field.handle })
+              Nothing -> Ok (NormalizedFieldOccurrenceDraft { draftId = draft.draftId, field = field, codeName = draft.codeName, occurrenceType = draft.occurrenceType, facets = draft.facets, contextualOverride = draft.contextualOverride })
+          ReuseField ->
+            case fieldAuthoringFindDurable field.handle available of
+              Nothing -> Err (MissingReusedField { message = concat "field-authoring: reused field does not exist: " field.handle, handle = field.handle })
+              Just prior ->
+                case prior.status of
+                  FieldTombstoned -> Err (TombstonedFieldReuse { message = concat "field-authoring: tombstoned field requires explicit resurrection: " field.handle, handle = field.handle })
+                  FieldLive ->
+                    if not (fieldAuthoringReuseVisible draft.owner prior)
+                    then Err (FieldReuseNotVisible { message = concat "field-authoring: reused field is not visible to this owner: " field.handle, handle = field.handle })
+                    else if not (eq prior.currentCodeName draft.codeName)
+                    then Err (InvalidFieldCodeName { message = concat "field-authoring: reuse cannot implicitly rename the canonical field: " field.handle, codeName = draft.codeName })
+                    else Ok (NormalizedFieldOccurrenceDraft { draftId = draft.draftId, field = field, codeName = draft.codeName, occurrenceType = draft.occurrenceType, facets = draft.facets, contextualOverride = draft.contextualOverride })
+          ResurrectField ->
+            case fieldAuthoringFindDurable field.handle available of
+              Nothing -> Err (InvalidFieldResurrection { message = concat "field-authoring: resurrected field does not exist: " field.handle, handle = field.handle, reason = "missing" })
+              Just prior ->
+                case prior.realm of
+                  DurableRepositoryField -> Err (InvalidFieldResurrection { message = concat "field-authoring: repository fields cannot be resurrected: " field.handle, handle = field.handle, reason = "repository" })
+                  DurableAccountField ->
+                    case prior.status of
+                      FieldLive -> Err (InvalidFieldResurrection { message = concat "field-authoring: live field cannot be resurrected: " field.handle, handle = field.handle, reason = "live" })
+                      FieldTombstoned ->
+                        if not (fieldAuthoringSameOwner draft.owner prior)
+                        then Err (FieldResurrectionNotVisible { message = concat "field-authoring: tombstoned field can only be resurrected inside its original owner: " field.handle, handle = field.handle })
+                        else if not (eq prior.currentCodeName draft.codeName)
+                        then Err (InvalidFieldCodeName { message = concat "field-authoring: resurrection must retain the reserved Codeable: " field.handle, codeName = draft.codeName })
+                        else Ok (NormalizedFieldOccurrenceDraft { draftId = draft.draftId, field = field, codeName = draft.codeName, occurrenceType = draft.occurrenceType, facets = draft.facets, contextualOverride = draft.contextualOverride })
+
+@category "engine-internal"
+fieldAuthoringReconcileExactCandidate : (claimed: List Number) -> (parsed: FieldReconcileParsed) -> (prior: FieldReconcilePrior) -> Bool
+fieldAuthoringReconcileExactCandidate claimed parsed prior =
+  and (not (elem prior.index claimed)) (eq prior.codeName parsed.codeName)
+
+@category "engine-internal"
+fieldAuthoringReconcileExactStep : (state: a) -> (parsed: FieldReconcileParsed) -> a
+fieldAuthoringReconcileExactStep state parsed =
+  case find (fieldAuthoringReconcileExactCandidate state.claimed parsed) state.prior of
+    Nothing -> state
+    Just prior -> {
+      prior = state.prior,
+      actions = appendItem (KeepReconciledField { parsedIndex = parsed.index, priorIndex = prior.index, field = prior.field }) state.actions,
+      claimed = appendItem prior.index state.claimed
+    }
+
+@category "engine-internal"
+fieldAuthoringReconcileActionAt : (parsedIndex: Number) -> (actions: List FieldReconcileAction) -> Maybe FieldReconcileAction
+fieldAuthoringReconcileActionAt parsedIndex actions = find (\action -> eq action.parsedIndex parsedIndex) actions
+
+@category "engine-internal"
+fieldAuthoringReconcilePositionalCandidate : (claimed: List Number) -> (parsed: FieldReconcileParsed) -> (prior: FieldReconcilePrior) -> Bool
+fieldAuthoringReconcilePositionalCandidate claimed parsed prior =
+  and (not (elem prior.index claimed)) (eq prior.index parsed.index)
+
+@category "engine-internal"
+fieldAuthoringReconcilePositionalStep : (state: a) -> (parsed: FieldReconcileParsed) -> a
+fieldAuthoringReconcilePositionalStep state parsed =
+  case fieldAuthoringReconcileActionAt parsed.index state.actions of
+    Just _ -> state
+    Nothing ->
+      case find (fieldAuthoringReconcilePositionalCandidate state.claimed parsed) state.prior of
+        Just prior -> {
+          prior = state.prior,
+          actions = appendItem (KeepReconciledField { parsedIndex = parsed.index, priorIndex = prior.index, field = prior.field }) state.actions,
+          claimed = appendItem prior.index state.claimed
+        }
+        Nothing -> {
+          prior = state.prior,
+          actions = appendItem (MintReconciledField { parsedIndex = parsed.index }) state.actions,
+          claimed = state.claimed
+        }
+
+@label "Reconcile named field occurrences"
+@description "Classify a code-editor parse using exact Codeable matches first, positional rename fallback second, and explicit mint actions last. The host may materialize entropy only for MintReconciledField actions."
+@tags "engine" "field-identity" "authoring" "reconciliation" "phase-2b"
+reconcileNamedFieldOccurrencesKernel : (prior: List FieldReconcilePrior) -> (parsed: List FieldReconcileParsed) -> List FieldReconcileAction
+reconcileNamedFieldOccurrencesKernel prior parsed =
+  let exact = fold fieldAuthoringReconcileExactStep { prior = prior, actions = [], claimed = [] } parsed
+  let complete = fold fieldAuthoringReconcilePositionalStep exact parsed
+  sort (\action -> action.parsedIndex) complete.actions
+
+@category "engine-internal"
+fieldAuthoringPresentationErrorStep : (state: Maybe FieldAuthoringError) -> (presentation: FieldDeclarationPresentation) -> Maybe FieldAuthoringError
+fieldAuthoringPresentationErrorStep state presentation =
+  case state of
+    Just _ -> state
+    Nothing ->
+      case presentation.label of
+        Just _ -> Just (NonCanonicalFieldPresentation { message = concat "field-authoring: declaration-level FieldDef.label is not canonical; write a Labelable UUID facet: " presentation.qualifiedName, qualifiedName = presentation.qualifiedName })
+        Nothing ->
+          case presentation.display of
+            Just _ -> Just (NonCanonicalFieldPresentation { message = concat "field-authoring: declaration-level FieldDef.ui is not canonical; write a Displayable UUID facet: " presentation.qualifiedName, qualifiedName = presentation.qualifiedName })
+            Nothing -> Nothing
+
+@label "Validate canonical field declarations"
+@description "Reject declaration-level FieldDef label/UI values on the normal authoring path. Presentation belongs to UUID facets; the migration command is the only authority that lifts legacy inline slots."
+@tags "engine" "field-identity" "authoring" "validation" "phase-2b"
+validateCanonicalFieldDeclarations : (presentations: List FieldDeclarationPresentation) -> Result FieldAuthoringError Bool
+validateCanonicalFieldDeclarations presentations =
+  case fold fieldAuthoringPresentationErrorStep Nothing presentations of
+    Just err -> Err err
+    Nothing -> Ok true
+
+@category "engine-internal"
+fieldAuthoringCanonicalOwnerKey : (kind: String) -> (storageName: String) -> String
+fieldAuthoringCanonicalOwnerKey kind storageName = concat kind (concat ":" storageName)
+
+@category "engine-internal"
+fieldAuthoringValidOwnerKind : (kind: String) -> Bool
+fieldAuthoringValidOwnerKind kind = if eq kind "type" then true else eq kind "function"
+
+@category "engine-internal"
+fieldAuthoringOwnerMetadataError : (owner: FieldOwnerDefinition) -> Maybe FieldAuthoringError
+fieldAuthoringOwnerMetadataError owner =
+  if not (fieldAuthoringValidOwnerKind owner.kind)
+  then Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: invalid owner kind: " owner.kind, ownerKey = owner.ownerKey, reason = "invalid-kind" })
+  else if not (eq owner.ownerKey (fieldAuthoringCanonicalOwnerKey owner.kind owner.storageName))
+  then Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: owner key does not match kind and storage name: " owner.ownerKey, ownerKey = owner.ownerKey, reason = "non-canonical-owner-key" })
+  else if not (eq owner.definition.id owner.storageName)
+  then Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: definition id does not match authoritative storage name: " owner.ownerKey, ownerKey = owner.ownerKey, reason = "definition-id-mismatch" })
+  else Nothing
+
+@category "engine-internal"
+fieldAuthoringDeleteMetadataError : (ownerKey: String) -> (kind: String) -> (storageName: String) -> Maybe FieldAuthoringError
+fieldAuthoringDeleteMetadataError ownerKey kind storageName =
+  if not (fieldAuthoringValidOwnerKind kind)
+  then Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: invalid deleted owner kind: " kind, ownerKey = ownerKey, reason = "invalid-kind" })
+  else if not (eq ownerKey (fieldAuthoringCanonicalOwnerKey kind storageName))
+  then Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: deleted owner key does not match kind and storage name: " ownerKey, ownerKey = ownerKey, reason = "non-canonical-owner-key" })
+  else Nothing
+
+@category "engine-internal"
+fieldAuthoringOwnerDuplicateStep : (state: a) -> (owner: FieldOwnerDefinition) -> a
+fieldAuthoringOwnerDuplicateStep state owner =
+  case state.error of
+    Just err -> state
+    Nothing ->
+      case fieldAuthoringOwnerMetadataError owner of
+        Just err -> { keys = state.keys, error = Just err }
+        Nothing ->
+          if elem owner.ownerKey state.keys
+          then { keys = state.keys, error = Just (DuplicateOwnerMutation { message = concat "field-authoring: duplicate owner key: " owner.ownerKey, ownerKey = owner.ownerKey }) }
+          else { keys = appendItem owner.ownerKey state.keys, error = Nothing }
+
+@category "engine-internal"
+fieldAuthoringCheckOwners : (owners: List FieldOwnerDefinition) -> Maybe FieldAuthoringError
+fieldAuthoringCheckOwners owners =
+  let result = fold fieldAuthoringOwnerDuplicateStep { keys = [], error = Nothing } owners
+  result.error
+
+@category "engine-internal"
+fieldAuthoringDesiredDuplicateStep : (state: a) -> (field: DesiredFieldEntity) -> a
+fieldAuthoringDesiredDuplicateStep state field =
+  case state.error of
+    Just err -> state
+    Nothing ->
+      if elem field.id.handle state.keys
+      then { keys = state.keys, error = Just (DuplicateDesiredField { message = concat "field-authoring: duplicate desired field: " field.id.handle, handle = field.id.handle }) }
+      else { keys = appendItem field.id.handle state.keys, error = Nothing }
+
+@category "engine-internal"
+fieldAuthoringCheckDesiredFields : (fields: List DesiredFieldEntity) -> Maybe FieldAuthoringError
+fieldAuthoringCheckDesiredFields fields =
+  let result = fold fieldAuthoringDesiredDuplicateStep { keys = [], error = Nothing } fields
+  result.error
+
+@category "engine-internal"
+fieldAuthoringOwnerByKey : (key: String) -> (owners: List FieldOwnerDefinition) -> Maybe FieldOwnerDefinition
+fieldAuthoringOwnerByKey key owners = find (\owner -> eq owner.ownerKey key) owners
+
+@category "engine-internal"
+fieldAuthoringRemoveOwner : (key: String) -> (owners: List FieldOwnerDefinition) -> List FieldOwnerDefinition
+fieldAuthoringRemoveOwner key owners = filter (\owner -> not (eq owner.ownerKey key)) owners
+
+@category "engine-internal"
+fieldAuthoringApplyOwnerMutation : (state: a) -> (mutation: FieldOwnerMutation) -> a
+fieldAuthoringApplyOwnerMutation state mutation =
+  case state.error of
+    Just err -> state
+    Nothing ->
+      case mutation of
+        UpsertFieldOwner { owner = owner } ->
+          case fieldAuthoringOwnerMetadataError owner of
+            Just err -> { owners = state.owners, touched = state.touched, error = Just err }
+            Nothing ->
+              if elem owner.ownerKey state.touched
+              then { owners = state.owners, touched = state.touched, error = Just (DuplicateOwnerMutation { message = concat "field-authoring: owner is mutated more than once: " owner.ownerKey, ownerKey = owner.ownerKey }) }
+              else
+                case fieldAuthoringOwnerByKey owner.ownerKey state.owners of
+                  Nothing ->
+                    case owner.storageId of
+                      Just _ -> { owners = state.owners, touched = appendItem owner.ownerKey state.touched, error = Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: new owner must not supply a storage id: " owner.ownerKey, ownerKey = owner.ownerKey, reason = "new-owner-storage-id" }) }
+                      Nothing ->
+                        if not (fieldIdentityIsUuid owner.storageName)
+                        then { owners = state.owners, touched = appendItem owner.ownerKey state.touched, error = Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: new owner id is not an RFC-4122 UUID: " owner.storageName, ownerKey = owner.ownerKey, reason = "new-owner-id-not-uuid" }) }
+                        else { owners = appendItem owner state.owners, touched = appendItem owner.ownerKey state.touched, error = Nothing }
+                  Just prior ->
+                    if not (eq owner.kind prior.kind)
+                    then { owners = state.owners, touched = appendItem owner.ownerKey state.touched, error = Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: owner kind does not match server-loaded metadata: " owner.ownerKey, ownerKey = owner.ownerKey, reason = "owner-kind-mismatch" }) }
+                    else if not (eq owner.storageName prior.storageName)
+                    then { owners = state.owners, touched = appendItem owner.ownerKey state.touched, error = Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: owner storage name does not match server-loaded metadata: " owner.ownerKey, ownerKey = owner.ownerKey, reason = "owner-storage-name-mismatch" }) }
+                    else
+                      case owner.storageId of
+                        Just requestedId ->
+                          case prior.storageId of
+                            Just currentId ->
+                              if eq requestedId currentId
+                              then { owners = appendItem (FieldOwnerDefinition { ownerKey = prior.ownerKey, kind = prior.kind, storageName = prior.storageName, storageId = prior.storageId, definition = owner.definition }) (fieldAuthoringRemoveOwner prior.ownerKey state.owners), touched = appendItem prior.ownerKey state.touched, error = Nothing }
+                              else { owners = state.owners, touched = appendItem owner.ownerKey state.touched, error = Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: owner storage id does not match server-loaded metadata: " owner.ownerKey, ownerKey = owner.ownerKey, reason = "owner-storage-id-mismatch" }) }
+                            Nothing -> { owners = state.owners, touched = appendItem owner.ownerKey state.touched, error = Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: owner supplied a storage id absent from server-loaded metadata: " owner.ownerKey, ownerKey = owner.ownerKey, reason = "owner-storage-id-mismatch" }) }
+                        Nothing -> { owners = appendItem (FieldOwnerDefinition { ownerKey = prior.ownerKey, kind = prior.kind, storageName = prior.storageName, storageId = prior.storageId, definition = owner.definition }) (fieldAuthoringRemoveOwner prior.ownerKey state.owners), touched = appendItem prior.ownerKey state.touched, error = Nothing }
+        DeleteFieldOwner { ownerKey = ownerKey, kind = kind, storageName = storageName } ->
+          case fieldAuthoringDeleteMetadataError ownerKey kind storageName of
+            Just err -> { owners = state.owners, touched = state.touched, error = Just err }
+            Nothing ->
+              if elem ownerKey state.touched
+              then { owners = state.owners, touched = state.touched, error = Just (DuplicateOwnerMutation { message = concat "field-authoring: owner is mutated more than once: " ownerKey, ownerKey = ownerKey }) }
+              else
+                case fieldAuthoringOwnerByKey ownerKey state.owners of
+                  Nothing -> { owners = state.owners, touched = appendItem ownerKey state.touched, error = Just (MissingOwnerMutationTarget { message = concat "field-authoring: deleted owner does not exist: " ownerKey, ownerKey = ownerKey }) }
+                  Just prior ->
+                    if not (eq kind prior.kind)
+                    then { owners = state.owners, touched = appendItem ownerKey state.touched, error = Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: deleted owner kind does not match server-loaded metadata: " ownerKey, ownerKey = ownerKey, reason = "owner-kind-mismatch" }) }
+                    else if not (eq storageName prior.storageName)
+                    then { owners = state.owners, touched = appendItem ownerKey state.touched, error = Just (InvalidOwnerStorageIdentity { message = concat "field-authoring: deleted owner storage name does not match server-loaded metadata: " ownerKey, ownerKey = ownerKey, reason = "owner-storage-name-mismatch" }) }
+                    else { owners = fieldAuthoringRemoveOwner ownerKey state.owners, touched = appendItem ownerKey state.touched, error = Nothing }
+
+@label "Apply field owner mutations"
+@description "Apply an atomic multi-owner upsert/delete request to the server-loaded current owner graph. Duplicate mutation targets and missing deletes are structured errors; the host never reconstructs mutation semantics with a Map."
+@tags "engine" "field-identity" "authoring" "persistence" "phase-2b"
+applyFieldOwnerMutationsKernel : (current: List FieldOwnerDefinition) -> (mutations: List FieldOwnerMutation) -> Result FieldAuthoringError (List FieldOwnerDefinition)
+applyFieldOwnerMutationsKernel current mutations =
+  case fieldAuthoringCheckOwners current of
+    Just err -> Err err
+    Nothing ->
+      let state = fold fieldAuthoringApplyOwnerMutation { owners = current, touched = [], error = Nothing } mutations
+      case state.error of
+        Just err -> Err err
+        Nothing -> Ok state.owners
+
+@category "engine-internal"
+fieldAuthoringOwnerWithin : (root: FieldOwner) -> (candidate: FieldOwner) -> Bool
+fieldAuthoringOwnerWithin root candidate =
+  if eufValEq root candidate
+  then true
+  else
+    case candidate of
+      InlineNominalFieldOwner { parent = parent } -> fieldAuthoringOwnerWithin root parent
+      TypeFieldOwner -> false
+      FunctionFieldOwner -> false
+
+@category "engine-internal"
+fieldAuthoringAnyOwnerWithin : (roots: List FieldOwner) -> (candidate: FieldOwner) -> Bool
+fieldAuthoringAnyOwnerWithin roots candidate =
+  case head roots of
+    Nothing -> false
+    Just root ->
+      if fieldAuthoringOwnerWithin root candidate
+      then true
+      else
+        case tail roots of
+          Nothing -> false
+          Just rest -> fieldAuthoringAnyOwnerWithin rest candidate
+
+@category "engine-internal"
+fieldAuthoringSelectResurrectionStep : (available: List DurableFieldEntity) -> (state: a) -> (field: FieldRef) -> a
+fieldAuthoringSelectResurrectionStep available state field =
+  case state.error of
+    Just _ -> state
+    Nothing ->
+      if elem field.handle state.handles
+      then { fields = state.fields, handles = state.handles, error = Just (DuplicateFieldResurrection { message = concat "field-authoring: duplicate field resurrection request: " field.handle, handle = field.handle }) }
+      else if not (fieldIdentityIsUuid field.handle)
+      then { fields = state.fields, handles = appendItem field.handle state.handles, error = Just (InvalidFieldResurrection { message = concat "field-authoring: resurrection id is not an RFC-4122 UUID: " field.handle, handle = field.handle, reason = "invalid-uuid" }) }
+      else
+        case fieldAuthoringFindDurable field.handle available of
+          Nothing -> { fields = state.fields, handles = appendItem field.handle state.handles, error = Just (InvalidFieldResurrection { message = concat "field-authoring: resurrected field does not exist: " field.handle, handle = field.handle, reason = "missing" }) }
+          Just durable ->
+            case durable.realm of
+              DurableRepositoryField -> { fields = state.fields, handles = appendItem field.handle state.handles, error = Just (InvalidFieldResurrection { message = concat "field-authoring: repository fields cannot be resurrected: " field.handle, handle = field.handle, reason = "repository" }) }
+              DurableAccountField ->
+                case durable.status of
+                  FieldLive -> { fields = state.fields, handles = appendItem field.handle state.handles, error = Just (InvalidFieldResurrection { message = concat "field-authoring: live field cannot be resurrected: " field.handle, handle = field.handle, reason = "live" }) }
+                  FieldTombstoned -> { fields = appendItem durable state.fields, handles = appendItem field.handle state.handles, error = Nothing }
+
+@label "Select explicit field resurrections"
+@description "Resolve an explicit resurrection request against the account reservation set. Only tombstoned account Fields are admitted; ordinary field refs never call this authority."
+@tags "engine" "field-identity" "authoring" "resurrection" "phase-2b"
+selectFieldResurrections : (available: List DurableFieldEntity) -> (requested: List FieldRef) -> Result FieldAuthoringError (List DurableFieldEntity)
+selectFieldResurrections available requested =
+  let selected = fold (fieldAuthoringSelectResurrectionStep available) { fields = [], handles = [], error = Nothing } requested
+  case selected.error of
+    Just err -> Err err
+    Nothing -> Ok selected.fields
+
+@category "engine-internal"
+fieldAuthoringOwnerDefinitionOwner : (owner: FieldOwnerDefinition) -> FieldOwner
+fieldAuthoringOwnerDefinitionOwner owner =
+  if eq owner.kind "type"
+  then TypeFieldOwner { module = Nothing, localId = owner.storageName }
+  else FunctionFieldOwner { id = owner.storageName }
+
+@category "engine-internal"
+fieldAuthoringResurrectionCandidateFor : (owner: FieldOwner) -> (field: DurableFieldEntity) -> Bool
+fieldAuthoringResurrectionCandidateFor owner field =
+  and (fieldAuthoringAccountTombstone field) (fieldAuthoringSameOwner owner field)
+
+@category "engine-internal"
+fieldAuthoringResurrectionCandidate : (field: DurableFieldEntity) -> FieldResurrectionCandidate
+fieldAuthoringResurrectionCandidate field = FieldResurrectionCandidate { field = field.id, codeName = field.currentCodeName }
+
+@label "Query owner field resurrections"
+@description "List only the account tombstones retained for one exact owner. This is the explicit resurrection catalog; ordinary reuse queries remain live-only."
+@tags "engine" "field-identity" "authoring" "resurrection" "phase-2b"
+queryFieldResurrectionCandidates : (owner: FieldOwnerDefinition) -> (fields: List DurableFieldEntity) -> List FieldResurrectionCandidate
+queryFieldResurrectionCandidates owner fields =
+  fieldAuthoringResurrectionsForOwner (fieldAuthoringOwnerDefinitionOwner owner) fields
+
+@category "engine-internal"
+fieldAuthoringResurrectionsForOwner : (owner: FieldOwner) -> (fields: List DurableFieldEntity) -> List FieldResurrectionCandidate
+fieldAuthoringResurrectionsForOwner owner fields =
+  map fieldAuthoringResurrectionCandidate (filter (fieldAuthoringResurrectionCandidateFor owner) fields)
+
+@label "Query field resurrections by owner target"
+@description "Resolve an exact current owner, or the canonical identity of a removed owner, without fabricating a type/function definition. Reuse the existing owner/tombstone resurrection query; malformed target coordinates refuse."
+queryFieldResurrectionsByTarget : (owners: List FieldOwnerDefinition) -> (fields: List DurableFieldEntity) -> (ownerKey: String) -> (kind: String) -> (storageName: String) -> Result String (List FieldResurrectionCandidate)
+queryFieldResurrectionsByTarget owners fields ownerKey kind storageName =
+  case fieldAuthoringOwnerByKey ownerKey owners of
+    Just owner ->
+      if and (eq owner.kind kind) (eq owner.storageName storageName)
+      then Ok (queryFieldResurrectionCandidates owner fields)
+      else Err "Field resurrection owner coordinates do not match the current definition."
+    Nothing ->
+      if not (eq ownerKey (concat kind (concat ":" storageName)))
+      then Err "Field resurrection owner coordinates are not canonical."
+      else if eq kind "type"
+      then Ok (fieldAuthoringResurrectionsForOwner (TypeFieldOwner { module = Nothing, localId = storageName }) fields)
+      else if eq kind "function"
+      then Ok (fieldAuthoringResurrectionsForOwner (FunctionFieldOwner { id = storageName }) fields)
+      else Err "Field resurrection requires a type or function owner."
+
+@category "engine-internal"
+fieldAuthoringOccurrenceReferences : (handle: String) -> (occurrence: ResolvedFieldOccurrence) -> Bool
+fieldAuthoringOccurrenceReferences handle occurrence =
+  case occurrence.key of
+    PositionalField -> false
+    NamedField { ref = ref } -> eq ref.handle handle
+
+@category "engine-internal"
+fieldAuthoringReuseVisibilityStep : (field: DurableFieldEntity) -> (state: Maybe FieldAuthoringError) -> (occurrence: ResolvedFieldOccurrence) -> Maybe FieldAuthoringError
+fieldAuthoringReuseVisibilityStep field state occurrence =
+  case state of
+    Just _ -> state
+    Nothing ->
+      if not (fieldAuthoringOccurrenceReferences field.id.handle occurrence)
+      then Nothing
+      else
+        case field.status of
+          FieldTombstoned -> Nothing
+          FieldLive ->
+            if fieldAuthoringReuseVisible occurrence.owner field
+            then Nothing
+            else Just (FieldReuseNotVisible { message = concat "field-authoring: desired owner graph reuses a field outside its durable visibility: " field.id.handle, handle = field.id.handle })
+
+@category "engine-internal"
+fieldAuthoringReuseVisibilityFieldStep : (occurrences: List ResolvedFieldOccurrence) -> (state: Maybe FieldAuthoringError) -> (field: DurableFieldEntity) -> Maybe FieldAuthoringError
+fieldAuthoringReuseVisibilityFieldStep occurrences state field =
+  case state of
+    Just _ -> state
+    Nothing -> fold (fieldAuthoringReuseVisibilityStep field) Nothing occurrences
+
+@label "Validate field reuse visibility"
+@description "Validate the complete desired owner graph against durable Field visibility. Owner-only Fields remain inside their retained origin owner (including inline-nominal descendants), account-reusable Fields remain account-local, and only explicitly repository-reusable Fields may cross the repository/account boundary."
+@tags "engine" "field-identity" "authoring" "reuse" "visibility" "phase-2b"
+validateFieldReuseVisibility : (fields: List DurableFieldEntity) -> (occurrences: List ResolvedFieldOccurrence) -> Result FieldAuthoringError Bool
+validateFieldReuseVisibility fields occurrences =
+  case fold (fieldAuthoringReuseVisibilityFieldStep occurrences) Nothing fields of
+    Just err -> Err err
+    Nothing -> Ok true
+
+@category "engine-internal"
+fieldAuthoringResurrectionOutsideOwner : (owner: FieldOwner) -> (occurrence: ResolvedFieldOccurrence) -> Bool
+fieldAuthoringResurrectionOutsideOwner owner occurrence = not (fieldAuthoringOwnerWithin owner occurrence.owner)
+
+@category "engine-internal"
+fieldAuthoringValidateResurrectionUseStep : (occurrences: List ResolvedFieldOccurrence) -> (state: Maybe FieldAuthoringError) -> (field: DurableFieldEntity) -> Maybe FieldAuthoringError
+fieldAuthoringValidateResurrectionUseStep occurrences state field =
+  case state of
+    Just _ -> state
+    Nothing ->
+      let uses = filter (fieldAuthoringOccurrenceReferences field.id.handle) occurrences
+      case head uses of
+        Nothing -> Just (UnusedFieldResurrection { message = concat "field-authoring: explicit resurrection is not referenced by the desired owner graph: " field.id.handle, handle = field.id.handle })
+        Just _ ->
+          case field.origin of
+            Nothing -> Just (InvalidFieldResurrection { message = concat "field-authoring: tombstoned field has no owner origin and cannot be resurrected: " field.id.handle, handle = field.id.handle, reason = "missing-origin" })
+            Just origin ->
+              case head (filter (fieldAuthoringResurrectionOutsideOwner origin.owner) uses) of
+                Just _ -> Just (FieldResurrectionNotVisible { message = concat "field-authoring: tombstoned field can only be resurrected inside its original owner: " field.id.handle, handle = field.id.handle })
+                Nothing -> Nothing
+
+@label "Validate field resurrection uses"
+@description "Require every explicitly selected tombstone to occur in the desired graph and only inside its retained original owner (including inline-nominal descendants)."
+@tags "engine" "field-identity" "authoring" "resurrection" "phase-2b"
+validateFieldResurrectionUses : (selected: List DurableFieldEntity) -> (occurrences: List ResolvedFieldOccurrence) -> Result FieldAuthoringError Bool
+validateFieldResurrectionUses selected occurrences =
+  case fold (fieldAuthoringValidateResurrectionUseStep occurrences) Nothing selected of
+    Just err -> Err err
+    Nothing -> Ok true
+
+@category "engine-internal"
+fieldAuthoringResurrectionSelected : (selected: List DurableFieldEntity) -> (handle: String) -> Bool
+fieldAuthoringResurrectionSelected selected handle =
+  case fieldAuthoringFindDurable handle selected of
+    Just _ -> true
+    Nothing -> false
+
+@category "engine-internal"
+fieldAuthoringValidateTombstoneReferenceStep : (tombstones: List DurableFieldEntity) -> (selected: List DurableFieldEntity) -> (state: Maybe FieldAuthoringError) -> (occurrence: ResolvedFieldOccurrence) -> Maybe FieldAuthoringError
+fieldAuthoringValidateTombstoneReferenceStep tombstones selected state occurrence =
+  case state of
+    Just _ -> state
+    Nothing ->
+      case occurrence.key of
+        PositionalField -> Nothing
+        NamedField { ref = ref } ->
+          case fieldAuthoringFindDurable ref.handle tombstones of
+            Nothing -> Nothing
+            Just _ ->
+              if fieldAuthoringResurrectionSelected selected ref.handle
+              then Nothing
+              else Just (TombstonedFieldReuse { message = concat "field-authoring: tombstoned field requires explicit resurrection: " ref.handle, handle = ref.handle })
+
+@label "Validate tombstone references"
+@description "Reject a desired graph that merely reuses a reserved tombstone. Tombstones are admitted to normalization only so this Fenel authority can distinguish ordinary reuse from the separately selected resurrection action."
+@tags "engine" "field-identity" "authoring" "resurrection" "phase-2b"
+validateFieldTombstoneReferences : (tombstones: List DurableFieldEntity) -> (selected: List DurableFieldEntity) -> (occurrences: List ResolvedFieldOccurrence) -> Result FieldAuthoringError Bool
+validateFieldTombstoneReferences tombstones selected occurrences =
+  case fold (fieldAuthoringValidateTombstoneReferenceStep tombstones selected) Nothing occurrences of
+    Just err -> Err err
+    Nothing -> Ok true
+
+@category "engine-internal"
+fieldAuthoringOccurrenceAffected : (roots: List FieldOwner) -> (occurrence: ResolvedFieldOccurrence) -> Bool
+fieldAuthoringOccurrenceAffected roots occurrence = fieldAuthoringAnyOwnerWithin roots occurrence.owner
+
+@category "engine-internal"
+fieldAuthoringCollectAffected : (refs: List FieldRef) -> (occurrence: ResolvedFieldOccurrence) -> List FieldRef
+fieldAuthoringCollectAffected refs occurrence =
+  case occurrence.key of
+    PositionalField -> refs
+    NamedField { ref = ref } ->
+      if elem ref.handle (map (\field -> field.handle) refs)
+      then refs
+      else appendItem ref refs
+
+@label "Affected fields for owner mutations"
+@description "Project the UUID set touched by a multi-owner mutation, including removed and desired occurrences and inline-nominal descendants. Used to scope exact optional-facet replacement without deleting unrelated account facets."
+@tags "engine" "field-identity" "authoring" "persistence" "phase-2b"
+fieldAuthoringAffectedFields : (roots: List FieldOwner) -> (current: List ResolvedFieldOccurrence) -> (desired: List ResolvedFieldOccurrence) -> List FieldRef
+fieldAuthoringAffectedFields roots current desired =
+  let relevant = concat (filter (fieldAuthoringOccurrenceAffected roots) current) (filter (fieldAuthoringOccurrenceAffected roots) desired)
+  fold fieldAuthoringCollectAffected [] relevant
+
+@category "engine-internal"
+fieldAuthoringOwnerChanged : (current: List FieldOwnerDefinition) -> (desired: FieldOwnerDefinition) -> Bool
+fieldAuthoringOwnerChanged current desired =
+  case fieldAuthoringOwnerByKey desired.ownerKey current of
+    Nothing -> true
+    Just old -> not (eufValEq old.definition desired.definition)
+
+@category "engine-internal"
+fieldAuthoringOwnerRemoved : (desired: List FieldOwnerDefinition) -> (current: FieldOwnerDefinition) -> Bool
+fieldAuthoringOwnerRemoved desired current =
+  case fieldAuthoringOwnerByKey current.ownerKey desired of
+    Nothing -> true
+    Just _ -> false
+
+@category "engine-internal"
+fieldAuthoringDesiredByHandle : (handle: String) -> (fields: List DesiredFieldEntity) -> Maybe DesiredFieldEntity
+fieldAuthoringDesiredByHandle handle fields = find (\field -> eq field.id.handle handle) fields
+
+@category "engine-internal"
+fieldAuthoringLiveDurable : (current: List DurableFieldEntity) -> (desired: DesiredFieldEntity) -> DurableFieldEntity
+fieldAuthoringLiveDurable current desired =
+  case fieldAuthoringFindDurable desired.id.handle current of
+    Just prior -> DurableFieldEntity { id = desired.id, currentCodeName = desired.currentCodeName, status = FieldLive, realm = prior.realm, reuseVisibility = prior.reuseVisibility, origin = case desired.origin of Just o -> Just o; Nothing -> prior.origin }
+    Nothing -> DurableFieldEntity { id = desired.id, currentCodeName = desired.currentCodeName, status = FieldLive, realm = DurableAccountField, reuseVisibility = FieldAccountReusable, origin = desired.origin }
+
+@category "engine-internal"
+fieldAuthoringTombstone : (field: DurableFieldEntity) -> DurableFieldEntity
+fieldAuthoringTombstone field = DurableFieldEntity { id = field.id, currentCodeName = field.currentCodeName, status = FieldTombstoned, realm = field.realm, reuseVisibility = field.reuseVisibility, origin = field.origin }
+
+@category "engine-internal"
+fieldAuthoringDurableChanged : (current: List DurableFieldEntity) -> (desired: DurableFieldEntity) -> Bool
+fieldAuthoringDurableChanged current desired =
+  case fieldAuthoringFindDurable desired.id.handle current of
+    Nothing -> true
+    Just old -> not (eufValEq old desired)
+
+@category "engine-internal"
+fieldAuthoringCurrentNeedsTombstone : (desired: List DesiredFieldEntity) -> (current: DurableFieldEntity) -> Bool
+fieldAuthoringCurrentNeedsTombstone desired current =
+  case current.realm of
+    DurableRepositoryField -> false
+    DurableAccountField ->
+      case current.status of
+        FieldTombstoned -> false
+        FieldLive ->
+          case fieldAuthoringDesiredByHandle current.id.handle desired of
+            Nothing -> true
+            Just _ -> false
+
+@category "engine-internal"
+fieldAuthoringFacetKey : (facet: FieldFacetValue) -> String
+fieldAuthoringFacetKey facet = concat facet.field.handle (concat "|" facet.typeName)
+
+@category "engine-internal"
+fieldAuthoringFacetByKey : (key: String) -> (facets: List FieldFacetValue) -> Maybe FieldFacetValue
+fieldAuthoringFacetByKey key facets = find (\facet -> eq (fieldAuthoringFacetKey facet) key) facets
+
+@category "engine-internal"
+fieldAuthoringFacetFamily : (typeName: String) -> Bool
+fieldAuthoringFacetFamily typeName = elem typeName ["Codeable", "Labelable", "Describable", "Iconable", "Displayable"]
+
+@category "engine-internal"
+fieldAuthoringIsRecordValue : (value: a) -> Bool
+fieldAuthoringIsRecordValue value =
+  and (not (isNull value)) (and (not (isArray value)) (and (not (isString value)) (and (not (isNumber value)) (not (isBoolean value)))))
+
+@category "engine-internal"
+fieldAuthoringEntryValueIsString : (entry: a) -> Bool
+fieldAuthoringEntryValueIsString entry = isString entry.value
+
+@category "engine-internal"
+fieldAuthoringIsLocaleString : (value: a) -> Bool
+fieldAuthoringIsLocaleString value =
+  if isString value
+  then true
+  else and (fieldAuthoringIsRecordValue value) (eq (length (filter fieldAuthoringEntryValueIsString (entries value))) (length (entries value)))
+
+@category "engine-internal"
+fieldAuthoringSingleMethod : (methods: a) -> (name: String) -> Maybe a
+fieldAuthoringSingleMethod methods name =
+  if not (fieldAuthoringIsRecordValue methods)
+  then Nothing
+  else if not (eq (length (entries methods)) 1)
+  then Nothing
+  else mapGet methods name
+
+@category "engine-internal"
+fieldAuthoringMaybeTag : (value: a) -> Maybe String
+fieldAuthoringMaybeTag value =
+  if not (fieldAuthoringIsRecordValue value)
+  then Nothing
+  else case mapGet value "$tag" of
+    Nothing -> Nothing
+    Just tag -> if isString tag then Just tag else Nothing
+
+@category "engine-internal"
+fieldAuthoringMaybeNothing : (value: a) -> Bool
+fieldAuthoringMaybeNothing value =
+  case fieldAuthoringMaybeTag value of
+    Nothing -> false
+    Just tag -> and (eq tag "Nothing") (eq (length (entries value)) 1)
+
+@category "engine-internal"
+fieldAuthoringMaybeJust : (value: a) -> Maybe a
+fieldAuthoringMaybeJust value =
+  case fieldAuthoringMaybeTag value of
+    Nothing -> Nothing
+    Just tag ->
+      if and (eq tag "Just") (eq (length (entries value)) 2)
+      then mapGet value "_0"
+      else Nothing
+
+@category "engine-internal"
+fieldAuthoringMaybeString : (value: a) -> Bool
+fieldAuthoringMaybeString value =
+  if fieldAuthoringMaybeNothing value
+  then true
+  else case fieldAuthoringMaybeJust value of Nothing -> false; Just inner -> isString inner
+
+@category "engine-internal"
+fieldAuthoringMaybeLocaleString : (value: a) -> Bool
+fieldAuthoringMaybeLocaleString value =
+  if fieldAuthoringMaybeNothing value
+  then true
+  else case fieldAuthoringMaybeJust value of Nothing -> false; Just inner -> fieldAuthoringIsLocaleString inner
+
+@category "engine-internal"
+fieldAuthoringDisplayOptionValid : (value: a) -> Bool
+fieldAuthoringDisplayOptionValid value = fieldAuthoringIsRecordValue value
+
+@category "engine-internal"
+fieldAuthoringMaybeOptions : (value: a) -> Bool
+fieldAuthoringMaybeOptions value =
+  if fieldAuthoringMaybeNothing value
+  then true
+  else case fieldAuthoringMaybeJust value of
+    Nothing -> false
+    Just inner -> and (isArray inner) (all inner fieldAuthoringDisplayOptionValid)
+
+@category "engine-internal"
+fieldAuthoringMaybeColumns : (value: a) -> Bool
+fieldAuthoringMaybeColumns value =
+  if fieldAuthoringMaybeNothing value
+  then true
+  else case fieldAuthoringMaybeJust value of
+    Nothing -> false
+    Just inner -> and (isNumber inner) (and (gt inner 0) (not (gt inner 12)))
+
+@category "engine-internal"
+fieldAuthoringMaybeRefFilter : (value: a) -> Bool
+fieldAuthoringMaybeRefFilter value =
+  if fieldAuthoringMaybeNothing value
+  then true
+  else case fieldAuthoringMaybeJust value of Nothing -> false; Just inner -> fieldAuthoringIsRecordValue inner
+
+@category "engine-internal"
+fieldAuthoringDisplayEntryValid : (entry: a) -> Bool
+fieldAuthoringDisplayEntryValid entry =
+  if eq entry.key "widget" then fieldAuthoringMaybeString entry.value
+  else if eq entry.key "placeholder" then fieldAuthoringMaybeLocaleString entry.value
+  else if eq entry.key "helpText" then fieldAuthoringMaybeLocaleString entry.value
+  else if eq entry.key "prefix" then fieldAuthoringMaybeLocaleString entry.value
+  else if eq entry.key "suffix" then fieldAuthoringMaybeLocaleString entry.value
+  else if eq entry.key "options" then fieldAuthoringMaybeOptions entry.value
+  else if eq entry.key "format" then fieldAuthoringMaybeString entry.value
+  else if eq entry.key "columns" then fieldAuthoringMaybeColumns entry.value
+  else if eq entry.key "refFilter" then fieldAuthoringMaybeRefFilter entry.value
+  else false
+
+@category "engine-internal"
+fieldAuthoringDisplayHintValid : (hint: a) -> Bool
+fieldAuthoringDisplayHintValid hint =
+  and (fieldAuthoringIsRecordValue hint) (and (eq (length (entries hint)) 9) (all (entries hint) fieldAuthoringDisplayEntryValid))
+
+@category "engine-internal"
+fieldAuthoringFacetMethodsValid : (facet: DesiredFieldFacet) -> Bool
+fieldAuthoringFacetMethodsValid facet =
+  if eq facet.typeName "Labelable"
+  then case fieldAuthoringSingleMethod facet.methods "label" of Nothing -> false; Just label -> fieldAuthoringIsLocaleString label
+  else if eq facet.typeName "Describable"
+  then case fieldAuthoringSingleMethod facet.methods "description" of Nothing -> false; Just description -> fieldAuthoringIsLocaleString description
+  else if eq facet.typeName "Iconable"
+  then case fieldAuthoringSingleMethod facet.methods "icon" of Nothing -> false; Just icon -> and (isString icon) (gt (length icon) 0)
+  else if eq facet.typeName "Displayable"
+  then case fieldAuthoringSingleMethod facet.methods "hint" of Nothing -> false; Just hint -> fieldAuthoringDisplayHintValid hint
+  else false
+
+@category "engine-internal"
+fieldAuthoringFacetExpectedMethods : (typeName: String) -> String
+fieldAuthoringFacetExpectedMethods typeName =
+  if eq typeName "Labelable" then "{ label: LocaleString }"
+  else if eq typeName "Describable" then "{ description: LocaleString }"
+  else if eq typeName "Iconable" then "{ icon: non-empty String }"
+  else if eq typeName "Displayable" then "{ hint: canonical field_ui_hint (nine Maybe slots; columns 1..12) }"
+  else "FieldRepresentational methods"
+
+@category "engine-internal"
+fieldAuthoringValidateFacetStep : (desiredFields: List DurableFieldEntity) -> (replaceFields: List FieldRef) -> (state: a) -> (facet: DesiredFieldFacet) -> a
+fieldAuthoringValidateFacetStep desiredFields replaceFields state facet =
+  case state.error of
+    Just err -> state
+    Nothing ->
+      if not (elem facet.field.handle (map (\field -> field.handle) replaceFields))
+      then { keys = state.keys, error = Just (UnlistedDesiredFacet { message = concat "field-authoring: desired facet target is not explicitly marked for replacement: " facet.field.handle, handle = facet.field.handle, typeName = facet.typeName }) }
+      else if eq facet.typeName "Codeable"
+      then { keys = state.keys, error = Just (ImmutableFieldCodeableFacet { message = concat "field-authoring: Codeable is derived from the durable Field and cannot be requested as an optional facet: " facet.field.handle, handle = facet.field.handle }) }
+      else if not (fieldAuthoringFacetFamily facet.typeName)
+      then { keys = state.keys, error = Just (InvalidFieldFacetFamily { message = concat "field-authoring: type is not a FieldRepresentational facet: " facet.typeName, typeName = facet.typeName }) }
+      else if not (fieldAuthoringFacetMethodsValid facet)
+      then { keys = state.keys, error = Just (InvalidFieldFacetMethods { message = concat "field-authoring: invalid methods for " (concat facet.typeName (concat "; expected " (fieldAuthoringFacetExpectedMethods facet.typeName))), typeName = facet.typeName, expected = fieldAuthoringFacetExpectedMethods facet.typeName }) }
+      else case fieldAuthoringFindDurable facet.field.handle desiredFields of
+          Nothing -> { keys = state.keys, error = Just (InvalidFieldFacetTarget { message = concat "field-authoring: facet target is not a live desired field: " facet.field.handle, handle = facet.field.handle }) }
+          Just field ->
+            case field.realm of
+              DurableRepositoryField -> { keys = state.keys, error = Just (ImmutableRepositoryFieldFacet { message = concat "field-authoring: repository field facets are immutable: " facet.field.handle, handle = facet.field.handle }) }
+              DurableAccountField ->
+                let key = fieldAuthoringFacetKey facet
+                if elem key state.keys
+                then { keys = state.keys, error = Just (DuplicateDesiredFacet { message = concat "field-authoring: duplicate logical facet: " key, handle = facet.field.handle, typeName = facet.typeName }) }
+                else { keys = appendItem key state.keys, error = Nothing }
+
+@category "engine-internal"
+fieldAuthoringCheckDesiredFacets : (desiredFields: List DurableFieldEntity) -> (replaceFields: List FieldRef) -> (facets: List DesiredFieldFacet) -> Maybe FieldAuthoringError
+fieldAuthoringCheckDesiredFacets desiredFields replaceFields facets =
+  let result = fold (fieldAuthoringValidateFacetStep desiredFields replaceFields) { keys = [], error = Nothing } facets
+  result.error
+
+@category "engine-internal"
+fieldAuthoringCheckReplacementStep : (desiredFields: List DurableFieldEntity) -> (state: a) -> (field: FieldRef) -> a
+fieldAuthoringCheckReplacementStep desiredFields state field =
+  case state.error of
+    Just err -> state
+    Nothing ->
+      if elem field.handle state.handles
+      then { handles = state.handles, error = Just (DuplicateFacetReplacement { message = concat "field-authoring: duplicate facet replacement target: " field.handle, handle = field.handle }) }
+      else case fieldAuthoringFindDurable field.handle desiredFields of
+        Nothing -> { handles = state.handles, error = Just (InvalidFacetReplacement { message = concat "field-authoring: facet replacement target is not a live desired field: " field.handle, handle = field.handle, reason = "not-live" }) }
+        Just durable ->
+          case durable.realm of
+            DurableRepositoryField -> { handles = state.handles, error = Just (InvalidFacetReplacement { message = concat "field-authoring: repository field facets are immutable: " field.handle, handle = field.handle, reason = "repository" }) }
+            DurableAccountField -> { handles = appendItem field.handle state.handles, error = Nothing }
+
+@category "engine-internal"
+fieldAuthoringCheckReplacements : (desiredFields: List DurableFieldEntity) -> (replaceFields: List FieldRef) -> Maybe FieldAuthoringError
+fieldAuthoringCheckReplacements desiredFields replaceFields =
+  let result = fold (fieldAuthoringCheckReplacementStep desiredFields) { handles = [], error = Nothing } replaceFields
+  result.error
+
+@category "engine-internal"
+fieldAuthoringCodeableFacet : (current: List FieldFacetValue) -> (field: DurableFieldEntity) -> FieldFacetValue
+fieldAuthoringCodeableFacet current field =
+  let key = concat field.id.handle "|Codeable"
+  let rowId = case fieldAuthoringFacetByKey key current of
+    Just prior -> prior.rowId
+    Nothing -> Nothing
+  FieldFacetValue { rowId = rowId, field = field.id, typeName = "Codeable", methods = { codeName = field.currentCodeName }, scope = "account", priority = 100, storageCanonical = true }
+
+@category "engine-internal"
+fieldAuthoringIsAccountField : (field: DurableFieldEntity) -> Bool
+fieldAuthoringIsAccountField field =
+  case field.realm of
+    DurableAccountField -> true
+    DurableRepositoryField -> false
+
+@category "engine-internal"
+fieldAuthoringNotCodeable : (facet: FieldFacetValue) -> Bool
+fieldAuthoringNotCodeable facet = not (eq facet.typeName "Codeable")
+
+@category "engine-internal"
+fieldAuthoringFacetIsReplaced : (replaceFields: List FieldRef) -> (facet: FieldFacetValue) -> Bool
+fieldAuthoringFacetIsReplaced replaceFields facet = elem facet.field.handle (map (\field -> field.handle) replaceFields)
+
+@category "engine-internal"
+fieldAuthoringFacetTargetsLive : (live: List DurableFieldEntity) -> (facet: FieldFacetValue) -> Bool
+fieldAuthoringFacetTargetsLive live facet =
+  case fieldAuthoringFindDurable facet.field.handle live of
+    Nothing -> false
+    Just _ -> true
+
+@category "engine-internal"
+fieldAuthoringKeepCurrentOptionalFacet : (live: List DurableFieldEntity) -> (replaceFields: List FieldRef) -> (facet: FieldFacetValue) -> Bool
+fieldAuthoringKeepCurrentOptionalFacet live replaceFields facet =
+  let optional = fieldAuthoringNotCodeable facet
+  let liveTarget = fieldAuthoringFacetTargetsLive live facet
+  let replacedTarget = fieldAuthoringFacetIsReplaced replaceFields facet
+  and optional (and liveTarget (not replacedTarget))
+
+@category "engine-internal"
+fieldAuthoringCanonicalFacet : (current: List FieldFacetValue) -> (facet: DesiredFieldFacet) -> FieldFacetValue
+fieldAuthoringCanonicalFacet current facet =
+  let key = concat facet.field.handle (concat "|" facet.typeName)
+  let rowId = case fieldAuthoringFacetByKey key current of
+    Just prior -> prior.rowId
+    Nothing -> Nothing
+  FieldFacetValue { rowId = rowId, field = facet.field, typeName = facet.typeName, methods = facet.methods, scope = "account", priority = 100, storageCanonical = true }
+
+@category "engine-internal"
+fieldAuthoringFacetChanged : (current: List FieldFacetValue) -> (desired: FieldFacetValue) -> Bool
+fieldAuthoringFacetChanged current desired =
+  case fieldAuthoringFacetByKey (fieldAuthoringFacetKey desired) current of
+    Nothing -> true
+    Just old -> or (not old.storageCanonical) (or (not (eq old.scope desired.scope)) (or (not (eq old.priority desired.priority)) (not (eufValEq old.methods desired.methods))))
+
+@category "engine-internal"
+fieldAuthoringFacetRetained : (current: List FieldFacetValue) -> (desired: FieldFacetValue) -> Bool
+fieldAuthoringFacetRetained current desired = not (fieldAuthoringFacetChanged current desired)
+
+@category "engine-internal"
+fieldAuthoringFacetRemoved : (desired: List FieldFacetValue) -> (current: FieldFacetValue) -> Bool
+fieldAuthoringFacetRemoved desired current =
+  case fieldAuthoringFacetByKey (fieldAuthoringFacetKey current) desired of
+    Nothing -> true
+    Just _ -> false
+
+@label "Plan field persistence"
+@description "Diff complete normalized account owner/Field/facet snapshots. The returned plan explicitly chooses owner writes/deletes, durable Field live/tombstone operations, Codeable reservations, optional facet upserts/deletes, and the committed snapshot for one account transaction."
+@tags "engine" "field-identity" "authoring" "persistence" "phase-2b"
+planFieldPersistenceKernel : (input: FieldAuthoringPlanInput) -> Result FieldAuthoringError FieldPersistencePlan
+planFieldPersistenceKernel input =
+  case head input.storageIssues of
+    Just issue -> Err (AmbiguousOwnerStorage { message = concat "field-authoring: account owner storage is ambiguous for " (concat issue.ownerKind (concat ":" issue.storageName)), ownerKind = issue.ownerKind, storageName = issue.storageName })
+    Nothing ->
+      case fieldAuthoringCheckOwners input.currentOwners of
+        Just err -> Err err
+        Nothing ->
+          case fieldAuthoringCheckOwners input.desiredOwners of
+            Just err -> Err err
+            Nothing ->
+              case fieldAuthoringCheckDesiredFields input.desiredFields of
+                Just err -> Err err
+                Nothing ->
+                  let desiredLiveFields = map (fieldAuthoringLiveDurable input.currentFields) input.desiredFields
+                  case fieldAuthoringCheckReplacements desiredLiveFields input.replaceFacetFields of
+                    Just err -> Err err
+                    Nothing ->
+                      case fieldAuthoringCheckDesiredFacets desiredLiveFields input.replaceFacetFields input.desiredFacets of
+                        Just err -> Err err
+                        Nothing ->
+                          let tombstones = map fieldAuthoringTombstone (filter (fieldAuthoringCurrentNeedsTombstone input.desiredFields) input.currentFields)
+                          let priorTombstones = filter (\field ->
+                            case field.status of
+                              FieldLive -> false
+                              FieldTombstoned ->
+                                case fieldAuthoringDesiredByHandle field.id.handle input.desiredFields of
+                                  Nothing -> true
+                                  Just _ -> false
+                          ) input.currentFields
+                          let snapshotFields = concat desiredLiveFields (concat tombstones priorTombstones)
+                          let retainedOptional = filter (fieldAuthoringKeepCurrentOptionalFacet desiredLiveFields input.replaceFacetFields) input.currentFacets
+                          let requestedOptional = map (fieldAuthoringCanonicalFacet input.currentFacets) (filter fieldAuthoringNotCodeable input.desiredFacets)
+                          let optionalFacets = concat retainedOptional requestedOptional
+                          let codeables = map (fieldAuthoringCodeableFacet input.currentFacets) (filter fieldAuthoringIsAccountField snapshotFields)
+                          let snapshotFacets = concat codeables optionalFacets
+                          Ok (FieldPersistencePlan {
+                            ownerUpserts = filter (fieldAuthoringOwnerChanged input.currentOwners) input.desiredOwners,
+                            ownerDeletes = filter (fieldAuthoringOwnerRemoved input.desiredOwners) input.currentOwners,
+                            fieldUpserts = filter (fieldAuthoringDurableChanged input.currentFields) desiredLiveFields,
+                            fieldTombstones = tombstones,
+                            facetUpserts = filter (fieldAuthoringFacetChanged input.currentFacets) snapshotFacets,
+                            facetDeletes = filter (fieldAuthoringFacetRemoved snapshotFacets) input.currentFacets,
+                            retainedFacets = filter (fieldAuthoringFacetRetained input.currentFacets) snapshotFacets,
+                            snapshot = FieldPersistenceSnapshot { owners = input.desiredOwners, fields = snapshotFields, facets = snapshotFacets }
+                          })
+
+LegacyFieldPresentation = LegacyFieldPresentation field: FieldRef qualifiedName: String codeName: String label: Maybe a display: Maybe a
+
+LegacyFieldIdentity = LegacyFieldIdentity field: FieldRef qualifiedName: String codeName: String uuidAsName: Bool
+
+LegacyFieldMigrationProjection = LegacyFieldMigrationProjection fields: List DesiredFieldEntity facets: List FieldFacetValue
+
+@category "engine-internal"
+fieldAuthoringLegacyUuidName : (identity: LegacyFieldIdentity) -> Bool
+fieldAuthoringLegacyUuidName identity = identity.uuidAsName
+
+@label "Validate legacy field identities"
+@description "Reject UUID-as-name ingress until the one-shot migration has an explicit readable Codeable mapping. The host reports source facts but does not decide migration policy."
+@tags "engine" "field-identity" "migration" "phase-2b"
+validateLegacyFieldIdentities : (identities: List LegacyFieldIdentity) -> Result FieldAuthoringError Bool
+validateLegacyFieldIdentities identities =
+  case find fieldAuthoringLegacyUuidName identities of
+    Nothing -> Ok true
+    Just identity -> Err (LegacyFieldMigrationAmbiguous { message = "field migration: UUID-as-name requires an explicit readable Codeable mapping; refusing to preserve the UUID as source/JSON name", qualifiedName = identity.qualifiedName })
+
+@category "engine-internal"
+fieldAuthoringLegacyDurableField : (field: FieldEntity) -> DurableFieldEntity
+fieldAuthoringLegacyDurableField field = DurableFieldEntity {
+  id = field.id,
+  currentCodeName = field.currentCodeName,
+  status = FieldLive,
+  realm = DurableAccountField,
+  reuseVisibility = FieldAccountReusable,
+  origin = field.origin
+}
+
+@label "Select migrated account field entities"
+@description "Project normalized non-repository field entities into the durable live account catalog used by the migration plan."
+@tags "engine" "field-identity" "migration" "realm" "phase-2b"
+selectMigratedAccountFields : (fields: List FieldEntity) -> (repositoryIds: List FieldRef) -> List DurableFieldEntity
+selectMigratedAccountFields fields repositoryIds = map fieldAuthoringLegacyDurableField (filter (fieldAuthoringNotRepositoryEntity repositoryIds) fields)
+
+@category "engine-internal"
+fieldAuthoringLegacyDisplaySlot : (display: a) -> (name: String) -> a
+fieldAuthoringLegacyDisplaySlot display name =
+  case mapGet display name of
+    Nothing -> Nothing
+    Just value -> value
+
+@category "engine-internal"
+fieldAuthoringCompleteLegacyDisplay : (display: a) -> a
+fieldAuthoringCompleteLegacyDisplay display = {
+  widget = fieldAuthoringLegacyDisplaySlot display "widget",
+  placeholder = fieldAuthoringLegacyDisplaySlot display "placeholder",
+  helpText = fieldAuthoringLegacyDisplaySlot display "helpText",
+  prefix = fieldAuthoringLegacyDisplaySlot display "prefix",
+  suffix = fieldAuthoringLegacyDisplaySlot display "suffix",
+  options = fieldAuthoringLegacyDisplaySlot display "options",
+  format = fieldAuthoringLegacyDisplaySlot display "format",
+  columns = fieldAuthoringLegacyDisplaySlot display "columns",
+  refFilter = fieldAuthoringLegacyDisplaySlot display "refFilter"
+}
+
+@category "engine-internal"
+fieldAuthoringLegacyField : (legacy: LegacyFieldPresentation) -> DesiredFieldEntity
+fieldAuthoringLegacyField legacy = DesiredFieldEntity { id = legacy.field, currentCodeName = legacy.codeName, origin = Nothing }
+
+@category "engine-internal"
+fieldAuthoringLegacyFacets : (facets: List FieldFacetValue) -> (legacy: LegacyFieldPresentation) -> List FieldFacetValue
+fieldAuthoringLegacyFacets facets legacy =
+  let withLabel = case legacy.label of Nothing -> facets; Just label -> appendItem (FieldFacetValue { rowId = Nothing, field = legacy.field, typeName = "Labelable", methods = { label = label }, scope = "account", priority = 100, storageCanonical = true }) facets
+  case legacy.display of
+    Nothing -> withLabel
+    Just display -> appendItem (FieldFacetValue { rowId = Nothing, field = legacy.field, typeName = "Displayable", methods = { hint = fieldAuthoringCompleteLegacyDisplay display }, scope = "account", priority = 100, storageCanonical = true }) withLabel
+
+@label "Classify legacy field presentation"
+@description "Lift legacy inline field label/UI slots onto UUID facets after the field-identity kernel has adopted UUID-as-name or resolved a supplied stable mint. The returned definitions are expected to write the same readable codeName with an explicit NamedField key and clear both inline slots."
+@tags "engine" "field-identity" "migration" "phase-2b"
+classifyLegacyFieldPresentation : (legacy: List LegacyFieldPresentation) -> LegacyFieldMigrationProjection
+classifyLegacyFieldPresentation legacy = LegacyFieldMigrationProjection {
+  fields = map fieldAuthoringLegacyField legacy,
+  facets = fold fieldAuthoringLegacyFacets [] legacy
+}
+
+@category "engine-internal"
+fieldAuthoringFacetAsDesired : (facet: FieldFacetValue) -> DesiredFieldFacet
+fieldAuthoringFacetAsDesired facet =
+  if eq facet.typeName "Displayable"
+  then case mapGet facet.methods "hint" of
+    Nothing -> DesiredFieldFacet { field = facet.field, typeName = facet.typeName, methods = facet.methods }
+    Just hint -> DesiredFieldFacet { field = facet.field, typeName = facet.typeName, methods = { hint = fieldAuthoringCompleteLegacyDisplay hint } }
+  else DesiredFieldFacet { field = facet.field, typeName = facet.typeName, methods = facet.methods }
+
+@category "engine-internal"
+fieldAuthoringDesiredFacetByKey : (key: String) -> (facets: List DesiredFieldFacet) -> Maybe DesiredFieldFacet
+fieldAuthoringDesiredFacetByKey key facets = find (\facet -> eq (fieldAuthoringFacetKey facet) key) facets
+
+@category "engine-internal"
+fieldAuthoringMergeLegacyFacetStep : (state: a) -> (facet: FieldFacetValue) -> a
+fieldAuthoringMergeLegacyFacetStep state facet =
+  case state.error of
+    Just err -> state
+    Nothing ->
+      let key = fieldAuthoringFacetKey facet
+      case fieldAuthoringDesiredFacetByKey key state.facets of
+        Nothing -> { facets = appendItem (fieldAuthoringFacetAsDesired facet) state.facets, error = Nothing }
+        Just prior ->
+          if eufValEq prior.methods facet.methods
+          then state
+          else { facets = state.facets, error = Just (LegacyFieldMigrationAmbiguous { message = concat "field migration: conflicting persisted and inline facet for " key, qualifiedName = key }) }
+
+@label "Merge legacy field facets"
+@description "Preserve current optional account facets and add inline-presentation facets lifted by migration. Same logical facet with equal methods dedupes; differing methods are a structured ambiguity, making dry-run/apply/dry-run convergent."
+@tags "engine" "field-identity" "migration" "phase-2b"
+mergeLegacyFieldFacets : (current: List FieldFacetValue) -> (lifted: List FieldFacetValue) -> Result FieldAuthoringError (List DesiredFieldFacet)
+mergeLegacyFieldFacets current lifted =
+  let optional = map fieldAuthoringFacetAsDesired (filter fieldAuthoringNotCodeable current)
+  let merged = fold fieldAuthoringMergeLegacyFacetStep { facets = optional, error = Nothing } lifted
+  case merged.error of
+    Just err -> Err err
+    Nothing -> Ok merged.facets
+
+FieldReuseCatalogEntry = FieldReuseCatalogEntry fieldId: String codeName: String label: Maybe a owners: List String occurrenceTypes: List a status: AccountFieldStatus realm: DurableFieldRealm reuseVisibility: FieldReuseVisibility
+
+FieldReuseCatalogPage = FieldReuseCatalogPage fields: List FieldReuseCatalogEntry nextCursor: Maybe Number
+
+FieldReuseOccurrence = FieldReuseOccurrence owner: String occurrenceType: a
+
+FieldReuseOccurrenceSummary = FieldReuseOccurrenceSummary owners: List String occurrenceTypes: List a
+
+@category "engine-internal"
+fieldReuseCatalogVisible : (entry: FieldReuseCatalogEntry) -> Bool
+fieldReuseCatalogVisible entry =
+  case entry.status of
+    FieldTombstoned -> false
+    FieldLive ->
+      case entry.reuseVisibility of
+        FieldOwnerOnly -> false
+        FieldAccountReusable ->
+          case entry.realm of
+            DurableAccountField -> true
+            DurableRepositoryField -> false
+        FieldRepositoryReusable -> true
+
+@category "engine-internal"
+fieldReuseCatalogLabelEntryValue : (entry: a) -> String
+fieldReuseCatalogLabelEntryValue entry = entry.value
+
+@category "engine-internal"
+fieldReuseCatalogLabelText : (label: Maybe a) -> String
+fieldReuseCatalogLabelText label =
+  case label of
+    Nothing -> ""
+    Just value ->
+      if isString value
+      then value
+      else join (map fieldReuseCatalogLabelEntryValue (entries value)) " "
+
+@category "engine-internal"
+fieldReuseCatalogSearchText : (entry: FieldReuseCatalogEntry) -> String
+fieldReuseCatalogSearchText entry = concat entry.codeName (concat " " (fieldReuseCatalogLabelText entry.label))
+
+@category "engine-internal"
+fieldReuseCatalogMatches : (query: String) -> (entry: FieldReuseCatalogEntry) -> Bool
+fieldReuseCatalogMatches query entry =
+  if eq query "" then true else contains (lower (fieldReuseCatalogSearchText entry)) (lower query)
+
+@category "engine-internal"
+fieldReuseCatalogKey : (entry: FieldReuseCatalogEntry) -> String
+fieldReuseCatalogKey entry = concat entry.codeName (concat "|" entry.fieldId)
+
+@category "engine-internal"
+fieldReuseCatalogCursor : (cursorText: String) -> Number
+fieldReuseCatalogCursor cursorText =
+  case tryParseInt cursorText of
+    Nothing -> 0
+    Just cursor -> if and (gte cursor 0) (lte cursor 9007199254740991) then cursor else 0
+
+@category "engine-internal"
+fieldReuseCatalogLimitNumber : (requested: Number) -> Number
+fieldReuseCatalogLimitNumber requested =
+  case tryParseInt (toString requested) of
+    Nothing -> 50
+    Just limit -> if lt limit 1 then 1 else if gt limit 100 then 100 else limit
+
+@category "engine-internal"
+fieldReuseCatalogLimit : (requested: Maybe Number) -> Number
+fieldReuseCatalogLimit requested =
+  case requested of
+    Nothing -> 50
+    Just limit -> fieldReuseCatalogLimitNumber limit
+
+@category "engine-internal"
+fieldReuseCatalogHasOwner : (owners: List String) -> (owner: String) -> Bool
+fieldReuseCatalogHasOwner owners owner =
+  case find (\prior -> eq prior owner) owners of
+    Nothing -> false
+    Just _ -> true
+
+@category "engine-internal"
+fieldReuseCatalogHasOccurrenceType : (types: List a) -> (candidate: a) -> Bool
+fieldReuseCatalogHasOccurrenceType types candidate =
+  case find (\prior -> eufValEq prior candidate) types of
+    Nothing -> false
+    Just _ -> true
+
+@category "engine-internal"
+fieldReuseCatalogSummarizeOccurrence : (summary: FieldReuseOccurrenceSummary) -> (occurrence: FieldReuseOccurrence) -> FieldReuseOccurrenceSummary
+fieldReuseCatalogSummarizeOccurrence summary occurrence = FieldReuseOccurrenceSummary {
+  owners = if fieldReuseCatalogHasOwner summary.owners occurrence.owner then summary.owners else appendItem occurrence.owner summary.owners,
+  occurrenceTypes = if fieldReuseCatalogHasOccurrenceType summary.occurrenceTypes occurrence.occurrenceType then summary.occurrenceTypes else appendItem occurrence.occurrenceType summary.occurrenceTypes
+}
+
+@label "Summarize field reuse occurrences"
+@description "Deduplicate owner names and occurrence types for one durable Field. Type equivalence is structural and record-key-order independent through eufValEq; the host only marshals occurrence facts."
+@tags "engine" "field-identity" "authoring" "reuse" "catalog" "phase-2b"
+summarizeFieldReuseOccurrences : (occurrences: List FieldReuseOccurrence) -> FieldReuseOccurrenceSummary
+summarizeFieldReuseOccurrences occurrences =
+  let summary = fold fieldReuseCatalogSummarizeOccurrence (FieldReuseOccurrenceSummary { owners = [], occurrenceTypes = [] }) occurrences
+  FieldReuseOccurrenceSummary { owners = sort (\owner -> owner) summary.owners, occurrenceTypes = summary.occurrenceTypes }
+
+@label "Query reusable fields"
+@description "Filter the combined account/repository field catalog by liveness and explicit reuse visibility, then apply deterministic search and cursor pagination. Tombstones and owner-local/internal repository fields never escape."
+@tags "engine" "field-identity" "authoring" "reuse" "catalog" "phase-2b"
+queryFieldReuseCatalog : (entries: List FieldReuseCatalogEntry) -> (query: String) -> (cursorText: String) -> (requestedLimit: Maybe Number) -> FieldReuseCatalogPage
+queryFieldReuseCatalog entries query cursorText requestedLimit =
+  let cursor = fieldReuseCatalogCursor cursorText
+  let limit = fieldReuseCatalogLimit requestedLimit
+  let visible = filter fieldReuseCatalogVisible entries
+  let matched = filter (fieldReuseCatalogMatches query) visible
+  let ordered = sort fieldReuseCatalogKey matched
+  let page = take limit (drop cursor ordered)
+  let next = add cursor (length page)
+  FieldReuseCatalogPage { fields = page, nextCursor = if lt next (length ordered) then Just next else Nothing }

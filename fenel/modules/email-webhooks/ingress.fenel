@@ -1,0 +1,389 @@
+-- =========================================================================
+-- module emailWebhooks where — email-webhook ingress for mailgun / postmark
+-- / resend / ses.
+--
+-- typed-function-references Phase FM-retire-5 Step 5a (2026-06-06) — the
+-- `FenelModule`-retirement port. This file was the body-only `ingress.fenel`
+-- (loaded as `email-webhooks-ingress`, bodies re-IDed by 20 `defineFunction`
+-- specs in engine/src/modules/email-webhooks.ts). It is now the SOURCE OF
+-- TRUTH: a full `module emailWebhooks where` file carrying each fn's signature
+-- + identity facets (@label/@description/@tags/@category) + the `@requires
+-- "HasStateIO"` constraint on the 11 emit/handle fns + the SesIngressDecision
+-- ADT + the bodies (unchanged). The seam in email-webhooks.ts collapses to a
+-- thin `loadFenelModule` (0 `defineFunction`).
+--
+-- HEADER NAME = `emailWebhooks` (NOT `email-webhooks`): the function ids are
+-- `emailWebhooks:<fn>` (the api/src/routes/{mailgun,postmark,resend,ses}-webhook
+-- .ts dispatch by that id via `invokeIOAction`). The loader ties the module
+-- name AND the id-prefix to the header name, so the header MUST be
+-- `emailWebhooks` to keep those ids byte-identical (0 consumer edits). The
+-- human-facing module LABEL stays "Email-webhook ingress" (overridden at the
+-- seam). Because the id-prefix is `emailWebhooks` but the catalog category was
+-- `email-webhooks`, the category does NOT derive from the prefix — so each fn
+-- carries an explicit `@category "email-webhooks"` (the Phase-3j rule: author
+-- `@category` ONLY when it differs from the id prefix; here it does).
+--
+-- Phase 12c-routes sub-step 1 (origin) — Six route bodies (mailgunEvents /
+-- mailgunInbound / postmarkEvents / postmarkInbound / resendEvents / sesEvents)
+-- + the cross-cut composing primitive emitEmailEvent + 1 ADT entity
+-- SesIngressDecision + per-route helpers.
+--
+-- The 4 lifecycle-event routes (mailgun/postmark/resend events + ses
+-- Notification arm) share the post-mapping tail (markWebhookProcessed →
+-- appendEvent → dispatchEventTriggers ×2 → autoSuppressIfBadEvent). The
+-- composing primitive emitEmailEvent wraps the last 4 steps; each route's
+-- body handles the dedup gate + mapping-result branch.
+--
+-- The 2 inbound routes (mailgun/postmark inbound) have a slimmer tail
+-- (no autoSuppress, fixed "email.received" event type).
+--
+-- The SES route returns the SesIngressDecision ADT instead of a plain
+-- response; the TS wrapper pattern-matches $tag and executes the
+-- subscription-confirmation HTTP-GET in the ConfirmSubscription arm
+-- (Decision H2 — wrapper-executed http:fetchGet keeps the body sync).
+--
+-- Decisions resolved (per the origin brief):
+--   G1: single sub-step covers all 4 email webhooks. Cross-cut tail
+--       primitive + 4 provider-specific verify+map+orchestrate wrappers.
+--   H2: SES SubscriptionConfirmation returns ConfirmSubscription ADT
+--       case; the TS wrapper executes the HTTP-GET. No new HasHttpIO
+--       class for this sub-step.
+--   I3: verify in the TS wrapper; Fenel body sees verified payload.
+--   J1: both events:emitEvent (generic) AND events:emitEmailEvent
+--       (specialised). This sub-step lands the specialised one only.
+--
+-- Substrate primitives consumed:
+--   - state:markWebhookProcessed
+--   - state:appendEvent
+--   - state:dispatchEventTriggers
+--   - state:autoSuppressIfBadEvent
+--
+-- The EmailEvent / Address types referenced in the signatures are the `email`
+-- module's entities (resolved cross-module through the catalog walk).
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line (12a-3/4/7 surprise pattern).
+-- =========================================================================
+
+module emailWebhooks where
+
+-- SesIngressDecision — centerpiece ADT for /webhooks/ses's 4-way dispatch.
+-- Four variants: ConfirmSubscription (auto-confirm HTTP-GET path),
+-- EmitEvent (standard post-mapping tail path), IgnoreEvent (non-modelled
+-- event type or unknown SNS Type), RejectEnvelope (topic-ARN mismatch or
+-- bad SubscribeURL). The TS wrapper switches on $tag and runs the
+-- matching IO (fetch for ConfirmSubscription, emitEmailEvent for
+-- EmitEvent, response-with-status for the rest).
+SesIngressDecision = ConfirmSubscription url: String
+  | EmitEvent event: EmailEvent recipient: Maybe<Address> messageId: String eventType: String
+  | IgnoreEvent reason: String
+  | RejectEnvelope code: Number error: String
+
+-- ---- Shared helpers -----------------------------------------------------
+
+-- emitEmailEvent — the cross-cut post-mapping tail. Composes
+-- appendEvent + dispatchEventTriggers ×2 + autoSuppressIfBadEvent into
+-- one Fenel-bodied primitive. Used by the 4 lifecycle-event routes
+-- (mailgun/postmark/resend/ses Notification). The single-line let
+-- bindings keep each call on its own line per parseApp's multi-line
+-- arg rule.
+emitEmailEvent : String -> String -> EmailEvent -> String -> Maybe Address -> Unit
+@label "Emit email event"
+@description "Phase 12c-routes sub-step 1 — composing primitive. Wraps the 4-step lifecycle-event tail: appendEvent + dispatchEventTriggers (specific) + dispatchEventTriggers (\"email.event\" umbrella) + autoSuppressIfBadEvent. Used by all 4 lifecycle-event routes (mailgun/postmark/resend/ses Notification arm)."
+@tags "email" "webhook" "event" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+emitEmailEvent provider eventType emailEvent messageId recipient =
+  let payload = { event = emailEvent, messageId = messageId }
+  let _appended = appendEvent eventType payload Nothing Nothing Nothing
+  let _dispatch1 = dispatchEventTriggers eventType payload
+  let _dispatch2 = dispatchEventTriggers "email.event" payload
+  autoSuppressIfBadEvent provider recipient emailEvent
+
+-- emitEmailInbound — slimmer tail for the /inbound paths (mailgun /
+-- postmark). No autoSuppress (incoming mail isn't subject to bounce
+-- handling); single dispatch (no umbrella "email.event" routing — only
+-- lifecycle events go through that).
+emitEmailInbound : {} -> String -> Unit
+@label "Emit email inbound"
+@description "Phase 12c-routes sub-step 1 — slimmer composing primitive for /inbound paths (mailgun/postmark inbound). appendEvent + single dispatchEventTriggers on \"email.received\". No autoSuppress, no umbrella routing."
+@tags "email" "webhook" "inbound" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+emitEmailInbound email messageId =
+  let payload = { email = email, messageId = messageId }
+  let _appended = appendEvent "email.received" payload Nothing Nothing Nothing
+  dispatchEventTriggers "email.received" payload
+
+-- ---- Mailgun /events -----------------------------------------------------
+
+-- Generic post-dedup emit-or-ignore branch shared by the 4 event routes.
+-- Returns the wire-stable response shape. maybeEvent is Maybe<EmailEvent>;
+-- Nothing reports `{ok, ignored}` to ack-and-drop the un-modelled event.
+emitOrIgnore : String -> Maybe EmailEvent -> Maybe Address -> String -> {}
+@label "Emit or ignore"
+@description "Phase 12c-routes sub-step 1 — branch helper. Maps a Maybe<EmailEvent> to the wire response shape — Just → emitEmailEvent + {ok:true}; Nothing → {ok:true, ignored:label}."
+@tags "email" "webhook" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+emitOrIgnore provider maybeEvent recipient ignoredLabel =
+  case maybeEvent of
+    Just emailEvent ->
+      let messageId = emailEvent.id._0
+      let eventType = emailEventType emailEvent
+      let _emitted = emitEmailEvent provider eventType emailEvent messageId recipient
+      { ok = true }
+    _ -> { ok = true, ignored = ignoredLabel }
+
+-- emailEventType — translate a typed EmailEvent to the wire event-type
+-- string ("email.delivered" / "email.bounced" / etc.). Pattern-matches
+-- on each EmailEvent constructor — Fenel pattern matching is the
+-- canonical way to discriminate by variant tag (parseApp doesn't
+-- surface a $tag field accessor).
+emailEventType : EmailEvent -> String
+@label "Email event type"
+@description "Phase 12c-routes sub-step 1 — translate a typed EmailEvent's $tag to the wire event-type string (e.g. Delivered → \"email.delivered\"). Tag-name-agnostic so future variants don't need a switch."
+@tags "email" "webhook" "pure" "phase-12c"
+@category "email-webhooks"
+emailEventType emailEvent =
+  case emailEvent of
+    Queued {} -> "email.queued"
+    Delivered {} -> "email.delivered"
+    Bounced {} -> "email.bounced"
+    Complained {} -> "email.complained"
+    Opened {} -> "email.opened"
+    Clicked {} -> "email.clicked"
+    Unsubscribed {} -> "email.unsubscribed"
+    Failed {} -> "email.failed"
+
+-- handleEmailEvent — the 4 lifecycle event routes share this body
+-- post-mapping. dedup gate via markWebhookProcessed, then emit-or-ignore.
+-- The TS wrapper has already parsed + verified + mapped + extracted
+-- recipient before calling this.
+handleEmailEvent : String -> String -> Maybe EmailEvent -> Maybe Address -> String -> {}
+@label "Handle email event"
+@description "Phase 12c-routes sub-step 1 — generic post-mapping body for the 4 lifecycle-event routes. dedup gate via markWebhookProcessed + emit-or-ignore branch."
+@tags "email" "webhook" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+handleEmailEvent provider dedupKey maybeEvent recipient ignoredLabel =
+  let fresh = markWebhookProcessed provider dedupKey
+  if fresh then emitOrIgnore provider maybeEvent recipient ignoredLabel
+  else { ok = true, deduped = true }
+
+-- handleEmailInbound — the 2 inbound routes share this body. dedup gate
+-- + emit-with-fixed-event-type. No autoSuppress, no recipient-extract.
+handleEmailInbound : String -> String -> {} -> String -> {}
+@label "Handle email inbound"
+@description "Phase 12c-routes sub-step 1 — generic post-parse body for the 2 inbound routes. dedup gate + emit-with-fixed-event-type."
+@tags "email" "webhook" "inbound" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+handleEmailInbound provider dedupKey email messageId =
+  let fresh = markWebhookProcessed provider dedupKey
+  if fresh then emitInbound email messageId
+  else { ok = true, deduped = true }
+
+emitInbound : {} -> String -> {}
+@label "Emit inbound"
+@description "Phase 12c-routes sub-step 1 — emitEmailInbound + {ok:true} response wrap."
+@tags "email" "webhook" "inbound" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+emitInbound email messageId =
+  let _emitted = emitEmailInbound email messageId
+  { ok = true }
+
+-- ---- Per-provider route bodies -------------------------------------------
+
+-- mailgunEvents — POST /webhooks/mailgun/:integrationId/events.
+mailgunEvents : String -> Maybe EmailEvent -> Maybe Address -> String -> {}
+@label "Mailgun events"
+@description "POST /webhooks/mailgun/:integrationId/events body. The TS wrapper handles HMAC-SHA256 verify + JSON parse + provider→EmailEvent map + recipient extract before invoking this body. Returns the wire-stable response shape."
+@tags "email" "webhook" "mailgun" "route" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+mailgunEvents dedupKey maybeEvent recipient ignoredLabel =
+  handleEmailEvent "mailgun" dedupKey maybeEvent recipient ignoredLabel
+
+-- mailgunInbound — POST /webhooks/mailgun/:integrationId/inbound.
+mailgunInbound : String -> {} -> String -> {}
+@label "Mailgun inbound"
+@description "POST /webhooks/mailgun/:integrationId/inbound body. The TS wrapper handles HMAC verify + multipart parse + provider→Email map before invoking this body."
+@tags "email" "webhook" "mailgun" "inbound" "route" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+mailgunInbound dedupKey email messageId =
+  handleEmailInbound "mailgun" dedupKey email messageId
+
+-- postmarkEvents — POST /webhooks/postmark/:integrationId/events.
+postmarkEvents : String -> Maybe EmailEvent -> Maybe Address -> String -> {}
+@label "Postmark events"
+@description "POST /webhooks/postmark/:integrationId/events body. Postmark doesn't sign payloads — the integration-id path segment is the secret. The TS wrapper handles JSON parse + provider→EmailEvent map + recipient extract."
+@tags "email" "webhook" "postmark" "route" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+postmarkEvents dedupKey maybeEvent recipient ignoredLabel =
+  handleEmailEvent "postmark" dedupKey maybeEvent recipient ignoredLabel
+
+-- postmarkInbound — POST /webhooks/postmark/:integrationId/inbound.
+postmarkInbound : String -> {} -> String -> {}
+@label "Postmark inbound"
+@description "POST /webhooks/postmark/:integrationId/inbound body. The TS wrapper handles JSON parse + provider→Email map."
+@tags "email" "webhook" "postmark" "inbound" "route" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+postmarkInbound dedupKey email messageId =
+  handleEmailInbound "postmark" dedupKey email messageId
+
+-- resendEvents — POST /webhooks/resend/:integrationId/events.
+resendEvents : String -> Maybe EmailEvent -> Maybe Address -> String -> {}
+@label "Resend events"
+@description "POST /webhooks/resend/:integrationId/events body. The TS wrapper handles Svix HMAC verify (over `${svix-id}.${svix-timestamp}.${rawBody}`) + JSON parse + provider→EmailEvent map + recipient extract."
+@tags "email" "webhook" "resend" "route" "phase-12c"
+@category "email-webhooks"
+@requires "HasStateIO"
+resendEvents dedupKey maybeEvent recipient ignoredLabel =
+  handleEmailEvent "resend" dedupKey maybeEvent recipient ignoredLabel
+
+-- sesEvents — POST /webhooks/ses/:integrationId/events. Two-mode dispatch:
+-- the TS wrapper has already parsed the SNS envelope + (for Notification)
+-- mapped the inner SES event + extracted recipient. The body returns
+-- SesIngressDecision; the wrapper executes the corresponding IO arm.
+--
+-- envType — SNS envelope.Type ("SubscriptionConfirmation" / "Notification" /
+--           "UnsubscribeConfirmation" / other).
+-- expectedArn — the integration's configured SES_SNS_TOPIC_ARN.
+-- actualArn — the envelope's TopicArn.
+-- subscribeUrl — Maybe<String>, present only on SubscriptionConfirmation.
+-- maybeEvent — Maybe<EmailEvent>, present only on Notification + mapped.
+-- recipient — Maybe<Address>, present only on Notification.
+-- messageId — String, the envelope's MessageId (used as dedup key).
+sesEvents : String -> String -> String -> Maybe String -> Maybe EmailEvent -> Maybe Address -> String -> SesIngressDecision
+@label "SES events"
+@description "POST /webhooks/ses/:integrationId/events body. The TS wrapper has already parsed the SNS envelope + (for Notification) parsed inner SES event + mapped → EmailEvent + extracted recipient. Returns SesIngressDecision; wrapper dispatches based on $tag (ConfirmSubscription → HTTP-GET; EmitEvent → emitEmailEvent; IgnoreEvent / RejectEnvelope → response)."
+@tags "email" "webhook" "ses" "route" "phase-12c"
+@category "email-webhooks"
+sesEvents envType expectedArn actualArn subscribeUrl maybeEvent recipient messageId =
+  let isConfirm = eq envType "SubscriptionConfirmation"
+  let confirmArm = sesConfirmDecision expectedArn actualArn subscribeUrl
+  let notifyArm = sesNotificationDecision envType expectedArn actualArn maybeEvent recipient messageId
+  ifElse isConfirm confirmArm notifyArm
+
+-- sesConfirmDecision — SubscriptionConfirmation arm. Topic-ARN match
+-- (and configured) + a present SubscribeURL → ConfirmSubscription;
+-- otherwise RejectEnvelope.
+sesConfirmDecision : String -> String -> Maybe String -> SesIngressDecision
+@label "SES confirm decision"
+@description "Phase 12c-routes sub-step 1 — SubscriptionConfirmation arm. ARN-matches + URL-present → ConfirmSubscription; else RejectEnvelope."
+@tags "email" "webhook" "ses" "pure" "phase-12c"
+@category "email-webhooks"
+sesConfirmDecision expectedArn actualArn subscribeUrl =
+  let arnOk = sesArnMatches expectedArn actualArn
+  let confirmArm = sesConfirmFromUrl subscribeUrl
+  let rejectArm = RejectEnvelope { code = 403, error = "Topic ARN does not match configured integration" }
+  ifElse arnOk confirmArm rejectArm
+
+sesConfirmFromUrl : Maybe String -> SesIngressDecision
+@label "SES confirm from url"
+@description "Phase 12c-routes sub-step 1 — Just<url> → ConfirmSubscription { url }; Nothing → RejectEnvelope."
+@tags "email" "webhook" "ses" "pure" "phase-12c"
+@category "email-webhooks"
+sesConfirmFromUrl subscribeUrl =
+  case subscribeUrl of
+    Just url -> ConfirmSubscription { url = url }
+    _ -> RejectEnvelope { code = 400, error = "Invalid SubscribeURL" }
+
+-- sesArnMatches — strict equality, requires non-empty expectedArn.
+sesArnMatches : String -> String -> Boolean
+@label "SES ARN matches"
+@description "Phase 12c-routes sub-step 1 — strict expectedArn-equals-actualArn gate, requires non-empty expectedArn."
+@tags "email" "webhook" "ses" "pure" "phase-12c"
+@category "email-webhooks"
+sesArnMatches expectedArn actualArn =
+  ifElse (eq expectedArn "") false (eq expectedArn actualArn)
+
+-- sesNotificationDecision — Notification arm + non-modelled-Type fallback.
+sesNotificationDecision : String -> String -> String -> Maybe EmailEvent -> Maybe Address -> String -> SesIngressDecision
+@label "SES notification decision"
+@description "Phase 12c-routes sub-step 1 — Notification arm + non-modelled-Type fallback."
+@tags "email" "webhook" "ses" "pure" "phase-12c"
+@category "email-webhooks"
+sesNotificationDecision envType expectedArn actualArn maybeEvent recipient messageId =
+  let isNotify = eq envType "Notification"
+  let notifyArm = sesNotificationCheckArn expectedArn actualArn maybeEvent recipient messageId
+  let ignoreArm = IgnoreEvent { reason = envType }
+  ifElse isNotify notifyArm ignoreArm
+
+-- sesNotificationCheckArn — optional ARN gate (expectedArn empty → skip;
+-- non-empty + mismatch → reject), then dispatch to Emit or Ignore.
+sesNotificationCheckArn : String -> String -> Maybe EmailEvent -> Maybe Address -> String -> SesIngressDecision
+@label "SES notification check arn"
+@description "Phase 12c-routes sub-step 1 — optional ARN gate then dispatch to Emit or Reject."
+@tags "email" "webhook" "ses" "pure" "phase-12c"
+@category "email-webhooks"
+sesNotificationCheckArn expectedArn actualArn maybeEvent recipient messageId =
+  let arnBad = sesArnMismatch expectedArn actualArn
+  let rejectArm = RejectEnvelope { code = 403, error = "Topic ARN mismatch" }
+  let emitArm = sesNotificationEmit maybeEvent recipient messageId
+  ifElse arnBad rejectArm emitArm
+
+-- sesArnMismatch — non-empty expectedArn AND different from actualArn.
+sesArnMismatch : String -> String -> Boolean
+@label "SES ARN mismatch"
+@description "Phase 12c-routes sub-step 1 — non-empty expectedArn AND different from actualArn."
+@tags "email" "webhook" "ses" "pure" "phase-12c"
+@category "email-webhooks"
+sesArnMismatch expectedArn actualArn =
+  ifElse (eq expectedArn "") false (not (eq expectedArn actualArn))
+
+-- sesNotificationEmit — final dispatch within Notification: mapped event
+-- → EmitEvent (with the event-type derived from the EmailEvent $tag);
+-- nothing mapped → IgnoreEvent (un-modelled SES eventType).
+sesNotificationEmit : Maybe EmailEvent -> Maybe Address -> String -> SesIngressDecision
+@label "SES notification emit"
+@description "Phase 12c-routes sub-step 1 — final dispatch within Notification: Just<event> → EmitEvent (with derived event-type); Nothing → IgnoreEvent (un-modelled SES eventType)."
+@tags "email" "webhook" "ses" "pure" "phase-12c"
+@category "email-webhooks"
+sesNotificationEmit maybeEvent recipient messageId =
+  case maybeEvent of
+    Just emailEvent ->
+      EmitEvent { event = emailEvent, recipient = recipient, messageId = messageId, eventType = emailEventType emailEvent }
+    _ -> IgnoreEvent { reason = "unmapped" }
+
+-- =========================================================================
+-- rights R4a C1a — THE TWO SNS OUTBOUND SITES, DECLARED.
+--
+-- SNS verification and subscription confirmation each issue an outbound HTTPS
+-- request, and both ran as bare `fetch` calls in `api/src/sns-signature.ts` —
+-- OUTSIDE `perform`, so no envelope judged them and no gate saw them. There are
+-- TWO sites, not one, and the first is easy to miss because it is inside the
+-- VERIFIER: a cold certificate cache makes `verifySnsEnvelope` itself reach the
+-- network before anything has been verified at all.
+--
+-- Each leaf is one irreducible host act — a single bounded HTTPS GET — so each
+-- is an ordinary IO leaf under the ledger's existing "IO leaves" exception. What
+-- stays in `api/src` is the part that is NOT irreducible IO and NOT Fenel-able:
+-- the X509 parse and the `VerifiedSnsEnvelope` brand, whose whole purpose is a
+-- host-private symbol no value can forge — the same argument `design/authority.md`
+-- makes for the authority table itself.
+-- =========================================================================
+
+@native
+@label "Fetch an SNS signing certificate"
+@description "One bounded HTTPS GET for an AWS SNS signing certificate, returning the PEM text. The caller has already constrained the URL to the configured topic's exact regional SNS endpoint; this leaf adds only the transport bounds (no redirects, a 5 s timeout, a capped body) and never inspects or trusts the response beyond returning its text. Refuses with Nothing on any transport failure so the caller answers 503 rather than treating an outage as a verification failure."
+@tags "email" "webhook" "ses" "sns" "io" "rights"
+@ioAction "email_webhooks.sns_fetch_signing_certificate"
+@requires "HasStateIO"
+@category "email-webhooks"
+snsFetchSigningCertificate : (url: String) -> Maybe String
+
+@native
+@label "Confirm an SNS subscription"
+@description "One bounded HTTPS GET of an SNS SubscribeURL, confirming an HTTP subscription. State-changing at AWS, which is exactly why it must be an act the gate judges rather than a bare fetch inside a route. True on a non-redirected 2xx; False otherwise."
+@tags "email" "webhook" "ses" "sns" "io" "rights"
+@ioAction "email_webhooks.sns_confirm_subscription"
+@requires "HasStateIO"
+@category "email-webhooks"
+snsConfirmSubscription : (url: String) -> Boolean

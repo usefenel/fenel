@@ -1,0 +1,1878 @@
+module engine where
+
+-- =========================================================================
+-- validation-carrier.fenel — the Phase 4+4b OCCURRENCE-KEYED ANNOTATED
+-- CARRIER (slice 3f; the first half of P4-D3).
+--
+-- WHAT THIS IS FOR. The signature-use ledger (`validation-ledger.fenel`)
+-- answers "what evidence does this body DEMAND". It deliberately
+-- OVER-reports: an extra row demands more evidence, never less. That is the
+-- right direction for demands and it is the WRONG direction for IDENTITY —
+-- P4-D3 allocates one fresh meta namespace per resolved use, so a body whose
+-- ledger emits two rows for ONE runtime occurrence would receive two
+-- independent instances of the same call.
+--
+-- So identity is a SEPARATE PROJECTION over the ledger's rows, and this
+-- module is that projection. The rows stay exactly as they are.
+--
+-- ANNOTATED NODES, NOT A PATH-KEYED SIDE TABLE. `check.fenel` has fourteen
+-- child-recursion sites and several folds that DISCARD the discriminator a
+-- global path key would need (constructor argument index, match-arm index,
+-- call argument index, the indexless operator `map`). One omitted increment
+-- and a rule silently reads a SIBLING occurrence's authority — the worst
+-- failure available here, because it authorizes a wrong target with no
+-- diagnostic. So each node carries its own evidence and its own children:
+-- consumption follows the BUNDLED children, never a lookup.
+--
+-- Paths are still present, and they are BUILD-TIME reconciliation material
+-- plus audit/invalidation metadata. They are never used to look anything up
+-- at consumption time.
+--
+-- THE CORRESPONDENCE PROPERTY THIS EXISTS TO MAKE PROVABLE:
+--
+--   Following raw semantic occurrence P through the carrier reaches exactly
+--   the node whose role, spelling, target and child topology agree with the
+--   ledger row for P.
+--
+-- It is enforced, not hoped for: every ledger row must be consumed by
+-- exactly one carrier node. A row no node reaches, or a node two rows reach,
+-- is a CLOSED FENCE. That reconciliation is what makes the second walk safe
+-- — a divergence between this walk and the ledger's cannot be silent.
+--
+-- THE SHARED DECOMPOSITION IS THE ONLY STRUCTURAL AUTHORITY. Every arm below
+-- consumes `fdcNodePlan` and the shared layouts (slice 3e), exactly as
+-- `vlgWalk` and `vobWalk` do. This walker re-derives NO structural fact — the
+-- ninth shared defect was found precisely because two analyses had each
+-- derived the op slot schedule by hand.
+--
+-- NO RE-LIFT. The carrier is built from the RAW stored body. It never passes
+-- through `jsonLogicToSyntax` / `dispatchedJsonLogicToExpr`: the S1 gate
+-- proved that re-lift is non-injective and execution-unfaithful (invented
+-- `appendItem` edges, `cat` rewritten to `concat`, lazy ops strictified,
+-- `let`/`do` re-nested), and an occurrence identity minted from it would
+-- name a site the runtime never visits.
+--
+-- NO PUBLIC TERM IS MUTATED OR PERSISTED. The public `Syntax` / `Expr` are
+-- untouched. A public term carrying validation ids would be a FORGEABLE
+-- AUTHORITY.
+--
+-- POSTURE, AMENDED BY SLICE 3g. This module still mints no authority itself:
+-- it computes a carrier, a whole-ledger readiness judgment and a no-fallback
+-- occurrence lookup, and `vckPreflightTable` / `vckLookup` remain exactly what
+-- 3f labelled them — NON-AUTHORITATIVE, because they accept a table from their
+-- caller and key isolation does not prove value authority.
+--
+-- What changed is that the carrier now has ONE consumer that does mint:
+-- `vteValidate` (`validation-entry.fenel`), which builds the carrier itself,
+-- builds its own table, and never accepts one. The authoritative path is a
+-- DISTINCT entry rather than a flag on these functions, so the static gate can
+-- see the difference. `checkExpr` / `checkExprFix` are still unchanged; the
+-- checker RULES that consume an admission are slice 3h's.
+--
+-- NUMBERS ARE NEVER RENDERED INTO AN IDENTITY. A cloned decider context
+-- BOXES host numbers, so `toString` on one yields the host object rendering
+-- (the recorded landmine, `validation-observe.fenel` § positional key). An
+-- id built that way would silently collide. Identity here is a STRUCTURED
+-- record compared by an explicit total structural equality, so there is no
+-- rendering, no escaping question, and no table-size ceiling.
+--
+-- Constructor names carry family prefixes (Vcp/Vci/Vca/Vco/Vcr/Vck) because
+-- constructor ids are repo-global.
+-- =========================================================================
+
+-- ---- what core node a carrier node projects to ---------------------------
+
+-- The locked seven-case core `Expr` (`fenel/std/expr.fenel`) is what the
+-- checker consumes. A raw form outside it gets an EXPLICIT `VcpUnsupported`
+-- — never a silent omission and never a strictified stand-in. `VcpPattern`
+-- is not an expression projection at all: it marks the arm-pattern position,
+-- which is where the ledger places its non-total-binder fence and which the
+-- checker reaches through its own arm classifier.
+--
+-- SLICE 3h widens ONE family and enriches three projections. The binding
+-- forms (`let` / `where` / `do` / a `do` item's inline `let`) stop being
+-- `VcpUnsupported` and become the closed `VcpBinding`, because the checker
+-- arm now threads Γ through them; the widening is the coverage decision 3g
+-- deferred to "a checker-rule slice, not a reader" (`:568-569`). The three
+-- enrichments all exist because the arm may CONSUME what the carrier built
+-- and may never RE-DERIVE it from raw: a lambda's ordered binders, an
+-- intrinsic-routed call's exact versioned rule id, and a construction's
+-- effective wire tag + field-identity vector.
+VcaProjection =
+  VcpLit
+  | VcpVar name: String
+  | VcpCall fnId: String ruleId: String
+  | VcpConstruct ctor: String wireTag: String reading: VcaCtorReading fields: [VcaCtorField]
+  | VcpRecord
+  | VcpLambda binders: [String]
+  | VcpMatch
+  | VcpPattern
+  | VcpBinding form: VcaBindingForm
+  | VcpUnsupported form: String
+
+-- The four members of the binding family, form-total against `fdcBindingOf`'s
+-- own vocabulary. A closed ADT rather than the kind STRING the decomposition
+-- passes around, because the checker selects its Γ-threading rule on it and a
+-- string would let a new spelling pick a rule silently.
+VcaBindingForm = VbfLet | VbfWhere | VbfDo | VbfDoInlineLet
+
+-- Which payload reading the carrier could PROVE for a construction.
+-- `VcrUndecided` is the alias state — the payload is a single plain record and
+-- the named-versus-positional choice needs the registered field table; the
+-- payload children are aliased and the occurrence fences. `VcrPositional` is
+-- the decided reading, and the only one the checker may synthesise from.
+VcaCtorReading = VcrPositional | VcrUndecided
+
+-- One constructor field, in DECLARATION order: the SEMANTIC key (the field's
+-- stable identity — a `FieldKey`, never a spelling, because field-identity
+-- Phase 3 made renames meaning-preserving and equal spellings with distinct
+-- ids distinct) and the wire name (its runtime projection). The pair is what
+-- an exact `SeCtor` synthesis needs and neither half alone will do:
+-- `SetCtorField` is keyed on the first and carries the second.
+VcaCtorField = VcaCtorField semanticKey: FieldKey wireName: String
+
+-- One registered constructor's field layout, supplied by the transport from
+-- the SAME registry generation as every other request table and bound into
+-- `vteInputsHash`. `source` is the SOURCE constructor spelling, the same key
+-- `vcaWireOf` reads, so the two tables join without a second name mapping.
+ValidationCtorFieldRow = ValidationCtorFieldRow source: String fields: [VcaCtorField]
+
+-- Whether this node position is one the ledger mints a row for. It is
+-- DERIVED FROM THE FORM, independently of whether a row was actually found,
+-- which is what lets the reconciliation catch a node that needs evidence and
+-- joined none — a direction "every row was reached" cannot see.
+VcaDemand = VcdRequiresRow | VcdNoRow
+
+-- The CLOSED route a registered-name occurrence actually takes. A bare
+-- `VcpCall fnId` cannot distinguish them and the distinction is observable:
+-- checking treats `if` intrinsically first while synthesis consults the
+-- registry first, so a registered function named `if` is checked one way and
+-- synthesised the other. The route says which semantics the runtime selected.
+VcaRoute =
+  VrtRegistered targetId: String authorityKind: String
+  | VrtIntrinsic ruleId: String
+  | VrtLexical binderId: String
+  | VrtNone
+  | VrtRouteFenced reason: ValidationReason
+
+-- One entry of the authoritative constructor target-to-wire projection. The
+-- runtime projects a source constructor name through `_constructorWireNames`
+-- and only then applies the Boolean fast path, so a source `AliasTrue` mapping
+-- to wire `True` evaluates to a NATIVE BOOLEAN while a carrier reading the
+-- source spelling would call it a tagged construction. The carrier consumes
+-- this table and FENCES without an entry — fail-closed; the authoritative
+-- table is slice 3g's to supply.
+ValidationWireProjection = ValidationWireProjection source: String wire: String
+
+-- ---- occurrence identity -------------------------------------------------
+
+-- One occurrence identity. A SEMANTIC RECORD, never a short name, object
+-- identity, raw traversal counter, or hash-only surrogate: the caller's
+-- canonical identity, the syntactic role, the injective typed path, and —
+-- for a resolved use — the exact target identity and authority kind.
+VcaUseId = VcaUseId callerId: String role: String path: [UsePathSeg] targetId: String kind: String
+
+-- The identity STATUS of one carrier node.
+--   * `VciInert` — not a use site at all.
+--   * `VciUse` — exactly one identity; the only status a lookup may key.
+--   * `VciAliased` — a runtime occurrence whose reading is UNDECIDED (the
+--     constructor payload). It carries both readings and issues NO identity,
+--     which is what keeps identity FUNCTIONAL without discarding evidence.
+--   * `VciMirror` — the redundant second walk of a payload whose two readings
+--     provably COINCIDE. The occurrence is real and already identified on the
+--     canonical side; this copy issues no second identity.
+--   * `VciFenced` — a negative row, or a positive row this slice cannot admit
+--     (a flat-target disagreement, a duplicate path).
+VcaIdentity =
+  VciInert
+  | VciUse useId: VcaUseId
+  | VciAliased detail: String
+  | VciMirror detail: String
+  | VciFenced reason: ValidationReason
+
+-- ---- the carrier ---------------------------------------------------------
+
+-- One annotated node. `children` is the BUNDLED child topology and it is the
+-- only recursion channel; `path` is audit + build-time reconciliation
+-- material; `raw` is the exact raw node, retained so a consumer never has to
+-- re-derive it from a path.
+VcaNode = VcaNode path: [UsePathSeg] raw: (JsonLogic Any) projection: VcaProjection demand: VcaDemand expectedKey: String identity: VcaIdentity route: VcaRoute rows: [UseLedgerRow] children: [VcaChild]
+
+-- A child, labelled by the SAME typed segment vocabulary the ledger paths
+-- use. `child.node.path` is `parent.path` extended by `seg`, by construction.
+VcaChild = VcaChild seg: UsePathSeg node: VcaNode
+
+-- The identity of the material this carrier was built from. An occurrence
+-- table built against a different body, a different parser representation, or
+-- a different carrier version is STALE, and a preflight that could not say so
+-- would be accepting evidence for a body it never saw.
+--
+-- SLICE 3g EXTENDS IT WITH `inputsHash`, and the granularity is a deliberate
+-- deviation from "one hash per input table". Five sibling digests bind five
+-- tables INDIVIDUALLY and say nothing about the COMBINATION, so a caller could
+-- pair a route table frozen from one registry generation with a scheme table
+-- from another and every individual digest would still verify. One digest over
+-- a labelled payload binds the combination. The payload names each table, so a
+-- diagnostic can still say which one moved:
+--
+--   { domain, callerId, paramNames, routes, flatRoutes, arities, wires,
+--     schemes, certificates, registryGeneration, validatorVersion,
+--     carrierVersion }
+--
+-- `paramNames` and `arities` are in there because BOTH change the carrier's
+-- ANSWERS and neither was bound before: `paramNames` decides lexical-versus-
+-- registered resolution, and `arities` decides saturation and `entersTarget`,
+-- so an identical body and route table at arity 1 versus arity 2 previously
+-- produced the very same snapshot.
+--
+-- `bodyHash` remains the caller's provenance field HERE — the carrier has no
+-- digest primitive — and the trusted entry RECOMPUTES it and refuses a
+-- mismatch, so nothing downstream rests on the caller's word for it.
+VcaSnapshot = VcaSnapshot bodyHash: String astAbi: String parser: String carrierVersion: String inputsHash: ValidationHash
+
+-- The readiness judgment rides ON the carrier rather than beside it: a
+-- preflight handed a readiness computed from a DIFFERENT ledger would be a
+-- silent hole, and there is no reason to leave that door open.
+VcaCarrier = VcaCarrier callerId: String root: VcaNode snapshot: VcaSnapshot readiness: VckReadiness identities: [VcaUseId] fences: [ValidationReason]
+
+VcaOutcome =
+  VcoCarrier carrier: VcaCarrier
+  | VcoFenced reason: ValidationReason
+
+-- ---- whole-ledger readiness (the R5 repair) ------------------------------
+
+-- `vlgLedger` returns `LgoFenced` only for parser-representation divergence;
+-- every negative OCCURRENCE row still yields an aggregate `LgoLedger`, so a
+-- positive lookup could bypass a sibling negative row. This is the missing
+-- WHOLE-LEDGER judgment, and it is separate from the rows on purpose: the
+-- rows remain diagnostics and invalidation material either way.
+--
+-- Three outcomes, because two would lie, and the distinction is by STAGE
+-- rather than by locality. A "local negatives do not count" rule would
+-- authorize a body containing an unsupported dynamic lexical call; but
+-- refusing every negative row BEFORE the solve over-fences obligations the
+-- solve can legitimately discharge — an exact registered function propagated
+-- through a lexical binding first reads as dynamic, and an overapplication
+-- first reads as dynamic although it may be validated stagewise against an
+-- exact arrow.
+--
+-- So: rows a later refinement can still discharge are NOT-YET-READY, not
+-- fenced; rows nothing can discharge are a FINAL fence. Any remaining negative
+-- row — local or nonlocal — fences the whole validation.
+--
+-- SLICE 3g SPLITS THE MIDDLE STATE, because 3f's bucket was over-broad in the
+-- one direction that matters. It counted EVERY `UlsDynamicOrReflective` row as
+-- pending, and most of them can never be discharged by anything: a non-string
+-- `var`, a dotted data-dependent path, a non-literal constructor name, a binder
+-- spelling the walk cannot reproduce, a marshal-lossy bindings carrier,
+-- scope-dependent capability dispatch. Those are FINAL, and calling them
+-- pending is precisely how a row that nothing discharges becomes admissible by
+-- having been called pending.
+--
+-- AND THE PENDING KIND IS TYPED, not an adjective. The three rows that CAN be
+-- discharged are not discharged by a type solve — the first needs exact ORIGIN
+-- evidence, the second a certified stagewise residual callable, the third the
+-- frozen formal vector and the runtime's own reorder decision. So each pending
+-- row NAMES the evidence it is waiting for, and the slice that supplies it
+-- inherits a demand rather than a mood.
+VckPendingKind =
+  VrpExactOrigin
+  | VrpCertifiedEtaStage
+  | VrpNamedArgumentDecision
+
+VckPending = VckPending useId: String kind: VckPendingKind detail: String
+
+VckReadiness =
+  VrdStructurallyReady
+  | VrdNeedsRefinement pending: [VckPending]
+  | VrdFinalFence reason: ValidationReason
+
+-- ---- the occurrence-keyed lookup + its preflight (D2) --------------------
+
+-- One entry of the validation-local, occurrence-keyed instance table. In
+-- slice 3g `instance` is the ground arrow extracted from the
+-- certificate-filtered whole-body/group solve; in this slice it is a
+-- SYNTHETIC per-occurrence arrow, which is exactly what makes the cut
+-- testable with no solve behind it.
+-- `snapshot` and `schemeHash` are BINDING material, not decoration: the key
+-- alone proves which occurrence an entry claims and nothing about the arrow it
+-- carries. 3f compares the snapshot; comparing `schemeHash` against the
+-- target's published scheme is slice 3g's, and the field exists so that
+-- comparison has somewhere to land rather than being retrofitted.
+VckEntry = VckEntry useId: VcaUseId snapshot: VcaSnapshot schemeHash: ValidationHash instance: SetExpr
+
+-- The closed preflight result. `VcpReady` is the ONLY outcome a consumer may
+-- proceed from, and it is reached only when every live identity in the
+-- carrier has exactly one entry and every entry has exactly one identity.
+VckPreflight =
+  VckReady entries: [VckEntry]
+  | VckRefused reason: ValidationReason
+
+-- =========================================================================
+-- structural equality — explicit, total, and number-rendering-free
+-- =========================================================================
+
+-- Segment equality is decided on three TOTAL projections — the closed
+-- constructor tag, the ordinal, and the name/key — rather than on a nested
+-- constructor match, because the triple already determines the segment
+-- uniquely for every one of the sixteen cases and three flat matches read
+-- (and parse) far better than sixteen nested ones. Numbers are compared
+-- NUMERICALLY and never rendered: a cloned decider context boxes host numbers,
+-- so an identity built from `toString` would silently collide.
+@label "Carrier segment kind"
+@description "The closed constructor tag of one typed use-path segment. A total projection; combined with the ordinal and the name/key it determines the segment uniquely."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaSegKind : (seg: UsePathSeg) -> String
+vcaSegKind seg =
+  case seg of
+    VpsCallee -> "VpsCallee"
+    VpsArg -> "VpsArg"
+    VpsSeq -> "VpsSeq"
+    VpsBinding -> "VpsBinding"
+    VpsArmPattern -> "VpsArmPattern"
+    VpsArmGuard -> "VpsArmGuard"
+    VpsArmBody -> "VpsArmBody"
+    VpsPatternArg -> "VpsPatternArg"
+    VpsPatternField -> "VpsPatternField"
+    VpsField -> "VpsField"
+    VpsLambdaBody -> "VpsLambdaBody"
+    VpsScrutinee -> "VpsScrutinee"
+    VpsCond -> "VpsCond"
+    VpsThen -> "VpsThen"
+    VpsElse -> "VpsElse"
+    VpsWhereBinding -> "VpsWhereBinding"
+
+@label "Carrier segment ordinal"
+@description "The ordinal of one typed use-path segment, or zero for a segment that carries none. Compared numerically, never rendered."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaSegIndex : (seg: UsePathSeg) -> Nat
+vcaSegIndex seg =
+  case seg of
+    VpsArg { index = i } -> i
+    VpsSeq { index = i } -> i
+    VpsBinding { index = i } -> i
+    VpsArmPattern { index = i } -> i
+    VpsArmGuard { index = i } -> i
+    VpsArmBody { index = i } -> i
+    VpsPatternArg { index = i } -> i
+    VpsWhereBinding { index = i } -> i
+    _ -> 0
+
+@label "Carrier segment name"
+@description "The name or key of one typed use-path segment, or the empty string for a segment that carries none."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaSegName : (seg: UsePathSeg) -> String
+vcaSegName seg =
+  case seg of
+    VpsBinding { name = n } -> n
+    VpsWhereBinding { name = n } -> n
+    VpsField { key = k } -> k
+    VpsPatternField { key = k } -> k
+    _ -> ""
+
+@label "Carrier segment equality"
+@description "Exact structural equality of two typed use-path segments — same closed constructor tag, same ordinal, same name/key. The triple is injective over all sixteen cases, so this is exact and not a heuristic."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaSegEq : (left: UsePathSeg) -> (right: UsePathSeg) -> Boolean
+vcaSegEq left right =
+  if not (eq (vcaSegKind left) (vcaSegKind right)) then false
+  else if not (eq (vcaSegIndex left) (vcaSegIndex right)) then false
+  else eq (vcaSegName left) (vcaSegName right)
+
+@label "Carrier path equality"
+@description "Exact structural equality of two typed use-site paths — same length, same segments, same order. The injectivity the occurrence identity rests on."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaPathEq : (left: List UsePathSeg) -> (right: List UsePathSeg) -> Boolean
+vcaPathEq left right =
+  case head left of
+    Nothing -> eq (length right) 0
+    Just l ->
+      case head right of
+        Nothing -> false
+        Just r ->
+          if not (vcaSegEq l r)
+          then false
+          else vcaPathEq (eufRest left) (eufRest right)
+
+@label "Carrier use-id equality"
+@description "Exact structural equality of two occurrence identities: caller, role, typed path, target identity and authority kind. The lookup key comparison — no rendering, no hashing, no surrogate."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaUseIdEq : (left: VcaUseId) -> (right: VcaUseId) -> Boolean
+vcaUseIdEq left right =
+  if not (eq left.callerId right.callerId) then false
+  else if not (eq left.role right.role) then false
+  else if not (eq left.targetId right.targetId) then false
+  else if not (eq left.kind right.kind) then false
+  else vcaPathEq left.path right.path
+
+@label "Carrier role tag"
+@description "The closed role tag string of a use role — an exact total projection of the UseRole constructor, used as identity material rather than as a display name."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaRoleTag : (role: UseRole) -> String
+vcaRoleTag role =
+  case role of
+    VurCall -> "VurCall"
+    VurReference -> "VurReference"
+    VurConstructor -> "VurConstructor"
+    VurIntrinsic -> "VurIntrinsic"
+    VurCapabilityDispatch -> "VurCapabilityDispatch"
+    VurLexical -> "VurLexical"
+
+-- =========================================================================
+-- whole-ledger readiness
+-- =========================================================================
+
+@label "Carrier ledger readiness"
+@description "The WHOLE-LEDGER readiness judgment the aggregate LgoLedger result does not make: any fencing negative row (fenced / missing / ambiguous / dynamic-reflective) refuses the whole ledger, so a positive lookup can never bypass a sibling negative row. A lexical row is a positive occurrence whose monotype a later solve supplies, and is reported separately rather than as a fence."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vckLedgerReadiness : (ledger: SignatureUseLedger) -> VckReadiness
+vckLedgerReadiness ledger = vckReadinessGo ledger.rows []
+
+@label "Carrier readiness worker"
+@description "Scan every ledger row once: the first UNDISCHARGEABLE negative refuses the whole ledger immediately; a row whose evidence demand is nameable accumulates as a TYPED pending entry. A dynamic row whose detail names no known demand is FINAL, not pending — the safe direction, and the default over a closed vocabulary. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vckReadinessGo : (rows: [UseLedgerRow]) -> (pending: [VckPending]) -> VckReadiness
+vckReadinessGo rows pending =
+  case head rows of
+    Nothing -> if eq (length pending) 0 then VrdStructurallyReady else VrdNeedsRefinement { pending = pending }
+    Just row ->
+      case row.status of
+        -- SLICE 3h — THE OVER-SATURATED RESOLVED ROW. The ledger no longer
+        -- degrades an over-applied call whose callee RESOLVES; it retains the
+        -- route, so the occurrence keeps a live identity and the checker's
+        -- stagewise rule has something to classify. The DEMAND has to survive
+        -- that retention or the retention would silently drop a pending, so it
+        -- is re-raised here from the row's own saturation. Scoped to the CALL
+        -- role deliberately: a constructor has no eta path at all (extra
+        -- arguments become extra positional fields, `vlgAppliedStatus`'s own
+        -- reason for exempting it), so raising the demand there would fence the
+        -- whole over-supplied-construction corpus for a tail that does not exist.
+        UlsResolved ->
+          if vckRowNeedsEtaStage row
+          then vckReadinessGo (eufRest rows) (appendItem (VckPending { useId = row.rawKey, kind = VrpCertifiedEtaStage, detail = "overapplication eta-tail may enter an unledgered callable" }) pending)
+          else vckReadinessGo (eufRest rows) pending
+        -- SLICE 3h — THE LEXICAL SPLIT. An ordinary lexical VAR READ is no
+        -- longer a typed pending. It is ordinary explicit evidence: the binder
+        -- identity on the row IS the evidence, and the checker's Γ discipline
+        -- discharges it. Nothing about the binder's monotype is needed to
+        -- decide membership of a read whose value the Γ threading already
+        -- carries. What still pends is the APPLIED lexical callable — a
+        -- disjoint status (`UlsDynamicOrReflective "lexical callable applied
+        -- without an exact origin"`, minted by `vlgCalleeRow`, never here) and
+        -- 3i's demand.
+        UlsLexical { binderId = binderId } -> vckReadinessGo (eufRest rows) pending
+        UlsDynamicOrReflective { detail = detail } ->
+          case vckPendingKindOf detail of
+            Nothing -> VrdFinalFence { reason = RsnDynamicOrReflectiveUse { useId = row.rawKey, detail = detail } }
+            Just kind ->
+              vckReadinessGo (eufRest rows) (appendItem (VckPending { useId = row.rawKey, kind = kind, detail = detail }) pending)
+        UlsFenced { targetId = t } -> VrdFinalFence { reason = RsnUnresolvedSignatureUse { useId = t, status = "UlsFenced" } }
+        UlsMissing { spelling = s } -> VrdFinalFence { reason = RsnUnresolvedSignatureUse { useId = s, status = "UlsMissing" } }
+        UlsAmbiguous -> VrdFinalFence { reason = RsnUnresolvedSignatureUse { useId = row.rawKey, status = "UlsAmbiguous" } }
+
+-- THE VOCABULARY IS CLOSED, WHICH IS THE ONLY REASON A STRING MAY DECIDE THIS.
+-- `vlgWalk` produces exactly seventeen distinct `detail` spellings — fourteen
+-- written literally in `validation-ledger.fenel` and three forwarded verbatim
+-- from `fdcBindingOf` — and a test enumerates all seventeen against the
+-- ledger's own call sites. The DEFAULT is `Nothing`, i.e. FINAL FENCE, so a
+-- spelling nobody has classified cannot drift into a pending bucket; a new
+-- dynamic form fences until someone names its demand.
+--
+-- Three spellings, and only three, name a demand a later stage can meet:
+--   * an applied lexical callable is waiting for its exact ORIGIN;
+--   * an overapplication eta-tail is waiting for a CERTIFIED stagewise
+--     residual callable, not merely for an arrow-shaped type;
+--   * a single-record argument is waiting for the frozen formal vector and the
+--     runtime's own named-argument reorder decision.
+-- None of the three is discharged by an HM type solve, which is exactly why
+-- the kind names the evidence instead of calling the row "solve-refinable".
+@label "Carrier row needs eta stage"
+@description "Does this RESOLVED row carry the over-application demand? True only for a CALL role whose saturation is over — a reference is exact by construction and a constructor's extra arguments become extra positional fields rather than an eta tail."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vckRowNeedsEtaStage : (row: UseLedgerRow) -> Boolean
+vckRowNeedsEtaStage row =
+  let site = row.site
+  case site.role of
+    VurCall ->
+      case row.saturation of
+        VusOver -> true
+        VusUnder -> false
+        VusExact -> false
+        _ -> false
+    VurReference -> false
+    VurConstructor -> false
+    VurIntrinsic -> false
+    VurCapabilityDispatch -> false
+    VurLexical -> false
+    _ -> false
+
+@label "Carrier pending kind of detail"
+@description "The TYPED evidence demand a dynamic-or-reflective row is waiting for, or Nothing when nothing can discharge it. Total over the ledger's closed seventeen-spelling detail vocabulary, defaulting to Nothing — a final fence — so an unclassified spelling can never be treated as pending."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vckPendingKindOf : (detail: String) -> Maybe VckPendingKind
+vckPendingKindOf detail =
+  if eq detail "lexical callable applied without an exact origin"
+  then Just VrpExactOrigin
+  else if eq detail "overapplication eta-tail may enter an unledgered callable"
+  then Just VrpCertifiedEtaStage
+  else if eq detail "single-record argument may be a named-argument application"
+  then Just VrpNamedArgumentDecision
+  else Nothing
+
+-- =========================================================================
+-- the carrier build
+-- =========================================================================
+
+@label "Validation occurrence carrier"
+@description "Build the occurrence-keyed annotated carrier for one raw stored body. Walks the RAW body through the shared form decomposition (never the re-lift), joins each ledger row onto the node whose path it names, closes the constructor reading alias so one runtime occurrence yields at most one identity, and fences any occurrence whose FROZEN source-frame target disagrees with the FLAT runtime target. Reconciliation is bidirectional and total: every row is claimed exactly once, every node that DEMANDS a row has exactly one, every node that demands none has none, and no two node paths coincide. DORMANT — mints no authority and has no production caller."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaCarrier : (callerId: String) -> (body: (JsonLogic Any)) -> (paramNames: List String) -> (routes: List ValidationRoute) -> (arities: List ValidationArity) -> (provenance: LedgerBodyProvenance) -> (flatRoutes: List ValidationRoute) -> (wireProjections: List ValidationWireProjection) -> (ctorFields: List ValidationCtorFieldRow) -> (inputsHash: ValidationHash) -> VcaOutcome
+vcaCarrier callerId body paramNames routes arities provenance flatRoutes wireProjections ctorFields inputsHash =
+  -- POSITIONAL patterns, deliberately. `vlgLedger` applies both constructors
+  -- POSITIONALLY (`LgoLedger (SignatureUseLedger { … })`), so the payload lands
+  -- at `_0` regardless of the declared field name — and a named-field pattern
+  -- against it does not match, falls through, and yields null with no error.
+  -- That silent failure cost a debugging round; the rule is to match a
+  -- constructor the way its producer applies it.
+  case vlgLedger callerId body paramNames routes arities provenance of
+    LgoFenced reason -> VcoFenced { reason = reason }
+    LgoLedger ledger ->
+      -- `routes` is LOAD-BEARING and was omitted from the first environment:
+      -- `vcaKeyAsFnId` reads it to decide the key-as-fnId branch exactly as the
+      -- ledger does, so dropping it silently routed every registered keyed call
+      -- to the builtin-intrinsic branch instead. The reconciliation did not
+      -- catch it — both branches build one row-demanding root with the same raw
+      -- key and children, so the row count, the demand, the paths and the
+      -- identities all still agreed while the two walkers had made DIFFERENT
+      -- semantic decisions.
+      let env = { callerId = callerId, rows = ledger.rows, routes = routes, flat = flatRoutes, wires = wireProjections, ctorFields = ctorFields, suppress = "" }
+      let root = vcaWalk body [] env
+      case vcaReconcile root ledger of
+        Just reason -> VcoFenced { reason = reason }
+        Nothing -> VcoCarrier { carrier = vcaAssemble callerId root provenance ledger inputsHash }
+
+@label "Carrier assemble"
+@description "Package a reconciled carrier: its snapshot, its whole-ledger readiness, its live occurrence identities and its recorded fences. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaAssemble : (callerId: String) -> (root: VcaNode) -> (provenance: LedgerBodyProvenance) -> (ledger: SignatureUseLedger) -> (inputsHash: ValidationHash) -> VcaCarrier
+vcaAssemble callerId root provenance ledger inputsHash =
+  VcaCarrier {
+    callerId = callerId,
+    root = root,
+    snapshot = VcaSnapshot {
+      bodyHash = provenance.bodyHash,
+      astAbi = provenance.astAbi,
+      parser = provenance.parser,
+      carrierVersion = vcaCarrierVersion 0,
+      inputsHash = inputsHash
+    },
+    readiness = vckLedgerReadiness ledger,
+    identities = vcaCollectIdentities root [],
+    fences = vcaCollectFences root []
+  }
+
+-- The carrier's own construction version. It participates in the snapshot
+-- because a table built by an earlier construction is not evidence about this
+-- one, and a version that only lived in a comment could not say so.
+--
+-- IT TAKES A UNIT PARAMETER, and that is a REPAIR rather than a style choice.
+-- As a nullary declaration it was a `String`-typed constant, and a bare nullary
+-- name in ARGUMENT or RECORD-FIELD position does not evaluate to its value — it
+-- resolves to a `{$ref}` handle. So 3f's snapshot carried
+-- `carrierVersion = {$ref:"engine:vcaCarrierVersion"}` instead of the version
+-- string. Benign there (two refs compare equal, so the equality was merely
+-- vacuous rather than wrong) and NOT benign here, where the same shape reaches a
+-- digest payload and a host seam that requires a string. Found by the slice-3g
+-- ladder when the certificate-byte leaf refused its domain argument.
+@label "Carrier version"
+@description "The occurrence-carrier construction version, part of every snapshot. A table built by a different construction is stale. Takes a unit argument so the name evaluates to its VALUE in argument and record-field position rather than to a reference handle."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaCarrierVersion : (unit: a) -> String
+vcaCarrierVersion unit = "fenel.validation.carrier.v2"
+
+-- RECONCILIATION IS BIDIRECTIONAL, and that is the whole reason a SECOND
+-- `fdc*` walk is safe. "Every ledger row was reached" alone does not detect a
+-- node that needs evidence and joined none, and neither direction detects two
+-- nodes landing on one path — which a marshalled `JlObject` makes possible,
+-- because it is a LIST of fields and can carry duplicate sibling keys an
+-- ordinary JS object cannot.
+@label "Carrier reconcile"
+@description "The bidirectional reconciliation: the claimed-row count equals the ledger's, every node demanding a row has exactly one, every node demanding none has none, and all node paths are distinct. Nothing when the carrier reconciles."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaReconcile : (root: VcaNode) -> (ledger: SignatureUseLedger) -> Maybe ValidationReason
+vcaReconcile root ledger =
+  let claimed = vcaCollectRows root []
+  if not (eq (length claimed) (length ledger.rows))
+  then Just (RsnUnsupportedSyntax { form = "carrier-ledger-row-count", path = [] })
+  else
+    case vcaFirstDemandViolation root of
+      Just node -> Just (RsnUnsupportedSyntax { form = "carrier-demand-violation", path = node.path })
+      Nothing ->
+        case vcaFirstUnsupportedIdentity root of
+          Just bad -> Just (RsnUnsupportedSyntax { form = "carrier-unsupported-node-issued-identity", path = bad.path })
+          Nothing ->
+            if vcaPathsCollide (vcaCollectPaths root [])
+            then Just (RsnUnsupportedSyntax { form = "carrier-duplicate-node-path", path = [] })
+            else if vcaIdentitiesCollide (vcaCollectIdentities root [])
+            then Just (RsnUnsupportedSyntax { form = "carrier-duplicate-occurrence-identity", path = [] })
+            else Nothing
+
+-- THE INVARIANT AN ARM CANNOT OPT OUT OF. Marking a projection unsupported and
+-- still letting the joined row issue a live identity hands evidence to a
+-- position the carrier has just said it cannot read — which is exactly what the
+-- wire-refused constructor did before it was repaired, and what a future arm
+-- could reintroduce one `vcaRowNode` at a time. Checking it centrally makes the
+-- per-arm discipline unnecessary rather than merely documented.
+@label "Carrier first unsupported identity"
+@description "The first node that projects to an UNSUPPORTED form and nevertheless issues a live occurrence identity. Nothing when no node does."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaFirstUnsupportedIdentity : (node: VcaNode) -> Maybe VcaNode
+vcaFirstUnsupportedIdentity node =
+  if vcaUnsupportedWithIdentity node
+  then Just node
+  else vcaFirstUnsupportedIdentityKids node.children
+
+@label "Carrier unsupported with identity"
+@description "Does this node project to an unsupported form while still issuing a live identity? Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaUnsupportedWithIdentity : (node: VcaNode) -> Boolean
+vcaUnsupportedWithIdentity node =
+  case node.projection of
+    VcpUnsupported -> vcaIssuesIdentity node.identity
+    _ -> false
+
+@label "Carrier issues identity"
+@description "Does this identity status issue a live occurrence identity? Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaIssuesIdentity : (identity: VcaIdentity) -> Boolean
+vcaIssuesIdentity identity =
+  case identity of
+    VciUse -> true
+    _ -> false
+
+@label "Carrier first unsupported identity in children"
+@description "Fold the unsupported-identity check over a bundled child list. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaFirstUnsupportedIdentityKids : (children: [VcaChild]) -> Maybe VcaNode
+vcaFirstUnsupportedIdentityKids children =
+  case head children of
+    Nothing -> Nothing
+    Just c ->
+      case vcaFirstUnsupportedIdentity c.node of
+        Just bad -> Just bad
+        Nothing -> vcaFirstUnsupportedIdentityKids (eufRest children)
+
+@label "Carrier first demand violation"
+@description "The first node whose row count disagrees with its demand: a node that requires an occurrence and joined none or two, or a node that requires none and joined one. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaFirstDemandViolation : (node: VcaNode) -> Maybe VcaNode
+vcaFirstDemandViolation node =
+  if not (vcaDemandSatisfied node)
+  then Just node
+  else vcaFirstDemandViolationKids node.children
+
+@label "Carrier demand satisfied"
+@description "Does this node's joined row count match its demand? Exactly one for a node that requires an occurrence, exactly none otherwise. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaDemandSatisfied : (node: VcaNode) -> Boolean
+vcaDemandSatisfied node =
+  case node.demand of
+    VcdRequiresRow -> eq (length node.rows) 1
+    VcdNoRow -> eq (length node.rows) 0
+
+@label "Carrier first demand violation in children"
+@description "Fold the demand check over a bundled child list. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaFirstDemandViolationKids : (children: [VcaChild]) -> Maybe VcaNode
+vcaFirstDemandViolationKids children =
+  case head children of
+    Nothing -> Nothing
+    Just c ->
+      case vcaFirstDemandViolation c.node of
+        Just bad -> Just bad
+        Nothing -> vcaFirstDemandViolationKids (eufRest children)
+
+@label "Carrier collect paths"
+@description "Every node path in the carrier, in walk order. Compared pairwise to prove injectivity."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaCollectPaths : (node: VcaNode) -> (acc: a) -> a
+vcaCollectPaths node acc = vcaCollectPathsKids node.children (appendItem node.path acc)
+
+@label "Carrier collect paths in children"
+@description "Fold the path collection over a bundled child list. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCollectPathsKids : (children: [VcaChild]) -> (acc: a) -> a
+vcaCollectPathsKids children acc =
+  case head children of
+    Nothing -> acc
+    Just c -> vcaCollectPathsKids (eufRest children) (vcaCollectPaths c.node acc)
+
+@label "Carrier paths collide"
+@description "True when two carrier node paths are structurally equal — two distinct nodes claiming one position, which a duplicate sibling field key can produce."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaPathsCollide : (paths: a) -> Boolean
+vcaPathsCollide paths =
+  case head paths of
+    Nothing -> false
+    Just first ->
+      let rest = eufRest paths
+      if vcaPathMember first rest
+      then true
+      else vcaPathsCollide rest
+
+@label "Carrier path member"
+@description "Is this path structurally present in the list? Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaPathMember : (path: List UsePathSeg) -> (paths: a) -> Boolean
+vcaPathMember path paths =
+  case head paths of
+    Nothing -> false
+    Just other ->
+      if vcaPathEq path other
+      then true
+      else vcaPathMember path (eufRest paths)
+
+@label "Carrier suppress"
+@description "Rebuild the carrier walk environment with a replacement identity-suppression mode (the mirrored or aliased constructor payload readings). Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaEnvSuppress : (env: a) -> (mode: String) -> a
+vcaEnvSuppress env mode =
+  { callerId = env.callerId, rows = env.rows, routes = env.routes, flat = env.flat, wires = env.wires, ctorFields = env.ctorFields, suppress = mode }
+
+-- =========================================================================
+-- the walk — a structural MIRROR of `vlgWalk`, over the same shared plan
+-- =========================================================================
+
+@label "Carrier walk node"
+@description "The annotated node walk. Delegates form recognition to the shared `fdcNodePlan` exactly as the ledger walk does, so the two cannot disagree about topology; what this adds is the per-node evidence join, the checker projection, and the bundled child list."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaWalk : (node: (JsonLogic Any)) -> (path: List UsePathSeg) -> (env: a) -> VcaNode
+vcaWalk node path env =
+  case fdcNodePlan node of
+    FdcPlanInert -> vcaLeaf node path env VcpLit
+    FdcPlanSeq { items = xs } ->
+      vcaNodeAt node path env (VcpUnsupported { form = "array-literal" }) (vcaWalkSeq xs path 0 env [])
+    FdcPlanRecord { fields = fs } ->
+      vcaNodeAt node path env VcpRecord (vcaWalkFields fs path env [])
+    FdcPlanOp { op = op, rawArgs = raw, argList = args, schedule = sched } ->
+      vcaFormOp node op raw args sched path env
+    FdcPlanKeyed { op = op, rawArgs = raw, argList = args, unresolved = fb } ->
+      vcaKeyAsFnId node op raw args fb path env
+
+@label "Carrier leaf"
+@description "A childless annotated node. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaLeaf : (node: (JsonLogic Any)) -> (path: List UsePathSeg) -> (env: a) -> (projection: VcaProjection) -> VcaNode
+vcaLeaf node path env projection = vcaNodeAt node path env projection []
+
+@label "Carrier node at"
+@description "Build one STRUCTURAL annotated node — one the ledger mints no row for. Joining a row here is a reconciliation violation, not a silently accepted extra."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaNodeAt : (node: (JsonLogic Any)) -> (path: List UsePathSeg) -> (env: a) -> (projection: VcaProjection) -> (children: [VcaChild]) -> VcaNode
+vcaNodeAt node path env projection children =
+  vcaBuildNode node path env projection VcdNoRow "" children
+
+@label "Carrier row leaf"
+@description "A childless annotated node that DEMANDS a ledger row under an independently derived raw key. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaRowLeaf : (node: (JsonLogic Any)) -> (path: List UsePathSeg) -> (env: a) -> (projection: VcaProjection) -> (expectedKey: String) -> VcaNode
+vcaRowLeaf node path env projection expectedKey =
+  vcaBuildNode node path env projection VcdRequiresRow expectedKey []
+
+-- A node whose OCCURRENCE is refused outright, not merely projected as
+-- unsupported. The distinction is load-bearing: an unsupported PROJECTION
+-- still lets a resolved row issue an identity, which would hand evidence to a
+-- position the carrier has just said it cannot read.
+@label "Carrier row refused"
+@description "A node that demands a ledger row and REFUSES its occurrence with a closed reason — the projection is unsupported AND no identity is issued, so the position cannot supply evidence. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaRowRefused : (node: (JsonLogic Any)) -> (path: List UsePathSeg) -> (env: a) -> (form: String) -> (expectedKey: String) -> (children: [VcaChild]) -> VcaNode
+vcaRowRefused node path env form expectedKey children =
+  let built = vcaRowNode node path env (VcpUnsupported { form = form }) expectedKey children
+  VcaNode {
+    path = built.path,
+    raw = built.raw,
+    projection = built.projection,
+    demand = built.demand,
+    expectedKey = built.expectedKey,
+    identity = VciFenced { reason = RsnUnsupportedSyntax { form = form, path = path } },
+    route = built.route,
+    rows = built.rows,
+    children = built.children
+  }
+
+@label "Carrier row node"
+@description "An annotated node that DEMANDS a ledger row under an independently derived raw key, with bundled children. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaRowNode : (node: (JsonLogic Any)) -> (path: List UsePathSeg) -> (env: a) -> (projection: VcaProjection) -> (expectedKey: String) -> (children: [VcaChild]) -> VcaNode
+vcaRowNode node path env projection expectedKey children =
+  vcaBuildNode node path env projection VcdRequiresRow expectedKey children
+
+-- THE EXPECTED KEY IS AN INDEPENDENT DERIVATION, and that is the point. Every
+-- other field a node carries about its occurrence — role, target, saturation —
+-- comes FROM the joined row, so comparing them to the row would be vacuous.
+-- The raw spelling is derived here from the shared form layout instead, so a
+-- projection that mislabels a position (swapping two argument indices, say)
+-- joins a row whose spelling disagrees and fences, where a pure path-equality
+-- reconciliation would have accepted it.
+@label "Carrier build node"
+@description "Build one annotated node: join every ledger row naming this exact path, check the joined row's raw spelling against the INDEPENDENTLY derived expected key, derive the occurrence identity and the closed route, and bundle the already-walked children. A path claimed by two rows is a closed fence rather than a chosen row."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaBuildNode : (node: (JsonLogic Any)) -> (path: List UsePathSeg) -> (env: a) -> (projection: VcaProjection) -> (demand: VcaDemand) -> (expectedKey: String) -> (children: [VcaChild]) -> VcaNode
+vcaBuildNode node path env projection demand expectedKey children =
+  let rows = vcaRowsAt env.rows path []
+  let identity = vcaIdentityChecked rows path env expectedKey
+  VcaNode {
+    path = path,
+    raw = node,
+    projection = projection,
+    demand = demand,
+    expectedKey = expectedKey,
+    identity = identity,
+    route = vcaRouteOf rows,
+    rows = rows,
+    children = children
+  }
+
+@label "Carrier identity checked"
+@description "The occurrence identity, refused first when the joined row's raw spelling disagrees with the independently derived expected key. A disagreement means the projection and the ledger walk are describing different positions, which no downstream comparison would catch."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaIdentityChecked : (rows: [UseLedgerRow]) -> (path: List UsePathSeg) -> (env: a) -> (expectedKey: String) -> VcaIdentity
+vcaIdentityChecked rows path env expectedKey =
+  if eq expectedKey ""
+  then vcaIdentityOf rows path env
+  else
+    case head rows of
+      Nothing -> vcaIdentityOf rows path env
+      Just row ->
+        if not (eq row.rawKey expectedKey)
+        then VciFenced { reason = RsnUnsupportedSyntax { form = "carrier-expected-key-disagreement", path = path } }
+        else vcaIdentityOf rows path env
+
+@label "Carrier route of"
+@description "The CLOSED route a joined row describes: a registered target with its authority kind, an intrinsic language rule, a lexical binder, a fence, or none at all. What distinguishes a registered function named `if` from the intrinsic `if` the checker reaches first."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaRouteOf : (rows: [UseLedgerRow]) -> VcaRoute
+vcaRouteOf rows =
+  case head rows of
+    Nothing -> VrtNone
+    Just row ->
+      case row.status of
+        UlsResolved { targetId = targetId, kind = kind } ->
+          if eq kind "intrinsic"
+          then VrtIntrinsic { ruleId = targetId }
+          else VrtRegistered { targetId = targetId, authorityKind = kind }
+        UlsLexical { binderId = binderId } -> VrtLexical { binderId = binderId }
+        UlsFenced { targetId = t } -> VrtRouteFenced { reason = RsnUnresolvedSignatureUse { useId = t, status = "UlsFenced" } }
+        UlsMissing { spelling = s } -> VrtRouteFenced { reason = RsnUnresolvedSignatureUse { useId = s, status = "UlsMissing" } }
+        UlsAmbiguous -> VrtRouteFenced { reason = RsnUnresolvedSignatureUse { useId = row.rawKey, status = "UlsAmbiguous" } }
+        UlsDynamicOrReflective { detail = d } -> VrtRouteFenced { reason = RsnDynamicOrReflectiveUse { useId = row.rawKey, detail = d } }
+
+@label "Carrier rows at path"
+@description "Every ledger row whose site path is exactly this path. More than one is the duplicate case the identity derivation refuses. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaRowsAt : (rows: [UseLedgerRow]) -> (path: List UsePathSeg) -> (acc: [UseLedgerRow]) -> [UseLedgerRow]
+vcaRowsAt rows path acc =
+  case head rows of
+    Nothing -> acc
+    Just row ->
+      let site = row.site
+      let next = if vcaPathEq site.path path then appendItem row acc else acc
+      vcaRowsAt (eufRest rows) path next
+
+@label "Carrier identity of"
+@description "Derive one node's occurrence identity. No row is inert; two rows on one path is a closed fence; a negative row fences with its exact reason; a suppressed reading (the mirrored or aliased constructor payload) issues no identity; and a positive row issues an identity only after the FROZEN source-frame target is confirmed to agree with the FLAT runtime target."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaIdentityOf : (rows: [UseLedgerRow]) -> (path: List UsePathSeg) -> (env: a) -> VcaIdentity
+vcaIdentityOf rows path env =
+  if eq (length rows) 0 then VciInert
+  else if gt (length rows) 1
+  then VciFenced { reason = RsnUnsupportedSyntax { form = "carrier-duplicate-row-at-path", path = path } }
+  else
+    case head rows of
+      Nothing -> VciInert
+      Just row ->
+        if eq env.suppress "mirror"
+        then VciMirror { detail = "the two constructor payload readings coincide; this walk is the redundant copy" }
+        else if eq env.suppress "aliased"
+        then VciAliased { detail = "the constructor payload reading needs the registered field table a pure body does not carry" }
+        else vcaRowIdentity row path env
+
+@label "Carrier row identity"
+@description "The identity of one positive or negative ledger row. A resolved CALL or REFERENCE must additionally agree with the flat runtime route: the frozen source frame gives a local declaration priority while the runtime's key-as-fnId path asks the flat registry first, so two positive answers can differ and the disagreeing occurrence must fence before it can supply evidence."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaRowIdentity : (row: UseLedgerRow) -> (path: List UsePathSeg) -> (env: a) -> VcaIdentity
+vcaRowIdentity row path env =
+  let site = row.site
+  case row.status of
+    UlsResolved { targetId = targetId, kind = kind } ->
+      let role = vcaRoleTag site.role
+      let useId = VcaUseId { callerId = site.callerId, role = role, path = path, targetId = targetId, kind = kind }
+      if not (vcaFlatRouteRelevant site.role)
+      then VciUse { useId = useId }
+      else vcaFlatAgreement row targetId useId env
+    UlsLexical { binderId = binderId } ->
+      VciUse { useId = VcaUseId { callerId = site.callerId, role = vcaRoleTag site.role, path = path, targetId = binderId, kind = "lexical" } }
+    UlsFenced { targetId = targetId, diagnostics = diagnostics } ->
+      VciFenced { reason = RsnUnresolvedSignatureUse { useId = targetId, status = "UlsFenced" } }
+    UlsMissing { spelling = spelling } ->
+      VciFenced { reason = RsnUnresolvedSignatureUse { useId = spelling, status = "UlsMissing" } }
+    UlsAmbiguous { candidates = candidates } ->
+      VciFenced { reason = RsnUnresolvedSignatureUse { useId = row.rawKey, status = "UlsAmbiguous" } }
+    UlsDynamicOrReflective { detail = detail } ->
+      VciFenced { reason = RsnDynamicOrReflectiveUse { useId = row.rawKey, detail = detail } }
+
+@label "Carrier flat route relevant"
+@description "Which roles route through the FLAT runtime registry and therefore have to agree with it: a call, a bare registered reference, and an INTRINSIC rule — an intrinsic row means the frozen frame MISSED and the builtin fallback took over, so a flat registry that resolves the same spelling is a disagreement, not a coincidence. A constructor, a capability dispatch and a lexical binding do not take that route."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaFlatRouteRelevant : (role: UseRole) -> Boolean
+vcaFlatRouteRelevant role =
+  case role of
+    VurCall -> true
+    VurReference -> true
+    VurIntrinsic -> true
+    VurConstructor -> false
+    VurCapabilityDispatch -> false
+    VurLexical -> false
+
+-- THE INVERSE APPLIES TO ONE INTRINSIC ORIGIN, NOT BOTH, and conflating them
+-- fenced correct bodies. A `builtin-op-native` row is a FALLBACK: the runtime
+-- asks `ctx.getFunction` first and only reaches the native on a miss, so a flat
+-- registry that resolves the spelling really does disagree. A `known-op` row is
+-- STRUCTURAL: `KNOWN_OPS` dispatches BEFORE any registry lookup, so `{and:[…]}`
+-- stays the language rule even when `std:and` exists, and inverting it refused
+-- a body the runtime never routes through the registry at all.
+@label "Carrier flat route inverted"
+@description "Whether an occurrence's agreement condition is INVERTED — true only for a builtin-op-native FALLBACK row, where the frozen frame missed the spelling and the flat registry must miss it too. A known-op row dispatches structurally before any registry lookup and is not inverted; every other role uses the ordinary agreement."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaFlatRouteInverted : (row: UseLedgerRow) -> Boolean
+vcaFlatRouteInverted row =
+  case row.status of
+    UlsResolved { targetId = targetId } -> startsWith targetId "@intrinsic/builtin-op-native/"
+    _ -> false
+
+@label "Carrier flat route exempt"
+@description "Whether an occurrence takes no flat runtime route at all and so has nothing to agree with: a known-op intrinsic, which `KNOWN_OPS` dispatches structurally before any registry lookup."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaFlatRouteExempt : (row: UseLedgerRow) -> Boolean
+vcaFlatRouteExempt row =
+  case row.status of
+    UlsResolved { targetId = targetId } -> startsWith targetId "@intrinsic/known-op/"
+    _ -> false
+
+@label "Carrier flat agreement"
+@description "Confirm the FLAT runtime route for this occurrence's raw spelling exists, is itself resolved, and names the same target as the frozen source frame. A missing flat route is a fence, not an admission: absence of a second opinion is not agreement."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaFlatAgreement : (row: UseLedgerRow) -> (targetId: String) -> (useId: VcaUseId) -> (env: a) -> VcaIdentity
+vcaFlatAgreement row targetId useId env =
+  if vcaFlatRouteExempt row
+  then VciUse { useId = useId }
+  else if vcaFlatRouteInverted row
+  then
+    case vlgLookupRoute env.flat row.rawKey of
+      Nothing -> VciUse { useId = useId }
+      Just flat ->
+        -- Any flat ENTRY at all disagrees here, not only a resolved one: the
+        -- ledger recorded a registry MISS, so a flat table that knows the
+        -- spelling — resolved, ambiguous or fenced — contradicts that miss.
+        VciFenced { reason = RsnUnresolvedSignatureUse { useId = row.rawKey, status = concat "FlatKnowsAFallbackSpelling:" flat.status } }
+  else
+    case vlgLookupRoute env.flat row.rawKey of
+      Nothing -> VciFenced { reason = RsnUnresolvedSignatureUse { useId = row.rawKey, status = "FlatRouteAbsent" } }
+      Just flat ->
+        if not (eq flat.status "resolved")
+        then VciFenced { reason = RsnUnresolvedSignatureUse { useId = row.rawKey, status = concat "FlatRoute:" flat.status } }
+        else if not (eq flat.targetId targetId)
+        then VciFenced { reason = RsnUnresolvedSignatureUse { useId = row.rawKey, status = "FrozenFlatTargetDisagreement" } }
+        else if not (eq flat.kind (vcaRouteKindOf row))
+        then VciFenced { reason = RsnUnresolvedSignatureUse { useId = row.rawKey, status = "FrozenFlatAuthorityKindDisagreement" } }
+        else VciUse { useId = useId }
+
+@label "Carrier route kind of"
+@description "The authority kind the frozen source-frame row published for this occurrence, so the flat route's own kind can be compared against it rather than only its target. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaRouteKindOf : (row: UseLedgerRow) -> String
+vcaRouteKindOf row =
+  case row.status of
+    UlsResolved { kind = kind } -> kind
+    _ -> ""
+
+-- ---- child walks ---------------------------------------------------------
+
+@label "Carrier walk sequence"
+@description "Walk a positional item list, each item bundled under its VpsSeq segment. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaWalkSeq : (items: a) -> (path: List UsePathSeg) -> (index: Nat) -> (env: b) -> (acc: [VcaChild]) -> [VcaChild]
+vcaWalkSeq items path index env acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let seg = VpsSeq { index = index }
+      let child = VcaChild { seg = seg, node = vcaWalk item (appendItem seg path) env }
+      vcaWalkSeq (eufRest items) path (add index 1) env (appendItem child acc)
+
+@label "Carrier walk args"
+@description "Walk a positional argument list, each argument bundled under its VpsArg segment. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaWalkArgs : (items: a) -> (path: List UsePathSeg) -> (index: Nat) -> (env: b) -> (acc: [VcaChild]) -> [VcaChild]
+vcaWalkArgs items path index env acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let seg = VpsArg { index = index }
+      let child = VcaChild { seg = seg, node = vcaWalk item (appendItem seg path) env }
+      vcaWalkArgs (eufRest items) path (add index 1) env (appendItem child acc)
+
+@label "Carrier walk fields"
+@description "Walk a record field list, each value bundled under its VpsField segment. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaWalkFields : (fields: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: [VcaChild]) -> [VcaChild]
+vcaWalkFields fields path env acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let seg = VpsField { key = f.name }
+      let child = VcaChild { seg = seg, node = vcaWalk f.value (appendItem seg path) env }
+      vcaWalkFields (eufRest fields) path env (appendItem child acc)
+
+@label "Carrier walk slots"
+@description "Walk exactly the argument slots the runtime evaluates, from the shared op schedule, each at its logical VpsArg index. The unevaluated residue is not a child: the runtime never reaches it. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaWalkSlots : (slots: [FdcCallSlot]) -> (path: List UsePathSeg) -> (env: a) -> (acc: [VcaChild]) -> [VcaChild]
+vcaWalkSlots slots path env acc =
+  case head slots of
+    Nothing -> acc
+    Just s ->
+      let next =
+            if s.evaluated
+            then
+              let seg = VpsArg { index = s.logicalIndex }
+              appendItem (VcaChild { seg = seg, node = vcaWalk s.node (appendItem seg path) env }) acc
+            else acc
+      vcaWalkSlots (eufRest slots) path env next
+
+-- ---- the forms -----------------------------------------------------------
+
+@label "Carrier form op"
+@description "Dispatch one KNOWN_OP through the shared schedule, mirroring the ledger walk arm for arm. Only the forms the locked seven-case core Expr can express receive a checker projection; every other form is an EXPLICIT unsupported node that fences, never a strictified stand-in."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaFormOp : (node: (JsonLogic Any)) -> (op: String) -> (rawArgs: (JsonLogic Any)) -> (argList: a) -> (sched: FdcSchedule) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaFormOp node op rawArgs argList sched path env =
+  case sched.form of
+    FdcFormVar -> vcaVarUse node argList path env
+    FdcFormEnvPath { kind = k } -> vcaRowRefused node path env (concat "env-path:" k) op []
+    -- THE RULE ID IS DERIVED HERE, NOT READ OFF THE ROUTE. `VrtIntrinsic`
+    -- carries the frozen route table's `@intrinsic/…` spelling, which is
+    -- CALLER-SUPPLIED; `sched.form` is the shared decomposition's own reading
+    -- of the body. The checker selects an intrinsic image on this id, so it
+    -- has to be the derived one. Versioned in the string because a schedule
+    -- change is a different rule, not the same rule with new behaviour.
+    FdcFormLazy -> vcaRowNode node path env (VcpCall { fnId = op, ruleId = concat "fdc.form.v1/lazy/" op }) op (vcaWalkSlots (fdcScheduledSlots sched.slots argList) path env [])
+    FdcFormEager -> vcaRowNode node path env (VcpCall { fnId = op, ruleId = concat "fdc.form.v1/eager/" op }) op (vcaWalkSlots (fdcScheduledSlots sched.slots argList) path env [])
+    FdcFormAnn -> vcaNodeAt node path env (VcpUnsupported { form = "ann" }) (vcaWalkSlots (fdcScheduledSlots sched.slots argList) path env [])
+    FdcFormWithInstance -> vcaNodeAt node path env (VcpUnsupported { form = "withInstance" }) (vcaWalkSlots (fdcScheduledSlots sched.slots argList) path env [])
+    FdcFormTypeDef -> vcaLeaf node path env (VcpUnsupported { form = "typeDef" })
+    FdcFormRawRule { ruleIndex = i } -> vcaRawRuleForm node op argList sched i path env
+    FdcFormDynamicApply { kind = k } ->
+      vcaRowNode node path env (VcpUnsupported { form = concat "dynamic-apply:" k }) op (vcaWalkSlots (fdcScheduledSlots sched.slots argList) path env [])
+    FdcFormBinding { kind = k } -> vcaBindingForm node k argList path env
+    FdcFormMatch -> vcaMatchOp node argList path env
+    FdcFormLambda -> vcaFnOp node argList path env
+    FdcFormCall -> vcaCallOp node argList path env
+    FdcFormConstruct -> vcaConstructOp node argList path env
+    FdcFormMethod ->
+      let methodLayout = fdcCallLayout "method" argList
+      vcaRowNode node path env (VcpUnsupported { form = "method" }) "method" (vcaWalkSlots methodLayout.slots path env [])
+
+@label "Carrier raw-rule form"
+@description "The raw-rule intrinsics (map / filter / reduce / all / some / none): the evaluated slots plus the RULE slot, which the runtime evaluates per element in a derived data context. Unsupported, because the rule's bare variables may bind to item fields rather than to any lexical binder."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaRawRuleForm : (node: (JsonLogic Any)) -> (op: String) -> (argList: a) -> (sched: FdcSchedule) -> (ruleIndex: Nat) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaRawRuleForm node op argList sched ruleIndex path env =
+  let evaluated = vcaWalkSlots (fdcScheduledSlots sched.slots argList) path env []
+  let seg = VpsArg { index = ruleIndex }
+  let rule = VcaChild { seg = seg, node = vcaWalk (ifNthArg argList ruleIndex) (appendItem seg path) env }
+  vcaRowNode node path env (VcpUnsupported { form = concat "raw-rule:" op }) op (appendItem rule evaluated)
+
+@label "Carrier var use"
+@description "`{var: name}` — the checker's EVar when the spelling is a literal, and an explicit unsupported node otherwise (the runtime coerces a non-string name, a spelling this walk will not manufacture)."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaVarUse : (node: (JsonLogic Any)) -> (argList: a) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaVarUse node argList path env =
+  case head argList of
+    Nothing -> vcaRowRefused node path env "var-without-name" "var" []
+    Just first ->
+      case first of
+        JlString { value = name } -> vcaRowLeaf node path env (VcpVar { name = name }) name
+        _ -> vcaRowRefused node path env "var-without-name" "var" []
+
+@label "Carrier binding form"
+@description "`let` / `do` / `where`: sequential binding forms that are NOT cases of the locked seven-case core Expr, so they carry an explicit unsupported projection while still bundling their children faithfully, at the exact segments the ledger walked."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaBindingForm : (node: (JsonLogic Any)) -> (kind: String) -> (argList: a) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaBindingForm node kind argList path env =
+  if eq kind "do"
+  then vcaDoOp node argList path env
+  else
+    let layout = fdcBindingLayout kind argList
+    -- The dotted-binder fence, same reason as the lambda's: the ledger matches
+    -- `"x.y"` as ONE binder and the runtime's `resolveVar` splits it, so the
+    -- binding is one no read can name. The children are bundled identically in
+    -- both directions so reconciliation cannot see the difference; only the
+    -- PROJECTION changes, and an unsupported projection refuses the body at the
+    -- entry's total walk.
+    let dotted = vcaAnyDottedBinding layout.entries
+    if not layout.total
+    then vcaRowRefused node path env (concat "binding-not-total:" kind) kind []
+    else if eq kind "let"
+    then
+      let letProjection = if dotted then VcpUnsupported { form = "binding-binder-dotted:let" } else VcpBinding { form = VbfLet }
+      vcaNodeAt node path env letProjection (vcaBindings layout.entries path env [])
+    else
+      let bindings = vcaWhereBindings layout.entries path env []
+      let seg = VpsArg { index = 0 }
+      let body = VcaChild { seg = seg, node = vcaWalk layout.body (appendItem seg path) env }
+      let whereProjection = if dotted then VcpUnsupported { form = "binding-binder-dotted:where" } else VcpBinding { form = VbfWhere }
+      vcaNodeAt node path env whereProjection (appendItem body bindings)
+
+@label "Carrier any dotted binding"
+@description "Does any binding entry in this layout install a binder spelling carrying the runtime's path separator? Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaAnyDottedBinding : (entries: [FdcBindingEntry]) -> Boolean
+vcaAnyDottedBinding entries =
+  case head entries of
+    Nothing -> false
+    Just e -> if vlgIsDotted e.name then true else vcaAnyDottedBinding (eufRest entries)
+
+@label "Carrier let bindings"
+@description "Bundle a sequential `let` binding list at VpsBinding, in the runtime's order. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaBindings : (entries: [FdcBindingEntry]) -> (path: List UsePathSeg) -> (env: a) -> (acc: [VcaChild]) -> [VcaChild]
+vcaBindings entries path env acc =
+  case head entries of
+    Nothing -> acc
+    Just e ->
+      let seg = VpsBinding { name = e.name, index = e.index }
+      let child = VcaChild { seg = seg, node = vcaWalk e.value (appendItem seg path) env }
+      vcaBindings (eufRest entries) path env (appendItem child acc)
+
+@label "Carrier where bindings"
+@description "Bundle a `where` binding list at VpsWhereBinding, in the runtime's order. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaWhereBindings : (entries: [FdcBindingEntry]) -> (path: List UsePathSeg) -> (env: a) -> (acc: [VcaChild]) -> [VcaChild]
+vcaWhereBindings entries path env acc =
+  case head entries of
+    Nothing -> acc
+    Just e ->
+      let seg = VpsWhereBinding { name = e.name, index = e.index }
+      let child = VcaChild { seg = seg, node = vcaWalk e.value (appendItem seg path) env }
+      vcaWhereBindings (eufRest entries) path env (appendItem child acc)
+
+@label "Carrier do op"
+@description "`{do: [...]}` — a FLAT statement list. An item carrying a `let` KEY has only its binding values walked, exactly as the runtime evaluates it; every other item is an ordinary expression at VpsSeq."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaDoOp : (node: (JsonLogic Any)) -> (items: a) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaDoOp node items path env =
+  vcaNodeAt node path env (VcpBinding { form = VbfDo }) (vcaDoItems items path 0 env [])
+
+@label "Carrier do items"
+@description "The do-list worker: an inline-let item bundles only its binding values, in sequential scope; every other item is an ordinary expression. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaDoItems : (items: a) -> (path: List UsePathSeg) -> (index: Nat) -> (env: b) -> (acc: [VcaChild]) -> [VcaChild]
+vcaDoItems items path index env acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let seg = VpsSeq { index = index }
+      let itemPath = appendItem seg path
+      let inline = fdcInlineLet item
+      let child =
+            if not inline.present
+            then VcaChild { seg = seg, node = vcaWalk item itemPath env }
+            else if not inline.total
+            then VcaChild { seg = seg, node = vcaRowRefused item itemPath env "do-inline-let-not-total" "do" [] }
+            else
+              let inlineProjection = if vcaAnyDottedBinding inline.entries then VcpUnsupported { form = "binding-binder-dotted:do-inline-let" } else VcpBinding { form = VbfDoInlineLet }
+              VcaChild { seg = seg, node = vcaNodeAt item itemPath env inlineProjection (vcaBindings inline.entries itemPath env []) }
+      vcaDoItems (eufRest items) path (add index 1) env (appendItem child acc)
+
+@label "Carrier match op"
+@description "`{match: [scrut, p1, b1, ...]}` through the shared match layout: the scrutinee at VpsScrutinee, each arm's PATTERN position as an explicit pattern node (which is where the ledger places its non-total-binder fence), each guard at VpsArmGuard and each body at VpsArmBody, and a lone trailing default arm as a body."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaMatchOp : (node: (JsonLogic Any)) -> (argList: a) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaMatchOp node argList path env =
+  let layout = fdcMatchLayout argList
+  if not layout.scrutineePresent
+  then vcaLeaf node path env (VcpUnsupported { form = "match-without-scrutinee" })
+  else
+    let scrutChild = VcaChild { seg = VpsScrutinee, node = vcaWalk layout.scrutinee (appendItem VpsScrutinee path) env }
+    let withArms = vcaMatchArms layout.arms path env [scrutChild]
+    let children =
+          if not layout.fallbackPresent
+          then withArms
+          else
+            let seg = VpsArmBody { index = layout.fallbackIndex }
+            appendItem (VcaChild { seg = seg, node = vcaWalk layout.fallback (appendItem seg path) env }) withArms
+    vcaNodeAt node path env VcpMatch children
+
+@label "Carrier match arms"
+@description "Bundle every arm of the shared match layout. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaMatchArms : (arms: [FdcMatchArm]) -> (path: List UsePathSeg) -> (env: a) -> (acc: [VcaChild]) -> [VcaChild]
+vcaMatchArms arms path env acc =
+  case head arms of
+    Nothing -> acc
+    Just arm -> vcaMatchArms (eufRest arms) path env (vcaMatchArm arm path env acc)
+
+@label "Carrier match arm"
+@description "One arm: the pattern position as an explicit node (the ledger's non-total-binder fence lands there), the guard condition when present, and the body. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaMatchArm : (arm: FdcMatchArm) -> (path: List UsePathSeg) -> (env: a) -> (acc: [VcaChild]) -> [VcaChild]
+vcaMatchArm arm path env acc =
+  let patSeg = VpsArmPattern { index = arm.index }
+  let patPath = appendItem patSeg path
+  let total = fdcPatternBindsTotal arm.pattern
+  -- The pattern POSITION is where the ledger places its non-total-binder fence,
+  -- so its demand is conditional on exactly that: a non-total pattern demands
+  -- that row, a total one demands nothing.
+  let patNode =
+        if total
+        then vcaNodeAt arm.pattern patPath env VcpPattern []
+        else vcaRowLeaf arm.pattern patPath env VcpPattern "match"
+  let withPattern = appendItem (VcaChild { seg = patSeg, node = patNode }) acc
+  -- The ledger fences a non-total binder set AT THE PATTERN position and then
+  -- walks NEITHER the guard NOR the body: an incomplete binder set could mint a
+  -- positive row for a target the runtime never reaches. The carrier mirrors
+  -- that exactly, so the two walks cannot disagree about which nodes exist.
+  if not total
+  then withPattern
+  else
+    let withGuard =
+          if not arm.guarded
+          then withPattern
+          else
+            let gSeg = VpsArmGuard { index = arm.index }
+            appendItem (VcaChild { seg = gSeg, node = vcaWalk arm.guard (appendItem gSeg path) env }) withPattern
+    let bSeg = VpsArmBody { index = arm.index }
+    appendItem (VcaChild { seg = bSeg, node = vcaWalk arm.body (appendItem bSeg path) env }) withGuard
+
+@label "Carrier fn op"
+@description "`{fn: [...]}` through the shared lambda layout: the body at VpsLambdaBody. A parameter spelling the runtime coerces but this walk cannot reproduce fences the whole lambda, exactly as the ledger does, and its body is then NOT walked — an incomplete binder set could mint a positive identity for a target the runtime never reaches."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaFnOp : (node: (JsonLogic Any)) -> (argList: a) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaFnOp node argList path env =
+  let layout = fdcLambdaLayout argList
+  let binders = vcaBinderNames layout.params []
+  if not layout.namesTotal
+  then vcaRowRefused node path env "lambda-parameter-not-reproducible" "fn" []
+  -- A DOTTED BINDER FENCES. `fdcCoerceName` accepts `"x.y"` as one literal
+  -- binder and the ledger matches it as one, but the runtime's `resolveVar`
+  -- SPLITS on dots, so a `{var:"x.y"}` read does not resolve to the binding —
+  -- it projects field `y` off binder `x`. Binding one Γ slot to a name the
+  -- runtime never reads under that spelling is exactly the wrong-evidence
+  -- shape. The node stays walked (reconciliation is unchanged) and its
+  -- unsupported projection refuses the whole body at the entry's total walk.
+  else if vcaAnyDottedName binders
+  then
+    let dottedChild = if layout.bodyPresent then [VcaChild { seg = VpsLambdaBody, node = vcaWalk layout.body (appendItem VpsLambdaBody path) env }] else []
+    vcaNodeAt node path env (VcpUnsupported { form = "lambda-binder-dotted" }) dottedChild
+  else if not layout.bodyPresent
+  then vcaLeaf node path env (VcpLambda { binders = binders })
+  else
+    let child = VcaChild { seg = VpsLambdaBody, node = vcaWalk layout.body (appendItem VpsLambdaBody path) env }
+    vcaNodeAt node path env (VcpLambda { binders = binders }) [child]
+
+-- THE BINDER VECTOR IS RETAINED, NOT RE-DERIVED. `vcaFnOp` computed
+-- `fdcLambdaLayout` and threw `layout.params` away, so a bidirectional lambda
+-- rule downstream had no binder source at all and would have had to re-run the
+-- decomposition from raw inside the checker — the one thing the consume-only
+-- discipline forbids. Retaining it here is consumption: the carrier is BUILT
+-- from `fdc*`. Verification is test-side: the reconciliation test recomputes
+-- `fdcLambdaLayout` independently and compares vectors.
+--
+-- Only a name the decomposition REPRODUCES contributes; `namesTotal` has
+-- already refused an opaque one, so the fallback arm is unreachable today and
+-- is written down anyway (a `case` with no matching arm falls through to
+-- host-null, which reads FALSE).
+@label "Carrier binder names"
+@description "The ordered literal binder spellings of a lambda layout's parameters — the vector the bidirectional lambda-argument rule binds against. A name the decomposition refuses to reproduce contributes the empty spelling, which the namesTotal gate has already fenced. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaBinderNames : (params: [FdcLambdaParam]) -> (acc: [String]) -> [String]
+vcaBinderNames params acc =
+  case head params of
+    Nothing -> acc
+    Just p ->
+      let spelling =
+            case p.name of
+              FdcNameLiteral { name = n } -> n
+              FdcNameCoerced { name = n } -> n
+              FdcNameOpaque -> ""
+              _ -> ""
+      vcaBinderNames (eufRest params) (appendItem spelling acc)
+
+@label "Carrier any dotted name"
+@description "Does any binder spelling in this vector carry the runtime's path separator? The runtime's resolveVar splits a var spelling on dots before consulting the binder scope, so a dotted binder is a binding no read can name. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaAnyDottedName : (names: [String]) -> Boolean
+vcaAnyDottedName names =
+  case head names of
+    Nothing -> false
+    Just n -> if vlgIsDotted n then true else vcaAnyDottedName (eufRest names)
+
+@label "Carrier call op"
+@description "`{call: [callee, ...args]}` through the shared call layout: the callee bundled at VpsCallee when it is an expression position (the `$` application vehicle included), the actuals at their logical VpsArg indices."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCallOp : (node: (JsonLogic Any)) -> (argList: a) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaCallOp node argList path env =
+  let layout = fdcCallLayout "call" argList
+  let withCallee = vcaCalleeChildren layout path env []
+  let children = vcaWalkSlots layout.slots path env withCallee
+  vcaRowNode node path env (vcaCallProjection layout) (vcaCallExpectedKey layout) children
+
+@label "Carrier call expected key"
+@description "The raw spelling the ledger records for a call layout, derived independently from the layout: a literal callee name, the `$` vehicle's own spelling, an indirect `{var}` name, or the bare form name when the callee is neither. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCallExpectedKey : (layout: FdcCallLayout) -> String
+vcaCallExpectedKey layout =
+  case layout.callee of
+    FdcCalleeName { name = name } -> name
+    FdcCalleeDollar -> "$"
+    FdcCalleeVar { name = name } -> name
+    FdcCalleeExpr -> "call"
+    FdcCalleeAbsent -> "call"
+
+@label "Carrier callee children"
+@description "Bundle a non-name call callee as an ordinary expression at VpsCallee so no nested use disappears. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCalleeChildren : (layout: FdcCallLayout) -> (path: List UsePathSeg) -> (env: a) -> (acc: [VcaChild]) -> [VcaChild]
+vcaCalleeChildren layout path env acc =
+  case layout.callee of
+    FdcCalleeExpr -> appendItem (VcaChild { seg = VpsCallee, node = vcaWalk layout.calleeNode (appendItem VpsCallee path) env }) acc
+    FdcCalleeDollar -> appendItem (VcaChild { seg = VpsCallee, node = vcaWalk layout.calleeNode (appendItem VpsCallee path) env }) acc
+    _ -> acc
+
+@label "Carrier call projection"
+@description "The checker projection of a call layout: a literal name is ECall; every indirect head (the `$` vehicle, a bound variable callee, an expression callee, an absent callee) is explicitly unsupported. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCallProjection : (layout: FdcCallLayout) -> VcaProjection
+vcaCallProjection layout =
+  case layout.callee of
+    -- A written `{call:[…]}` head is never an intrinsic SCHEDULE — the known-op
+    -- forms reach `vcaFormOp`, not here — so the rule id is empty.
+    FdcCalleeName { name = name } -> VcpCall { fnId = name, ruleId = "" }
+    FdcCalleeDollar -> VcpUnsupported { form = "dollar-application" }
+    FdcCalleeVar { name = name } -> VcpUnsupported { form = "indirect-callee" }
+    FdcCalleeExpr -> VcpUnsupported { form = "expression-callee" }
+    FdcCalleeAbsent -> VcpUnsupported { form = "absent-callee" }
+
+@label "Carrier key as fnId"
+@description "The universal key-as-fnId call form, decided by RESOLUTION exactly as the runtime and the ledger decide it: the frozen frame first, then the builtin-op-native intrinsic fallback, then the unresolved fallback the shared plan attached (an inert `$`-marker with no children, or a single-field record literal)."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaKeyAsFnId : (node: (JsonLogic Any)) -> (op: String) -> (rawArgs: (JsonLogic Any)) -> (argList: a) -> (fb: FdcKeyedFallback) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaKeyAsFnId node op rawArgs argList fb path env =
+  case vlgLookupRoute env.routes op of
+    Just route -> vcaRowNode node path env (VcpCall { fnId = op, ruleId = "" }) op (vcaWalkArgs argList path 0 env [])
+    Nothing ->
+      if vlgIsBuiltinOpNative op
+      then vcaRowNode node path env (VcpCall { fnId = op, ruleId = concat "fdc.builtin-op-native.v1/" op }) op (vcaWalkArgs argList path 0 env [])
+      else
+        case fb of
+          FdcKeyedInert -> vcaLeaf node path env VcpLit
+          FdcKeyedField { key = k } ->
+            let seg = VpsField { key = k }
+            vcaNodeAt node path env VcpRecord [VcaChild { seg = seg, node = vcaWalk rawArgs (appendItem seg path) env }]
+
+-- ---- the constructor alias (the R3 repair) -------------------------------
+
+@label "Carrier construct op"
+@description "`{construct: [ctor, ...]}` through the shared constructor layout. When the payload's named-record reading is live the layout ALSO says the decision needs the registered field table a pure body does not carry, so the carrier walks BOTH readings — and issues at most ONE identity for them. Where the two readings provably COINCIDE (a plain multi-key record payload) the named side is canonical and the positional copy is a mirror; where they do not, BOTH sides are aliased and neither issues an identity."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaConstructOp : (node: (JsonLogic Any)) -> (argList: a) -> (path: List UsePathSeg) -> (env: b) -> VcaNode
+vcaConstructOp node argList path env =
+  let layout = fdcCtorLayout argList
+  if not layout.namePresent
+  then vcaRowRefused node path env "constructor-name-not-literal" "construct" []
+  else
+    let wire = vcaWireVerdict layout.name (length layout.payload) env.wires
+    if not (eq wire "")
+    then vcaRowRefused node path env wire layout.name (vcaWalkArgs layout.payload path 0 (vcaEnvSuppress env "aliased") [])
+    else if not layout.namedPossible
+    then vcaRowNode node path env (VcpConstruct { ctor = layout.name, wireTag = vcaWireTagOf layout.name env.wires, reading = VcrPositional, fields = vcaCtorFieldsFor layout.name env.ctorFields }) layout.name (vcaWalkArgs layout.payload path 0 env [])
+    else
+      -- BOTH READINGS ARE ALIASED. An earlier draft admitted a "coincidence"
+      -- shortcut — treat the named reading as canonical when the payload's own
+      -- `fdcNodePlan` is a record whose fields equal `layout.namedFields` — and
+      -- the result review showed that test is TAUTOLOGICAL: `fdcCtorPayload`
+      -- populated `namedFields` FROM those very fields, so it always holds for a
+      -- plain record and says nothing about the REGISTERED constructor fields
+      -- that actually select the runtime branch. With `R`'s declared fields
+      -- `["payload"]`, `{construct:["R",{x:…,y:0}]}` takes the POSITIONAL branch
+      -- at runtime while the shortcut issued the live identity on the named
+      -- path — the sole identity, attached to the reading the runtime did not
+      -- take, with every reconciliation check still passing.
+      --
+      -- Without the authoritative constructor-field table (slice 3g's), the
+      -- honest answer is the one the design settled on: carry both readings,
+      -- issue NO identity beneath either, and fence.
+      let aliasedEnv = vcaEnvSuppress env "aliased"
+      let positional = vcaWalkArgs layout.payload path 0 aliasedEnv []
+      let children = vcaWalkFields layout.namedFields path aliasedEnv positional
+      vcaRowNode node path env (VcpConstruct { ctor = layout.name, wireTag = vcaWireTagOf layout.name env.wires, reading = VcrUndecided, fields = vcaCtorFieldsFor layout.name env.ctorFields }) layout.name children
+
+-- THE FIELD VECTOR IS A REQUEST TABLE, NOT A DERIVATION, and it has to be:
+-- `FdcCtorLayout` publishes the payload readings and explicitly LACKS the
+-- registered constructor table, while `ValidationWireProjection` carries only
+-- `source`/`wire`. An exact `SeCtor` synthesis needs each field's semantic key
+-- AND its wire name, so the transport supplies them from the same registry
+-- generation as every other table and `vteInputsHash` binds the combination.
+--
+-- AMBIGUITY IS EMPTY, NOT THE FIRST MATCH — `vteSchemeFor`'s discipline. An
+-- empty vector is not a licence to guess: the checker's constructor rule
+-- refuses to synthesise without one.
+@label "Carrier constructor fields for"
+@description "The ordered semantic-key/wire-name field vector a registered constructor publishes, or the empty vector when the table names it zero times or more than once. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCtorFieldsFor : (source: String) -> (rows: [ValidationCtorFieldRow]) -> [VcaCtorField]
+vcaCtorFieldsFor source rows =
+  if not (eq (vcaCtorFieldCount source rows 0) 1)
+  then []
+  else vcaCtorFieldFirst source rows
+
+@label "Carrier constructor field count"
+@description "How many constructor field-layout rows name one source spelling. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCtorFieldCount : (source: String) -> (rows: [ValidationCtorFieldRow]) -> (acc: Nat) -> Nat
+vcaCtorFieldCount source rows acc =
+  case head rows of
+    Nothing -> acc
+    Just row ->
+      let next = if eq row.source source then add acc 1 else acc
+      vcaCtorFieldCount source (eufRest rows) next
+
+@label "Carrier constructor field first"
+@description "The field vector of the first row naming a source spelling, called only after the count is exactly one. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCtorFieldFirst : (source: String) -> (rows: [ValidationCtorFieldRow]) -> [VcaCtorField]
+vcaCtorFieldFirst source rows =
+  case head rows of
+    Nothing -> []
+    Just row -> if eq row.source source then row.fields else vcaCtorFieldFirst source (eufRest rows)
+
+@label "Carrier wire tag of"
+@description "The effective wire spelling for a source constructor, or the empty string when the projection table does not name it unambiguously. Called only after vcaWireVerdict has already passed, so the empty case is the unreachable safe default. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaWireTagOf : (source: String) -> (wires: List ValidationWireProjection) -> String
+vcaWireTagOf source wires =
+  case vcaWireOf source wires of
+    Nothing -> ""
+    Just wire -> wire
+
+-- THE WIRE PROJECTION IS AUTHORITATIVE AND THE SOURCE SPELLING IS NOT. The
+-- runtime projects a source constructor name through `_constructorWireNames`
+-- and applies the Boolean fast path to the EFFECTIVE wire name, so a source
+-- `AliasTrue` mapping to wire `True` evaluates to a native boolean while a
+-- carrier reading the source spelling would call it a tagged construction —
+-- and the inverse mapping produces the opposite disagreement. Absence of a
+-- mapping is a fence, not a licence to read the source name.
+@label "Carrier wire verdict"
+@description "The refusal reason for a constructor whose effective wire name cannot be read as an ordinary construction: no projection entry at all, an effective Boolean wire (the runtime yields a NATIVE boolean, not a tagged value), or a source-versus-wire Boolean disagreement. The empty string means the construction reads through."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaWireVerdict : (source: String) -> (arity: Nat) -> (wires: List ValidationWireProjection) -> String
+vcaWireVerdict source arity wires =
+  if gt (vcaWireCount source wires 0) 1
+  then "constructor-wire-projection-ambiguous"
+  else
+    case vcaWireOf source wires of
+      Nothing -> "constructor-wire-projection-absent"
+      Just wire ->
+        let wireIsBool = fdcIsBoolTag wire
+        let sourceIsBool = fdcIsBoolTag source
+        if and wireIsBool (not sourceIsBool) then "constructor-wire-boolean-alias"
+        else if and sourceIsBool (not wireIsBool) then "constructor-wire-boolean-demotion"
+        -- The runtime's native-Boolean shortcut fires at ZERO PAYLOAD only:
+        -- json-logic.ts tests `args.length === 1` counting the TAG itself, so
+        -- `{construct:["True"]}` evaluates to a NATIVE boolean while ANY payload
+        -- (`{construct:["True",1]}`) builds an ordinary tagged value the wire
+        -- table handles normally. `arity` here is the PAYLOAD count (tag
+        -- excluded), so the fence condition is zero, not one. (2026-07-31 Fable
+        -- audit — the landed comparison was `eq arity 1`, written from the
+        -- runtime's tag-inclusive count against a tag-exclusive argument: it
+        -- both MISSED the real native-Boolean case and FALSE-FENCED every
+        -- one-payload Boolean-wire construction, with the test pinned to the
+        -- same wrong convention.)
+        else if and wireIsBool (eq arity 0) then "constructor-boolean-native-representation"
+        else ""
+
+@label "Carrier wire of"
+@description "The effective wire name a source constructor spelling projects to, or Nothing when the authoritative table carries no entry for it. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaWireOf : (source: String) -> (wires: List ValidationWireProjection) -> Maybe String
+vcaWireOf source wires =
+  case head wires of
+    Nothing -> Nothing
+    Just w ->
+      if eq w.source source
+      then Just w.wire
+      else vcaWireOf source (eufRest wires)
+
+@label "Carrier wire count"
+@description "How many entries the projection table carries for one source spelling. More than one is an AMBIGUOUS table, and taking the first would make the answer depend on table order. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaWireCount : (source: String) -> (wires: List ValidationWireProjection) -> (acc: Nat) -> Nat
+vcaWireCount source wires acc =
+  case head wires of
+    Nothing -> acc
+    Just w ->
+      let next = if eq w.source source then add acc 1 else acc
+      vcaWireCount source (eufRest wires) next
+
+-- WHAT WOULD DECIDE THE READING, AND WHY IT IS NOT HERE. `applyOp` selects the
+-- named branch from the REGISTERED constructor field names, so deciding the
+-- reading needs that table and nothing weaker. A structural test over the
+-- payload's own shape cannot substitute for it: the obvious candidate — "the
+-- payload's `fdcNodePlan` is a record whose fields equal `layout.namedFields`" —
+-- is TAUTOLOGICAL, because `fdcCtorPayload` built `namedFields` from exactly
+-- those fields. It was implemented, and the result review produced the body it
+-- mis-reads. The table arrives in slice 3g; until then both readings alias.
+
+-- =========================================================================
+-- collection + reconciliation
+-- =========================================================================
+
+@label "Carrier collect rows"
+@description "Every ledger row any node in the carrier claimed. Compared by COUNT against the ledger to prove the walk reached each row exactly once."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCollectRows : (node: VcaNode) -> (acc: [UseLedgerRow]) -> [UseLedgerRow]
+vcaCollectRows node acc = vcaCollectRowsKids node.children (concat acc node.rows)
+
+@label "Carrier collect rows in children"
+@description "Fold the row collection over a bundled child list. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCollectRowsKids : (children: [VcaChild]) -> (acc: [UseLedgerRow]) -> [UseLedgerRow]
+vcaCollectRowsKids children acc =
+  case head children of
+    Nothing -> acc
+    Just c -> vcaCollectRowsKids (eufRest children) (vcaCollectRows c.node acc)
+
+@label "Carrier collect identities"
+@description "Every live occurrence identity the carrier issues, in walk order. Mirrored, aliased, inert and fenced nodes issue none."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaCollectIdentities : (node: VcaNode) -> (acc: [VcaUseId]) -> [VcaUseId]
+vcaCollectIdentities node acc =
+  let here =
+        case node.identity of
+          VciUse { useId = useId } -> appendItem useId acc
+          _ -> acc
+  vcaCollectIdentitiesKids node.children here
+
+@label "Carrier collect identities in children"
+@description "Fold the identity collection over a bundled child list. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCollectIdentitiesKids : (children: [VcaChild]) -> (acc: [VcaUseId]) -> [VcaUseId]
+vcaCollectIdentitiesKids children acc =
+  case head children of
+    Nothing -> acc
+    Just c -> vcaCollectIdentitiesKids (eufRest children) (vcaCollectIdentities c.node acc)
+
+@label "Carrier collect fences"
+@description "Every closed fence reason the carrier records, in walk order. Retained as diagnostics; a nonempty list refuses the preflight."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaCollectFences : (node: VcaNode) -> (acc: [ValidationReason]) -> [ValidationReason]
+vcaCollectFences node acc =
+  -- An ALIASED reading is collected here too, and it must be: it is exactly an
+  -- occurrence that cannot supply evidence. Counting only `VciFenced` would let
+  -- a preflight accept a table that covers the constructor and silently omits
+  -- the call inside its undecided payload.
+  let here =
+        case node.identity of
+          VciFenced { reason = reason } -> appendItem reason acc
+          VciAliased { detail = detail } ->
+            appendItem (RsnUnsupportedSyntax { form = concat "carrier-aliased-reading:" detail, path = node.path }) acc
+          _ -> acc
+  vcaCollectFencesKids node.children here
+
+@label "Carrier collect fences in children"
+@description "Fold the fence collection over a bundled child list. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaCollectFencesKids : (children: [VcaChild]) -> (acc: [ValidationReason]) -> [ValidationReason]
+vcaCollectFencesKids children acc =
+  case head children of
+    Nothing -> acc
+    Just c -> vcaCollectFencesKids (eufRest children) (vcaCollectFences c.node acc)
+
+@label "Carrier identities collide"
+@description "True when two live occurrence identities in one carrier are structurally equal — the functional-identity violation the whole projection exists to make impossible. A hard fence, never a silent merge."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaIdentitiesCollide : (identities: [VcaUseId]) -> Boolean
+vcaIdentitiesCollide identities =
+  case head identities of
+    Nothing -> false
+    Just first ->
+      let rest = eufRest identities
+      if vcaUseIdMember first rest
+      then true
+      else vcaIdentitiesCollide rest
+
+@label "Carrier use-id member"
+@description "Is this occurrence identity structurally present in the list? Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vcaUseIdMember : (useId: VcaUseId) -> (identities: [VcaUseId]) -> Boolean
+vcaUseIdMember useId identities =
+  case head identities of
+    Nothing -> false
+    Just other ->
+      if vcaUseIdEq useId other
+      then true
+      else vcaUseIdMember useId (eufRest identities)
+
+-- =========================================================================
+-- the dormant preflight + lookup (D2)
+-- =========================================================================
+
+-- NON-AUTHORITATIVE, and the label is part of the deliverable. Key isolation
+-- does not prove VALUE authority: an entry keyed to a live occurrence can
+-- still carry the arrow of a DIFFERENT target, and an ordinary Fenel ADT is
+-- not unforgeable. What this binds is the KEY — caller, role, typed path,
+-- target identity, authority kind — plus the carrier's body/parser SNAPSHOT,
+-- so a table built against another body or another parser representation is
+-- refused. Binding the scheme identity, the route/registry snapshot and the
+-- validation frame, and building the table inside ONE trusted orchestration
+-- path instead of accepting an arbitrary one, is slice 3g's; the carrier
+-- contract states it so it cannot be skipped.
+@label "Carrier occurrence preflight"
+@description "The DORMANT, NON-AUTHORITATIVE preflight. Refuses before any consumer entry when the whole ledger is not structurally ready, when the carrier recorded any fence, when an entry's snapshot is not this carrier's, when a live identity has no entry, when an entry names no live identity, or when either side carries a duplicate. It is a preflight rather than a checker branch because the checker's own result type cannot publish an Indeterminate. NO production caller, and no fallback anywhere."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vckPreflightTable : (carrier: VcaCarrier) -> (entries: [VckEntry]) -> VckPreflight
+vckPreflightTable carrier entries =
+  case carrier.readiness of
+    VrdFinalFence { reason = reason } -> VckRefused { reason = reason }
+    VrdNeedsRefinement { pending = pending } ->
+      VckRefused { reason = RsnMissingEvidence { useId = carrier.callerId, observed = "the ledger carries rows whose evidence demand is named but unmet" } }
+    VrdStructurallyReady ->
+      if gt (length carrier.fences) 0
+      then VckRefused { reason = RsnCheckerAbstained { detail = "the carrier recorded at least one fenced occurrence" } }
+      else if vcaIdentitiesCollide carrier.identities
+      then VckRefused { reason = RsnUnsupportedSyntax { form = "carrier-duplicate-occurrence-identity", path = [] } }
+      else if vckEntriesCollide entries
+      then VckRefused { reason = RsnUnsupportedSyntax { form = "table-duplicate-occurrence-key", path = [] } }
+      else if not (vckEntriesShareSnapshot entries carrier.snapshot)
+      then VckRefused { reason = RsnStaleEvidence { useId = carrier.callerId, observed = "a table entry was built against a different body or parser representation" } }
+      else if not (eq (length entries) (length carrier.identities))
+      then VckRefused { reason = RsnMissingEvidence { useId = carrier.callerId, observed = "the occurrence table and the carrier identities are not in bijection" } }
+      else if not (vckEveryIdentityHasEntry carrier.identities entries)
+      then VckRefused { reason = RsnMissingEvidence { useId = carrier.callerId, observed = "a live occurrence identity has no table entry" } }
+      else VckReady { entries = entries }
+
+@label "Carrier snapshot equality"
+@description "Exact equality of two carrier snapshots — the body hash, the AST ABI, the parser provenance and the carrier version. A table built against a different one is stale, not merely different."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaSnapshotEq : (left: VcaSnapshot) -> (right: VcaSnapshot) -> Boolean
+vcaSnapshotEq left right =
+  if not (eq left.bodyHash right.bodyHash) then false
+  else if not (eq left.astAbi right.astAbi) then false
+  else if not (eq left.parser right.parser) then false
+  else if not (eq left.carrierVersion right.carrierVersion) then false
+  else vcaHashEq left.inputsHash right.inputsHash
+
+-- A CROSS-DOMAIN COMPARISON IS A BOUNDARY REJECTION, NEVER AN EQUALITY. Two
+-- digests computed under different domain literals describe different KINDS of
+-- thing, and comparing their hex would be asking whether a scheme identity
+-- happens to collide with a body identity. So the domain is compared FIRST and
+-- a mismatch answers false outright rather than falling through to the hex.
+@label "Carrier hash equality"
+@description "Exact equality of two domain-tagged validation digests: same domain literal AND same hex. A domain mismatch is false — a boundary rejection rather than a hex comparison across incomparable kinds."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaHashEq : (left: ValidationHash) -> (right: ValidationHash) -> Boolean
+vcaHashEq left right =
+  if not (eq left.domain right.domain) then false
+  else if eq left.hex "" then false
+  else eq left.hex right.hex
+
+@label "Carrier table entries share snapshot"
+@description "Every table entry was built against exactly this carrier's snapshot. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vckEntriesShareSnapshot : (entries: [VckEntry]) -> (snapshot: VcaSnapshot) -> Boolean
+vckEntriesShareSnapshot entries snapshot =
+  case head entries of
+    Nothing -> true
+    Just entry ->
+      if not (vcaSnapshotEq entry.snapshot snapshot)
+      then false
+      else vckEntriesShareSnapshot (eufRest entries) snapshot
+
+@label "Carrier table entries collide"
+@description "True when two table entries carry structurally equal occurrence keys. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vckEntriesCollide : (entries: [VckEntry]) -> Boolean
+vckEntriesCollide entries =
+  case head entries of
+    Nothing -> false
+    Just first ->
+      let rest = eufRest entries
+      if vckEntryKeyMember first.useId rest
+      then true
+      else vckEntriesCollide rest
+
+@label "Carrier table key member"
+@description "Is this occurrence key structurally present among these entries? Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vckEntryKeyMember : (useId: VcaUseId) -> (entries: [VckEntry]) -> Boolean
+vckEntryKeyMember useId entries =
+  case head entries of
+    Nothing -> false
+    Just entry ->
+      if vcaUseIdEq useId entry.useId
+      then true
+      else vckEntryKeyMember useId (eufRest entries)
+
+@label "Carrier every identity has entry"
+@description "Every live occurrence identity has exactly one table entry. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "carrier"
+@category "engine-internal"
+vckEveryIdentityHasEntry : (identities: [VcaUseId]) -> (entries: [VckEntry]) -> Boolean
+vckEveryIdentityHasEntry identities entries =
+  case head identities of
+    Nothing -> true
+    Just useId ->
+      if not (vckEntryKeyMember useId entries)
+      then false
+      else vckEveryIdentityHasEntry (eufRest identities) entries
+
+@label "Carrier occurrence lookup"
+@description "The occurrence-keyed instance lookup, with NO FALLBACK OF ANY KIND. A miss is Nothing — never the function id's instance, never the public registry's declaration, never the top set, never a different use's instance. Two uses of the same quantified function in one body therefore receive different ground arrows or none."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vckLookup : (useId: VcaUseId) -> (entries: [VckEntry]) -> Maybe SetExpr
+vckLookup useId entries =
+  case head entries of
+    Nothing -> Nothing
+    Just entry ->
+      if vcaUseIdEq useId entry.useId
+      then Just entry.instance
+      else vckLookup useId (eufRest entries)
+
+-- =========================================================================
+-- the 3g carrier contract (D5) — an executable obligation, not prose
+-- =========================================================================
+
+-- `ObsCallTarget` is keyed by raw SPELLING and `vobTargetLookup` takes the
+-- FIRST same-spelled target, so two same-spelled quantified occurrences can
+-- share the wrong `resultRigids`. Converting that key is slice 3g's job. What
+-- this slice owns is making the requirement UNSKIPPABLE: the carrier contract
+-- states, in a form a test can execute, that an observation target consumed
+-- against this carrier must be keyed by an OCCURRENCE identity and not by a
+-- spelling.
+VcaContractClause = VcaContractClause id: String requirement: String satisfiedBy: String
+
+@label "Carrier contract"
+@description "The obligations any consumer of this carrier must satisfy — occurrence-keyed observation targets, no spelling keys, no fallback on a lookup miss, whole-ledger readiness before any table is populated, and flat-target agreement before any occurrence supplies evidence. Executable so slice 3g cannot quietly keep the spelling key."
+@tags "engine" "signature-substrate" "phase-4" "validation" "carrier"
+vcaCarrierContract : (unit: a) -> [VcaContractClause]
+vcaCarrierContract unit =
+  [ VcaContractClause {
+      id = "occurrence-keyed-observation-targets",
+      requirement = "an observation target consumed against this carrier is keyed by a VcaUseId occurrence identity, never by a raw call spelling",
+      satisfiedBy = "slice 3g discharges this by FENCING rather than by converting the key: vteValidate refuses any caller whose own scheme is not ground, and a ground caller has no quantifiers, so no rigid can be mis-shared and no consumer joins vobTargetLookup to a carrier occurrence. The conversion is still owed before a quantified caller is admitted"
+    }
+  , VcaContractClause {
+      id = "every-node-projection-supported",
+      requirement = "a consumer may read a carrier only when EVERY node projects to a supported form; an unsupported node that issues no identity is invisible to the fence collection and must be refused separately",
+      satisfiedBy = "vteFirstUnsupported — the total projection walk the trusted entry runs before anything else. Collecting only VciFenced and VciAliased lets an array literal, a let, a do, a where, an ann, a withInstance or a typeDef reach VckReady as VciInert"
+    }
+  , VcaContractClause {
+      id = "authority-bound-to-the-instance",
+      requirement = "an admitted occurrence binds its exact OccurrenceAuthority together with its instance, because two runs with the same key, snapshot, scheme hash and arrow can mean SueAuthorized and NsuNoCertificate",
+      satisfiedBy = "vteEntryDigest, which digests the authority alongside the instance, and vteAdmissionDigest, which binds the certificate set and the readiness the admission was reached under"
+    }
+  , VcaContractClause {
+      id = "no-lookup-fallback",
+      requirement = "a use-site lookup miss yields Nothing and never falls back to the function id, the public registry, the declaration, the top set, or a different use",
+      satisfiedBy = "vckLookup"
+    }
+  , VcaContractClause {
+      id = "whole-ledger-readiness-first",
+      requirement = "no resolved subset may populate any table before the WHOLE ledger is judged ready, so a positive lookup cannot bypass a sibling negative row",
+      satisfiedBy = "vckLedgerReadiness, consulted by vckPreflightTable before any entry is accepted"
+    }
+  , VcaContractClause {
+      id = "frozen-flat-target-agreement",
+      requirement = "an occurrence whose FROZEN source-frame target and FLAT runtime target disagree fences before it can supply evidence",
+      satisfiedBy = "vcaFlatAgreement"
+    }
+  , VcaContractClause {
+      id = "one-runtime-occurrence-one-identity",
+      requirement = "one runtime occurrence issues at most one live identity; an undecided constructor payload reading issues none",
+      satisfiedBy = "vcaConstructOp plus the vcaIdentitiesCollide reconciliation"
+    }
+  ]

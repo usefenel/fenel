@@ -1,0 +1,163 @@
+-- triggers — the durable event-router's PURE decision logic, ported as
+-- Fenel bodies (Phase 5b, ts-elimination-completion).
+--
+-- Phase 11a already ported `triggerMatches` (the trigger-match filter) into
+-- runtime/pure-algos.fenel. Phase 5b finishes the job: the remaining pure
+-- decision logic in runtime/src/triggers.ts — the waiting-instance filter
+-- match (incl. the `$`-interpolation) and the timeout-due comparison — moves
+-- here, and each per-row LOOP folds into a Fenel "which rows to act on"
+-- selection over candidate records.
+--
+-- THE INVOCATION SHAPE (Step-0 finding, notes/phase-5b-…):
+--   The top-level orchestration (read → decide → start/resume/timeout) is NOT
+--   a callUserFunction Fenel body — that path inserts a function_instances row
+--   per call (evaluator.ts:831), which on the hot per-event router path is a
+--   faithfulness regression. Instead these bodies are dispatched via the
+--   SYNCHRONOUS PURE PASS (dispatchEngineBody, same as triggerMatches): the TS
+--   shell reads the rows + wall clock (irreducible IO), calls one of these
+--   pure folds to get the action list, then runs the irreducible IO leaves
+--   (startFunctionInstance insert / resumeWaitingInstance / handleTimeout —
+--   the evaluator's durable state machine, which STAYS TS). Same "Fenel
+--   decides, TS runs the effects" shape as telegram's form-completion body.
+--
+-- All bodies here are PURE (no IO, no `requires`). Effect INFERRED.
+--
+-- typed-function-references Phase FM-retire-5 Step 5b (2026-06-06) — gained the
+-- `module runtime where` header + sigs + facets; unions with the other 3
+-- runtime body files at the seam. Ids stay `runtime:<fn>`.
+
+module runtime where
+
+-- ---------------------------------------------------------------------------
+-- EmField — one pre-classified waiting-instance filter field.
+--
+-- The TS wrapper walks the WaitEvent `filter` record (skipping the "event"
+-- key) and for each remaining field emits:
+--   * rawValue       — the filter's value verbatim (a literal, or a
+--                       "$varName" interpolation reference)
+--   * payloadValue   — eventPayload[key] (the actual incoming value)
+--   * payloadPresent — whether `key` was present in eventPayload (reproduces
+--                      JS's `undefined`-mismatch semantics for absent keys)
+--
+-- The `$`-interpolation guard + key-slice + vars-lookup stay in the BODY
+-- (emMatchInterp) — NOT pre-resolved wrapper-side — so the round-trip test
+-- exercises the real interpolation path (watch-out #1).
+-- ---------------------------------------------------------------------------
+
+EmField =
+  EmField rawValue: a payloadValue: a payloadPresent: a
+
+-- ---------------------------------------------------------------------------
+-- EmInput — pre-classified waiting-instance match input.
+--
+-- The wrapper checks `filter.event === eventType` (+ WaitEvent extraction +
+-- the profile gate) TS-side; on any "does not apply" it emits EmiTypeMismatch
+-- (sister of triggerMatches's TmiTypeMismatch). On a type match it emits
+-- EmiCheck carrying the per-field list + the instance's `vars` record (so the
+-- body can resolve `$`-interpolations against it).
+-- ---------------------------------------------------------------------------
+
+EmInput =
+  EmiTypeMismatch
+  | EmiCheck fields: a vars: a
+
+-- ---------------------------------------------------------------------------
+-- eventMatchesFilter — does an incoming event satisfy a waiting instance's
+-- wait_for filter? Mirrors the inner loop of
+-- implementations/typescript/runtime/src/triggers.ts:matchWaitingInstances:
+--
+--   if (filter["event"] !== eventType) continue;
+--   for (const [key, value] of Object.entries(filter)) {
+--     if (key === "event") continue;
+--     const interpolated =
+--       typeof value === "string" && value.startsWith("$")
+--         ? vars[value.slice(1)] : value;
+--     if (eventPayload[key] !== interpolated) { matches = false; break; }
+--   }
+--
+-- Body: dispatch on the variant; on EmiCheck AND across the fields.
+-- ---------------------------------------------------------------------------
+
+eventMatchesFilter : a -> Boolean
+@label "triggers: eventMatchesFilter"
+@description "Phase 5b — does an incoming event satisfy a waiting instance's wait_for filter? The TS wrapper at runtime/src/triggers.ts pre-classifies into EmInput (EmiTypeMismatch when the WaitEvent extraction / profile gate / `filter.event !== eventType` fails; EmiCheck carrying the per-field EmField list + the instance `vars` otherwise). The body dispatches on the variant + ANDs over the fields via std:all. The `$`-interpolation (startsWith `$` → lookup vars (slice value 1)) lives in the body (emMatchInterp). Boundary adapter dispatched via `dispatchedEventMatchesFilter`. Mirrors the inner loop of matchWaitingInstances."
+@tags "runtime" "triggers" "boundary" "phase-5b"
+eventMatchesFilter input = case input of
+  EmiTypeMismatch -> False
+  EmiCheck { fields = fs, vars = vs } -> all fs (emFieldMatches vs)
+
+-- emFieldMatches — per-field predicate. `$`-prefixed string values
+-- interpolate against the instance vars (key = value without the leading
+-- `$`, via `slice rv 1 (length rv)`); everything else compares verbatim.
+-- `payloadPresent` short-circuits the absent-payload cases to reproduce JS
+-- strict-`!==`-against-`undefined`.
+emFieldMatches : a -> a -> Boolean
+@label "triggers: emFieldMatches"
+@description "Phase 5b — per-field predicate for eventMatchesFilter. `$`-prefixed string filter values interpolate against the instance vars (key = value without the leading `$`); everything else compares verbatim. `payloadPresent` reproduces JS strict-`!==`-against-`undefined` for absent payload keys. Internal helper consumed by `runtime:eventMatchesFilter` via std:all. Body-only fnId."
+@tags "runtime" "triggers" "internal" "phase-5b"
+@category "runtime-internal"
+emFieldMatches vars f = case f of
+  EmField { rawValue = rv, payloadValue = pv, payloadPresent = pp } ->
+    if (isString rv) and (startsWith rv "$")
+    then emMatchInterp (lookup vars (slice rv 1 (length rv))) pv pp
+    else pp and (eq pv rv)
+
+-- emMatchInterp — resolve a `$`-interpolated field. vars-hit → match the
+-- present payload against the interpolated value; vars-miss → interpolated is
+-- JS `undefined`, so it matches iff the payload key is ALSO absent.
+emMatchInterp : a -> a -> Boolean -> Boolean
+@label "triggers: emMatchInterp"
+@description "Phase 5b — resolve a `$`-interpolated filter field. vars-hit (Just iv) → match the present payload against the interpolated value; vars-miss (Nothing) → the interpolated value is JS `undefined`, so it matches iff the payload key is also absent (`not payloadPresent`). Internal helper consumed by `runtime:emFieldMatches`. Body-only fnId."
+@tags "runtime" "triggers" "internal" "phase-5b"
+@category "runtime-internal"
+emMatchInterp lk pv pp = case lk of
+  Nothing -> not pp
+  Just iv -> pp and (eq pv iv)
+
+-- ---------------------------------------------------------------------------
+-- selectWaitingToResume — fold the matchWaitingInstances loop. Given the
+-- pre-classified candidate list (each `{ instanceId, emInput }`), return the
+-- ids whose filter matches (the instances the TS shell should resume).
+-- ---------------------------------------------------------------------------
+
+selectWaitingToResume : a -> a
+@label "triggers: selectWaitingToResume"
+@description "Phase 5b — fold the matchWaitingInstances loop. Given the pre-classified candidate list (each `{ instanceId, emInput }`), return the instanceIds whose filter matches (the instances the TS shell should resume). Boundary adapter dispatched via `dispatchedSelectWaitingToResume`."
+@tags "runtime" "triggers" "boundary" "phase-5b"
+selectWaitingToResume cs =
+  map (\c -> c.instanceId) (filter (\c -> eventMatchesFilter c.emInput) cs)
+
+-- ---------------------------------------------------------------------------
+-- instantDue — is a suspended instant due relative to `now`? Mirrors both
+-- `wakeAt && new Date(wakeAt) <= now` (WaitTimer) and
+-- `timeoutAt && new Date(timeoutAt) <= now` (WaitEvent _timeoutAt) — the two
+-- timeout checks SUBSUME into one comparison. `maybeMs` is the parsed
+-- epoch-ms (Nothing when the timestamp is absent → not due); `nowMs` is
+-- `Date.now()` parsed wrapper-side (the irreducible wall-clock IO leaf). The
+-- `<=` is inclusive (equal timestamps ARE due) — pinned by the round-trip
+-- test's `==` boundary case.
+-- ---------------------------------------------------------------------------
+
+instantDue : a -> Number -> Boolean
+@label "triggers: instantDue"
+@description "Phase 5b — is a suspended instant due relative to `now`? Subsumes both `wakeAt <= now` (WaitTimer) and `_timeoutAt <= now` (WaitEvent timeout) — the two timeout checks are one comparison. `maybeMs` is the parsed epoch-ms (Nothing → absent → not due); `nowMs` is `Date.now()` parsed wrapper-side (the irreducible wall-clock IO leaf). `<=` is inclusive. Internal helper consumed by `runtime:selectDueInstances`. Body-only fnId."
+@tags "runtime" "triggers" "internal" "phase-5b"
+@category "runtime-internal"
+instantDue maybeMs nowMs = case maybeMs of
+  Nothing -> False
+  Just m -> lte m nowMs
+
+-- ---------------------------------------------------------------------------
+-- selectDueInstances — fold the checkTimeouts / checkAllTimeouts loops.
+-- `input` = `{ candidates: List { instanceId, maybeMs }, nowMs }`. Returns the
+-- ids that are due. Used for BOTH the timer sweep (→ resumeWaitingInstance
+-- {_timer_fired}) and the event-timeout sweep (→ handleTimeout) — same
+-- selection logic; the TS shell picks the leaf per list.
+-- ---------------------------------------------------------------------------
+
+selectDueInstances : a -> a
+@label "triggers: selectDueInstances"
+@description "Phase 5b — fold the checkTimeouts / checkAllTimeouts loops. `input` = `{ candidates: List { instanceId, maybeMs }, nowMs }`. Returns the due instanceIds. Used for BOTH the timer sweep (→ resumeWaitingInstance {_timer_fired}) and the event-timeout sweep (→ handleTimeout) — same selection. Boundary adapter dispatched via `dispatchedSelectDueInstances`."
+@tags "runtime" "triggers" "boundary" "phase-5b"
+selectDueInstances input =
+  map (\c -> c.instanceId) (filter (\c -> instantDue c.maybeMs input.nowMs) input.candidates)

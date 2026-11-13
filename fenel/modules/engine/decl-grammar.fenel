@@ -1,0 +1,830 @@
+module engine where
+
+-- =========================================================================
+-- The DECLARATION GRAMMAR in Fenel — `Pattern Token` productions for the SIX
+-- top-level decl frames (`flattenProgram`'s output, fenel-module.ts:50-107),
+-- one level BELOW FenelModule. parser-substrate Phase 4 (brief:
+-- `workstreams/parser-substrate/briefs/phase-4-declaration-grammar.md`).
+--
+-- This EXTENDS the expression grammar (`expr-grammar.fenel`): the decl env =
+-- `concat <declProductions> (exprGrammar table nullValue toks)`, parsed from
+-- "Program". def bodies reuse the ENTIRE Expr machinery (Stmts/Params/…). The
+-- expr-grammar helpers (`pPunct`/`pVirt`/`splitVal`/`encodeTok`/`vocabFor`/
+-- `buildStmts`/…) resolve through the merged env — NOT duplicated here.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE DECL-LEVEL ORACLE (the Phase-4 parity contract): `parseProgToks` ⇒ a
+-- list of plain decl-frame records, deep-equal to `flattenProgram(parse src)`
+-- normalised — bodies compared in Syntax space (`dispatchedJsonLogicToSyntax`,
+-- no ctorDefs), TYPES compared via a test-local marker→`$`-key marshal (a
+-- Fenel body cannot author `$`-prefixed keys — the expr-substrate barrier; the
+-- grammar emits a plain-record TYPE-MARKER tree, the test walks it to the
+-- `$`-keyed FenelType). The marker vocabulary IS the Phase-5 loader-marshal
+-- contract. Sig/def PAIRING + facet lifting + entity assembly are the LOADER's
+-- job (Phase 5's seam) — NOT this phase; the grammar emits SEPARATE frames.
+--
+-- Each Program element is `{ frame, directives }` (directives kept beside the
+-- frame, NOT spread into it — Fenel has no record-update; the test merges them
+-- at compare time, defaulting []). A decl LINE is `{ dir = true, directive }`
+-- (a `@name args` line) or `{ dir = false, frame }`; `buildDecls` accumulates
+-- consecutive leading directives onto the next real frame (the collectLeads
+-- mirror — directives attach to the FOLLOWING decl, fenel-module.ts:216).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE FORM-MAP TABLE (pinned by RUNNING `parse(src)` + `layoutTokens(lexAll
+-- src)`, 2026-06-12 — the throwaway `_probe_p4*.ts`, deleted):
+--
+-- TYPEEXPR → compatibility FenelType plus authoritative `type_sig.scheme`:
+--   | source              | parse type_sig.type           | marker            |
+--   |---------------------|-------------------------------|-------------------|
+--   | Number / Bot        | {$ref:"Number"}               | {mk:ref,name}     |
+--   | a (sig binder)      | {$var:"a"}; qN/KType in scheme| ref → var at bind |
+--   | Type                | {$type:true}                  | {mk:ref,"Type"}   |
+--   | Maybe a / List T /  | the EXPANDED $variant/$opaque | {mk:app,head,args}|
+--   |  Result E A         |  (type-foundation Maybe/List/ |  (walker EXPANDS  |
+--   |                     |  Result helpers — VERIFIED    |  via the helper)  |
+--   |                     |  byte-identical to parse)     |                   |
+--   | Foo a (nominal app) | {$el:{call:["Foo",{$var:a}]}}  | {mk:app,head,args}|
+--   |                     | scheme app carries headRef    |  (walker ⇒ $el)   |
+--   | f a (ctor variable) | same compatibility `$el`;     | app role=scheme;  |
+--   |                     | scheme app carries headVarId  | kind KType→KType  |
+--   | Number -> String    | {$arrow:{params:[{name:_0,    | {mk:arrow,params, |
+--   |                     |  label,type,ui,meta:{}}],ret}}|  ret} (bare param |
+--   |                     |  — bare param HAS meta:{}     |  ⇒ _<i> + meta:{})|
+--   | (tk: a) -> String   | $arrow param {name:tk,label,  | named param ⇒ no  |
+--   |                     |  type,ui} — NAMED param NO meta|  meta, given name |
+--   | (A, B) -> C         | $arrow params _0=A, _1=B      | paren param list  |
+--   | (Number, String)    | {$tuple:[{$ref},{$ref}]}      | {mk:tuple,items}  |
+--   | { x: A, y: B }      | {$record:{fields:[{name,label,| {mk:record,fields}|
+--   |                     |  type,ui,meta:{}}]}}          |                   |
+--   | (T)                 | T (transparent paren)         | (unwrapped)       |
+--
+-- DECL FRAMES (the normalised `{ kind, … }` records; directives beside):
+--   | source              | parse frame                   | Fenel frame       |
+--   |---------------------|-------------------------------|-------------------|
+--   | f : T               | {type_sig:{name,type,scheme}} | {kind:sig,name,   |
+--   |                     |                               |  ty,scheme}       |
+--   | f x = body          | {def:{name,params,body,dir?}} | {kind:def,name,   |
+--   |                     |  body = JSON Logic            |  params,body=Synt}|
+--   | @label "x" ↑decl    | directives:[{name,args}] on   | accumulated by    |
+--   |                     |  the FOLLOWING decl frame     |  buildDecls       |
+--   | module X where      | {module_decl:{name}}          | {kind:module,name}|
+--   | (header + decls)    | module frame FIRST, decls aft | mkModuleProg      |
+--
+-- LAYOUT (pinned): header-less = `vopen Decl (vsemi Decl)* vclose eof`; a
+-- single decl unwraps (flattenProgram:628). Headered = `vopen module IDENT
+-- where vopen Decls vclose vclose eof` (the `where` OPENS an inner block);
+-- header-ONLY (no decls) = `vopen module IDENT where vclose eof` (no inner
+-- vopen). Directives lay out as a vsemi SIBLING before their decl (`vopen @
+-- name str vsemi <decl> …`). The `=` opener wraps a def body `vopen Stmts
+-- vclose`. D1: TypeExpr + sigs + module headers + directives + Program/Decls +
+-- def bodies. D2: type DEFS — variants (nullary / bare-positional / named /
+-- brace-record / `[T]` list-sugar fields), type params, opaque ctor-form +
+-- alias-form, @discriminator (the directive lifts to the discriminator slot,
+-- reproduced test-side). The typedef-vs-def discriminator is the LHS name's
+-- CASE (`Foo = …` ⇒ type_def via upperIdentCls, `x = …` ⇒ def via
+-- lowerIdentCls). Ctor HEADS are upperIdentCls; a ctor body is a flat ELEM
+-- list (`ident :` markers + atoms) regrouped by `buildCtor` (the no-lookahead
+-- encoding: `chars: List Char` ⇒ one app field, `lo: Number hi: Number` ⇒ two
+-- atom fields). opaque ALIAS arm precedes the ctor arm (the `no | / no ident:`
+-- ⇒ alias rule). `[T]` list-sugar ⇒ `List T` (also a D1 sig atom).
+--
+-- FENCES (parity over coverage — pinned + corpus-counted, deliberately out):
+--   • IMPORTS — all four TS forms are supported: selective and alias for
+--     either module case (and spelled `using` as well, modules-as-values
+--     Phase 5c-1a); qualified/hiding for uppercase module names. Bare
+--     lowercase `import foo` remains ordinary application syntax on both
+--     sides; `using M` and `using M hiding (…)` are refused (Phase 5b).
+--   • FIXITY declarations are supported. The file driver threads the updated
+--     table through following declaration groups; earlier bodies are unchanged.
+--   • the type-application EXPANSION beyond Maybe/List/Result — the parser
+--     resolves ANY registered parametric type against the type registry; the
+--     test walker reproduces only the three std helpers (the Phase-5 loader
+--     marshal does the general registry resolution). Other registered heads
+--     are out of the differential; UNregistered heads ⇒ `$el` (clean, in).
+--   • REFINEMENT-form type-defs — the WHOLE `value ∈ <set>` class is now IN
+--     (Phase 4i — `refinedLine`/`setexprBody`): enum + intervals + the predicate
+--     `$where` (token-clean) AND regex / named-format / math-symbol / union (the
+--     lexer-SHREDDED forms). `spliceSetBodies` (the lexer-stream pre-pass) cuts
+--     the verbatim source slice of the body into ONE `setbody` token, and the
+--     TS marshal hands it to `dispatchedParseSetExpr` (the canonical SetExpr
+--     parser the oracle uses). FENCED: the `value in` keyword form (0 corpus);
+--     the opaque+refinement hybrid `opaque … = Nat | value ∈ …` (foundation,
+--     bootstrapped — the TS oracle drops the opaque repr).
+--   • Inline `T where p` declaration types use the DeclTy profile of the shared
+--     type grammar; expression annotations retain their smaller fragment. The expression
+--     annotation `( Expr : Type )` (modules-as-values Phase 2d) reuses this
+--     TypeExpr sub-grammar, now defined once in `typeGrammar`; `::` is not
+--     syntax on either side.
+--   • def-where (`f x = y where y = …`) — LANDED (fenel-surface-extensions
+--     Phase 4): the def body's `Stmts` reuses the expr grammar, whose `exprStmt`
+--     now carries the optional `where`-clause (`whereOptPat`), so a def-where
+--     body parses to the oracle's `{where:[…]}` for free (no decl-grammar change).
+--
+-- NO new entities (decl frames + type markers are plain records — lock stays
+-- 1189). NO laws. The marker builders + decl/type productions + `parseProgToks`
+-- are all NEW Fenel fns here.
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- buildTyApp — a TypeExpr application head + atom-arg list ⇒ a marker. No
+-- args ⇒ the head atom passes through (a bare ref / paren / tuple / record);
+-- with args ⇒ an `app` marker carrying the head's NAME (the walker dispatches
+-- Maybe/List/Result ⇒ expansion, else ⇒ `$el`). parser-substrate Phase 4 (D1).
+-- -------------------------------------------------------------------------
+
+@label "Build type application"
+@description "Fold a TypeExpr application head marker + a list of atom-arg markers into a marker: no args ⇒ the head passes through; with args ⇒ `{mk = \"app\", head = head.name, args}` (the test walker resolves Maybe/List/Result via the std helpers, an unregistered head via `$el`). parser-substrate Phase 4 (D1)."
+@tags "engine" "parser" "decl-grammar" "parser-substrate" "phase-4"
+buildTyApp : (head: a) -> (args: a) -> a
+buildTyApp head args =
+  if eq (length args) 0 then head
+  else { mk = "app", head = head.name, args = args }
+
+@label "Build source signature frame"
+@description "Bind one parsed source signature at its declaration boundary. sourceBindSignature is Fenel-owned; this helper seats its compatibility marker and authoritative scheme sidecar directly on the grammar frame. Signature-substrate Phase 2."
+@tags "engine" "parser" "decl-grammar" "signature-substrate" "phase-2"
+buildSourceSigFrame : (name: String) -> (ty: a) -> a
+buildSourceSigFrame name ty =
+  let bound = sourceBindSignature name ty
+  { kind = "sig", name = name, ty = bound.type, scheme = bound.scheme }
+
+
+-- -------------------------------------------------------------------------
+-- buildDecls — a decl-LINE list ⇒ the `{ frame, directives }` element list.
+-- Walks accumulating consecutive directive lines (`l.dir`) into a directives
+-- list; each real decl line (`l.frame`) flushes the accumulator onto that
+-- frame and resets (the collectLeads mirror — directives attach to the
+-- FOLLOWING decl, fenel-module.ts:216). parser-substrate Phase 4 (D1).
+-- -------------------------------------------------------------------------
+
+@label "Build declarations"
+@description "Re-assemble a decl-LINE list into the Program element list `[{frame, directives}]`: consecutive `@name args` directive lines accumulate and attach to the FOLLOWING real decl frame (the loader's collectLeads behaviour, fenel-module.ts:216). parser-substrate Phase 4 (D1)."
+@tags "engine" "parser" "decl-grammar" "parser-substrate" "phase-4"
+buildDecls : (lines: a) -> a
+buildDecls lines = buildDeclsGo lines [] []
+
+@label "Build declarations (go)"
+@description "buildDecls' walk: thread a directive accumulator + the output element list; a directive line appends to the accumulator, a real frame flushes the accumulator onto `{frame, directives}` and resets. At end of input a NON-EMPTY accumulator means directives that annotate nothing: they emit a `dangling` frame (naming the first of them) instead of being silently dropped (declaration-annotations Phase 1 A.1). Internal decl-grammar helper. parser-substrate Phase 4 (D1)."
+@tags "engine" "internal" "parser" "decl-grammar" "parser-substrate" "phase-4"
+@category "engine-internal"
+buildDeclsGo : (lines: a) -> (dirs: a) -> (frames: a) -> a
+buildDeclsGo lines dirs frames =
+  case head lines of
+    -- End of input. A non-empty accumulator is a DANGLING directive run: the
+    -- directives attach to the FOLLOWING declaration and there is none. Emit a
+    -- `dangling` frame naming the first of them — elementToFrame has no arm for
+    -- that kind, so it maps to `{}` and the loader marshal rejects the program
+    -- (`expected exactly one own-data frame discriminator`). This is the same
+    -- rejection channel importFrame uses for directives-on-import: parity of
+    -- rejection with the TS parser, never a silent drop. The empty guard keeps
+    -- every VALID program byte-identical.
+    Nothing ->
+      if eq (length dirs) 0
+      then frames
+      else
+        let d0 = at dirs 0
+        appendItem { frame = { kind = "dangling", name = d0.name }, directives = dirs } frames
+    Just l ->
+      if l.dir
+      then buildDeclsGo (tailOr lines) (appendItem l.directive dirs) frames
+      else buildDeclsGo (tailOr lines) [] (appendItem { frame = l.frame, directives = dirs } frames)
+
+-- -------------------------------------------------------------------------
+-- D2 — type-def CONSTRUCTOR field assembly. A ctor body is a flat ELEM list:
+-- `{ek = "name", name}` (an `ident :` field-start marker), `{ek = "pos", atom}`
+-- (an explicit `:Type` positional field), or `{ek = "atom", atom}` (a TyAtom).
+-- `foldCtorElems` walks it: a bare atom (NOT inside an open
+-- named field) is its own positional `_<i>` field; a `name:` marker opens a
+-- named field whose type is the APPLICATION of the following atoms (so
+-- `chars: List Char` ⇒ field `chars : List Char`, but `lo: Number hi: Number`
+-- ⇒ two fields — the `hi:` marker flushes `lo`). This is the no-lookahead
+-- encoding of the parser's `ident :`-stops-the-type behaviour. ctor fields
+-- carry NO meta/ui (unlike record-TYPE fields). parser-substrate Phase 4 (D2).
+-- -------------------------------------------------------------------------
+
+@label "Named field type"
+@description "The type marker of a named ctor field from its accumulated atom list: the application of the head atom to the rest (`List Char` ⇒ app(List,[Char]); `Number` ⇒ the bare ref). Empty ⇒ a Unit ref (defensive; a named field always has ≥1 type atom). Internal decl-grammar helper. parser-substrate Phase 4 (D2)."
+@tags "engine" "internal" "parser" "decl-grammar" "parser-substrate" "phase-4"
+@category "engine-internal"
+namedFieldType : (atoms: a) -> a
+namedFieldType atoms =
+  case head atoms of
+    Nothing -> { mk = "ref", name = "Unit" }
+    Just h -> buildTyApp h (tailOr atoms)
+
+@label "Flush pending ctor field"
+@description "Close an open named ctor field: if a field name is pending, append `{name, type = namedFieldType patoms}` to the fields, advance the containing-list occurrence index, and clear the pending state; else pass through. Internal decl-grammar helper. parser-substrate Phase 4 (D2), field-identity Phase 2a."
+@tags "engine" "internal" "parser" "decl-grammar" "parser-substrate" "phase-4"
+@category "engine-internal"
+flushPending : (st: a) -> a
+flushPending st =
+  if eq st.pname ""
+  then st
+  else { pname = "", patoms = [], idx = add st.idx 1, fields = appendItem { name = st.pname, type = namedFieldType st.patoms } st.fields }
+
+@label "Fold ctor elems"
+@description "Walk a ctor's flat ELEM list into the field list, threading `{pname, patoms, idx, fields}` where idx is the containing-list occurrence ordinal: a `name:` marker flushes any open named field then opens a new one; an `afield` marker appends a named arrow field; a `pos` marker flushes and appends an explicit PositionalField; a bare atom with NO open named field is likewise positional; a bare atom inside an open named field accumulates as its type application spine. Internal decl-grammar helper. parser-substrate Phase 4 (D2), field-identity Phase 2a."
+@tags "engine" "internal" "parser" "decl-grammar" "parser-substrate" "phase-4"
+@category "engine-internal"
+foldCtorElems : (elems: a) -> (st: a) -> a
+foldCtorElems elems st =
+  case head elems of
+    Nothing -> flushPending st
+    Just e ->
+      if eq e.ek "afield"
+      then
+        let st2 = flushPending st
+        let st3 = { pname = "", patoms = [], idx = add st2.idx 1, fields = appendItem { name = e.name, type = e.type } st2.fields }
+        foldCtorElems (concat e.siblings (tailOr elems)) st3
+      else if eq e.ek "pos"
+      then
+        let st2 = flushPending st
+        let pos = { name = concat "_" (toString st2.idx), key = PositionalField { index = st2.idx }, type = e.atom }
+        foldCtorElems (tailOr elems) { pname = "", patoms = [], idx = add st2.idx 1, fields = appendItem pos st2.fields }
+      else if eq e.ek "name"
+      then
+        let st2 = flushPending st
+        foldCtorElems (tailOr elems) { pname = e.name, patoms = [], idx = st2.idx, fields = st2.fields }
+      else
+        if eq st.pname ""
+        then foldCtorElems (tailOr elems) { pname = "", patoms = [], idx = add st.idx 1, fields = appendItem { name = concat "_" (toString st.idx), key = PositionalField { index = st.idx }, type = e.atom } st.fields }
+        else foldCtorElems (tailOr elems) { pname = st.pname, patoms = appendItem e.atom st.patoms, idx = st.idx, fields = st.fields }
+
+@label "Build constructor"
+@description "A type-def constructor from its name + flat ELEM list: `{name, fields}` where fields run `foldCtorElems` (bare atoms / `:Type` markers ⇒ explicit PositionalField `_<i>` occurrences, `name:` markers ⇒ named application-typed fields, `afield` markers ⇒ named arrow-typed fields). parser-substrate Phase 4 (D2), field-identity Phase 2a."
+@tags "engine" "parser" "decl-grammar" "parser-substrate" "phase-4"
+buildCtor : (name: String) -> (elems: a) -> a
+buildCtor name elems =
+  let st = foldCtorElems elems { pname = "", patoms = [], idx = 0, fields = [] }
+  { name = name, fields = st.fields }
+
+-- -------------------------------------------------------------------------
+-- fenel-surface-extensions Phase 7 (D-G) — the dependent-ADT `data … where`
+-- ctor-sig decomposition. A `data` constructor carries a FULL type SIGNATURE
+-- (`Cons : a -> Vec a n -> Vec a (Succ n)`), not an elem list. `dataCtorFields`
+-- mirrors the TS oracle's `arrowToFields` (fenel-parser.ts:2610): walk the
+-- ctor type's `{mk = "arrow"}` spine, collecting each param as a positional
+-- `{name, type}` field (auto-named `_<i>` when the param is unnamed; the final
+-- non-arrow `ret` is the ctor's RETURN type, NOT a field). A NULLARY ctor
+-- (`Nil : Vec a Zero` — no arrow) ⇒ `fields = []`. Pure marker walk (NO
+-- `$`-key — the field type markers ride to the loader-marshal `walkType`).
+-- -------------------------------------------------------------------------
+
+@label "Fold data-ctor arrow params"
+@description "Walk one `{mk=arrow}` marker's param list into ctor fields, threading the containing-list occurrence ordinal `{i, fields}`: a named param keeps its name and advances i; a bare param becomes `_<i>` with an explicit PositionalField i and advances i. Mirrors the TS `arrowToFields`. Internal decl-grammar helper. fenel-surface-extensions Phase 7 (D-G), field-identity Phase 2a."
+@tags "engine" "internal" "parser" "decl-grammar" "fenel-surface-extensions" "phase-7"
+@category "engine-internal"
+foldArrowParams : (params: a) -> (i: a) -> (fields: a) -> a
+foldArrowParams params i fields =
+  case head params of
+    Nothing -> { i = i, fields = fields }
+    Just p ->
+      if p.named
+      then foldArrowParams (tailOr params) (add i 1) (appendItem { name = p.name, type = p.type } fields)
+      else foldArrowParams (tailOr params) (add i 1) (appendItem { name = concat "_" (toString i), key = PositionalField { index = i }, type = p.type } fields)
+
+@label "Data-ctor fields"
+@description "Decompose a `data` constructor's full type-signature marker into fields (the TS `arrowToFields` mirror): walk the `{mk=arrow}` spine collecting named or explicit-positional params via `foldArrowParams`, recursing into `ret`; the final non-arrow `ret` is the RETURN type (not a field). A nullary ctor (non-arrow type) ⇒ `[]`. fenel-surface-extensions Phase 7 (D-G), field-identity Phase 2a."
+@tags "engine" "parser" "decl-grammar" "fenel-surface-extensions" "phase-7"
+dataCtorFields : (ty: a) -> (i: a) -> (fields: a) -> a
+dataCtorFields ty i fields =
+  if eq ty.mk "arrow"
+  then
+    let st = foldArrowParams ty.params i fields
+    dataCtorFields ty.ret st.i st.fields
+  else fields
+
+@label "Build data constructor"
+@description "A dependent-ADT constructor from its name + full type-signature marker: `{name, type, fields}` where `type` is the verbatim sig marker (carried for the future dependent checker) and `fields` is its `dataCtorFields` arrow-spine decomposition. fenel-surface-extensions Phase 7 (D-G)."
+@tags "engine" "parser" "decl-grammar" "fenel-surface-extensions" "phase-7"
+buildDataCtor : (name: String) -> (ty: a) -> a
+buildDataCtor name ty = { name = name, type = ty, fields = dataCtorFields ty 0 [] }
+
+-- -------------------------------------------------------------------------
+-- Signature-substrate Phase 2 — constructor continuation layout. When a type
+-- def's fields or `|`-variants wrap to a column LESS than the `=`-opened body
+-- block's anchor, layout emits a SPURIOUS `vclose` MID-body. The orphaned tail
+-- is separator-less: named fields appear as `ident : TyExpr`; peer constructors
+-- retain their leading `|`. `CtorLayoutTail` parses those events and this fold
+-- attaches each field to the current last constructor or appends the peer.
+-- A real next top-level declaration is preceded by `vsemi`, so it cannot enter
+-- this tail. This is the source-of-truth fix mirrored by fenel-parser.ts.
+--
+-- Former S6 only repaired multi-VARIANT ctor body layout. When a type def's `|`-variants wrap to a
+-- column LESS than the `=`-opened body block's anchor, layout emits a SPURIOUS
+-- `vclose` MID-body (the body block opened at the FIRST ctor head's column; a
+-- dedented `| Ctor` line closes it early). The trailing variants then ride
+-- OUTSIDE that block (program-continuation level), closed only by the OUTER
+-- program vclose. (`ir-types`, `prover/types`, `permissions`, `subscriptions`,
+-- `dashboard/io`, `email-webhooks`, `codec`, `inputs`, `auth/subject`.) Phase 2
+-- generalises that repair to the 55 named fields formerly misread as signatures.
+-- -------------------------------------------------------------------------
+
+@label "Append fields to final constructor"
+@description "Append separator-less continuation fields to the current final constructor while preserving every preceding constructor. Signature-substrate Phase 2 multiline-ADT layout repair."
+@tags "engine" "parser" "decl-grammar" "signature-substrate" "phase-2"
+appendFieldsToLastCtor : (ctors: a) -> (fields: a) -> a
+appendFieldsToLastCtor ctors fields =
+  case head ctors of
+    Nothing -> ctors
+    Just ctor ->
+      case head (tailOr ctors) of
+        Nothing -> appendItem (mapSet ctor "fields" (concat ctor.fields fields)) []
+        Just remaining -> concat (appendItem ctor []) (appendFieldsToLastCtor (tailOr ctors) fields)
+
+@label "Apply constructor layout tail"
+@description "Fold orphaned post-vclose constructor-layout events in source order: a field event appends to the current final constructor; a constructor event appends a peer. A top-level declaration cannot appear here because layout prefixes it with vsemi. Signature-substrate Phase 2."
+@tags "engine" "parser" "decl-grammar" "signature-substrate" "phase-2"
+applyCtorLayoutTail : (ctors: a) -> (events: a) -> a
+applyCtorLayoutTail ctors events =
+  case head events of
+    Nothing -> ctors
+    Just event ->
+      if eq event.kind "field"
+      then applyCtorLayoutTail (appendFieldsToLastCtor ctors (appendItem event.field [])) (tailOr events)
+      else applyCtorLayoutTail (appendItem event.ctor ctors) (tailOr events)
+
+-- -------------------------------------------------------------------------
+-- withInclusive — attach the bracket-derived `inclusive` flag to a parsed
+-- interval bound. A PRESENT bound `{present, value}` gains `inclusive` (`[`/`]`
+-- ⇒ true, `(`/`)` ⇒ false); an absent bound `{present = false}` passes through.
+-- parser-substrate Phase 4h batch 3 (S2 — intervals).
+-- -------------------------------------------------------------------------
+
+@label "With interval-bound inclusive flag"
+@description "Attach an `inclusive` flag to a parsed interval bound: a present bound `{present, value}` becomes `{present, value, inclusive}` (`[`/`]` ⇒ true, `(`/`)` ⇒ false); an absent `{present = false}` passes through unchanged. parser-substrate Phase 4h batch 3 (S2)."
+@tags "engine" "parser" "decl-grammar" "parser-substrate" "phase-4h"
+withInclusive : (b: a) -> (incl: a) -> a
+withInclusive b incl =
+  if b.present
+  then { present = true, value = b.value, inclusive = incl }
+  else b
+-- NB withInclusive is RETAINED (registered) but SUPERSEDED by the Phase-4i
+-- slice path — the 4h-b3 token-clean interval productions it served were folded
+-- into the `value ∈ SETBODY` handoff (one refinement path, not two). Kept to
+-- avoid roster churn; not reachable from a parser entry ⇒ out of the compiled closure.
+
+-- -------------------------------------------------------------------------
+-- spliceSetBodies — parser-substrate Phase 4i. The SetExpr refinement SLICE
+-- recovery: the lexer SHREDS `value ∈ /^\d{5}$/` / `format:uuid` / `∈ ℤ` /
+-- unions into many tokens the decl grammar can't reassemble, and Design E drops
+-- offsets so the grammar can't recover the verbatim source span. This pre-pass
+-- (run on the LEXER stream, BEFORE layout) finds each `value ∈`/`value in` form,
+-- cuts the VERBATIM source slice of the body (the same `src.slice(startOff,
+-- endOff)` span the TS `parseSetForm` recovers, fenel-parser.ts:919), and
+-- REPLACES the body tokens with ONE `{t="setbody", v=<slice>}` token. The slice
+-- then rides Design E as an ordinary value-bearing token (`vocabFor toks
+-- "setbody"`, splitVal recovers it) and the decl-grammar `value ∈ SETBODY` arm
+-- hands it to `dispatchedParseSetExpr` at the marshal (the canonical SetExpr
+-- parser the TS oracle ALSO uses ⇒ byte-parity by construction). `value ∈`
+-- occurs ONLY in refinement set-forms in the corpus (every other occurrence is
+-- a comment/@description), so the context-free splice is safe. The predicate
+-- form `value.length > 0` (no `∈` — `value.length` is ONE dotted-ident token)
+-- is NOT spliced; it keeps the `$where` arm.
+-- -------------------------------------------------------------------------
+
+@label "Drop leading newlines"
+@description "Drop leading `nl` tokens from a token list (the TS `parseSetForm` `this.skip()` before reading the first set-body token). Internal decl-grammar helper. parser-substrate Phase 4i."
+@tags "engine" "internal" "parser" "decl-grammar" "parser-substrate" "phase-4i"
+@category "engine-internal"
+dropNl : (toks: a) -> a
+dropNl toks =
+  case head toks of
+    Nothing -> []
+    Just t -> if eq t.t "nl" then dropNl (tailOr toks) else toks
+
+@label "SetExpr body span"
+@description "Walk a `value ∈`-body token run tracking bracket depth (`()[]{}`), returning `{endOff, rest}`: endOff = the last non-newline body token's `off + length v` (the TS `parseSetForm` endOffset arithmetic), rest = the token list from the depth-0 `nl`/`;`/`eof` terminator onward. Interior (depth>0) newlines are skipped without advancing endOff; brackets are depth-tracked exactly as TS (fenel-parser.ts:945-963). Internal decl-grammar helper. parser-substrate Phase 4i."
+@tags "engine" "internal" "parser" "decl-grammar" "parser-substrate" "phase-4i"
+@category "engine-internal"
+setBodySpan : (toks: a) -> (depth: a) -> (endOff: a) -> a
+setBodySpan toks depth endOff =
+  case head toks of
+    Nothing -> { endOff = endOff, rest = [] }
+    Just t ->
+      if eq t.t "eof" then { endOff = endOff, rest = toks }
+      else
+        let d2 =
+              if elem t.t ["(", "[", "{"] then add depth 1
+              else if elem t.t [")", "]", "}"] then (if gt depth 0 then sub depth 1 else depth)
+              else depth
+        if and (eq d2 0) (or (eq t.t "nl") (eq t.t ";"))
+        then { endOff = endOff, rest = toks }
+        else if eq t.t "nl"
+        then setBodySpan (tailOr toks) d2 endOff
+        else setBodySpan (tailOr toks) d2 (add t.off (length t.v))
+
+@label "Splice SetExpr bodies"
+@description "The SetExpr refinement slice pre-pass (run on the lexer stream before layout): replace each `value ∈`/`value in` body with one `{t=\"setbody\", v=<verbatim src slice>}` token, recovering the span the lexer shredded (the TS `parseSetForm` `src.slice` recovery). The decl-grammar's `value ∈ SETBODY` arm hands the verbatim slice to `dispatchedParseSetExpr` at the marshal — the canonical SetExpr parser the TS oracle also uses. `value ∈` occurs only in refinement set-forms (context-safe). parser-substrate Phase 4i."
+@tags "engine" "parser" "decl-grammar" "parser-substrate" "phase-4i"
+spliceSetBodies : (src: String) -> (toks: a) -> a
+spliceSetBodies src toks = spliceGo src toks []
+
+@label "Splice SetExpr bodies (go)"
+@description "spliceSetBodies' walk: on a `value` ident followed by `∈` (op) / `in` (keyword), drop leading body newlines, compute the body span (setBodySpan), cut the verbatim slice `slice src startOff endOff`, and emit `value`, the `∈`/`in` token, and the synthetic setbody token, then continue from the terminator; every other token passes through. Internal decl-grammar helper. parser-substrate Phase 4i."
+@tags "engine" "internal" "parser" "decl-grammar" "parser-substrate" "phase-4i"
+@category "engine-internal"
+spliceGo : (src: String) -> (toks: a) -> (out: a) -> a
+spliceGo src toks out =
+  case head toks of
+    Nothing -> out
+    Just tk ->
+      let rest = tailOr toks
+      if and (eq tk.t "ident") (eq tk.v "value")
+      then
+        case head rest of
+          Nothing -> appendItem tk out
+          Just op ->
+            if or (and (eq op.t "op") (eq op.v "∈")) (eq op.t "in")
+            then
+              let body0 = dropNl (tailOr rest)
+              case head body0 of
+                Nothing -> spliceGo src rest (appendItem tk out)
+                Just first ->
+                  let span = setBodySpan body0 0 first.off
+                  let sl = slice src first.off span.endOff
+                  let setTok = { t = "setbody", v = sl, ln = tk.ln, col = tk.col, off = first.off }
+                  spliceGo src span.rest (appendItem setTok (appendItem op (appendItem tk out)))
+            else spliceGo src rest (appendItem tk out)
+      else spliceGo src rest (appendItem tk out)
+
+@label "Module program"
+@description "Assemble a headered Program's element list: the `{kind = \"module\", name}` frame FIRST (directives []), then `buildDecls` of the inner decl lines (parse emits the module_decl frame ahead of the body decls). parser-substrate Phase 4 (D1)."
+@tags "engine" "parser" "decl-grammar" "parser-substrate" "phase-4"
+mkModuleProg : (name: String) -> (decls: a) -> a
+mkModuleProg name decls =
+  concat (appendItem { frame = { kind = "module", name = name }, directives = [] } []) (buildDecls decls)
+
+
+-- =========================================================================
+-- declGrammar — build the per-input decl/type production env + merge the
+-- expression grammar. Parsed from "Program". The TypeExpr sub-grammar emits
+-- the plain-record marker tree; the decl-line productions emit `{dir, …}`
+-- items; Program/Decls assemble frames. Value-class vocabularies (ident/str)
+-- close over THIS token list (Design E). The non-recursive alternations
+-- (atoms, decl-line arms, arrow LHS) are inlined VALUES (the fixpoint cost is
+-- ~quadratic in NAMED count, P3b/P3c surprise) — 9 NEW named productions.
+-- =========================================================================
+
+@label "Declaration grammar"
+@description "Build the declaration environment from Program/Decls, the refinement-enabled DeclTy profile of typeGrammarProfile and the expression grammar. Annotation Ty productions remain separate and unchanged. Declaration type markers and source-bound signature schemes are lowered through the existing Fenel programToFrames body before their permanent host marshalling boundary."
+@tags "engine" "parser" "decl-grammar" "parser-substrate" "phase-4"
+declGrammar : (table: a) -> (nullValue: a) -> (toks: a) -> a
+declGrammar table nullValue toks =
+  -- VALUE CLASSES via WsPrefix (the 7g Design-E perf refinement — O(prefix)
+  -- membership, not an O(group) WsEnum eq-scan over the per-input ident vocab; see
+  -- expr-grammar.fenel's Design-E note). `encVirt "ident"` = the `ident\0` prefix.
+  let identCls = { tag = "WsPrefix", prefix = encVirt "ident" }
+  let fieldNameCls = parserFieldNameClass identCls
+  -- upper/lower-ident discriminate type-defs (uppercase head) from defs (lowercase
+  -- head) on the VALUE's first char (after `ident\0`) — NOT a pure type prefix.
+  -- Express EXACTLY via the existing combinators: upperIdentCls = the union of the
+  -- 26 `ident\0<A-Z>` prefixes (O(26), constant); lowerIdentCls = ident INTERSECT
+  -- the complement of upper (so `_`/digit/unicode initials stay lower, matching the
+  -- old `not (isUpperName …)` filter — `isUpperName` is `first char ∈ A-Z`).
+  let upperIdentCls = { tag = "WsUnion", branches = map (\c -> { tag = "WsPrefix", prefix = concat (encVirt "ident") c }) (chars "ABCDEFGHIJKLMNOPQRSTUVWXYZ") }
+  let lowerIdentCls = { tag = "WsIntersect", branches = appendItem identCls (appendItem { tag = "WsComplement", inner = upperIdentCls } []) }
+  let strClsD = { tag = "WsPrefix", prefix = encVirt "str" }
+  -- Declaration types bind the refinement-enabled DeclTy profile. Expression
+  -- annotations keep their Ty profile, so the same builder serves both without
+  -- admitting a refinement into the deliberately smaller annotation fragment.
+  let ty = typeGrammarProfile identCls "DeclTy" true
+  let tyAtom = ty.tyAtom
+  let tyAppAngle = ty.tyAppAngle
+  let arrowLHS = ty.arrowLHS
+  let numClsD = { tag = "WsPrefix", prefix = encVirt "num" }
+  -- Decl lines (inlined VALUE): directive / sig / def.
+  let dirArgsPat = PAlt (PRed (PSeq (PMatch strClsD) (PRef "DirArgs")) (\p -> concat (appendItem (splitVal p.fst) []) p.snd)) (PEpsV [])
+  let directiveLine = PRed (PSeq (pPunct "@") (PSeq (PMatch identCls) (PRef "DirArgs"))) (\p -> { dir = true, directive = { name = splitVal p.snd.fst, args = p.snd.snd } })
+  let sigLine = PRed (PSeq (PMatch identCls) (PSeq (pPunct ":") (PRef "DeclTyExpr"))) (\p -> { dir = false, frame = buildSourceSigFrame (splitVal p.fst) p.snd.snd })
+  let optParams = PAlt (PRef "Params") (PEpsV [])
+  -- S2 — typedef LHS angle-PARAMS (`EventEntry<a> = …`, `Event<a> = …` —
+  -- events/types). The `<a>` / `<a, b>` is a TYPE-PARAM on the typedef LHS
+  -- (DISTINCT from 7a's `<>` in the RHS type-ARG position) ⇒ the same `params`
+  -- list as the space-separated juxtaposition form (`EventEntry a = …` ⇒
+  -- params ["a"]). `<`/`>` are single-char punct tokens (the 7a/4h angle lexing
+  -- — `<a>` lexes `< ident >`); the body reuses the comma-separated ident list.
+  -- `tyOptParams` (angle FIRST, else juxtaposition Params, else none) seats the
+  -- LHS-param of typedef / refined (NOT def — a lowercase def takes value Params).
+  -- parser-substrate Phase 7b (the 7a-machinery 2-birds: same `<>` lexing, new seat).
+  let angleParamsListPat = PAlt (PRed (PSeq (PMatch identCls) (PSeq (pPunct ",") (PRef "AngleParams"))) (\p -> concat (appendItem (splitVal p.fst) []) p.snd.snd)) (PRed (PMatch identCls) (\e -> appendItem (splitVal e) []))
+  let angleParams = PRed (PSeq (pPunct "<") (PSeq (PRef "AngleParams") (pPunct ">"))) (\p -> p.snd.fst)
+  let tyOptParams = PAlt angleParams optParams
+  -- def name is LOWERCASE (the typedef-vs-def discriminator — the parser keys on
+  -- the LHS name's case: `Foo = Bar` ⇒ type_def, `x = Bar` ⇒ def).
+  let defLine = PRed (PSeq (PMatch lowerIdentCls) (PSeq optParams (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (pVirt "vclose")))))) (\p -> { dir = false, frame = { kind = "def", name = splitVal p.fst, params = p.snd.fst, body = p.snd.snd.snd.snd.fst } })
+  -- S1 — the `(op)` operator-def form (`std/operators`: `(.) : (b -> c) -> …` /
+  -- `(.) f g = …`, `($) : …` / `($) f x = …`). A PARENTHESIZED operator token is
+  -- a sig / def HEAD whose name is the BARE operator string (the oracle emits
+  -- `{type_sig:{name:"."}}` / `{def:{name:"."}}` — RUN-pinned 2026-06-13). `.`/`$`
+  -- lex as static op tokens (`(.)` ⇒ `( . )`); `opHeadCls` = the static op set +
+  -- the per-input `op` vocab. The arms sit AFTER sigLine/defLine but the `(`-head
+  -- is disjoint from the ident-head arms (no overlap). parser-substrate Phase 7b
+  -- (the FM-retire-9c precondition — that std-port phase ports `.`/`$` via this form).
+  let staticOpsD = [encStatic "+", encStatic "-", encStatic "*", encStatic "/", encStatic "%", encStatic "==", encStatic "!=", encStatic "<", encStatic ">", encStatic "<=", encStatic ">=", encStatic "$", encStatic "."]
+  let opHeadCls = { tag = "WsUnion", branches = appendItem { tag = "WsEnum", values = staticOpsD } (appendItem { tag = "WsPrefix", prefix = encVirt "op" } []) }
+  let opHead = PSeq (pPunct "(") (PSeq (PMatch opHeadCls) (pPunct ")"))
+  let sigLineOp = PRed (PSeq opHead (PSeq (pPunct ":") (PRef "DeclTyExpr"))) (\p -> { dir = false, frame = buildSourceSigFrame (splitVal p.fst.snd.fst) p.snd.snd })
+  let defLineOp = PRed (PSeq opHead (PSeq optParams (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (pVirt "vclose")))))) (\p -> { dir = false, frame = { kind = "def", name = splitVal p.fst.snd.fst, params = p.snd.fst, body = p.snd.snd.snd.snd.fst } })
+  -- D2 — type DEFS. A ctor body = flat ELEM list (`name:` markers + atoms);
+  -- ctor HEADS are UPPERCASE (rejecting the refined-form `Base | predicate`,
+  -- whose RHS is a lowercase predicate ⇒ FENCED). Ctors are `|`-separated,
+  -- multi-line inserting a `vsemi` before each `|` (the layout pin).
+  let namedMarker = PRed (PSeq (PMatch fieldNameCls) (pPunct ":")) (\p -> { ek = "name", name = splitVal p.fst })
+  -- A ctor-field atom admits the legacy `<>` angle-generic (`Maybe<Number>`,
+  -- `EntityRef<…>`) as a SINGLE atom — `tyAppAngle` FIRST so `Maybe<Number>`
+  -- matches as one unit (a bare `tyAtom` would match only `Maybe` and orphan
+  -- `<Number>`). The S2 batch-1 repair admitted `<>` in TyApp (sig position); this
+  -- extends it to the ctor-field-atom position (parser-substrate Phase 4h-b2).
+  let tyAtomA = PAlt tyAppAngle tyAtom
+  let atomElem = PRed tyAtomA (\a -> { ek = "atom", atom = a })
+  -- fenel-surface-extensions Phase 2 (D-F, Step 2) — the `:Type` ANONYMOUS
+  -- positional field. A leading `:` (no preceding ident) + a TyAtom ⇒ the SAME
+  -- `{ek = "pos", atom}` origin marker — `foldCtorElems` auto-names it
+  -- `_<idx>` (`Age = :Number` ≡ `Age = Age Number`; `Pair a b = :a :b`).
+  -- Disambiguated from `namedMarker` (`ident` THEN `:`) by the LEADING token: the
+  -- `:` comes FIRST here, no lookahead needed. The leading `:` is the newtype
+  -- discriminant (D-F sub-rule 1) — it spells "a field OF this type", distinct
+  -- from the bare `Age = Number` alias. TS mirror in fenel-parser.ts:parseTypeDef.
+  let posFieldElem = PRed (PSeq (pPunct ":") tyAtomA) (\p -> { ek = "pos", atom = p.snd })
+  -- S4 — arrow-typed ctor / typeclass-method fields (`update : (a, b) -> a`,
+  -- `read_post : PostId -> Post`, `fmap : (a -> b) -> f<a> -> f<b>`). `->` is a
+  -- LAYOUT OPENER (P4 surprise 2), so an arrow field reads `name : LHS -> vopen
+  -- <ret> <SIBLING fields> vclose` — the DEFERRED-VCLOSE NEST puts the FOLLOWING
+  -- ctor fields INSIDE the arrow's vopen block (single-line multi-field classes).
+  -- `RetSpine` returns `{ ret, siblings }`: it parses the return type (atoms, with
+  -- a curried `-> vopen RetSpine vclose` recursion building the nested arrow),
+  -- stopping at the first `ident :` (the namedMarker-first disambiguation, resolved
+  -- by parallel-derivation + first-Just). Because EACH `->` opens a DEEPER vopen,
+  -- a single-line multi-method class nests every FOLLOWING field in the INNERMOST
+  -- arrow's block — so the deferred-nested SIBLING fields are collected by the
+  -- PLAIN arm's trailing `CtorElems` and threaded back up unchanged through the
+  -- curried recursion, then spliced at the ctor level by foldCtorElems' `afield`
+  -- arm. The atom set ADMITS angle-apps (`f<a>`) via `tyAtomA`. arrowLHS (D1)
+  -- gives the param list (`(a,b)` ⇒ _0/_1).
+  let retAtomsPat = PAlt (PRed (PSeq tyAtomA (PRef "RetAtoms")) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV [])
+  let retSpineCurried = PRed (PSeq (PRef "RetAtoms") (PSeq (pPunct "->") (PSeq (pVirt "vopen") (PSeq (PRef "RetSpine") (pVirt "vclose"))))) (\p -> { ret = { mk = "arrow", params = appendItem { named = false, type = namedFieldType p.fst } [], ret = p.snd.snd.snd.fst.ret }, siblings = p.snd.snd.snd.fst.siblings })
+  -- fenel-surface-extensions Phase 2 (D-F) — the arrow-field SIBLING tail uses the
+  -- posFieldElem-FREE element list `CtorElemsNP`. RetAtoms is GREEDY (accumulates
+  -- atoms into the return type); WITHOUT this, a `:Type` positional arm in the
+  -- sibling CtorElems would let RetAtoms over-consume the NEXT field's NAME ident
+  -- and then mop up its `: Type` as a positional field — a spurious completion that
+  -- mis-parses arrow-method classes (`Monoid a = Monoid mappend: a -> a -> a
+  -- mempty: a` ⇒ `mempty` swallowed). Restricting the sibling tail to the
+  -- pre-Phase-2 element set restores the byte-identical parse (the sibling-tail
+  -- disambiguation always relied on the leftover `: a` NOT being consumable). A
+  -- `:Type` field AFTER an arrow-method field in the same ctor is unsupported (0
+  -- corpus, not in the D-F examples); the DIRECT ctor/sugar field list keeps it.
+  let retSpinePlain = PRed (PSeq (PRef "RetAtoms") (PRef "CtorElemsNP")) (\p -> { ret = namedFieldType p.fst, siblings = p.snd })
+  let retSpinePat = PAlt retSpineCurried retSpinePlain
+  let arrowField = PRed (PSeq (PMatch fieldNameCls) (PSeq (pPunct ":") (PSeq arrowLHS (PSeq (pPunct "->") (PSeq (pVirt "vopen") (PSeq (PRef "RetSpine") (pVirt "vclose"))))))) (\p -> { ek = "afield", name = splitVal p.fst, type = { mk = "arrow", params = p.snd.snd.fst, ret = p.snd.snd.snd.snd.snd.fst.ret }, siblings = p.snd.snd.snd.snd.snd.fst.siblings })
+  let elemVal = PAlt arrowField (PAlt namedMarker (PAlt posFieldElem atomElem))
+  let ctorElemsPat = PAlt (PRed (PSeq elemVal (PRef "CtorElems")) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV [])
+  -- The pre-Phase-2 element set (no `posFieldElem`) for the arrow-field sibling
+  -- tail (`retSpinePlain` → "CtorElemsNP"); see the retSpinePlain note above.
+  let elemValNP = PAlt arrowField (PAlt namedMarker atomElem)
+  let ctorElemsNPPat = PAlt (PRed (PSeq elemValNP (PRef "CtorElemsNP")) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV [])
+  let ctorVal = PRed (PSeq (PMatch upperIdentCls) (PRef "CtorElems")) (\p -> buildCtor (splitVal p.fst) p.snd)
+  let vsemiOptPipe = PSeq (PAlt (pVirt "vsemi") (PEpsV "")) (pPunct "|")
+  let ctorsPat = PAlt (PRed (PSeq ctorVal (PSeq vsemiOptPipe (PRef "Ctors"))) (\p -> concat (appendItem p.fst []) p.snd.snd)) (PRed ctorVal (\c -> appendItem c []))
+  -- Signature-substrate Phase 2 — after a spurious mid-body `vclose`, accept
+  -- the separator-less tail as an ordered stream of named-field continuations
+  -- and `| Ctor` peers. A following top-level declaration starts with `vsemi`
+  -- and therefore cannot be consumed here. The field arm uses full TyExpr, so
+  -- nested applications/arrows survive; blank/comment lines were already
+  -- erased by layout. Events are folded by applyCtorLayoutTail.
+  let ctorContinueField = PRed (PSeq (PMatch fieldNameCls) (PSeq (pPunct ":") (PRef "DeclTyExpr"))) (\p -> { kind = "field", field = { name = splitVal p.fst, type = p.snd.snd } })
+  let ctorContinuePeer = PRed (PSeq (pPunct "|") ctorVal) (\p -> { kind = "ctor", ctor = p.snd })
+  let ctorLayoutTailPat = PAlt (PRed (PSeq ctorContinueField (PRef "CtorLayoutTail")) (\p -> concat (appendItem p.fst []) p.snd)) (PAlt (PRed (PSeq ctorContinuePeer (PRef "CtorLayoutTail")) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV []))
+  let typedefLine = PRed (PSeq (PMatch upperIdentCls) (PSeq tyOptParams (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PRef "Ctors") (PSeq (pVirt "vclose") (PRef "CtorLayoutTail"))))))) (\p -> { dir = false, frame = { kind = "typedef", name = splitVal p.fst, params = p.snd.fst, ctors = applyCtorLayoutTail p.snd.snd.snd.snd.fst p.snd.snd.snd.snd.snd.snd } })
+  -- fenel-surface-extensions Phase 2 (D-F, Step 1) — the SINGLE-CONSTRUCTOR
+  -- SUGAR (the answer to the rejected `class`/`instance` keyword, D-B). A
+  -- single-ctor type omits the repeated ctor head: `MyType = x: String y: Number`
+  -- ≡ `MyType = MyType x: String y: Number` (the ctor name DEFAULTS to the type
+  -- name, D-F sub-rule 3). NO new IR / NO new builder — `buildCtor typeName elems`
+  -- supplies the type name as the ctor name, producing a `{type_def}` BYTE-
+  -- IDENTICAL to the de-sugared explicit form.
+  --   Discriminant (D-F): the body's LEAD elem must be a `namedMarker` (`ident :`),
+  -- a `posFieldElem` (leading `:Type`), or an `arrowField` (`ident : LHS -> …`) —
+  -- NOT a bare atom (that stays the `Age = Number` alias/type-app — sub-rule 1).
+  -- An UPPERCASE-head body parses as explicit ctor(s) via `typedefLine`, which is
+  -- ordered BEFORE this arm in `declLineVal` (first-Just-wins ⇒ explicit forms
+  -- win); the uppercase-named-field edge `Foo = Bar: T` is therefore caught by
+  -- `typedefLine` (ctor `Bar`, positional `_0:T`), never this arm. SINGLE-ctor
+  -- only — no `CtorTail` (a trailing `| Other` requires explicit heads; §3
+  -- decision, 0 corpus need). TS mirror in fenel-parser.ts:parseTypeDef.
+  let sugarLeadElem = PAlt arrowField (PAlt namedMarker posFieldElem)
+  let singleCtorSugar = PRed (PSeq (PMatch upperIdentCls) (PSeq tyOptParams (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq sugarLeadElem (PSeq (PRef "CtorElems") (pVirt "vclose"))))))) (\p -> { dir = false, frame = { kind = "typedef", name = splitVal p.fst, params = p.snd.fst, ctors = appendItem (buildCtor (splitVal p.fst) (concat (appendItem p.snd.snd.snd.snd.fst []) p.snd.snd.snd.snd.snd.fst)) [] } })
+  -- parser-substrate Phase 7j — a single ctor with an explicit LOWERCASE head
+  -- (`Block = form typeRef: … functionId: … submitLabel: …` — std/entities/page,
+  -- the `@discriminator "type"` persisted-value ctor). The TS oracle accepts ANY
+  -- ident as a ctor name (`ctorName = this.expect("ident").v`, fenel-parser.ts:801),
+  -- but the Fenel `ctorVal`/`typedefLine` require an UPPERCASE ctor head. This arm
+  -- fills the gap for the SINGLE-ctor / no-`|` case: uppercase typedef LHS + a
+  -- lowercase ctor head + field elems. SAFE vs refinements: the body's FIRST token
+  -- must be a LOWERCASE ident (a refinement base `Number | …` is uppercase ⇒ falls
+  -- to refinedLine; a `| <pred>` tail would leave the `|` unconsumed before vclose
+  -- ⇒ this arm fails, refinedLine wins). The `@discriminator` directive rides the
+  -- usual dirs lift in typedefFrame (NOT this arm). Ordered AFTER singleCtorSugar
+  -- (a `field:`-lead body is sugar; a bare-lowercase-ident-lead body is this).
+  let lowerSingleCtor = PRed (PSeq (PMatch upperIdentCls) (PSeq tyOptParams (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PMatch lowerIdentCls) (PSeq (PRef "CtorElems") (pVirt "vclose"))))))) (\p -> { dir = false, frame = { kind = "typedef", name = splitVal p.fst, params = p.snd.fst, ctors = appendItem (buildCtor (splitVal p.snd.snd.snd.snd.fst) p.snd.snd.snd.snd.snd.fst) [] } })
+  -- opaque: `opaque "<repr>" Name = vopen <body> vclose`. ALIAS arm FIRST (a
+  -- bare TyExpr body ⇒ alias; the `|`/`name:`-bearing body breaks TyExpr ⇒ falls
+  -- to the ctor arm — the parser's "no | and no `ident:` ⇒ alias" rule).
+  let opaqueKw = PMatch { tag = "WsEnum", values = appendItem (encodeTok { t = "ident", v = "opaque" }) [] }
+  -- NB the opaque-repr record is built via `mapSet {} "repr" …` rather than the
+  -- record literal `{ repr = … }`: a SINGLE-key record literal is lowered by the
+  -- compile pipeline (normaliseToCore) as a call `repr(…)` — the documented
+  -- single-key `{k=v}` collapse — which diverges from the interpreter (which
+  -- reads it as a record, `repr` being unregistered). `mapSet` is byte-identical
+  -- both ways and is the compile-safe idiom (parser-substrate Phase 6a).
+  let opaqueAlias = PRed (PSeq opaqueKw (PSeq (PMatch strClsD) (PSeq (PMatch identCls) (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PRef "DeclTyExpr") (pVirt "vclose"))))))) (\p -> { dir = false, frame = { kind = "typedef", name = splitVal p.snd.snd.fst, alias = p.snd.snd.snd.snd.snd.fst, opaque = mapSet {} "repr" (splitVal p.snd.fst) } })
+  -- parser-substrate Phase 7j — `tyOptParams` between the name and `=` so a
+  -- PARAMETRIC opaque variant (`opaque "array" List a = Nil | Cons head: a tail:
+  -- List a`) carries its type-params (the foundation List/String tower — 7j-S0
+  -- root-cause: NOT the `@directives` the brief §1 guessed; Nat/Int opaque defs
+  -- ALREADY parse with directives — the gap is the param list, which the
+  -- non-opaque `typedefLine` has but the opaque arm did not). `typedefFrame`
+  -- already keys `opaque`+`params`+`ctors` independently, so empty params drop
+  -- (Nat/Int/Number byte-identical) + non-empty params ride exactly as the
+  -- non-opaque path. NO marshal change.
+  let opaqueCtor = PRed (PSeq opaqueKw (PSeq (PMatch strClsD) (PSeq (PMatch identCls) (PSeq tyOptParams (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PRef "Ctors") (pVirt "vclose")))))))) (\p -> { dir = false, frame = { kind = "typedef", name = splitVal p.snd.snd.fst, params = p.snd.snd.snd.fst, ctors = p.snd.snd.snd.snd.snd.snd.fst, opaque = mapSet {} "repr" (splitVal p.snd.fst) } })
+  -- Phase 4i — the refinement-`∈` SetExpr handoff (the SLICE path). `value ∈
+  -- <body>` after the `=`-opened `vopen` (`Rate = Number | value ∈ [0..100]`,
+  -- `Uuid = String | value ∈ format:uuid`, `NonEmptyStr = String |
+  -- value.length > 0`). The lexer SHREDS regex/named-format/math-symbol/union
+  -- bodies and Design E drops offsets, so `spliceSetBodies` (the lexer-stream
+  -- pre-pass) has already collapsed the ENTIRE `value ∈ <body>` body to ONE
+  -- `setbody` token carrying the VERBATIM source slice. This arm matches `value
+  -- ∈ SETBODY` and emits `{mk=setexpr, slice}`; the TS marshal hands the slice
+  -- to `dispatchedParseSetExpr` (+ bridgeNamedToRef) — the canonical SetExpr
+  -- parser the TS oracle ALSO uses ⇒ byte-parity for enum / interval / regex /
+  -- named-format / math-symbol / union UNIFORMLY (the 4h-b3 token-clean
+  -- enum/interval productions are SUBSUMED — ONE handoff, not two). `∈` is an
+  -- `op`-class token; `value` a literal ident; `setbody` a per-input value
+  -- class — all matched via WsEnums.
+  -- DISCRIMINANT vs typedefLine — the TS `refinementFollows` rule
+  -- (fenel-parser.ts:864): the token after the first depth-0 `|` decides — an
+  -- UPPERCASE ident ⇒ an ADT variant, ANYTHING ELSE ⇒ a refinement. We honour it
+  -- by ORDERING `typedefLine` BEFORE `refinedLine` (below): a `| Ctor` upper-ident
+  -- continuation parses as a full variant list (typedefLine wins), while a
+  -- refinement RHS (`| value ∈ …` / `| <lowercase-pred>`) can't form a ctor list
+  -- ⇒ it falls through to refinedLine. (`Color = Red | Blue` ⇒ variant; `Rate =
+  -- Number | value ∈ [0..100]` ⇒ refinement.) FENCED (corpus-absent / 5c+):
+  -- the `value in` keyword form (0 corpus — splice + grammar do `∈` only). The
+  -- opaque+refinement hybrid `opaque "codepoint" Char = Nat | value ∈ …`
+  -- (foundation) is now CLOSED — `opaqueRefined` (below) reuses this `RefinedBody`
+  -- handoff with the opaque-repr carry (Phase 7j; the prior note's "the TS oracle
+  -- drops the opaque repr" was WRONG — it keeps it).
+  let valueLit = PMatch { tag = "WsEnum", values = appendItem (encodeTok { t = "ident", v = "value" }) [] }
+  let elemOp = PMatch { tag = "WsEnum", values = appendItem (encodeTok { t = "op", v = "∈" }) [] }
+  let setbodyCls = { tag = "WsPrefix", prefix = encVirt "setbody" }
+  let setexprBody = PRed (PSeq valueLit (PSeq elemOp (PMatch setbodyCls))) (\p -> { mk = "setexpr", slice = splitVal p.snd.snd })
+  -- the predicate `$where` arm: a general Expr (`value.length > 0`) ⇒ a `where`
+  -- marker carrying the Syntax (programToFrames lowers it Fenel-side via
+  -- syntaxToJsonLogic; the TS marshal authors only the `$where` wrapper). NB
+  -- `value.length` is ONE dotted-ident token ⇒ no `∈` ⇒ NOT spliced ⇒ reaches here.
+  let predicateBody = PRed (PRef "Expr") (\e -> { mk = "where", syntax = e })
+  let refinedBody = PAlt setexprBody predicateBody
+  let refinedLine = PRed (PSeq (PMatch upperIdentCls) (PSeq tyOptParams (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PRef "DeclTyExpr") (PSeq (pPunct "|") (PSeq (PRef "RefinedBody") (pVirt "vclose")))))))) (\p -> { dir = false, frame = { kind = "typedef", name = splitVal p.fst, params = p.snd.fst, refined = { mk = "refined", base = p.snd.snd.snd.snd.fst, set = p.snd.snd.snd.snd.snd.snd.fst } } })
+  -- parser-substrate Phase 7j — the opaque+refinement HYBRID (formerly fenced):
+  -- `opaque "codepoint" Char = Nat | value ∈ [0..0xD7FF] ∪ [0xE000..0x10FFFF]`
+  -- (foundation Char). It is `refinedLine` with the `opaque "<repr>"` prefix +
+  -- the opaque-repr carry. 7j-S0 root-cause CORRECTION: the brief §1 / the line-
+  -- 654 fence note BOTH said the TS oracle DROPS the opaque repr — it does NOT
+  -- (the oracle emits `opaque: {repr: "codepoint"}` alongside `refined`, verified
+  -- by the per-decl byte-diff). `typedefFrame` keys `opaque`+`refined`+`params`
+  -- independently, so this arm just feeds all three; empty params drop. The base
+  -- is a TyExpr (`Nat`); the set rides the same `RefinedBody` (`value ∈ SETBODY`
+  -- slice) handoff `refinedLine` uses ⇒ byte-parity by construction. Ordered
+  -- AFTER opaqueCtor (a `| <upper-ctor>` variant wins opaqueCtor first; a
+  -- `| value ∈ …` / lowercase-pred refinement falls through to here).
+  let opaqueRefined = PRed (PSeq opaqueKw (PSeq (PMatch strClsD) (PSeq (PMatch identCls) (PSeq tyOptParams (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PRef "DeclTyExpr") (PSeq (pPunct "|") (PSeq (PRef "RefinedBody") (pVirt "vclose")))))))))) (\p -> { dir = false, frame = { kind = "typedef", name = splitVal p.snd.snd.fst, params = p.snd.snd.snd.fst, refined = { mk = "refined", base = p.snd.snd.snd.snd.snd.snd.fst, set = p.snd.snd.snd.snd.snd.snd.snd.snd.fst }, opaque = mapSet {} "repr" (splitVal p.snd.fst) } })
+  -- fenel-surface-extensions Phase 7 (D-G) — the dependent-ADT `data … where`
+  -- declaration (Idris/Haskell-GADT). Ports the TS oracle's `parseDataDecl`
+  -- (fenel-parser.ts:1064) — a CONTEXTUAL keyword (`data` lexes as an ident,
+  -- distinguished by the `data Upper … : / where` shape). The per-ctor return
+  -- sigs (`Nil : Vec a Zero` vs `Cons : … -> Vec a (Succ n)`) are the one ADT
+  -- shape the `Vec a n = …` form CANNOT express. The frame reuses the `typedef`
+  -- KIND with two added carries: an optional `kindSig` (the `: <Kind>` arrow
+  -- FenelType) + a per-ctor `type` (the full sig). LAYOUT: `->` is a layout
+  -- OPENER (P3c) — the kindSig arrows DEFER their vcloses PAST the `where`-block
+  -- (the where nests inside the innermost kindSig-arrow vopen). So `KindWhere`
+  -- is RECURSIVE: each arrow level (`TyApp -> vopen KindWhere vclose`) wraps the
+  -- inner, and the BASE (`TyApp where vopen DataCtors vclose`) carries the
+  -- return atom + the ctor block — the deferred-vclose NEST matches by
+  -- construction (each level's vclose closes after the where block, exactly as
+  -- layout emits them). Each data ctor is a `Name : TyExpr` sig (the ctor-type
+  -- arrows ride the EXISTING `tyArrowLayout`, consuming their own deferred
+  -- vcloses). Value-level INDEX args (`Vec a 0` / `Vec a (n + 1)`) are FENCED —
+  -- the TyExpr type-arg grammar admits only type-level atoms (a PRE-EXISTING
+  -- gap: `f : Vec a 0` is Nothing in the Fenel parser too, NOT data-specific);
+  -- Peano-style type-ctor indices (`Vec a Zero` / `Vec a (Succ n)`) round-trip
+  -- via the existing `{mk=app}` ⇒ `$el` marshal fold. NO new IR — the frame is
+  -- the `typedef` kind; the loader-marshal authors the `$arrow`/`$el` `$`-keys.
+  let dataKwD = PMatch { tag = "WsEnum", values = appendItem (encodeTok { t = "ident", v = "data" }) [] }
+  let dataCtorSig = PRed (PSeq (PMatch upperIdentCls) (PSeq (pPunct ":") (PRef "DeclTyExpr"))) (\p -> buildDataCtor (splitVal p.fst) p.snd.snd)
+  let dataCtorsPat = PAlt (PRed (PSeq dataCtorSig (PSeq (pVirt "vsemi") (PRef "DataCtors"))) (\p -> concat (appendItem p.fst []) p.snd.snd)) (PRed dataCtorSig (\c -> appendItem c []))
+  let kindWhereArrow = PRed (PSeq (PRef "DeclTyApp") (PSeq (pPunct "->") (PSeq (pVirt "vopen") (PSeq (PRef "KindWhere") (pVirt "vclose"))))) (\p -> { kind = { mk = "arrow", params = appendItem { named = false, type = p.fst } [], ret = p.snd.snd.snd.fst.kind }, ctors = p.snd.snd.snd.fst.ctors })
+  let kindWhereBase = PRed (PSeq (PRef "DeclTyApp") (PSeq (pPunct "where") (PSeq (pVirt "vopen") (PSeq (PRef "DataCtors") (pVirt "vclose"))))) (\p -> { kind = p.fst, ctors = p.snd.snd.snd.fst })
+  let kindWherePat = PAlt kindWhereArrow kindWhereBase
+  let bareWhere = PRed (PSeq (pPunct "where") (PSeq (pVirt "vopen") (PSeq (PRef "DataCtors") (pVirt "vclose")))) (\p -> p.snd.snd.fst)
+  let dataWithKind = PRed (PSeq dataKwD (PSeq (PMatch upperIdentCls) (PSeq (pPunct ":") (PRef "KindWhere")))) (\p -> { dir = false, frame = { kind = "typedef", name = splitVal p.snd.fst, ctors = p.snd.snd.snd.ctors, kindSig = p.snd.snd.snd.kind } })
+  let dataNoKind = PRed (PSeq dataKwD (PSeq (PMatch upperIdentCls) bareWhere)) (\p -> { dir = false, frame = { kind = "typedef", name = splitVal p.snd.fst, ctors = p.snd.snd } })
+  let dataDecl = PAlt dataWithKind dataNoKind
+  -- signature-substrate Phase 4-prep (D0b) — STRUCTURED imports, the SELECTIVE
+  -- form `import <module> (A, B, …)` for ANY module-head case (the lowercase
+  -- heads `import engine (SetExpr)` / `import subject (Subject)` retire the
+  -- permissions.ts sidecar). The parenthesized name list makes the form
+  -- unambiguous at decl level (declLineVal has NO bare-expression arm, so the
+  -- application reading never competed here; in EXPRESSION position `import`
+  -- stays an ordinary ident). Emits `{kind="import", module, names}`;
+  -- elementToFrame (syntax-to-jsonlogic.fenel) authors the oracle's
+  -- `{import_decl: {module, names}}` with the same key order as
+  -- fenel-parser.ts:parseImportDecl. The empty list `import X ()` mirrors the
+  -- TS oracle's accepting behavior (names = []). A DIRECTIVE preceding an
+  -- import is rejected on both sides (the TS oracle throws "Directives only
+  -- apply to type-decls or function decls"; the Fenel side emits a
+  -- frame the loader marshal rejects — parity of rejection). The alias form
+  -- takes a module name in any case (`import codec as c`); hiding and the
+  -- bare qualified form retain the TS grammar's uppercase-module guard.
+  --
+  -- modules-as-values Phase 5c-1a — file-top `using`. `using M (a, b)` and
+  -- `using M as A` are the SAME frames as `import M (a, b)` / `import M as A`:
+  -- the selective and alias arms read either keyword (`selectKw`), so `using`
+  -- adds no production and no alternative (the fixpoint cost grows with
+  -- both). Open-all `using M` and `using M hiding (…)` have no arm: they wait
+  -- for Phase 5b (a bundle's member list when the file is read), and the TS
+  -- mirror's refusal carries the message.
+  --
+  -- The line's boundary is the layout's: a line indented past the keyword
+  -- continues it (`using codec` / `  as c` is one declaration; comments are
+  -- whitespace), a line at the keyword's column ends it. The TS mirror steps
+  -- the same continuation lines (`importLineNext`). An explicit `;` between
+  -- top-level declarations is not in this grammar for any declaration; the
+  -- public path serves such a source from the TS parser.
+  let importKw = PMatch { tag = "WsEnum", values = appendItem (encodeTok { t = "ident", v = "import" }) [] }
+  let selectKw = PMatch { tag = "WsEnum", values = appendItem (encodeTok { t = "ident", v = "using" }) (appendItem (encodeTok { t = "ident", v = "import" }) []) }
+  let importNamesPat = PAlt (PRed (PSeq (PMatch identCls) (PSeq (pPunct ",") (PRef "ImportNames"))) (\p -> concat (appendItem (splitVal p.fst) []) p.snd.snd)) (PAlt (PRed (PMatch identCls) (\n -> appendItem (splitVal n) [])) (PEpsV []))
+  let importSelective = PRed (PSeq selectKw (PSeq (PMatch identCls) (PSeq (pPunct "(") (PSeq (PRef "ImportNames") (pPunct ")"))))) (\p -> { dir = false, frame = { kind = "import", module = splitVal p.snd.fst, names = p.snd.snd.snd.fst } })
+  let asKw = PMatch { tag = "WsEnum", values = appendItem (encodeTok { t = "ident", v = "as" }) [] }
+  let hidingKw = PMatch { tag = "WsEnum", values = appendItem (encodeTok { t = "ident", v = "hiding" }) [] }
+  let importAlias = PRed (PSeq selectKw (PSeq (PMatch identCls) (PSeq asKw (PMatch identCls)))) (\p -> { dir = false, frame = { kind = "import", module = splitVal p.snd.fst, as = splitVal p.snd.snd.snd } })
+  let importHiding = PRed (PSeq importKw (PSeq (PMatch upperIdentCls) (PSeq hidingKw (PSeq (pPunct "(") (PSeq (PRef "ImportNames") (pPunct ")")))))) (\p -> { dir = false, frame = { kind = "import", module = splitVal p.snd.fst, hiding = p.snd.snd.snd.snd.fst } })
+  let importQualified = PRed (PSeq importKw (PMatch upperIdentCls)) (\p -> { dir = false, frame = { kind = "import", module = splitVal p.snd, qualified = true } })
+  let importLine = PAlt importSelective (PAlt importAlias (PAlt importHiding importQualified))
+  let fixityAssoc = PAlt (PRed (pPunct "infixl") (\_ -> "l")) (PAlt (PRed (pPunct "infixr") (\_ -> "r")) (PRed (pPunct "infix") (\_ -> "n")))
+  let fixityLine = PRed (PSeq fixityAssoc (PSeq (PMatch numClsD) (PMatch { tag = "WsUnion", branches = [opHeadCls, identCls] }))) (\p -> { dir = false, frame = { kind = "fixity", op = splitVal p.snd.snd, assoc = p.fst, prec = toNumber (join (takeWhile isDigit (chars (splitVal p.snd.fst))) "") } })
+  let ordinaryDeclLine = PAlt dataDecl (PAlt sigLine (PAlt sigLineOp (PAlt defLineOp (PAlt opaqueAlias (PAlt opaqueCtor (PAlt opaqueRefined (PAlt typedefLine (PAlt singleCtorSugar (PAlt lowerSingleCtor (PAlt refinedLine defLine))))))))))
+  let declLineVal = PAlt directiveLine (PAlt importLine (PAlt fixityLine ordinaryDeclLine))
+  -- Separator-less `ident : TyExpr` runs are no longer declarations: when they
+  -- follow a typedef vclose they are consumed by CtorLayoutTail above. Ordinary
+  -- top-level declarations always carry the layout `vsemi` separator.
+  let declsTailPat = PAlt (PRed (PSeq (pVirt "vsemi") (PRef "Decls")) (\p -> p.snd)) (PEpsV [])
+  let declsPat = PRed (PSeq declLineVal (PRef "DeclsTail")) (\p -> concat (appendItem p.fst []) p.snd)
+  -- field-identity Phase 4 (D6) — stray top-level expression statements are
+  -- REJECTED, deliberately: `declLineVal` has NO bare-expression arm, so a
+  -- module whose top level mixes declarations with a hoisted expression (the
+  -- layout-hazard class from the Phase-3 stabilization: a trailing multi-line
+  -- application argument dedenting to column 1 becomes its own top-level
+  -- statement while its callee stays a partial) fails the Program parse
+  -- structurally. The ledgered TS perf branch (`fenel-parser.ts:parseProgram`)
+  -- carries the same reject WITH the readable span (it previously ACCEPTED the
+  -- mixed program and the loader silently dropped the stray item). Do not add
+  -- a bare-expression Decls arm — expression-only sources ride the expression
+  -- entry, not Program.
+  -- Program: headered (full + header-only) then header-less. `module` matches
+  -- the literal ident; `where` is a keyword token (pPunct "where").
+  let modIdent = PMatch { tag = "WsEnum", values = appendItem (encodeTok { t = "ident", v = "module" }) [] }
+  let headeredFull = PRed (PSeq (pVirt "vopen") (PSeq modIdent (PSeq (PMatch identCls) (PSeq (pPunct "where") (PSeq (pVirt "vopen") (PSeq (PRef "Decls") (PSeq (pVirt "vclose") (PSeq (pVirt "vclose") (pVirt "eof"))))))))) (\p -> mkModuleProg (splitVal p.snd.snd.fst) p.snd.snd.snd.snd.snd.fst)
+  let headeredEmpty = PRed (PSeq (pVirt "vopen") (PSeq modIdent (PSeq (PMatch identCls) (PSeq (pPunct "where") (PSeq (pVirt "vclose") (pVirt "eof")))))) (\p -> appendItem { frame = { kind = "module", name = splitVal p.snd.snd.fst }, directives = [] } [])
+  let headerless = PRed (PSeq (pVirt "vopen") (PSeq (PRef "Decls") (PSeq (pVirt "vclose") (pVirt "eof")))) (\p -> buildDecls p.snd.fst)
+  let programPat = PAlt headeredFull (PAlt headeredEmpty headerless)
+  let declProds = [ { name = "Program", pat = programPat }
+                  , { name = "Decls", pat = declsPat }
+                  , { name = "DeclsTail", pat = declsTailPat }
+                  , { name = "ImportNames", pat = importNamesPat }
+                  , { name = "AngleParams", pat = angleParamsListPat }
+                  , { name = "DirArgs", pat = dirArgsPat }
+                  , { name = "Ctors", pat = ctorsPat }
+                  , { name = "CtorElems", pat = ctorElemsPat }
+                  , { name = "CtorElemsNP", pat = ctorElemsNPPat }
+                  , { name = "CtorLayoutTail", pat = ctorLayoutTailPat }
+                  , { name = "RetSpine", pat = retSpinePat }
+                  , { name = "RetAtoms", pat = retAtomsPat }
+                  , { name = "RefinedBody", pat = refinedBody }
+                  , { name = "KindWhere", pat = kindWherePat }
+                  , { name = "DataCtors", pat = dataCtorsPat }
+                  ]
+  concat declProds (concat ty.rows (exprGrammar table nullValue toks))
+
+@label "Parse program tokens"
+@description "The one-call program-parse entry: encode the layout token stream (Design E), build the merged decl+expr grammar, run `parseG` from the \"Program\" production. Returns `Just [{frame, directives}]` on a full parse, Nothing otherwise. `table` = the fixity table (closure-captured by the def-body OpSeq reductions); `nullValue` threads to the Unit primary. parser-substrate Phase 4 (D1)."
+@tags "engine" "parser" "decl-grammar" "parser-substrate" "phase-4"
+parseProgToks : (table: a) -> (nullValue: a) -> (toks: a) -> Maybe a
+parseProgToks table nullValue toks =
+  let enc = encodeToks toks
+  let g = declGrammar table nullValue toks
+  parseG g "Program" enc

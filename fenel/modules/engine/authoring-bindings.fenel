@@ -1,0 +1,1020 @@
+module engine where
+
+-- The reader's media scheduler inspects the existing call/ref/args carrier.
+-- Literal data stays opaque, including structural markers, as in the original
+-- scheduler. The host projects these calls through the canonical codec and
+-- resolves their emitted heads in the exact reader before asking for policy.
+@category "engine-internal"
+authoringMediaSchedulingCalls : (node: a) -> (saved: List ({ id: String, expression: a })) -> { root: Maybe a, calls: List a }
+authoringMediaSchedulingCalls node saved =
+  { root = abeMediaRoot node saved [], calls = abeMediaCalls node saved [] }
+
+@category "engine-internal"
+abeMediaRoot : (node: a) -> (saved: List ({ id: String, expression: a })) -> (seen: List String) -> Maybe a
+abeMediaRoot node saved seen =
+  if eq node.kind "call" then Just node
+  else if and (eq node.kind "ref") (not (elem node.savedExprId seen)) then
+    case find (\row -> eq row.id node.savedExprId) saved of
+      Nothing -> Nothing
+      Just row -> abeMediaRoot row.expression saved (appendItem node.savedExprId seen)
+  else Nothing
+
+@category "engine-internal"
+abeMediaCalls : (node: a) -> (saved: List ({ id: String, expression: a })) -> (seen: List String) -> List a
+abeMediaCalls node saved seen =
+  if eq node.kind "call" then
+    fold (\calls arg -> concat calls (abeMediaCalls arg saved seen)) [node] node.args
+  else if and (eq node.kind "ref") (not (elem node.savedExprId seen)) then
+    case find (\row -> eq row.id node.savedExprId) saved of
+      Nothing -> []
+      Just row -> abeMediaCalls row.expression saved (appendItem node.savedExprId seen)
+  else []
+
+@category "engine-internal"
+authoringMediaSchedulingHead : (logic: a) -> Maybe String
+authoringMediaSchedulingHead logic =
+  case lookup logic "call" of
+    Just args -> case head args of
+      Just name -> if isString name then Just name else Nothing
+      Nothing -> Nothing
+    Nothing -> case lookup logic "method" of
+      Just args -> case head args of
+        Nothing -> Nothing
+        Just owner -> case head (drop 1 args) of
+          Nothing -> Nothing
+          Just name -> if and (isString owner) (isString name) then Just (concat owner (concat "." name)) else Nothing
+      Nothing -> Nothing
+
+@category "engine-internal"
+authoringMediaSchedulingLookups : (logic: List a) -> List (Maybe ({ head: String, expression: b }))
+authoringMediaSchedulingLookups logic =
+  let mediaLookup = \emitted ->
+        case authoringMediaSchedulingHead emitted of
+          Nothing -> Nothing
+          Just name -> Just { head = name, expression = mapSet {} "var" [name, Nothing] }
+  map mediaLookup logic
+
+@category "engine-internal"
+authoringMediaSchedulingTargets : (rows: List ({ target: Maybe String, routes: List a, hasClassifier: Boolean, hasRoutingTable: Boolean })) -> List (Maybe String)
+authoringMediaSchedulingTargets rows = map (\row ->
+  if and row.hasRoutingTable (not row.hasClassifier) then Nothing
+  else if all row.routes (\route -> eq route.kind "direct") then row.target
+  else Nothing
+) rows
+
+@category "engine-internal"
+abeMediaTargetIs : (target: Maybe String) -> (expected: String) -> Boolean
+abeMediaTargetIs target expected = case target of
+  Nothing -> false
+  Just identity -> eq identity expected
+
+@category "engine-internal"
+authoringMediaSchedulingFacts : (root: Maybe a) -> (rootLogic: b) -> (rootTarget: Maybe String) -> (targets: List (Maybe String)) -> (capture: Boolean) -> { picture: Boolean, sampled: Boolean, weight: Number, slice: Maybe String }
+authoringMediaSchedulingFacts root rootLogic rootTarget targets capture =
+  let picture = std.some targets (\target -> abeMediaTargetIs target "picture:render")
+  let sampled = or picture (std.some targets (\target -> or (abeMediaTargetIs target "sound:renderSound") (abeMediaTargetIs target "movie:renderMovie")))
+  let weight = if abeMediaTargetIs rootTarget "picture:render" then 1 else if or (abeMediaTargetIs rootTarget "sound:renderSound") (abeMediaTargetIs rootTarget "movie:renderMovie") then 2 else if picture then 1 else if sampled then 2 else 0
+  let slice = if capture then Nothing else case root of
+        Nothing -> Nothing
+        Just call ->
+          let ordinary = case lookup call "callSyntax" of
+                Nothing -> true
+                Just syntax -> eq syntax "call"
+          let staticCall = case lookup rootLogic "call" of
+                Nothing -> false
+                Just args -> true
+          let literalDimensions = all (drop 1 call.args) (\arg ->
+                if eq arg.kind "literal" then and (isNumber arg.value) (numberIsFinite arg.value) else false)
+          if and literalDimensions (and ordinary (and (eq (length call.args) 3) staticCall)) then
+            if abeMediaTargetIs rootTarget "picture:render" then Just "picture"
+            else if abeMediaTargetIs rootTarget "sound:renderSound" then Just "sound"
+            else Nothing
+          else Nothing
+  { picture = picture, sampled = sampled, weight = weight, slice = slice }
+
+-- Authoring binding edits inspect the existing ExprNode/marker carrier through
+-- the shared JsonLogic snapshot. They return narrow patches and new wrapper
+-- skeletons; existing trees are reattached rather than reconstructed, retaining
+-- undefined holes, identities and untouched metadata on their host carriers.
+-- Scope/capture decisions are Fenel-owned. Unknown executable shapes refuse.
+
+abeGet : (node: (JsonLogic Any)) -> (name: String) -> (JsonLogic Any)
+abeGet node name =
+  case node of
+    JlObject { fields = fields } -> abeFind fields name
+    JlTagged { fields = fields } -> abeFind fields name
+    other -> JlNull
+
+abeFind : (fields: a) -> (name: String) -> (JsonLogic Any)
+abeFind fields name =
+  case head fields of
+    Nothing -> JlNull
+    Just field -> if eq field.name name then field.value else abeFind (tailOr fields) name
+
+abeText : (node: (JsonLogic Any)) -> String
+abeText node =
+  case node of
+    JlString { value = value } -> value
+    other -> ""
+
+abeItems : (node: (JsonLogic Any)) -> List Any
+abeItems node =
+  case node of
+    JlArray { items = items } -> items
+    other -> []
+
+abeFields : (node: (JsonLogic Any)) -> List Any
+abeFields node =
+  case node of
+    JlObject { fields = fields } -> fields
+    JlTagged { fields = fields } -> fields
+    other -> []
+
+abeHas : (node: (JsonLogic Any)) -> (name: String) -> Boolean
+abeHas node name = std.some (abeFields node) (\field -> eq field.name name)
+
+abeAt : (node: (JsonLogic Any)) -> (index: Number) -> (JsonLogic Any)
+abeAt node index = fromMaybe JlNull (head (drop index (abeItems node)))
+
+abePath : (path: List Any) -> (key: Any) -> List Any
+abePath path key = appendItem key path
+
+abeFail : (state: a) -> (path: List Any) -> (code: String) -> (message: String) -> a
+abeFail state path code message =
+  mapSet state "diagnostics" (appendItem { code = code, message = message, path = path } state.diagnostics)
+
+abePatch : (state: a) -> (path: List Any) -> (before: String) -> (after: String) -> a
+abePatch state path before after =
+  if eq before after then state else mapSet state "patches" (appendItem { path = path, before = before, after = after } state.patches)
+
+abeReference : (name: String) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeReference name path scope edit state =
+  if eq edit.checkBindingNames true then state
+  else if eq edit.collectNames true then mapSet state "names" (appendItem (dottedHead name) (concat state.names scope))
+  else if eq edit.collectTypes true then state
+  else if eq edit.predicateScope true then
+    let inspected = abeReference name path scope (mapSet edit "predicateScope" false) state
+    if and (eq (length inspected.patches) (length state.patches)) (eq (length inspected.diagnostics) (length state.diagnostics)) then state
+    else abeFail state path "binding.predicate-scope" "This predicate name may come from the candidate's record fields or the outer context; its binding cannot be refactored safely."
+  else if isNull edit.changes then abeReferenceOne name path scope edit state
+  else
+    let root = dottedHead name
+    let selected = find (\change -> and (not (eq change.kind "add")) (and (eq root change.oldName) (not (elem root scope)))) edit.changes
+    case selected of
+      Just change -> abeReferenceOne name path scope change state
+      Nothing -> fold (\current change -> if eq change.kind "remove" then current else if and (eq root change.name) (not (elem root scope)) then abeFail current path "binding.capture" "The changed parameters would capture an existing reference." else current) state edit.changes
+
+abeReferenceOne : (name: String) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeReferenceOne name path scope edit state =
+  let root = dottedHead name
+  let selected = and (not (eq edit.kind "add")) (and (eq root edit.oldName) (not (elem root scope)))
+  if selected then
+    if eq edit.kind "remove" then abeFail state path "binding.used" "This parameter is still used."
+    else if eq edit.name "_" then abeFail state path "binding.unnamed-used" "An unnamed parameter cannot retain named references."
+    else if elem edit.name scope then abeFail state path "binding.capture" "The new name is shadowed at this reference."
+    else abePatch state path name (concat edit.name (slice name (length root) (length name)))
+  else if and (not (eq edit.kind "remove")) (and (eq root edit.name) (not (elem root scope)))
+    then abeFail state path "binding.capture" "The new parameter name would capture an existing reference."
+    else state
+
+abeNodeList : (nodes: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeNodeList nodes index path scope edit state =
+  case head nodes of
+    Nothing -> state
+    Just node -> abeNodeList (tailOr nodes) (add index 1) path scope edit (abeNode node (abePath path index) scope edit state)
+
+abeNode : (node: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeNode node path scope edit state =
+  let scoped = if eq edit.collectNames true then mapSet state "names" (concat state.names scope) else state
+  let located = if eq edit.collectOccurrences true then mapSet scoped "occurrences" (appendItem { path = path } scoped.occurrences) else scoped
+  abeNodeInner node path scope edit located
+
+abeExpressionAnnotation : (expressionPath: List Any) -> (typePath: List Any) -> (edit: a) -> (state: b) -> b
+abeExpressionAnnotation expressionPath typePath edit state =
+  if eq edit.collectOccurrences true then mapSet state "annotations" (appendItem { expressionPath = expressionPath, typePath = typePath } state.annotations) else state
+
+abeNodeInner : (node: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeNodeInner node path scope edit state =
+  let kind = abeText (abeGet node "kind")
+  if eq kind "param" then abeReference (abeText (abeGet node "name")) (abePath path "name") scope edit state
+  -- A saved-data reference is an identity resolved by the codec's resolver,
+  -- not a lexical spelling, even when its handle equals a parameter name.
+  else if eq kind "ref" then state
+  else if eq kind "call" then
+    let syntax = abeText (abeGet node "callSyntax")
+    let headState =
+      if or (eq syntax "construct") (eq syntax "method") then state
+      else if abeHas node "sourceHead" then
+        let source = abeText (abeGet node "sourceHead")
+        let updated = abeReference source (abePath path "sourceHead") scope edit state
+        if eq source (abeText (abeGet node "fnId")) then abeReference source (abePath path "fnId") scope edit updated else updated
+      else abeReference (abeText (abeGet node "fnId")) (abePath path "fnId") scope edit state
+    abeNodeList (abeItems (abeGet node "args")) 0 (abePath path "args") scope edit headState
+  else if eq kind "literal" then abeLiteral (abeGet node "value") (abePath path "value") scope edit state
+  else abeFail state path "binding.unsupported" "This expression cannot yet be inspected safely for binding edits."
+
+abeLiteral : (value: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeLiteral value path scope edit state =
+  case value of
+    JlObject { fields = fields } ->
+      let functionData = if eq edit.checkBindingNames true then or (eufValEq (abeGet value "__fenelFn") (JlBool { value = true })) (eufValEq (abeGet value "__fenelPartial") (JlBool { value = true })) else or (abeHas value "__fenelFn") (abeHas value "__fenelPartial")
+      if or (std.some fields (\field -> startsWith field.name "$")) functionData
+      then if eq edit.checkBindingNames true then state else abeFail state path "binding.unsupported" "An opaque executable or typed literal needs an explicit binding analysis."
+      else abeMarker value path scope edit state
+    JlArray { items = items } -> if eq edit.checkBindingNames true then state else abeLogicList items 0 path scope edit state
+    other -> state
+
+abeMarker : (value: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeMarker value path scope edit state =
+  if abeHas value "__lambda" then
+    let node = abeGet value "__lambda"
+    let base = abePath path "__lambda"
+    if abeHas node "params" then
+      let names = map abeText (abeItems (abeGet node "params"))
+      abeNode (abeGet node "body") (abePath base "body") (concat scope names) edit state
+    else abeNode node base scope edit state
+  else if abeHas value "__do" then abeDo (abeItems (abeGet value "__do")) 0 (abePath path "__do") scope edit state
+  else if abeHas value "__let" then
+    let base = abePath (abePath path "__let") "bindings"
+    let result = abeBindings (abeItems (abeGet (abeGet value "__let") "bindings")) 0 base scope edit state
+    result.state
+  else if abeHas value "__where" then
+    let node = abeGet value "__where"
+    let base = abePath path "__where"
+    let bindings = abeItems (abeGet node "bindings")
+    let checked = if eq edit.checkBindingNames true then abeWhereBindingNames bindings 0 (abePath base "bindings") [] state else state
+    let result = abeBindings bindings 0 (abePath base "bindings") scope (if eq edit.collectOccurrences true then mapSet edit "freeInitializers" true else edit) checked
+    abeNode (abeGet node "body") (abePath base "body") result.scope edit result.state
+  else if abeHas value "__match" then
+    let node = abeGet value "__match"
+    let base = abePath path "__match"
+    let first = abeNode (abeGet node "scrutinee") (abePath base "scrutinee") scope edit state
+    abeArms (abeItems (abeGet node "arms")) 0 (abePath base "arms") scope edit first
+  else if abeHas value "__var" then
+    let node = abeGet value "__var"
+    let raw = abeGet node "path"
+    if eq edit.checkBindingNames true then state else case raw of
+      JlString { value = name } -> abeReference name (concat path ["__var", "path"]) scope edit state
+      other -> abeFail state path "binding.unsupported" "A dynamic variable path cannot be refactored safely."
+  else if abeHas value "__ann" then
+    let node = abeGet value "__ann"
+    let base = abePath path "__ann"
+    let annotated = abeExpressionAnnotation (abePath base "expr") (abePath base "type") edit state
+    abeType (abeGet node "type") (abePath base "type") scope edit (abeNode (abeGet node "expr") (abePath base "expr") scope edit annotated)
+  else if abeHas value "__record" then abeValueFields (abeItems (abeGet (abeGet value "__record") "fields")) 0 (concat path ["__record", "fields"]) scope edit state
+  else if abeHas value "__construct" then abeValueFields (abeItems (abeGet (abeGet value "__construct") "fields")) 0 (concat path ["__construct", "fields"]) scope edit state
+  else if abeHas value "__list" then abeNodeList (abeItems (abeGet value "__list")) 0 (abePath path "__list") scope edit state
+  else if abeHas value "__cat" then abeNodeList (abeItems (abeGet value "__cat")) 0 (abePath path "__cat") scope edit state
+  else if abeHas value "__apply" then
+    let node = abeGet value "__apply"
+    let base = abePath path "__apply"
+    let first = abeNode (abeGet node "target") (abePath base "target") scope edit state
+    if abeHas node "arguments" then abeNode (abeGet node "arguments") (abePath base "arguments") scope edit first
+    else abeNodeList (abeItems (abeGet node "args")) 0 (abePath base "args") scope edit first
+  else if abeHas value "__pipe" then
+    let node = abeGet value "__pipe"
+    let base = abePath path "__pipe"
+    abeNodeList (abeItems (abeGet node "steps")) 0 (abePath base "steps") scope edit (abeNode (abeGet node "value") (abePath base "value") scope edit state)
+  else if abeHas value "__withInstance" then
+    let node = abeGet value "__withInstance"
+    let base = abePath path "__withInstance"
+    abeNode (abeGet node "body") (abePath base "body") scope edit (abeNode (abeGet node "frame") (abePath base "frame") scope edit state)
+  else if abeHas value "__evaluator" then abeNode (abeGet (abeGet value "__evaluator") "body") (concat path ["__evaluator", "body"]) scope edit state
+  else if abeHas value "__operator" then
+    let node = abeGet value "__operator"
+    let op = abeText (abeGet node "op")
+    if or (eq edit.checkBindingNames true) (elem op ["if", "?:", "and", "or", "cat", "min", "max", "&", "|", "^", "~", "<<", ">>", "substr", "length", "in", "merge", "deepEq", "add", "sub", "mul", "div", "mod", "negate", "eq", "neq", "lt", "lte", "gt", "gte", "not", "concat", "ifElse", "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "!", "!!"]) then abeNodeList (abeItems (abeGet node "args")) 0 (concat path ["__operator", "args"]) scope edit state
+    else abeFail state path "binding.unsupported" "This legacy operator may introduce its own scope."
+  else if eq edit.checkBindingNames true then
+    if and (eq edit.collectOccurrences true) (std.some (abeFields value) (\field -> startsWith field.name "__"))
+    then abeFail state path "binding.unsupported" "This structural form has no expression occurrence analysis."
+    else state
+  else if std.some (abeFields value) (\field -> startsWith field.name "__")
+    then abeFail state path "binding.unsupported" "This structural form has no binding analysis."
+    else abeLogic value path scope edit state
+
+abeBindings : (bindings: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> { scope: List String, state: b }
+abeBindings bindings index path scope edit state =
+  case head bindings of
+    Nothing -> { scope = scope, state = state }
+    Just binding ->
+      let base = abePath path index
+      let expressionPath = abePath base "expr"
+      let bounded = if and (eq edit.collectOccurrences true) (or (eq edit.freeInitializers true) (gt (length bindings) 1)) then mapSet state "barriers" (appendItem expressionPath state.barriers) else state
+      let annotated = case abeGet binding "type" of
+        JlNull -> bounded
+        other -> abeExpressionAnnotation expressionPath (abePath base "type") edit bounded
+      let childEdit = if eq edit.collectOccurrences true then mapSet edit "freeInitializers" false else edit
+      let next = abeType (abeGet binding "type") (abePath base "type") scope childEdit (abeNode (abeGet binding "expr") expressionPath scope childEdit annotated)
+      abeBindings (tailOr bindings) (add index 1) path (appendItem (abeText (abeGet binding "name")) scope) edit next
+
+abeDo : (nodes: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeDo nodes index path scope edit state =
+  case head nodes of
+    Nothing -> state
+    Just node ->
+      let base = abePath path index
+      let literal = abeGet node "value"
+      let bounded = if and (eq edit.collectOccurrences true) (gt (length nodes) 1) then mapSet state "barriers" (appendItem base state.barriers) else state
+      if and (eq (abeText (abeGet node "kind")) "literal") (abeHas literal "__let") then
+        let located = if eq edit.collectOccurrences true then mapSet bounded "occurrences" (appendItem { path = base } bounded.occurrences) else bounded
+        let result = abeBindings (abeItems (abeGet (abeGet literal "__let") "bindings")) 0 (concat base ["value", "__let", "bindings"]) scope edit located
+        abeDo (tailOr nodes) (add index 1) path result.scope edit result.state
+      else abeDo (tailOr nodes) (add index 1) path scope edit (abeNode node base scope edit bounded)
+
+abeValueFields : (fields: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeValueFields fields index path scope edit state =
+  case head fields of
+    Nothing -> state
+    Just field -> abeValueFields (tailOr fields) (add index 1) path scope edit (abeNode (abeGet field "value") (concat path [index, "value"]) scope edit state)
+
+abePatternNames : (pattern: (JsonLogic Any)) -> List String
+abePatternNames pattern =
+  if abeHas pattern "$bind" then [abeText (abeGet pattern "$bind")]
+  else if abeHas pattern "$guard" then abePatternNames (abeAt (abeGet pattern "$guard") 0)
+  else case pattern of
+    JlArray { items = items } -> fold (\names item -> concat names (abePatternNames item)) [] items
+    other -> fold (\names field -> concat names (abePatternNames field.value)) [] (abeFields pattern)
+
+abePatternGuards : (pattern: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abePatternGuards pattern path scope edit state =
+  if abeHas pattern "$guard" then
+    let pair = abeGet pattern "$guard"
+    let condition = abeAt pair 1
+    let first = if abeHas condition "kind" then abeNode condition (concat path ["$guard", 1]) scope edit state else abeLogic condition (concat path ["$guard", 1]) scope edit state
+    abePatternGuards (abeAt pair 0) (concat path ["$guard", 0]) scope edit first
+  else case pattern of
+    JlArray { items = items } -> abePatternGuardList items 0 path scope edit state
+    other -> fold (\current field -> abePatternGuards field.value (abePath path field.name) scope edit current) state (abeFields pattern)
+
+abePatternGuardList : (nodes: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abePatternGuardList nodes index path scope edit state =
+  case head nodes of
+    Nothing -> state
+    Just node -> abePatternGuardList (tailOr nodes) (add index 1) path scope edit (abePatternGuards node (abePath path index) scope edit state)
+
+abeArms : (arms: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeArms arms index path scope edit state =
+  case head arms of
+    Nothing -> state
+    Just arm ->
+      let base = abePath path index
+      let pattern = abeGet arm "pattern"
+      let inner = concat scope (abePatternNames pattern)
+      let guarded = abePatternGuards pattern (abePath base "pattern") inner edit state
+      let next = abeNode (abeGet arm "body") (abePath base "body") inner edit guarded
+      abeArms (tailOr arms) (add index 1) path scope edit next
+
+-- Types are traversed solely to find term-expression positions. Type names,
+-- singleton data, field identities and type-variable binders are not terms.
+abeType : (node: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeType node path scope edit state =
+  if eq edit.checkBindingNames true then state
+  else if eq edit.collectTypes true then
+    case node of
+      JlNull -> state
+      other -> mapSet state "roots" (appendItem { path = path, scope = [] } state.roots)
+  else abeTypeInner node path scope edit state
+
+abeTypeInner : (node: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeTypeInner node path scope edit state =
+  if abeHas node "$el" then abeLogic (abeGet node "$el") (abePath path "$el") scope edit state
+  else if abeHas node "$arrow" then
+    let arrow = abeGet node "$arrow"
+    let fields = abeItems (abeGet arrow "params")
+    let inner = concat scope (map (\field -> abeText (abeGet field "name")) fields)
+    abeType (abeGet arrow "returns") (concat path ["$arrow", "returns"]) inner edit (abeTypeFields fields 0 (concat path ["$arrow", "params"]) inner edit state)
+  else if abeHas node "$record" then
+    let fields = abeItems (abeGet (abeGet node "$record") "fields")
+    let inner = concat scope (map (\field -> abeText (abeGet field "name")) fields)
+    abeTypeFields fields 0 (concat path ["$record", "fields"]) inner edit state
+  else if abeHas node "$variant" then
+    let variant = abeGet node "$variant"
+    let cases = abeGet variant "cases"
+    abeTypeCases (abeItems cases) 0 (concat path ["$variant", "cases"]) scope edit state
+  else if abeHas node "$refined" then
+    let refined = abeGet node "$refined"
+    let first = abeType (abeGet refined "base") (concat path ["$refined", "base"]) scope edit state
+    abeSet (abeGet refined "set") (concat path ["$refined", "set"]) scope edit first
+  else if abeHas node "$map" then
+    let mapType = abeGet node "$map"
+    abeSet (abeGet mapType "keys") (concat path ["$map", "keys"]) scope edit (abeType (abeGet mapType "values") (concat path ["$map", "values"]) scope edit state)
+  else if abeHas node "$mu" then abeType (abeGet (abeGet node "$mu") "body") (concat path ["$mu", "body"]) scope edit state
+  else if abeHas node "$opaque" then abeType (abeGet (abeGet node "$opaque") "pure") (concat path ["$opaque", "pure"]) scope edit state
+  else if abeHas node "$tagged" then
+    let tagged = abeGet node "$tagged"
+    abeType (abeGet tagged "phantom") (concat path ["$tagged", "phantom"]) scope edit (abeType (abeGet tagged "value") (concat path ["$tagged", "value"]) scope edit state)
+  else if abeHas node "$complement" then abeType (abeGet node "$complement") (abePath path "$complement") scope edit state
+  else if abeHas node "$tuple" then abeTypeList (abeItems (abeGet node "$tuple")) 0 (abePath path "$tuple") scope edit state
+  else if abeHas node "$union" then abeTypeList (abeItems (abeGet node "$union")) 0 (abePath path "$union") scope edit state
+  else if abeHas node "$intersect" then abeTypeList (abeItems (abeGet node "$intersect")) 0 (abePath path "$intersect") scope edit state
+  else if std.some (abeFields node) (\field -> not (elem field.name ["$ref", "$var", "$unit", "$void", "$type"]))
+    then abeFail state path "binding.unsupported-type" "This type cannot yet be inspected for dependent references."
+    else state
+
+abeTypeList : (nodes: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeTypeList nodes index path scope edit state =
+  case head nodes of
+    Nothing -> state
+    Just node -> abeTypeList (tailOr nodes) (add index 1) path scope edit (abeType node (abePath path index) scope edit state)
+
+abeTypeFields : (fields: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeTypeFields fields index path scope edit state =
+  case head fields of
+    Nothing -> state
+    Just field -> abeTypeFields (tailOr fields) (add index 1) path scope edit (abeType (abeGet field "type") (concat path [index, "type"]) scope edit state)
+
+abeTypeCase : (node: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeTypeCase node path scope edit state =
+  let fields = abeItems (abeGet node "fields")
+  let inner = concat scope (map (\field -> abeText (abeGet field "name")) fields)
+  abeTypeFields fields 0 (abePath path "fields") inner edit state
+
+abeTypeCases : (nodes: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeTypeCases nodes index path scope edit state =
+  case head nodes of
+    Nothing -> state
+    Just node -> abeTypeCases (tailOr nodes) (add index 1) path scope edit (abeTypeCase node (abePath path index) scope edit state)
+
+abeSet : (node: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeSet node path scope edit state =
+  if abeHas node "$where" then abePredicate (abeGet node "$where") (abePath path "$where") scope edit state
+  else if abeHas node "$expr" then abeLogic (abeGet node "$expr") (abePath path "$expr") scope edit state
+  else if abeHas node "$enum" then state
+  else case node of
+    JlTagged { tag = "SeWhere" } -> abePredicate (abeGet node "pred") (abePath path "pred") scope edit state
+    JlTagged { tag = "SeEnum" } -> state
+    JlTagged { tag = "SePattern" } -> abeFail state path "binding.unsupported" "A set pattern may contain scoped expressions and needs a dedicated binding analysis."
+    JlArray { items = items } -> abeSetList items 0 path scope edit state
+    other -> fold (\current field -> abeSet field.value (abePath path field.name) scope edit current) state (abeFields node)
+
+-- whereMember binds {...requestCtx, ...spread(candidate), "": candidate,
+-- value: candidate}. The final two roots are always local. Other roots may
+-- be supplied by candidate own fields, including undeclared record fields;
+-- a static field list cannot prove their origin. Only an affected ambiguous
+-- reference refuses: local lambda/pattern bindings and unrelated names remain.
+abePredicate : (node: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abePredicate node path scope edit state =
+  abeLogic node path (concat scope ["", "value"]) (mapSet edit "predicateScope" true) state
+
+abeSetList : (nodes: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeSetList nodes index path scope edit state =
+  case head nodes of
+    Nothing -> state
+    Just node -> abeSetList (tailOr nodes) (add index 1) path scope edit (abeSet node (abePath path index) scope edit state)
+
+-- Raw dependent expressions use the same lexical rules, preserving their
+-- wire carrier. Unknown binder-forming operators abstain atomically.
+abeLogic : (node: (JsonLogic Any)) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeLogic node path scope edit state =
+  if eq edit.checkBindingNames true then state else case node of
+    JlArray { items = items } -> abeLogicList items 0 path scope edit state
+    JlObject { fields = fields } -> abeLogicObject node fields path scope edit state
+    other -> state
+
+abeLogicObject : (node: (JsonLogic Any)) -> (fields: List Any) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeLogicObject node fields path scope edit state =
+  if or (abeHas node "$ref") (abeHas node "$var") then state
+  else if abeHas node "$el" then abeType node path scope edit state
+  else if abeHas node "var" then
+    let value = abeGet node "var"
+    case value of
+      JlString { value = name } -> abeReference name (abePath path "var") scope edit state
+      JlArray { items = items } ->
+        case head items of
+          Just (JlString { value = name }) -> abeReference name (concat path ["var", 0]) scope edit state
+          other -> abeFail state path "binding.unsupported" "A dynamic dependent variable path cannot be refactored safely."
+      other -> abeFail state path "binding.unsupported" "A dynamic dependent variable path cannot be refactored safely."
+  else if abeHas node "fn" then
+    let items = abeItems (abeGet node "fn")
+    let first = fromMaybe JlNull (head items)
+    let names = case first of
+      JlArray { items = params } -> map abeText params
+      other -> map abeText (fromMaybe [] (init items))
+    abeLogic (fromMaybe JlNull (last items)) (concat path ["fn", sub (length items) 1]) (concat scope names) edit state
+  else if abeHas node "call" then
+    let items = abeItems (abeGet node "call")
+    let first = fromMaybe JlNull (head items)
+    let next = case first of
+      JlString { value = name } -> abeReference name (concat path ["call", 0]) scope edit state
+      other -> abeLogic first (concat path ["call", 0]) scope edit state
+    abeLogicList (tailOr items) 1 (abePath path "call") scope edit next
+  else if abeHas node "ann" then abeType (abeAt (abeGet node "ann") 1) (concat path ["ann", 1]) scope edit (abeLogic (abeAt (abeGet node "ann") 0) (concat path ["ann", 0]) scope edit state)
+  else if abeHas node "let" then
+    let result = abeRawBindings (abeFields (abeGet node "let")) (abePath path "let") scope edit state
+    result.state
+  else if abeHas node "where" then
+    let pair = abeGet node "where"
+    let result = abeRawBindings (abeFields (abeAt pair 1)) (concat path ["where", 1]) scope edit state
+    abeLogic (abeAt pair 0) (concat path ["where", 0]) result.scope edit result.state
+  else if abeHas node "do" then abeRawDo (abeItems (abeGet node "do")) 0 (abePath path "do") scope edit state
+  else if abeHas node "match" then abeRawMatch (abeItems (abeGet node "match")) path scope edit state
+  else if abeHas node "construct" then abeLogicList (tailOr (abeItems (abeGet node "construct"))) 1 (abePath path "construct") scope edit state
+  else if abeHas node "method" then abeLogicList (drop 2 (abeItems (abeGet node "method"))) 2 (abePath path "method") scope edit state
+  else if eq (length fields) 1 then
+    let field = fromMaybe { name = "", value = JlNull } (head fields)
+    if elem field.name ["if", "?:", "and", "or", "cat", "apply", "withInstance", "|>", "pipe"] then abeLogic field.value (abePath path field.name) scope edit state
+    else abeFail state path "binding.unsupported" "This dependent expression operator has no binding analysis."
+  else fold (\current field -> abeLogic field.value (abePath path field.name) scope edit current) state fields
+
+abeLogicList : (nodes: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeLogicList nodes index path scope edit state =
+  case head nodes of
+    Nothing -> state
+    Just node -> abeLogicList (tailOr nodes) (add index 1) path scope edit (abeLogic node (abePath path index) scope edit state)
+
+abeRawBindings : (fields: List Any) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> { scope: List String, state: b }
+abeRawBindings fields path scope edit state =
+  case head fields of
+    Nothing -> { scope = scope, state = state }
+    Just field -> abeRawBindings (tailOr fields) path (appendItem field.name scope) edit (abeLogic field.value (abePath path field.name) scope edit state)
+
+abeRawDo : (nodes: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeRawDo nodes index path scope edit state =
+  case head nodes of
+    Nothing -> state
+    Just node ->
+      let base = abePath path index
+      if abeHas node "let" then
+        let result = abeRawBindings (abeFields (abeGet node "let")) (abePath base "let") scope edit state
+        abeRawDo (tailOr nodes) (add index 1) path result.scope edit result.state
+      else abeRawDo (tailOr nodes) (add index 1) path scope edit (abeLogic node base scope edit state)
+
+abeRawMatch : (nodes: List Any) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeRawMatch nodes path scope edit state =
+  let base = abePath path "match"
+  let first = abeLogic (fromMaybe JlNull (head nodes)) (abePath base 0) scope edit state
+  abeRawArms (tailOr nodes) 1 base scope edit first
+
+abeRawArms : (nodes: List Any) -> (index: Number) -> (path: List Any) -> (scope: List String) -> (edit: a) -> (state: b) -> b
+abeRawArms nodes index path scope edit state =
+  case head nodes of
+    Nothing -> state
+    Just pattern ->
+      if eq (length nodes) 1 then abeLogic pattern (abePath path index) scope edit state
+      else
+        let inner = concat scope (abePatternNames pattern)
+        let guarded = abePatternGuards pattern (abePath path index) inner edit state
+        let body = fromMaybe JlNull (head (tailOr nodes))
+        let next = abeLogic body (abePath path (add index 1)) inner edit guarded
+        abeRawArms (tailOr (tailOr nodes)) (add index 2) path scope edit next
+
+@label "Plan an authoring binding edit"
+@description "Analyze one parameter rename, addition or removal over the original authoring carrier and dependent types. Return narrow string patches or diagnostics; capture, usage and unknown executable forms refuse atomically. No source tree is rebuilt."
+@category "engine-internal"
+authoringBindingEditPlan : (draft: (JsonLogic Any)) -> (request: { kind: String, index: Number, name: String }) -> { patches: List ({ path: List Any, before: String, after: String }), diagnostics: List ({ code: String, message: String, path: List Any }), reattachments: List ({ path: List Any, source: List Any }), selections: List ({ path: List Any, indices: List Number }) }
+authoringBindingEditPlan draft request =
+  let state = { patches = [], diagnostics = [], reattachments = [], selections = [] }
+  let params = abeItems (abeGet draft "params")
+  let names = map (\param -> abeText (abeGet param "name")) params
+  let oldName = fromMaybe "" (head (drop request.index names))
+  let edit = { kind = request.kind, index = request.index, name = request.name, oldName = oldName }
+  if not (elem request.kind ["rename", "remove", "add"]) then abeFail state [] "binding.operation" "Unknown binding edit."
+  else if and (not (eq request.kind "add")) (or (lt request.index 0) (gte request.index (length params))) then abeFail state [] "binding.parameter" "The selected parameter no longer exists."
+  else if and (eq request.kind "rename") (eq oldName request.name) then state
+  else if and (not (eq request.kind "remove")) (not (abeValidName request.name)) then abeFail state [] "binding.name" "Use a nonempty identifier for the parameter name."
+  else if and (not (eq request.kind "remove")) (and (not (eq request.name "_")) (elem request.name names)) then abeFail state [] "binding.duplicate" "Another parameter already has this name."
+  else if and (not (eq request.kind "add")) (and (not (eq oldName "_")) (gt (length (filter (\name -> eq name oldName) names)) 1)) then abeFail state [] "binding.ambiguous" "Duplicate parameter names must be resolved before a binding edit."
+  else
+    let bodyState = abeNode (abeGet draft "body") ["body"] [] edit state
+    let parameterState = abeTypeFields params 0 ["params"] [] edit bodyState
+    let resultState = abeType (abeGet draft "returns") ["returns"] [] edit parameterState
+    let final = abeSchemePlan draft params edit resultState
+    if and (eq request.kind "rename") (eq (length final.diagnostics) 0)
+      then abePatch final ["params", request.index, "name"] oldName request.name
+      else final
+
+abeValidName : (name: String) -> Boolean
+abeValidName name = and (ppNameIsIdent name) (not (contains name "."))
+
+-- Whole-row edits are classified here, by existing FieldKey identity. The
+-- host supplies next rows unchanged; it never guesses a rename from an index.
+-- abeRows numbers the items of a list. The host iterates (std fold): one
+-- evaluator frame group per list, never one nested call per item. The
+-- self-call it replaces nested once per item, and a browser worker's stack
+-- holds under 200 such nestings on a first call: the reader's 221 countries
+-- overflowed it (Nov 11). Same rows, in the same order, numbered from `index`.
+abeRows : (nodes: List Any) -> (index: Number) -> List Any
+abeRows nodes index = fold (\rows node -> appendItem { node = node, index = add index (length rows) } rows) [] nodes
+
+abeSameRow : (left: a) -> (right: a) -> Boolean
+abeSameRow left right =
+  let leftKey = abeGet left.node "key"
+  let rightKey = abeGet right.node "key"
+  case leftKey of
+    JlTagged { tag = "NamedField" } -> eufValEq leftKey rightKey
+    JlTagged { tag = "PositionalField" } ->
+      case rightKey of
+        JlTagged { tag = "PositionalField" } -> eq left.index right.index
+        other -> false
+    other -> false
+
+abeRowHasKey : (row: a) -> Boolean
+abeRowHasKey row =
+  case abeGet row.node "key" of
+    JlTagged { tag = "NamedField" } -> not (eq (abeText (abeGet (abeGet (abeGet row.node "key") "ref") "$ref")) "")
+    JlTagged { tag = "PositionalField" } -> true
+    other -> false
+
+abeRowChanges : (oldRows: List Any) -> (nextRows: List Any) -> List Any
+abeRowChanges oldRows nextRows =
+  let oldChanges = fold (\changes row -> abeOldRowChange changes row nextRows) [] oldRows
+  fold (\changes row ->
+    if std.some oldRows (\old -> abeSameRow old row) then changes
+    else appendItem { kind = "add", oldName = "", name = abeText (abeGet row.node "name") } changes) oldChanges nextRows
+
+abeOldRowChange : (changes: List Any) -> (row: a) -> (nextRows: List Any) -> List Any
+abeOldRowChange changes row nextRows =
+  let oldName = abeText (abeGet row.node "name")
+  case find (\next -> abeSameRow row next) nextRows of
+    Nothing -> appendItem { kind = "remove", oldName = oldName, name = "" } changes
+    Just next ->
+      let name = abeText (abeGet next.node "name")
+      if eq oldName name then changes else appendItem { kind = "rename", oldName = oldName, name = name } changes
+
+abeDuplicateRows : (rows: List Any) -> Boolean
+abeDuplicateRows rows =
+  case head rows of
+    Nothing -> false
+    Just row -> or (std.some (tailOr rows) (\other -> or (abeSameRow row other) (and (not (eq (abeText (abeGet row.node "name")) "_")) (eq (abeText (abeGet row.node "name")) (abeText (abeGet other.node "name")))))) (abeDuplicateRows (tailOr rows))
+
+abeRowTypeChanged : (row: a) -> (nextRows: List Any) -> Boolean
+abeRowTypeChanged row nextRows =
+  case find (\next -> abeSameRow row next) nextRows of
+    Nothing -> false
+    Just next -> not (eufValEq (abeGet row.node "type") (abeGet next.node "type"))
+
+@label "Reconcile authoring parameter rows"
+@description "Classify complete next parameter rows by NamedField identity or container-relative positional identity, then plan simultaneous capture-safe binding changes over the existing draft. Types and unchanged metadata remain original host objects."
+@category "engine-internal"
+authoringBindingRowsPlan : (draft: (JsonLogic Any)) -> (nextParams: (JsonLogic Any)) -> { patches: List ({ path: List Any, before: String, after: String }), diagnostics: List ({ code: String, message: String, path: List Any }), reattachments: List ({ path: List Any, source: List Any }), selections: List ({ path: List Any, indices: List Number }) }
+authoringBindingRowsPlan draft nextParams =
+  let state = { patches = [], diagnostics = [], reattachments = [], selections = [] }
+  let oldRows = abeRows (abeItems (abeGet draft "params")) 0
+  let nextRows = abeRows (abeItems nextParams) 0
+  let changes = abeRowChanges oldRows nextRows
+  if not (std.all (concat oldRows nextRows) abeRowHasKey) then abeFail state ["params"] "binding.identity" "Parameter rows need an explicit stable or positional field identity."
+  else if or (abeDuplicateRows oldRows) (abeDuplicateRows nextRows) then abeFail state ["params"] "binding.ambiguous" "Parameter names and identities must be unambiguous."
+  else if not (std.all nextRows (\row -> abeValidName (abeText (abeGet row.node "name")))) then abeFail state ["params"] "binding.name" "Use a nonempty identifier for each parameter name."
+  else if eq (length changes) 0 then abeSchemePlan draft (abeItems nextParams) { changes = [] } state
+  else if std.some oldRows (\row -> abeRowTypeChanged row nextRows) then abeFail state ["params"] "binding.combined-type-edit" "Apply parameter binding changes separately from type changes so dependent references keep an unambiguous scope."
+  else
+    let edit = { changes = changes }
+    let bodyState = abeNode (abeGet draft "body") ["body"] [] edit state
+    let parameterState = abeTypeFields (abeItems nextParams) 0 ["params"] [] edit bodyState
+    let resultState = abeType (abeGet draft "returns") ["returns"] [] edit parameterState
+    abeSchemePlan draft (abeItems nextParams) edit resultState
+
+-- A TypeScheme remains the same existing scheme. Only compatibility-body
+-- occurrences and source-selected sidecar paths change; quantified identity
+-- and kinds are carried by reattachment, never regenerated from display names.
+abeSchemeRowsMatch : (actual: List Any) -> (expected: List Any) -> Boolean
+abeSchemeRowsMatch actual expected =
+  if not (eq (length actual) (length expected)) then false
+  else case head actual of
+    Nothing -> true
+    Just row ->
+      let other = fromMaybe JlNull (head expected)
+      and (eufValEq (abeGet row "key") (abeGet other "key")) (and (eufValEq (abeGet row "type") (abeGet other "type")) (and (eq (abeText (abeGet row "name")) (abeText (abeGet other "name"))) (abeSchemeRowsMatch (tailOr actual) (tailOr expected))))
+
+abeSchemePlan : (draft: (JsonLogic Any)) -> (nextParams: List Any) -> (edit: a) -> (state: b) -> b
+abeSchemePlan draft nextParams edit state =
+  let scheme = abeGet draft "scheme"
+  case scheme of
+    JlNull -> state
+    other ->
+      let body = abeGet scheme "body"
+      let arrow = abeGet body "$arrow"
+      let oldParams = abeItems (abeGet draft "params")
+      if not (abeHas body "$arrow") then abeFail state ["scheme", "body"] "binding.scheme-shape" "Refresh the canonical function scheme before editing this non-arrow signature."
+      else if not (abeSchemeRowsMatch (abeItems (abeGet arrow "params")) oldParams) then abeFail state ["scheme", "body"] "binding.scheme-shape" "The scheme parameter carrier differs from the draft; refresh it without flattening or guessing parameter identity."
+      else if and (abeHas draft "returns") (not (eufValEq (abeGet draft "returns") (abeGet arrow "returns"))) then abeFail state ["scheme", "body", "$arrow", "returns"] "binding.scheme-shape" "The draft result and scheme result differ; refresh the canonical scheme first."
+      else
+        let oldRows = abeRows oldParams 0
+        let nextRows = abeRows nextParams 0
+        let checkedResult = abeType (abeGet arrow "returns") ["scheme", "body", "$arrow", "returns"] [] edit state
+        let applications = abeSchemeSidecar scheme "applications" oldRows nextRows edit checkedResult
+        let nominals = abeSchemeSidecar scheme "nominals" oldRows nextRows edit applications
+        let diagnostics = abeSchemeSidecar scheme "diagnostics" oldRows nextRows edit nominals
+        let withParams = mapSet diagnostics "reattachments" (appendItem { path = ["scheme", "body", "$arrow", "params"], source = ["params"] } diagnostics.reattachments)
+        if abeHas draft "returns" then mapSet withParams "reattachments" (appendItem { path = ["scheme", "body", "$arrow", "returns"], source = ["returns"] } withParams.reattachments) else withParams
+
+abeSchemeSidecar : (scheme: (JsonLogic Any)) -> (name: String) -> (oldRows: List Any) -> (nextRows: List Any) -> (edit: a) -> (state: b) -> b
+abeSchemeSidecar scheme name oldRows nextRows edit state =
+  if not (abeHas scheme name) then state
+  else case abeGet scheme name of
+    JlNull -> state
+    JlArray { items = items } ->
+      let result = abeSchemeSidecarRows items 0 ["scheme", name] oldRows nextRows edit state []
+      if eq (length result.indices) (length items) then result.state
+      else mapSet result.state "selections" (appendItem { path = ["scheme", name], indices = result.indices } result.state.selections)
+    other -> abeFail state ["scheme", name] "binding.scheme-sidecar" "The scheme sidecar is not a list."
+
+abeSchemeSidecarRows : (items: List Any) -> (index: Number) -> (path: List Any) -> (oldRows: List Any) -> (nextRows: List Any) -> (edit: a) -> (state: b) -> (indices: List Number) -> { state: b, indices: List Number }
+abeSchemeSidecarRows items index path oldRows nextRows edit state indices =
+  case head items of
+    Nothing -> { state = state, indices = indices }
+    Just item ->
+      let result = abeSchemeSidecarRow item (abePath path index) oldRows nextRows edit state
+      let kept = if result.keep then appendItem index indices else indices
+      abeSchemeSidecarRows (tailOr items) (add index 1) path oldRows nextRows edit result.state kept
+
+abeSchemeSidecarRow : (item: (JsonLogic Any)) -> (path: List Any) -> (oldRows: List Any) -> (nextRows: List Any) -> (edit: a) -> (state: b) -> { state: b, keep: Boolean }
+abeSchemeSidecarRow item path oldRows nextRows edit state =
+  let selected = abeGet item "path"
+  let parts = map abeText (abeItems selected)
+  if not (abeHas item "path") then { state = abeFail state path "binding.scheme-path" "The scheme sidecar has no source path.", keep = true }
+  else if and (eq (fromMaybe "" (head parts)) "$arrow") (eq (fromMaybe "" (head (tailOr parts))) "params") then
+    let ordinal = fromMaybe "" (head (tailOr (tailOr parts)))
+    case find (\row -> eq (jsLit row.index) ordinal) oldRows of
+      Nothing -> { state = abeFail state path "binding.scheme-path" "The scheme sidecar points to no original parameter.", keep = true }
+      Just old ->
+        case find (\next -> if isNull edit.changes then eq old.index next.index else abeSameRow old next) nextRows of
+          Nothing -> { state = state, keep = false }
+          Just next ->
+            if not (eufValEq (abeGet old.node "type") (abeGet next.node "type")) then { state = abeFail state path "binding.scheme-refresh" "A parameter type with scheme evidence changed; refresh its canonical scheme before keeping that evidence.", keep = true }
+            else
+              let mapped = abePatch state (concat path ["path", 2]) ordinal (jsLit next.index)
+              { state = abeSchemeSidecarArguments item path edit mapped, keep = true }
+  else { state = abeSchemeSidecarArguments item path edit state, keep = true }
+
+abeSchemeSidecarArguments : (item: (JsonLogic Any)) -> (path: List Any) -> (edit: a) -> (state: b) -> b
+abeSchemeSidecarArguments item path edit state =
+  if abeHas item "args" then abeTypeList (abeItems (abeGet item "args")) 0 (abePath path "args") [] edit state else state
+
+@label "Collect authored expression type roots"
+@description "Use the binding editor's existing executable-slot walk to collect annotation and binding type roots. Term binders do not shadow type variables; the caller's type-scope planner analyzes each returned root. Unknown executable forms retain their refusal diagnostics."
+@category "engine-internal"
+authoringBindingTypeRoots : (body: (JsonLogic Any)) -> (path: List Any) -> { roots: List ({ path: List Any, scope: List String }), diagnostics: List ({ code: String, message: String, path: List Any }) }
+authoringBindingTypeRoots body path =
+  let result = abeNode body path [] { collectTypes = true } { patches = [], diagnostics = [], roots = [] }
+  { roots = result.roots, diagnostics = result.diagnostics }
+
+@label "Plan an authoring call edit"
+@description "Wrap an existing expression in an already seeded call, remove a call while returning its selected input, or swap a call with the call feeding its first input (move a step up). Multi-input calls retain their original inputs once in source-order local bindings. Return original-carrier reattachments and new wrapper skeletons; never rebuild existing expressions, infer types or execute functions. A call without inputs becomes the supplied incomplete slot."
+@category "engine-internal"
+authoringCallEditPlan : (draft: (JsonLogic Any)) -> (request: { kind: String, index: Maybe Number, targetIndex: Maybe Number, names: List String }) -> { patches: List ({ path: List Any, before: String, after: String }), diagnostics: List ({ code: String, message: String, path: List Any }), reattachments: List ({ path: List Any, source: List Any }), selections: List ({ path: List Any, indices: List Number }), initializations: List ({ path: List Any, value: Any }) }
+authoringCallEditPlan draft request =
+  let state = { patches = [], diagnostics = [], reattachments = [], selections = [], initializations = [] }
+  let node = abeGet draft "node"
+  let index = fromMaybe 0 request.index
+  if not (elem request.kind ["wrap", "remove", "swap"]) then abeFail state [] "call.operation" "Unknown call edit."
+  else if or (lt index 0) (not (eq index (floor index))) then abeFail state ["node", "args"] "call.argument" "Choose an existing input."
+  else if not (elem (abeText (abeGet node "kind")) ["literal", "call", "ref", "param"]) then abeFail state ["node"] "call.expression" "The selected expression no longer exists."
+  else if eq request.kind "wrap" then
+    let call = abeGet draft "call"
+    let callKind = abeText (abeGet call "kind")
+    let constructor = abeGet (abeGet call "value") "__construct"
+    let namedConstructor = and (eq callKind "literal") (not (eq (abeText (abeGet constructor "tag")) ""))
+    let name = if eq callKind "call" then abeText (abeGet call "fnId") else abeText (abeGet constructor "tag")
+    let slots = if eq callKind "call" then abeGet call "args" else abeGet constructor "fields"
+    let inputPath = if eq callKind "call" then ["call", "args", index] else ["call", "value", "__construct", "fields", index, "value"]
+    if or (not (or (eq callKind "call") namedConstructor)) (eq name "") then abeFail state ["call"] "call.target" "Choose a function call to insert."
+    else case slots of
+      JlArray { items = args } ->
+        if gte index (length args) then abeFail state ["call", "args"] "call.argument" "The inserted call needs an input for this expression."
+        else if and namedConstructor (not (abeHas (abeAt slots index) "value")) then abeFail state inputPath "call.argument" "The inserted constructor needs a value slot for this expression."
+        else abeCallWrapPlan node inputPath request.targetIndex state
+      other -> abeFail state ["call", "args"] "call.arguments" "The inserted call has no readable input slots."
+  else if eq request.kind "swap" then abeCallSwapPlan node state
+  else if not (eq (abeText (abeGet node "kind")) "call") then abeFail state ["node"] "call.target" "Only a function call can retain an input when removed."
+  else case abeGet node "args" of
+    JlArray { items = args } ->
+      if and (eq (length args) 0) (eq index 0) then
+        let empty = abeGet draft "empty"
+        if and (eq (abeText (abeGet empty "kind")) "literal") (abeHas empty "value") then
+          case abeGet empty "value" of
+            JlNull -> mapSet state "reattachments" [{ path = ["node"], source = ["empty"] }]
+            other -> abeFail state ["empty"] "call.empty" "Supply the editor's incomplete slot for a call without inputs."
+        else abeFail state ["empty"] "call.empty" "Supply the editor's incomplete slot for a call without inputs."
+      else if gte index (length args) then abeFail state ["node", "args"] "call.argument" "The selected input no longer exists."
+      else if gt (length args) 1 then abeCallPreserveInputs draft args index request.names state
+      else mapSet state "reattachments" [{ path = ["node"], source = ["node", "args", index] }]
+    other -> abeFail state ["node", "args"] "call.arguments" "The selected call has no readable input slots."
+
+-- Move a step up: P(N(x, n...), p...) becomes N(P(x, p...), n...). The four
+-- reattachments run in order over original carriers ("call" is the scratch
+-- slot): call <- N; P.args[0] <- x; call.args[0] <- P; node <- call. Moving
+-- the outer step down is the same swap at its parent. No type is judged here:
+-- a swapped graph that no longer type-checks shows its ordinary edge issue.
+abeCallSwapPlan : (node: (JsonLogic Any)) -> (state: a) -> a
+abeCallSwapPlan node state =
+  if not (eq (abeText (abeGet node "kind")) "call") then abeFail state ["node"] "call.target" "Only a function call can move past another step."
+  else
+    let inner = abeAt (abeGet node "args") 0
+    if not (eq (abeText (abeGet inner "kind")) "call") then abeFail state ["node", "args", 0] "call.swap" "This call's first input is not a step it can move past."
+    else if eq (length (abeItems (abeGet inner "args"))) 0 then abeFail state ["node", "args", 0, "args"] "call.swap" "The step before this call has no input to pass on."
+    else mapSet state "reattachments" [{ path = ["call"], source = ["node", "args", 0] }, { path = ["node", "args", 0], source = ["call", "args", 0] }, { path = ["call", "args", 0], source = ["node"] }, { path = ["node"], source = ["call"] }]
+
+abeCallWrapPlan : (node: (JsonLogic Any)) -> (inputPath: List Any) -> (target: Maybe Number) -> (state: a) -> a
+abeCallWrapPlan node inputPath target state =
+  case target of
+    Nothing -> mapSet state "reattachments" [{ path = inputPath, source = ["node"] }, { path = ["node"], source = ["call"] }]
+    Just targetIndex ->
+      if not (eq (abeText (abeGet node "kind")) "call") then abeFail state ["node"] "call.target" "Only a function call has an incoming expression to insert before."
+      else case abeGet node "args" of
+        JlArray { items = args } ->
+          if or (lt targetIndex 0) (or (not (eq targetIndex (floor targetIndex))) (gte targetIndex (length args))) then abeFail state ["node", "args"] "call.argument" "The selected input no longer exists."
+          else mapSet state "reattachments" [{ path = inputPath, source = ["node", "args", targetIndex] }, { path = ["node", "args", targetIndex], source = ["call"] }]
+        other -> abeFail state ["node", "args"] "call.arguments" "The selected call has no readable input slots."
+
+-- Ordinary where bindings evaluate once in source order, then their body.
+-- Retain every eager argument, including the primary, so deleting a call does
+-- not move or duplicate its argument evaluations. Structural lazy carriers
+-- refuse: preserving their dormant branches as eager bindings would execute
+-- inputs the original expression never evaluated.
+abeCallPreserveInputs : (draft: (JsonLogic Any)) -> (args: List Any) -> (selected: Number) -> (names: List String) -> (state: a) -> a
+abeCallPreserveInputs draft args selected names state =
+  let logic = abeGet draft "logic"
+  if not (or (abeHas logic "call") (or (abeHas logic "construct") (abeHas logic "method"))) then abeFail state ["node"] "call.lazy-inputs" "This expression chooses which inputs to evaluate. Edit its branches individually to keep unused inputs from running."
+  else
+    let inspected = abeNodeList args 0 ["node", "args"] [] { collectNames = true } (mapSet state "names" [])
+    if gt (length inspected.diagnostics) 0 then inspected
+    else
+      let rows = abeCallSavedInputRows args 0 names inspected.names []
+      let primary = fromMaybe { name = "", expr = {} } (head (drop selected rows))
+      let value = { kind = "literal", value = { __where = { body = { kind = "param", name = primary.name }, bindings = rows } } }
+      let copied = abeCallSavedInputPaths args 0
+      let initialized = mapSet inspected "initializations" [{ path = ["replacement"], value = value }]
+      mapSet initialized "reattachments" (appendItem { path = ["node"], source = ["replacement"] } copied)
+
+abeCallSavedInputRows : (args: List Any) -> (index: Number) -> (names: List String) -> (reserved: List String) -> (rows: List Any) -> List Any
+abeCallSavedInputRows args index names reserved rows =
+  case head args of
+    Nothing -> rows
+    Just arg ->
+      let preferred = fromMaybe "" (head (drop index names))
+      let base = if and (abeValidName preferred) (not (eq preferred "_")) then preferred else concat "input" (toString (add index 1))
+      let name = abeCallFreshInputName base 1 reserved
+      abeCallSavedInputRows (tailOr args) (add index 1) names (appendItem name reserved) (appendItem { name = name, expr = {} } rows)
+
+abeCallFreshInputName : (base: String) -> (suffix: Number) -> (reserved: List String) -> String
+abeCallFreshInputName base suffix reserved =
+  let name = if eq suffix 1 then base else concat base (toString suffix)
+  if elem name reserved then abeCallFreshInputName base (add suffix 1) reserved else name
+
+abeCallSavedInputPaths : (args: List Any) -> (index: Number) -> List Any
+abeCallSavedInputPaths args index =
+  case head args of
+    Nothing -> []
+    Just arg -> concat [{ path = ["replacement", "value", "__where", "bindings", index, "expr"], source = ["node", "args", index] }] (abeCallSavedInputPaths (tailOr args) (add index 1))
+
+@label "Authoring graph edge issue"
+@description "Project an existing incompatibility verdict or a literal membership refusal at this exact expression root. Descendant, unknown and annotation diagnostics do not attribute an error to this expression's outgoing connection; no new type judgment is made."
+@category "engine-internal"
+authoringGraphEdgeIssuePlan : (compatibility: String) -> (outcome: (JsonLogic Any)) -> (mismatchMessage: String) -> Maybe String
+authoringGraphEdgeIssuePlan compatibility outcome mismatchMessage =
+  if eq compatibility "incompatible" then Just mismatchMessage
+  else case outcome of
+    JlTagged { tag = "Invalid" } ->
+      case find abeGraphRootLiteralDiagnostic (abeItems (abeGet outcome "diagnostics")) of
+        Nothing -> Nothing
+        Just diagnostic -> Just (abeText (abeGet diagnostic "message"))
+    other -> Nothing
+
+abeGraphRootLiteralDiagnostic : (diagnostic: (JsonLogic Any)) -> Boolean
+abeGraphRootLiteralDiagnostic diagnostic =
+  let path = abeGet diagnostic "path"
+  and (eq (abeText (abeGet diagnostic "code")) "authoring.literal-membership") (and (eq (length (abeItems path)) 1) (eq (abeText (abeAt path 0)) "$expression"))
+
+@label "Authoring call candidate indices"
+@description "Select original catalogue rows that have a declared input when composing an existing expression. This is arity presentation only, without a compatibility judgment or callable inference."
+@category "engine-internal"
+authoringCallCandidateIndices : (arities: List Number) -> (requiresInput: Boolean) -> List Number
+authoringCallCandidateIndices arities requiresInput = abeCallCandidateIndices arities requiresInput 0
+
+abeCallCandidateIndices : (arities: List Number) -> (requiresInput: Boolean) -> (index: Number) -> List Number
+abeCallCandidateIndices arities requiresInput index =
+  let selected = fold (\state arity ->
+    { index = add state.index 1,
+      indices = if or (not requiresInput) (gt arity 0) then appendItem state.index state.indices else state.indices }
+  ) { index = index, indices = [] } arities
+  selected.indices
+
+@label "Propose naming an expression result"
+@description "Name one exact occurrence for its following linear eager calls. Stop lifting at non-primary inputs, lazy carriers and structural scope boundaries; retain the selected expression once as an ordinary local binding and replace only that occurrence with its name. Existing lexical analysis refuses capture and unknown executable shapes. The returned plan is a proposal, not a write."
+@category "engine-internal"
+authoringResultBindingPlan : (draft: (JsonLogic Any)) -> (request: { targetPath: List Any, name: String, boundNames: List String, sites: List ({ depth: Number, logic: (JsonLogic Any) }) }) -> { patches: List ({ path: List Any, before: String, after: String }), diagnostics: List ({ code: String, message: String, path: List Any }), reattachments: List ({ path: List Any, source: List Any }), selections: List ({ path: List Any, indices: List Number }), initializations: List ({ path: List Any, value: Any }), name: String, scopePath: List Any, targetPath: List Any }
+authoringResultBindingPlan draft request =
+  let root = abeGet draft "node"
+  let scopePath = abeResultBindingScopePath root request.targetPath request.sites
+  let state = { patches = [], diagnostics = [], reattachments = [], selections = [], initializations = [], name = request.name, scopePath = scopePath, targetPath = request.targetPath }
+  let selected = abeResultBindingReadPath root request.targetPath
+  let scope = abeResultBindingReadPath root scopePath
+  if or (not (abeValidName request.name)) (eq request.name "_") then abeFail state request.targetPath "binding.name" "Use a nonempty identifier for the result name."
+  else if not (elem (abeText (abeGet selected "kind")) ["literal", "call", "ref", "param"]) then abeFail state request.targetPath "binding.occurrence" "The selected expression no longer exists."
+  else
+    let inspected = abeNode scope scopePath [] { collectNames = true } (mapSet state "names" request.boundNames)
+    if gt (length inspected.diagnostics) 0 then inspected
+    else if elem request.name inspected.names then abeFail inspected scopePath "binding.capture" "This name is already used in the expression or its scope. Choose another result name."
+    else
+      let wrapper = { kind = "literal", value = { __where = { body = {}, bindings = [{ name = request.name, expr = {} }] } } }
+      let relativePath = drop (length scopePath) request.targetPath
+      let reference = { kind = "param", name = request.name }
+      let initialized = mapSet inspected "initializations" [{ path = ["replacement"], value = wrapper }, { path = ["reference"], value = reference }]
+      mapSet initialized "reattachments" [
+        { path = ["scope"], source = concat ["node"] scopePath },
+        { path = ["replacement", "value", "__where", "bindings", 0, "expr"], source = concat ["node"] request.targetPath },
+        { path = ["replacement", "value", "__where", "body"], source = ["scope"] },
+        { path = concat ["replacement", "value", "__where", "body"] relativePath, source = ["reference"] },
+        { path = concat ["node"] scopePath, source = ["replacement"] }
+      ]
+
+abeResultBindingReadPath : (node: (JsonLogic Any)) -> (path: List Any) -> (JsonLogic Any)
+abeResultBindingReadPath node path =
+  case head path of
+    Nothing -> node
+    Just key -> abeResultBindingReadPath (if isNumber key then abeAt node key else abeGet node key) (tailOr path)
+
+abeResultBindingScopePath : (root: (JsonLogic Any)) -> (path: List Any) -> (sites: List ({ depth: Number, logic: (JsonLogic Any) })) -> List Any
+abeResultBindingScopePath root path sites =
+  if lt (length path) 2 then path
+  else
+    let depth = sub (length path) 2
+    let parentPath = take depth path
+    let key = fromMaybe "" (head (drop depth path))
+    let ordinal = fromMaybe 0 (head (drop (add depth 1) path))
+    let parent = abeResultBindingReadPath root parentPath
+    if not (and (eq key "args") (and (eq ordinal 0) (eq (abeText (abeGet parent "kind")) "call"))) then path
+    else case find (\site -> eq site.depth depth) sites of
+      Nothing -> path
+      Just site ->
+        if or (abeHas site.logic "call") (or (abeHas site.logic "construct") (abeHas site.logic "method")) then abeResultBindingScopePath root parentPath sites else path
+
+@label "Authoring local binding name issue"
+@description "Check authored local-binding rows before the codec turns them into an object. Reject duplicate names in one where scope and invalid identifiers without rejecting nested lexical shadowing. Only actual structural marker slots are walked; literal data and opaque carriers remain inert."
+@category "engine-internal"
+authoringBindingNameIssuePlan : (node: (JsonLogic Any)) -> Maybe String
+authoringBindingNameIssuePlan node =
+  let inspected = abeNode node [] [] { checkBindingNames = true } { patches = [], diagnostics = [] }
+  case head inspected.diagnostics of
+    Nothing -> Nothing
+    Just diagnostic -> Just diagnostic.message
+
+abeWhereBindingNames : (bindings: List Any) -> (index: Number) -> (path: List Any) -> (seen: List String) -> (state: a) -> a
+abeWhereBindingNames bindings index path seen state =
+  case head bindings of
+    Nothing -> state
+    Just binding ->
+      let name = abeText (abeGet binding "name")
+      let namePath = concat path [index, "name"]
+      let checked =
+        if not (abeValidName name) then abeFail state namePath "binding.name" "Use a nonempty identifier for each local binding."
+        else if elem name seen then abeFail state namePath "binding.duplicate" (concat "The local binding name " (concat name " is repeated in this scope. Choose distinct names before saving."))
+        else state
+      abeWhereBindingNames (tailOr bindings) (add index 1) path (appendItem name seen) checked
+
+-- Suggestions reuse the binding walk's executable slots. A literal's nested
+-- data and a type's term-shaped payload are not editor expression occurrences.
+-- Barriers record the free initializer/non-result roles; they do not discard
+-- the initializer's own annotation or its later nested annotation sites.
+abeExpressionPathPrefix : (prefix: List Any) -> (path: List Any) -> Boolean
+abeExpressionPathPrefix prefix path = eq prefix (take (length prefix) path)
+
+@label "Inspect authoring expression sites"
+@description "Project executable expression occurrences, actual annotation slots and free initializer boundaries through the existing binding walk. Annotation sites are deepest first. No type judgment or expression evaluation is performed."
+@category "engine-internal"
+authoringExpressionSites : (node: (JsonLogic Any)) -> { occurrences: List ({ path: List Any, hasEnclosingAnnotation: Boolean, detached: Boolean }), annotations: List ({ expressionPath: List Any, typePath: List Any }), barriers: List (List Any), diagnostics: List ({ code: String, message: String, path: List Any }) }
+authoringExpressionSites node =
+  let inspected = abeNode node [] [] { checkBindingNames = true, collectOccurrences = true } { patches = [], diagnostics = [], occurrences = [], annotations = [], barriers = [] }
+  { occurrences = map (\site -> { path = site.path,
+      hasEnclosingAnnotation = std.some inspected.annotations (\annotation -> abeExpressionPathPrefix annotation.expressionPath site.path),
+      detached = std.some inspected.barriers (\barrier -> abeExpressionPathPrefix barrier site.path) }) inspected.occurrences,
+    annotations = fold (\sites site -> concat [site] sites) [] inspected.annotations,
+    barriers = inspected.barriers, diagnostics = inspected.diagnostics }
+
+@label "Replace one authoring expression occurrence"
+@description "Validate a captured executable expression path and return one reattachment into its original carrier. Metadata, literal data and type payloads are not expression replacement sites."
+@category "engine-internal"
+authoringExpressionOccurrencePlan : (draft: (JsonLogic Any)) -> (path: List Any) -> { patches: List ({ path: List Any, before: String, after: String }), diagnostics: List ({ code: String, message: String, path: List Any }), reattachments: List ({ path: List Any, source: List Any }), selections: List ({ path: List Any, indices: List Number }) }
+authoringExpressionOccurrencePlan draft path =
+  let inspected = authoringExpressionSites (abeGet draft "node")
+  let state = { patches = [], diagnostics = inspected.diagnostics, reattachments = [], selections = [] }
+  if gt (length inspected.diagnostics) 0 then state
+  else if not (std.some inspected.occurrences (\site -> eq site.path path)) then abeFail state path "binding.occurrence" "The selected path is not an executable expression occurrence."
+  else if not (elem (abeText (abeGet (abeGet draft "replacement") "kind")) ["literal", "call", "ref", "param"]) then abeFail state path "binding.replacement" "The replacement is not an expression carrier."
+  else mapSet state "reattachments" [{ path = concat ["node"] path, source = ["replacement"] }]
+
+@label "Attach an authoring occurrence check"
+@description "Build an inference-only check at one executable expression occurrence, retaining its original result expression after the supplied canonical consumer. This plan never evaluates or persists the checker expression."
+@category "engine-internal"
+authoringExpressionCheckPlan : (draft: (JsonLogic Any)) -> (path: List Any) -> (consumerId: String) -> { patches: List ({ path: List Any, before: String, after: String }), diagnostics: List ({ code: String, message: String, path: List Any }), reattachments: List ({ path: List Any, source: List Any }), selections: List ({ path: List Any, indices: List Number }), initializations: List ({ path: List Any, value: Any }) }
+authoringExpressionCheckPlan draft path consumerId =
+  let inspected = authoringExpressionSites (abeGet draft "node")
+  let state = { patches = [], diagnostics = inspected.diagnostics, reattachments = [], selections = [], initializations = [] }
+  -- Preserve source inference: an annotation checks a polymorphic expression
+  -- without replacing its principal type. The caller checks all missing-input
+  -- parameters in one surrounding lambda. Bound repeated proof work; budget
+  -- refusal is unavailable evidence, never a type incompatibility.
+  if gt (length inspected.diagnostics) 0 then state
+  else if gt (length inspected.occurrences) 512 then abeFail state path "binding.check-budget" "The enclosing expression exceeds this bounded annotation check."
+  else if not (std.some inspected.occurrences (\site -> eq site.path path)) then abeFail state path "binding.occurrence" "The selected path is not an executable expression occurrence."
+  else if eq consumerId "" then abeFail state path "binding.check-consumer" "The canonical check consumer is unavailable."
+  else
+    let wrapper = { kind = "literal", value = { __do = [{ kind = "call", fnId = consumerId, args = [{}] }, {}] } }
+    let initialized = mapSet state "initializations" [{ path = ["wrapper"], value = wrapper }]
+    mapSet initialized "reattachments" [
+      { path = ["wrapper", "value", "__do", 0, "args", 0], source = concat ["node"] path },
+      { path = ["wrapper", "value", "__do", 1], source = concat ["node"] path },
+      { path = concat ["node"] path, source = ["wrapper"] }
+    ]

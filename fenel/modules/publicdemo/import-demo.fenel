@@ -1,0 +1,368 @@
+module ImportDemo where
+
+import std (fold, map, head, tail, length, all, unique, concat, appendItem, split, join, slice, endsWith, toString, bindResult, fromMaybe, not, charFromCode, isString)
+import codec (JsonValue, JsonObjectEntry, JsonObject, JsonArray, JsonString, JsonNumber, jsonDecodeBounded, jsonParseHost, jsonWrapCheckedAtDepth, jsonEncode, decodeJsonString, decodeJsonInt, decodeRecordRequiredField, decodeJsonList)
+import set (contains)
+import StatisticsDemo (StatisticsPurchase, StatisticsCustomer, PurchaseStatistics, purchaseStatistics, statisticsPurchasesAdmitted, statisticsSampleCustomers)
+
+-- GP-62's bounded conversion slice. JSON syntax remains the existing host
+-- JSON.parse boundary. This does not claim a Fenel JSON grammar, dependent
+-- schema authoring, or strict typed-class dispatch over host List carriers.
+-- CSV has exactly id, customerId and amountCents columns in any order; LF or
+-- CRLF rows, commas inside quoted fields and doubled quotes are supported.
+-- Embedded newlines, stray quotes, padding after closing quotes and bare CR
+-- are refused. Text is limited to 16384 characters, purchases to 64 rows.
+-- CR retains the explicit charFromCode 13 spelling used by this CSV slice.
+
+importTextAdmitted : (text: String) -> Bool
+importTextAdmitted text = length text <= 16384
+
+importTextLimitMessage : String
+importTextLimitMessage = "Use at most 16384 characters."
+
+@label "Check purchase cents membership"
+@description "The existing set judgment checks the inclusive 0 through 1000000 interval. An undecided answer remains Nothing; it is never turned into success. Integer decoding is a separate preceding step."
+importAmountMembership : (amount: Number) -> Maybe Boolean
+importAmountMembership amount =
+  let interval = SeInterval { interval = { lo = Just ({ value = 0, inclusive = true }), hi = Just ({ value = 1000000, inclusive = true }) } }
+  set.contains interval amount
+
+importCheckedAmount : (amount: Number) -> Result String Number
+importCheckedAmount amount = case importAmountMembership amount of
+  Just true -> Ok (if amount == 0 then 0 else amount)
+  Just false -> Err "amountCents must be a whole amount from 0 through 1000000."
+  Nothing -> Err "Membership of amountCents was not decided."
+
+importJsonAmount : (value: JsonValue) -> Result String Number
+importJsonAmount value = bindResult (codec.decodeJsonInt value) importCheckedAmount
+
+importHeaderName : (name: String) -> Bool
+importHeaderName name = name == "id" || name == "customerId" || name == "amountCents"
+
+importExactHeaders : (headers: List String) -> Bool
+importExactHeaders headers = length headers == 3 && length (unique headers) == 3 && all headers importHeaderName
+
+@label "Decode a purchase row"
+@description "Require exactly id, customerId and amountCents. Decode both ids as Strings and cents as an integer, then ask the existing interval-membership judgment. The result reuses StatisticsPurchase."
+decodePurchaseRow : (value: JsonValue) -> Result String StatisticsPurchase
+decodePurchaseRow value = case value of
+  JsonObject { pairs = pairs } ->
+    if importExactHeaders (map (\pair -> pair.key) pairs) then
+      bindResult (codec.decodeRecordRequiredField value "id" codec.decodeJsonString) (\id ->
+        bindResult (codec.decodeRecordRequiredField value "customerId" codec.decodeJsonString) (\customerId ->
+          bindResult (codec.decodeRecordRequiredField value "amountCents" importJsonAmount) (\amount ->
+            Ok (StatisticsPurchase { id = id, customerId = customerId, amountCents = amount }))))
+    else Err "A purchase needs exactly id, customerId and amountCents, with no extra or repeated fields."
+  _ -> Err "A purchase must be a JSON object."
+
+@label "Check JSON purchase input"
+@description "Try malformed JSON, a JSON object with a wrong field type, then a valid purchase. The host codec decides JSON syntax; valid data deeper than 16 or beyond the finite Number representation is a text refusal. The Fenel decoder checks the declared row and shows the amount membership answer. Duplicate JSON keys follow the host codec's last-key rule. No data is saved."
+@tags "demo" "json" "parsing" "validation"
+checkPurchaseJson : (text: String) -> ImportJsonCheck
+checkPurchaseJson text =
+  if not (importTextAdmitted text) then ImportTextRefused { reason = importTextLimitMessage () }
+  else case codec.jsonParseHost text of
+    Err reason -> ImportJsonSyntaxRejected { reason = reason }
+    Ok raw -> case codec.jsonWrapCheckedAtDepth true (Just 16) 0 raw of
+      Err reason -> ImportTextRefused { reason = reason }
+      Ok parsed -> case decodePurchaseRow parsed of
+        Err reason -> ImportPurchaseRejected { parsed = parsed, reason = reason }
+        Ok purchase -> ImportPurchaseAccepted { parsed = parsed, purchase = purchase, amountMembership = importAmountMembership purchase.amountCents }
+
+importDecodePurchaseArray : (value: JsonValue) -> Result String (List StatisticsPurchase)
+importDecodePurchaseArray value = case value of
+  JsonArray { items = items } ->
+    if length items <= 64 then codec.decodeJsonList decodePurchaseRow value
+    else Err "Use at most 64 purchase rows."
+  _ -> Err "Expected a JSON array of purchase objects."
+
+@label "Read purchases from JSON"
+@description "Decode a JSON array to the existing typed purchase list. At most 64 rows, 16384 characters and value depth 16; ids are Strings and cents are whole amounts from 0 through 1000000. JSON syntax uses the existing host codec."
+@tags "demo" "json" "conversion"
+purchasesFromJson : (text: String) -> Result String (List StatisticsPurchase)
+purchasesFromJson text =
+  if importTextAdmitted text then bindResult (codec.jsonDecodeBounded 16 text) importDecodePurchaseArray
+  else Err (importTextLimitMessage ())
+
+importCsvFailure : (state: ImportCsvState) -> (reason: String) -> ImportCsvState
+importCsvFailure state reason = ImportCsvState { fields = state.fields, current = state.current, mode = state.mode, failure = Just reason }
+
+importCsvAppend : (state: ImportCsvState) -> (character: String) -> ImportCsvState
+importCsvAppend state character = ImportCsvState { fields = state.fields, current = concat state.current character, mode = state.mode, failure = Nothing }
+
+importCsvEndField : (state: ImportCsvState) -> ImportCsvState
+importCsvEndField state = ImportCsvState { fields = appendItem state.current state.fields, current = "", mode = ImportCsvBare, failure = Nothing }
+
+importCsvBareStep : (state: ImportCsvState) -> (character: String) -> ImportCsvState
+importCsvBareStep state character =
+  if character == "," then importCsvEndField state
+  else if character == "\"" then
+    if state.current == "" then ImportCsvState { fields = state.fields, current = "", mode = ImportCsvQuoted, failure = Nothing }
+    else importCsvFailure state "A quote may only start at the beginning of a CSV field."
+  else importCsvAppend state character
+
+importCsvQuotedStep : (state: ImportCsvState) -> (character: String) -> ImportCsvState
+importCsvQuotedStep state character =
+  if character == "\"" then ImportCsvState { fields = state.fields, current = state.current, mode = ImportCsvClosed, failure = Nothing }
+  else importCsvAppend state character
+
+importCsvClosedStep : (state: ImportCsvState) -> (character: String) -> ImportCsvState
+importCsvClosedStep state character =
+  if character == "," then importCsvEndField state
+  else if character == "\"" then ImportCsvState { fields = state.fields, current = concat state.current "\"", mode = ImportCsvQuoted, failure = Nothing }
+  else importCsvFailure state "Only a comma or end of line may follow a closing CSV quote."
+
+importCsvStep : (state: ImportCsvState) -> (character: String) -> ImportCsvState
+importCsvStep state character = case state.failure of
+  Just _ -> state
+  Nothing ->
+    if character == charFromCode 13 || character == "\n" then importCsvFailure state "Embedded line breaks are outside this CSV fragment."
+    else case state.mode of
+      ImportCsvBare -> importCsvBareStep state character
+      ImportCsvQuoted -> importCsvQuotedStep state character
+      ImportCsvClosed -> importCsvClosedStep state character
+
+@label "Read one CSV line"
+@description "A strict Fenel character fold handles at most 16384 characters, quoted commas and doubled quotes, and returns an error for an unfinished quote, stray quote, padding after a closing quote or embedded line break."
+importCsvLine : (line: String) -> Result String (List String)
+importCsvLine line =
+  if not (importTextAdmitted line) then Err (importTextLimitMessage ())
+  else
+    let initial = ImportCsvState { fields = [], current = "", mode = ImportCsvBare, failure = Nothing }
+    let finished = fold importCsvStep initial (split line "")
+    case finished.failure of
+      Just reason -> Err reason
+      Nothing -> case finished.mode of
+        ImportCsvQuoted -> Err "Unclosed CSV quote; embedded newlines are not supported."
+        _ -> Ok (appendItem finished.current finished.fields)
+
+importCsvPhysicalLine : (line: String) -> (followedByLf: Bool) -> String
+importCsvPhysicalLine line followedByLf = if followedByLf && endsWith line (charFromCode 13) then slice line 0 (-1) else line
+
+importDigit : (character: String) -> Maybe Number
+importDigit character = case character of
+  "0" -> Just 0
+  "1" -> Just 1
+  "2" -> Just 2
+  "3" -> Just 3
+  "4" -> Just 4
+  "5" -> Just 5
+  "6" -> Just 6
+  "7" -> Just 7
+  "8" -> Just 8
+  "9" -> Just 9
+  _ -> Nothing
+
+importAmountDigit : (result: Result String Number) -> (character: String) -> Result String Number
+importAmountDigit result character = case result of
+  Err reason -> Err reason
+  Ok amount -> case importDigit character of
+    Nothing -> Err "amountCents needs ASCII digits only, with no sign, decimal point or surrounding spaces."
+    Just digit ->
+      let next = amount * 10 + digit
+      if next <= 1000000 then Ok next else Err "amountCents must be at most 1000000."
+
+importCsvAmount : (text: String) -> Result String Number
+importCsvAmount text =
+  if text == "" then Err "amountCents must not be empty."
+  else bindResult (fold importAmountDigit (Ok 0) (split text "")) importCheckedAmount
+
+importCsvValue : (name: String) -> (cell: String) -> Result String JsonValue
+importCsvValue name cell =
+  if name == "amountCents" then bindResult (importCsvAmount cell) (\amount -> Ok (JsonNumber { value = amount }))
+  else Ok (JsonString { value = cell })
+
+importCsvPairs : (headers: List String) -> (cells: List String) -> Result String (List JsonObjectEntry)
+importCsvPairs headers cells = case head headers of
+  Nothing -> Ok []
+  Just name -> case head cells of
+    Nothing -> Err "The CSV row has fewer cells than the header."
+    Just cell ->
+      bindResult (importCsvValue name cell) (\decoded ->
+        bindResult (importCsvPairs (fromMaybe [] (tail headers)) (fromMaybe [] (tail cells))) (\rest ->
+          Ok (concat [JsonObjectEntry { key = name, value = decoded }] rest)))
+
+importCsvPurchase : (headers: List String) -> (line: String) -> Result String StatisticsPurchase
+importCsvPurchase headers line =
+  bindResult (importCsvLine line) (\cells ->
+    if length cells == length headers then
+      bindResult (importCsvPairs headers cells) (\pairs -> decodePurchaseRow (JsonObject { pairs = pairs }))
+    else Err "The CSV row must have exactly three cells, matching the header.")
+
+importCsvNextRow : (headers: List String) -> (line: String) -> (rest: List String) -> (state: ImportCsvRows) -> Result String (List StatisticsPurchase)
+importCsvNextRow headers line rest state =
+  if length state.rows >= 64 then Err "Use at most 64 purchase rows."
+  else case importCsvPurchase headers line of
+    Err reason -> Err (concat (concat (concat "CSV line " (toString state.nextLine)) ": ") reason)
+    Ok purchase -> importCsvRows headers rest (ImportCsvRows { rows = appendItem purchase state.rows, nextLine = state.nextLine + 1 })
+
+importCsvRows : (headers: List String) -> (lines: List String) -> (state: ImportCsvRows) -> Result String (List StatisticsPurchase)
+importCsvRows headers lines state = case head lines of
+  Nothing -> Ok state.rows
+  Just raw ->
+    let rest = fromMaybe [] (tail lines)
+    let line = importCsvPhysicalLine raw (length rest > 0)
+    if line == "" && length rest == 0 then Ok state.rows
+    else importCsvNextRow headers line rest state
+
+importCsvBody : (lines: List String) -> Result String (List StatisticsPurchase)
+importCsvBody lines = case head lines of
+  Nothing -> Err "CSV needs the id,customerId,amountCents header."
+  Just rawHeader ->
+    let rest = fromMaybe [] (tail lines)
+    bindResult (importCsvLine (importCsvPhysicalLine rawHeader (length rest > 0))) (\headers ->
+      if importExactHeaders headers then importCsvRows headers rest (ImportCsvRows { rows = [], nextLine = 2 })
+      else Err "CSV needs exactly id, customerId and amountCents headers, in any order, with no duplicates or extra headers.")
+
+@label "Read purchases from CSV"
+@description "Strict Fenel CSV for exactly id, customerId and amountCents columns in any order. Quoted commas, doubled quotes and LF/CRLF rows work; embedded line breaks, invalid quotes, headers, row widths and typed cells return Err. At most 64 rows and 16384 characters."
+@tags "demo" "csv" "conversion"
+purchasesFromCsv : (text: String) -> Result String (List StatisticsPurchase)
+purchasesFromCsv text = if importTextAdmitted text then importCsvBody (split text "\n") else Err (importTextLimitMessage ())
+
+@label "Purchase as JSON data"
+@description "Construct the ordinary JsonValue ADT in Fenel before encoding. No host wrapper invents the purchase's JSON shape."
+purchaseJsonValue : (purchase: StatisticsPurchase) -> JsonValue
+purchaseJsonValue purchase = JsonObject { pairs = [
+  JsonObjectEntry { key = "id", value = JsonString { value = purchase.id } },
+  JsonObjectEntry { key = "customerId", value = JsonString { value = purchase.customerId } },
+  JsonObjectEntry { key = "amountCents", value = JsonNumber { value = purchase.amountCents } }
+] }
+
+importCheckedText : (text: String) -> Result String String
+importCheckedText text = if importTextAdmitted text then Ok text else Err (importTextLimitMessage ())
+
+-- Refuse oversized ids before a character fold or JSON encoding expands them.
+-- The final output bound still applies after escaping and header punctuation.
+importExportAdmitted : (purchases: List StatisticsPurchase) -> Bool
+importExportAdmitted purchases =
+  if length purchases > 64 then false
+  else if not (all purchases (\purchase -> isString purchase.id && isString purchase.customerId)) then false
+  else if fold (\total purchase -> total + length purchase.id + length purchase.customerId) 0 purchases > 16384 then false
+  else statisticsPurchasesAdmitted [] purchases
+
+@label "Write purchases as JSON"
+@description "Construct JsonValue in Fenel, then use the existing host JSON encoder. Refuse more than 64 rows, invalid purchase amounts, or an output longer than 16384 characters."
+@tags "demo" "json" "conversion"
+purchasesToJson : (purchases: List StatisticsPurchase) -> Result String String
+purchasesToJson purchases =
+  if importExportAdmitted purchases then bindResult (codec.jsonEncode (JsonArray { items = map purchaseJsonValue purchases })) importCheckedText
+  else Err "Use at most 64 purchase rows, String ids totaling at most 16384 characters, and whole amounts from 0 through 1000000 cents."
+
+importCsvEscapeCharacter : (character: String) -> String
+importCsvEscapeCharacter character = if character == "\"" then "\"\"" else character
+
+importCsvString : (text: String) -> Result String String
+importCsvString text =
+  if all (split text "") (\character -> character != charFromCode 13 && character != "\n") then
+    Ok (concat (concat "\"" (join (map importCsvEscapeCharacter (split text "")) "")) "\"")
+  else Err "CSV export refuses embedded line breaks in fields; multiline CSV is outside this fragment."
+
+importCsvPurchaseText : (purchase: StatisticsPurchase) -> Result String String
+importCsvPurchaseText purchase =
+  bindResult (importCsvString purchase.id) (\id ->
+    bindResult (importCsvString purchase.customerId) (\customerId ->
+      Ok (join [id, customerId, toString purchase.amountCents] ",")))
+
+importCsvTextStep : (result: Result String (List String)) -> (purchase: StatisticsPurchase) -> Result String (List String)
+importCsvTextStep result purchase = bindResult result (\lines -> bindResult (importCsvPurchaseText purchase) (\line -> Ok (appendItem line lines)))
+
+@label "Write purchases as CSV"
+@description "A Fenel serializer writes the fixed id,customerId,amountCents header and quotes ids, doubling internal quotes. It preserves normalized typed rows rather than original CSV bytes, and refuses embedded line breaks or the row/text limits."
+@tags "demo" "csv" "conversion"
+purchasesToCsv : (purchases: List StatisticsPurchase) -> Result String String
+purchasesToCsv purchases =
+  if importExportAdmitted purchases then
+    bindResult (fold importCsvTextStep (Ok ["id,customerId,amountCents"]) purchases) (\lines -> importCheckedText (join lines "\n"))
+  else Err "Use at most 64 purchase rows, String ids totaling at most 16384 characters, and whole amounts from 0 through 1000000 cents."
+
+@label "Convert CSV to JSON"
+@description "Strict CSV becomes typed StatisticsPurchase rows, then Fenel-constructed JsonValue and JSON text. Every failure remains Err."
+@tags "demo" "csv" "json" "conversion"
+csvToJson : (text: String) -> Result String String
+csvToJson text = bindResult (purchasesFromCsv text) purchasesToJson
+
+@label "Convert JSON to CSV"
+@description "JSON becomes checked purchase rows, then normalized CSV. Embedded line breaks in ids are refused by this declared CSV fragment."
+@tags "demo" "csv" "json" "conversion"
+jsonToCsv : (text: String) -> Result String String
+jsonToCsv text = bindResult (purchasesFromJson text) purchasesToCsv
+
+@label "Statistics from CSV purchases"
+@description "Strictly import typed purchases, then call the existing Fenel purchase-statistics function with the supplied customers. No storage is read or written."
+@tags "demo" "csv" "statistics"
+statisticsFromCsv : (customers: List StatisticsCustomer) -> (text: String) -> Result String PurchaseStatistics
+statisticsFromCsv customers text = bindResult (purchasesFromCsv text) (\purchases -> Ok (purchaseStatistics customers purchases))
+
+@label "Statistics from JSON purchases"
+@description "Decode typed purchases from JSON, then call the same Fenel purchase-statistics function used by the CSV example."
+@tags "demo" "json" "statistics"
+statisticsFromJson : (customers: List StatisticsCustomer) -> (text: String) -> Result String PurchaseStatistics
+statisticsFromJson customers text = bindResult (purchasesFromJson text) (\purchases -> Ok (purchaseStatistics customers purchases))
+
+-- The main gallery uses a typed record so the existing universal renderer
+-- offers its multiline text widget. Raw String converters remain reusable.
+@label "Check JSON purchase input"
+@description "Paste JSON and inspect syntax failure, a wrong row shape or an accepted purchase with its amount membership. The existing host codec reads JSON syntax; Fenel decodes the row."
+checkPurchaseJsonInput : (input: ImportTextInput) -> ImportJsonCheck
+checkPurchaseJsonInput input = checkPurchaseJson input.text
+
+@label "Read purchases from CSV"
+@description "Paste CSV with id,customerId,amountCents columns. Quoted commas, doubled quotes and LF/CRLF rows work. Invalid headers, row widths, quotes or cells return Err; at most 64 rows and 16384 characters."
+purchasesFromCsvInput : (input: ImportTextInput) -> Result String (List StatisticsPurchase)
+purchasesFromCsvInput input = purchasesFromCsv input.text
+
+@label "Read purchases from JSON"
+@description "Paste a JSON array and decode the same typed purchase rows. At most 64 rows and 16384 characters; String ids and whole cents from 0 through 1000000."
+purchasesFromJsonInput : (input: ImportTextInput) -> Result String (List StatisticsPurchase)
+purchasesFromJsonInput input = purchasesFromJson input.text
+
+@label "Convert CSV to JSON"
+@description "Paste CSV, decode checked purchases, construct JsonValue in Fenel and encode normalized JSON. Every failure remains Err."
+csvToJsonInput : (input: ImportTextInput) -> Result String String
+csvToJsonInput input = csvToJson input.text
+
+@label "Convert JSON to CSV"
+@description "Paste JSON and produce normalized CSV through the same purchase type. Embedded line breaks in ids are outside this CSV fragment and return Err."
+jsonToCsvInput : (input: ImportTextInput) -> Result String String
+jsonToCsvInput input = jsonToCsv input.text
+
+@label "Statistics from CSV purchases"
+@description "Paste CSV and use the supplied customers to run the existing typed purchase statistics. Editing 1200 cents to 2200 in the sample changes its total from 4000 to 5000. Nothing is saved."
+statisticsFromCsvInput : (customers: List StatisticsCustomer) -> (input: ImportTextInput) -> Result String PurchaseStatistics
+statisticsFromCsvInput customers input = statisticsFromCsv customers input.text
+
+@label "Statistics from JSON purchases"
+@description "Paste a JSON purchase array and compute the same counts, totals and customer breakdown as the CSV example."
+statisticsFromJsonInput : (customers: List StatisticsCustomer) -> (input: ImportTextInput) -> Result String PurchaseStatistics
+statisticsFromJsonInput customers input = statisticsFromJson customers input.text
+
+@label "Sample purchase CSV"
+importSampleCsv : String
+importSampleCsv = "id,customerId,amountCents\np1,ada,1200\np2,ada,800\np3,bo,1500\np4,guest,500"
+
+@label "Sample purchase JSON"
+importSampleJson : String
+importSampleJson = "[{\"id\":\"p1\",\"customerId\":\"ada\",\"amountCents\":1200},{\"id\":\"p2\",\"customerId\":\"ada\",\"amountCents\":800},{\"id\":\"p3\",\"customerId\":\"bo\",\"amountCents\":1500},{\"id\":\"p4\",\"customerId\":\"guest\",\"amountCents\":500}]"
+
+importDemoReadInputs : List ({ function: Any, arguments: List Any })
+importDemoReadInputs = [
+  { function = checkPurchaseJsonInput, arguments = [ImportTextInput { text = "{\"id\":\"p1\",\"customerId\":\"ada\",\"amountCents\":\"1200\"}" }] },
+  { function = purchasesFromCsvInput, arguments = [ImportTextInput { text = importSampleCsv () }] },
+  { function = purchasesFromJsonInput, arguments = [ImportTextInput { text = importSampleJson () }] }
+]
+
+importDemoConversionInputs : List ({ function: Any, arguments: List Any })
+importDemoConversionInputs = [
+  { function = csvToJsonInput, arguments = [ImportTextInput { text = importSampleCsv () }] },
+  { function = jsonToCsvInput, arguments = [ImportTextInput { text = importSampleJson () }] }
+]
+
+importDemoStatisticsInputs : List ({ function: Any, arguments: List Any })
+importDemoStatisticsInputs = [
+  { function = statisticsFromCsvInput, arguments = [statisticsSampleCustomers (), ImportTextInput { text = importSampleCsv () }] },
+  { function = statisticsFromJsonInput, arguments = [statisticsSampleCustomers (), ImportTextInput { text = importSampleJson () }] }
+]
+
+importDemoStartingInputs : List ({ function: Any, arguments: List Any })
+importDemoStartingInputs = concat (concat (concat (concat (concat (concat (concat (importDemoReadInputs ()) (importDemoConversionInputs ())) (importDemoStatisticsInputs ())) (jsonDemoStartingInputs ())) (csvDemoStartingInputs ())) (regexDemoStartingInputs ())) (fileDemoStartingInputs ())) (lispDemoStartingInputs ())

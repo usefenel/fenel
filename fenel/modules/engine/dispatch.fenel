@@ -1,0 +1,624 @@
+-- dispatch — Fenel-callable surface for the scoped instance registry.
+--
+-- Phase 10a-5d — V2 → canonical rename. The legacy `dispatch:register
+-- specTypeId args:List<String> methods scope` + `dispatch:lookup
+-- specTypeId target:String` shapes have been retired; the canonical
+-- surface takes a typed DispatchKey ADT.
+--
+--   dispatch:register specTypeId key:DispatchKey methods scope -> ()
+--     Adds an instance to the dispatch registry. Wraps
+--     `typeclassRegistry.addInstance`. The scope is Nothing for global
+--     instances; tagged scopes carry the tag string. DispatchKey:
+--     ByType target → registry args [target] (legacy parity);
+--     ByValue value → args [{$value: value}] (new); ByPattern predicate
+--     → args [{$pattern: predicate}] (reserved).
+--
+--   dispatch:lookup specTypeId key:DispatchKey -> LookupResult Value
+--     Resolves an instance for (specTypeId, key). Walks block scope
+--     (innermost `withInstance` frame) → tag / global scope (persisted
+--     registry). Returns Unique / Conflict / None. ByValue / ByPattern
+--     keys surface as None today (RESERVED — lookup-time matcher
+--     deferred to a future structural-dispatch sub-step).
+--
+--   dispatch:lookupOne specTypeId target -> Maybe Value
+--     Strict resolver. Unique x -> Just x; None -> Nothing; Conflict _
+--     throws (callers wanting permissive selection use lookupAll). The
+--     handler implements the case-of TS-side until the body authoring
+--     surface for Fenel-side LookupResult dispatch lands.
+--
+--   dispatch:lookupAll specTypeId target -> List Value
+--     Returns every matching instance's methods, in registry priority
+--     order. Permissive resolver for callers that want to surface every
+--     candidate (debug overlays, the conflict-resolution UI, etc.).
+--
+-- The `withInstance` JSON Logic op (`json-logic.ts:168-220`) is ALREADY
+-- Fenel-callable today via the raw form:
+--
+--   {withInstance: [{class, args, methods}, body]}
+--
+-- ...with `class` = the spec type name, `args` = [target], `methods` =
+-- the instance dict, and `body` = the expression evaluated in the
+-- pushed frame's scope. The parser doesn't yet have typeclass-style
+-- sugar (`with EngageableSpec Post = vocab in body`) — that's a parser
+-- extension deferred to a future sub-step.
+--
+-- LookupResult is declared here as the dispatch-scoped ADT. It mirrors
+-- Maybe / Result / Either structurally (named-field variant cases) but
+-- lives in this module rather than fenel/std/foundation.fenel because
+-- it's dispatch-specific rather than foundational.
+
+LookupResult a = Unique value: a | Conflict items: List a | None
+
+-- ===========================================================================
+-- resolution-substrate Phase 5.1 — the bare-name dispatch resolver, ported to
+-- Fenel (the TS `resolveMethod` + `classifyBareName` center of gravity).
+--
+-- This is the live `.fenel` source. TS remains the parity oracle and the
+-- guarded fallback for a missing or stale compiled artifact. Runtime input is
+-- a build-projected `RoutingTable`, arguments, block frames, and active tags.
+--
+-- REFLECTION WITHOUT A NEW LEAF (brief §2 — "confirm no existing native covers
+-- it FIRST; reuse, no new leaf"): `typeConstructorOf`'s value→type-constructor
+-- reflection is expressed entirely from EXISTING std natives —
+-- `isBoolean`/`isNumber`/`isString`/`isArray` (the JS-shape discrimination) +
+-- `mapGet value "$tag"` (the dynamic tag read, the same idiom derive-foldable
+-- uses). So NO `reflectShape` leaf was added (the brief's conditional D3 leaf is
+-- unnecessary) — maximally Fenel-first, no TS gate.
+--
+-- BOOTSTRAP DISCIPLINE (forward-looking, brief §4): the closure is DISPATCH-FREE
+-- — it references only single-binding std fns (`mapGet`/`head`/`tail`/`length`/
+-- `eq`/`lt`/`gte`/`sub`/`add`/`concat`/`elem` + the four `is*` predicates) + its
+-- own `rsv*` helpers, NO bare multi-binding name. That is what lets 5.3 compile
+-- it under the first-wins `$fenel` and have it SERVE as the dispatcher. All
+-- lookup indices are build-projected, so resolver calls only `mapGet` them.
+--
+-- D-5.1-a (the result ADT): a dedicated `ResolveOutcome` (lean — keeps
+-- `LookupResult` the general dispatch-registry ADT). It carries SIX cases, not
+-- the brief's five: a `Direct` case is added because §4-step-1 folds the
+-- classify lookup INTO the resolver, so `Direct` (the route miss / non-dispatch
+-- name) is a produced + 5.3-consumed outcome.
+-- ===========================================================================
+
+-- The classifier verdict, projected from TS `BareNameResolution` into `routes`.
+BareResolution =
+    RDirect
+  | RDispatch typeName: String
+  | RAmbiguousClass name: String classes: List String
+  | RAmbiguousModule name: String bindings: List String
+
+-- The resolver outcome the 5.3 call-site fork will consume: `Resolved` → apply;
+-- `Direct` → the caller's normal fast path; `Ambiguous`/`Conflicted` → the
+-- existing errors; `UnderApplied` → `buildDeferredMethodClosure`; `NoInstance` →
+-- the `unresolved bare dispatch` error.
+ResolveOutcome =
+    Resolved fnId: String
+  | Direct
+  | Ambiguous verdict: BareResolution
+  | Conflicted key: String count: Number
+  | NoInstance
+  | UnderApplied pos: Number
+  | CompleteUnsupported String
+
+-- The threaded build-static table. `methods` on an InstanceEntry is the
+-- already-default-merged dict (mirrors `spec-records.ts:resolve`); the `a`-typed
+-- fields hold opaque JSON dicts (the `CompileSource` idiom).
+--
+-- Build-projected indices cover bare routes, Class.method positions, tag
+-- owners, and exact class/key instance buckets. `generalIdx` marks classes
+-- requiring general matching. `routes` remains for TS dispatch-class recovery.
+-- modules-as-values Phase 2d — `generalScopeIdx` lists, per class, the scope of
+-- every row whose arguments are not all strings (the rows no exact bucket can
+-- compare as a complete tuple), so the complete-type entry asks whether such a
+-- row is VISIBLE to this frame: an invisible one changes nothing.
+-- `args` on an InstanceEntry / DictFrame is the complete type-argument tuple,
+-- `Just` only when every argument is a string.
+RoutingTable = RoutingTable routes: List RouteEntry routeIdx: a posIdx: b ownerIdx: c instanceIdx: d generalIdx: e generalScopeIdx: f
+RouteEntry = RouteEntry name: String resolution: BareResolution
+PositionEntry = PositionEntry typeName: String method: String pos: Number
+InstanceEntry = InstanceEntry typeName: String key: String args: Maybe (List String) scope: RsvInstanceScope priority: Number methods: a
+-- rights R3a — the OWNERSHIP coordinate, the Fenel twin of the TS
+-- `InstanceScope`. A row owned by an account is selected only under a frame
+-- whose authenticated authority derives the SAME account. The projection
+-- (`registry.ts:routingInstanceScope`) OMITS a row it cannot express here
+-- rather than widening it to global: projecting an unknown shape as global is
+-- how an invisible row becomes visible to this twin, and the twins have to
+-- agree row by row or the parity pin means nothing.
+RsvInstanceScope = RsvGlobalScope | RsvTagScope tag: String | RsvAccountScope accountId: String
+OwnerEntry = OwnerEntry tag: String owner: String
+DictFrame = DictFrame typeName: String key: String args: Maybe (List String) methods: a
+
+-- rsvRestOf — the tail of a list as a list (Nil on empty). The head/tail-Maybe
+-- → bare-list adapter the recursive scans below thread.
+@label "resolver: restOf"
+@description "Phase 5.1 — `tail xs` as a bare list (Nil on empty); the Maybe→list adapter for the resolver's recursive scans. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvRestOf : (xs: List a) -> List a
+rsvRestOf xs =
+  case tail xs of
+    Nothing -> []
+    Just r -> r
+
+-- rsvElemAt — `xs !! i` as a Maybe (Nothing when out of range). Head/tail
+-- recursion (the array-repr List idiom).
+@label "resolver: elemAt"
+@description "Phase 5.1 — `xs !! i` as a Maybe (Nothing when i is out of range). Head/tail recursion. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvElemAt : (xs: List a) -> (i: Number) -> Maybe a
+rsvElemAt xs i =
+  if eq i 0 then head xs
+  else
+    case tail xs of
+      Nothing -> Nothing
+      Just rest -> rsvElemAt rest (sub i 1)
+
+-- rsvOwnerOrSelf — a constructor tag → its owning type-constructor via the
+-- threaded caseOwner index; absent ⇒ the tag itself (a single-case record's tag
+-- IS its type). Mirrors `typeConstructorOf`'s `ctx._caseOwner[tag] ?? tag`.
+@label "resolver: ownerOrSelf"
+@description "Phase 5.1 — map a constructor tag to its owning type-constructor via the caseOwner index (`mapGet`); absent ⇒ the tag itself (single-case record). Mirrors typeConstructorOf's `_caseOwner[tag] ?? tag`. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvOwnerOrSelf : (ownerIdx: a) -> (tag: String) -> String
+rsvOwnerOrSelf ownerIdx tag =
+  case mapGet ownerIdx tag of
+    Nothing -> tag
+    Just o -> o
+
+-- rsvTypeKey — reflect a runtime value to its type-constructor name, the key the
+-- registry indexes instances under. The Fenel port of `typeConstructorOf`
+-- (`effect-dispatch.ts:1215`): the opaque-repr atoms by JS shape (the four `is*`
+-- predicates), a tagged object via `mapGet value "$tag"` + the caseOwner map.
+-- Nothing ⇒ unreflectable (null/undefined/foreign) — the resolver surfaces a
+-- NoInstance, exactly as the TS `key === undefined` arm does.
+@label "resolver: typeKey"
+@description "Phase 5.1 — reflect a runtime value to its type-constructor key (the Fenel port of typeConstructorOf): boolean→Boolean / number→Number / string→String / array→List (the is* predicates) / {$tag}→owning type-constructor (mapGet \"$tag\" + caseOwner) / else Nothing. NO new reflection leaf — composed from existing std natives. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvTypeKey : (v: a) -> (ownerIdx: b) -> Maybe String
+rsvTypeKey v ownerIdx =
+  if isBoolean v then Just "Boolean"
+  else if isNumber v then Just "Number"
+  else if isString v then Just "String"
+  else if isArray v then Just "List"
+  else
+    case mapGet v "$tag" of
+      Just tag -> Just (rsvOwnerOrSelf ownerIdx tag)
+      Nothing -> Nothing
+
+-- rsvFrameFor — walk the block-scope frames (projected innermost-FIRST) for the
+-- first matching (typeName, key). Mirrors `resolveDictFrame` (innermost wins);
+-- a matched block frame is always Unique (closest wins, no conflict).
+@label "resolver: frameFor"
+@description "Phase 5.1 — the first block-scope frame matching (typeName, key), frames projected innermost-first. Mirrors resolveDictFrame (closest wins). Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvFrameFor : (frames: List a) -> (cls: String) -> (key: String) -> Maybe a
+rsvFrameFor frames cls key =
+  case head frames of
+    Nothing -> Nothing
+    Just f ->
+      if eq f.typeName cls then
+        if eq f.key key then Just f
+        else rsvFrameFor (rsvRestOf frames) cls key
+      else rsvFrameFor (rsvRestOf frames) cls key
+
+-- Yield exact lookup to general matching when this class requires it.
+@label "resolver: classNeedsGeneral"
+@description "Whether exact lookup must yield to general registry matching. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvClassNeedsGeneral : (table: a) -> (cls: String) -> Bool
+rsvClassNeedsGeneral table cls =
+  case mapGet table.generalIdx cls of
+    Just marked -> true
+    Nothing -> false
+
+@label "resolver: instancesFor"
+@description "Read an exact class/key bucket, or [] when general matching is required. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvInstancesFor : (table: a) -> (cls: String) -> (key: String) -> List b
+rsvInstancesFor table cls key =
+  if rsvClassNeedsGeneral table cls then []
+  else
+    case mapGet table.instanceIdx cls of
+      Nothing -> []
+      Just byKey ->
+        case mapGet byKey key of
+          Nothing -> []
+          Just matches -> matches
+
+-- Global scope is visible; a tagged scope requires an active tag; an OWNED row
+-- requires the frame's own account (rights R3a). `account` is threaded exactly
+-- as `tags` is — an argument, never read from anywhere ambient.
+@label "resolver: instVisible"
+@description "rights R3a — global is visible; a tagged scope requires its active tag; an account-owned row requires the frame's own account (Nothing = no account, so no owned row is visible). Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5" "rights"
+@category "engine-internal"
+rsvInstVisible : (inst: a) -> (tags: List String) -> (account: Maybe String) -> Bool
+rsvInstVisible inst tags account =
+  case inst.scope of
+    RsvGlobalScope -> true
+    RsvTagScope tag -> elem tag tags
+    RsvAccountScope owner ->
+      case account of
+        Just a -> eq owner a
+        _ -> false
+    _ -> false
+
+-- rsvVisible — the visible subset (order-preserving), for conflict detection.
+@label "resolver: visible"
+@description "Phase 5.1 — the scope-visible subset of an instance list (order-preserving filter via rsvInstVisible). The conflict-detection input. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvVisible : (insts: List a) -> (tags: List String) -> (account: Maybe String) -> List a
+rsvVisible insts tags account =
+  case head insts of
+    Nothing -> []
+    Just it ->
+      if rsvInstVisible it tags account then concat [it] (rsvVisible (rsvRestOf insts) tags account)
+      else rsvVisible (rsvRestOf insts) tags account
+
+-- Fold from a real candidate seed, preserving every negative priority.
+@label "resolver: maxPriorityFrom"
+@description "Fold maximum priority from a real candidate seed; all negative values remain valid. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvMaxPriorityFrom : (insts: List a) -> (current: Number) -> Number
+rsvMaxPriorityFrom insts current =
+  case head insts of
+    Nothing -> current
+    Just it ->
+      let next = if gte it.priority current then it.priority else current
+      rsvMaxPriorityFrom (rsvRestOf insts) next
+
+-- rsvFirstAt — the FIRST instance (registry order) at priority `p`. Mirrors a
+-- stable priority-desc sort then `[0]`: among ties the first-in-order wins.
+@label "resolver: firstAt"
+@description "Phase 5.1 — the first instance (registry order) at priority `p`; mirrors a stable priority-desc sort then [0] (findInstance). Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvFirstAt : (insts: List a) -> (p: Number) -> Maybe a
+rsvFirstAt insts p =
+  case head insts of
+    Nothing -> Nothing
+    Just it ->
+      if eq it.priority p then Just it
+      else rsvFirstAt (rsvRestOf insts) p
+
+-- rsvCountAt — how many instances sit at priority `p` (the tie count).
+@label "resolver: countAt"
+@description "Phase 5.1 — the count of instances at priority `p` (the same-priority tie count for conflict detection). Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvCountAt : (insts: List a) -> (p: Number) -> Number
+rsvCountAt insts p =
+  case head insts of
+    Nothing -> 0
+    Just it ->
+      let restCount = rsvCountAt (rsvRestOf insts) p
+      if eq it.priority p then add 1 restCount else restCount
+
+-- rsvConflict — a Conflict is ≥2 VISIBLE instances tied at the top priority.
+-- Mirrors `resolveMethod`'s conflict block (matches.length ≥ 2 AND tied ≥ 2).
+@label "resolver: conflict"
+@description "Phase 5.1 — true iff ≥2 visible instances tie at the top priority (resolveMethod's conflict block). Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvConflict : (visible: List a) -> Bool
+rsvConflict visible =
+  case head visible of
+    Nothing -> false
+    Just top ->
+      if gte (length visible) 2 then
+        let maxPriority = rsvMaxPriorityFrom (rsvRestOf visible) top.priority
+        gte (rsvCountAt visible maxPriority) 2
+      else false
+
+-- rsvProjectMethod — project `name` from a resolved instance/frame's method dict
+-- → Resolved fnId; absent ⇒ NoInstance. Mirrors `resolveMethod`'s step 4.
+@label "resolver: projectMethod"
+@description "Phase 5.1 — project method `name` from a resolved instance/frame method dict (`mapGet`) → Resolved fnId; absent ⇒ NoInstance. resolveMethod step 4. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvProjectMethod : (methods: a) -> (name: String) -> ResolveOutcome
+rsvProjectMethod methods name =
+  case mapGet methods name of
+    Nothing -> NoInstance
+    Just m -> Resolved m
+
+-- rsvResolveKey — steps 3+4 once the dispatch key is reflected: block frames
+-- (always Unique) → persisted (highest-priority match, conflict on a top-tie).
+@label "resolver: resolveKey"
+@description "Phase 5.1 — scope-resolve a reflected (typeName, key): block frames closest-first (always Unique), else the highest-priority persisted instance (Conflicted on a visible top-priority tie), then project the method. Mirrors resolveEffect + the conflict block. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvResolveKey : (table: a) -> (cls: String) -> (name: String) -> (key: String) -> (frames: List b) -> (tags: List String) -> (account: Maybe String) -> ResolveOutcome
+rsvResolveKey table cls name key frames tags account =
+  case rsvFrameFor frames cls key of
+    Just frame -> rsvProjectMethod frame.methods name
+    Nothing ->
+      let visible = rsvVisible (rsvInstancesFor table cls key) tags account
+      case head visible of
+        Nothing -> NoInstance
+        Just top ->
+          let maxPriority = rsvMaxPriorityFrom (rsvRestOf visible) top.priority
+          if rsvConflict visible then Conflicted key (rsvCountAt visible maxPriority)
+          else
+            case rsvFirstAt visible maxPriority of
+              Nothing -> NoInstance
+              Just inst -> rsvProjectMethod inst.methods name
+
+-- rsvResolveDispatch — steps 2→3→4 for a `RDispatch` route: dispatch position
+-- from the table (`RETURN_POSITION` ⇒ NoInstance; pos ≥ |args| ⇒ UnderApplied,
+-- the eta-defer signal), reflect the dispatch arg → key, then rsvResolveKey.
+@label "resolver: resolveDispatch"
+@description "Phase 5.1 — the resolveMethod core for a dispatch route: position from the table (negative sentinel ⇒ NoInstance; pos ≥ |args| ⇒ UnderApplied — the eta wrinkle), reflect the dispatch arg via rsvTypeKey, then rsvResolveKey. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvResolveDispatch : (table: a) -> (cls: String) -> (name: String) -> (args: List b) -> (frames: List c) -> (tags: List String) -> (account: Maybe String) -> ResolveOutcome
+rsvResolveDispatch table cls name args frames tags account =
+  case mapGet table.posIdx (concat (concat cls ".") name) of
+    Nothing -> NoInstance
+    Just pos ->
+      if lt pos 0 then NoInstance
+      else rsvDispatchAt table cls name args frames tags account pos
+
+-- rsvDispatchAt — the in-range tail of rsvResolveDispatch, split out so neither
+-- function carries an `if … else if … else` CHAIN (a Fenel-parser fence — a bare
+-- single `if-then-else <block>` parses, the else-if chain does not). pos ≥ |args|
+-- ⇒ UnderApplied (the eta wrinkle); else reflect + resolve.
+@label "resolver: dispatchAt"
+@description "Phase 5.1 — the in-range tail of rsvResolveDispatch (pos already ≥ 0): pos ≥ |args| ⇒ UnderApplied; else reflect the dispatch arg via rsvTypeKey + rsvResolveKey. Split from rsvResolveDispatch to avoid an else-if chain. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvDispatchAt : (table: a) -> (cls: String) -> (name: String) -> (args: List b) -> (frames: List c) -> (tags: List String) -> (account: Maybe String) -> (pos: Number) -> ResolveOutcome
+rsvDispatchAt table cls name args frames tags account pos =
+  if gte pos (length args) then UnderApplied pos
+  else
+    case rsvElemAt args pos of
+      Nothing -> NoInstance
+      Just v ->
+        case rsvTypeKey v table.ownerIdx of
+          Nothing -> NoInstance
+          Just key -> rsvResolveKey table cls name key frames tags account
+
+-- rsvResolveBareName — the ENTRY. Classify `name` via the projected `routes`
+-- (a table miss / `RDirect` ⇒ the Direct fast path; `RAmbiguous*` ⇒ the
+-- ambiguous outcome the caller throws on), and for a `RDispatch` route run the
+-- resolveMethod core. The Fenel port of `classifyBareName` ∘ `resolveMethod`.
+@label "resolver: resolveBareName"
+@description "Phase 5.1/5.3 — the live bare-name dispatch resolver entry: classify `name` via the projected routes (miss/RDirect ⇒ Direct; RAmbiguous* ⇒ Ambiguous; RDispatch ⇒ the resolveMethod core over the threaded table + reflected key + block frames). Threaded args: the projected RoutingTable, the bare name, the evaluated args, the block-scope frames (innermost-first), the active tags, and (rights R3a) the frame's OWN account as a Maybe — an owned instance is visible only to it."
+@tags "engine" "dispatch" "resolution-substrate" "phase-5"
+@category "engine-internal"
+rsvResolveBareName : (table: a) -> (name: String) -> (args: List b) -> (frames: List c) -> (tags: List String) -> (account: Maybe String) -> ResolveOutcome
+rsvResolveBareName table name args frames tags account =
+  case mapGet table.routeIdx name of
+    Nothing -> Direct
+    Just res ->
+      case res of
+        RDirect -> Direct
+        RDispatch cls -> rsvResolveDispatch table cls name args frames tags account
+        RAmbiguousClass acName acClasses -> Ambiguous res
+        RAmbiguousModule amName amBindings -> Ambiguous res
+
+-- ===========================================================================
+-- modules-as-values Phase 2d — COMPLETE selection. `C t1 … tk` is selected by
+-- its whole type-argument tuple, never by its first argument: `Iso String
+-- JsonValue` must never shadow `Iso String Bytes`. A separate entry (its own
+-- compiled shard) beside rsvResolveBareName / rsvResolveDispatch, which keep
+-- their behaviour. The caller supplies the complete tuple (the typed call-site
+-- path); nothing here guesses a missing parameter, and priority never fills
+-- one. Every case enumerates its constructors: a wildcard arm lowers to a
+-- literal "_" match in the compiled resolver.
+-- ===========================================================================
+
+-- rsvArgsEqual — two string tuples are equal: same length, same strings in order.
+@label "resolver: argsEqual"
+@description "Phase 2d — element-wise equality of two type-argument tuples (same length, same strings in order). Head/tail recursion; an arity mismatch is unequal. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvArgsEqual : (xs: List String) -> (ys: List String) -> Bool
+rsvArgsEqual xs ys =
+  case head xs of
+    Nothing -> rsvArgsEmpty ys
+    Just x ->
+      case head ys of
+        Nothing -> false
+        Just y ->
+          if eq x y then rsvArgsEqual (rsvRestOf xs) (rsvRestOf ys)
+          else false
+
+-- rsvArgsEmpty — the tuple has no element.
+@label "resolver: argsEmpty"
+@description "Phase 2d — true iff a type-argument tuple has no element. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvArgsEmpty : (xs: List String) -> Bool
+rsvArgsEmpty xs =
+  case head xs of
+    Nothing -> true
+    Just x -> false
+
+-- rsvArgsMatch — a row's or frame's complete tuple (Nothing when some argument
+-- is not a string) equals the queried tuple. Nothing never matches.
+@label "resolver: argsMatch"
+@description "Phase 2d — whether a row/frame tuple `Maybe (List String)` is `Just` the queried tuple; `Nothing` (an argument that is not a string) never matches. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvArgsMatch : (args: Maybe (List String)) -> (typeArgs: List String) -> Bool
+rsvArgsMatch args typeArgs =
+  case args of
+    Nothing -> false
+    Just xs -> rsvArgsEqual xs typeArgs
+
+-- rsvArgsLabel — the tuple spelled with spaces (`String Bytes`), the key a
+-- Conflicted outcome reports.
+@label "resolver: argsLabel"
+@description "Phase 2d — a type-argument tuple joined with single spaces (`String Bytes`); the key a complete-selection Conflicted outcome reports. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvArgsLabel : (xs: List String) -> String
+rsvArgsLabel xs =
+  case head xs of
+    Nothing -> ""
+    Just x -> rsvArgsLabelFrom (rsvRestOf xs) x
+
+@label "resolver: argsLabelFrom"
+@description "Phase 2d — the accumulator loop of rsvArgsLabel. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvArgsLabelFrom : (xs: List String) -> (acc: String) -> String
+rsvArgsLabelFrom xs acc =
+  case head xs of
+    Nothing -> acc
+    Just x -> rsvArgsLabelFrom (rsvRestOf xs) (concat (concat acc " ") x)
+
+-- rsvCompleteFrame — the block frames, innermost first. A same-class frame with
+-- the same complete tuple wins (always unique: closest wins); a same-class frame
+-- without a complete tuple answers CompleteUnsupported (it could be the nearer
+-- instance, and nothing here can compare it); a same-class frame with another
+-- complete tuple is skipped. Nothing means no frame decides.
+@label "resolver: completeFrame"
+@description "Phase 2d — walk block frames innermost-first for complete selection: a same-class frame whose tuple equals the query wins (project the method); a same-class frame with no complete tuple gives CompleteUnsupported; another tuple is skipped. Nothing when no frame decides. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvCompleteFrame : (frames: List a) -> (cls: String) -> (name: String) -> (typeArgs: List String) -> Maybe ResolveOutcome
+rsvCompleteFrame frames cls name typeArgs =
+  case head frames of
+    Nothing -> Nothing
+    Just f ->
+      if eq f.typeName cls then rsvCompleteFrameAt f frames cls name typeArgs
+      else rsvCompleteFrame (rsvRestOf frames) cls name typeArgs
+
+@label "resolver: completeFrameAt"
+@description "Phase 2d — the same-class arm of rsvCompleteFrame (split out so every case stays enumerated and unnested under an if). Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvCompleteFrameAt : (f: a) -> (frames: List b) -> (cls: String) -> (name: String) -> (typeArgs: List String) -> Maybe ResolveOutcome
+rsvCompleteFrameAt f frames cls name typeArgs =
+  case f.args of
+    Nothing -> Just (CompleteUnsupported (concat (concat "a block frame for " cls) " carries no complete type; its instance cannot be compared with the written type"))
+    Just fargs ->
+      if rsvArgsEqual fargs typeArgs then Just (rsvProjectMethod f.methods name)
+      else rsvCompleteFrame (rsvRestOf frames) cls name typeArgs
+
+-- rsvAccountIs — the frame's own account is exactly `owner`.
+@label "resolver: accountIs"
+@description "Phase 2d — whether the frame's own account (a Maybe) is exactly `owner`; Nothing (no account) owns nothing. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values" "rights"
+@category "engine-internal"
+rsvAccountIs : (account: Maybe String) -> (owner: String) -> Bool
+rsvAccountIs account owner =
+  case account of
+    Nothing -> false
+    Just a -> eq owner a
+
+-- rsvScopeVisible — rsvInstVisible's rule over a bare scope, every constructor
+-- enumerated: global is visible, a tag needs its active tag, an owned row needs
+-- the frame's own account.
+@label "resolver: scopeVisible"
+@description "Phase 2d — rights R3a visibility over a bare RsvInstanceScope (the rule of rsvInstVisible, every constructor enumerated): global visible; a tag needs its active tag; an owned scope needs the frame's own account. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values" "rights"
+@category "engine-internal"
+rsvScopeVisible : (scope: RsvInstanceScope) -> (tags: List String) -> (account: Maybe String) -> Bool
+rsvScopeVisible scope tags account =
+  case scope of
+    RsvGlobalScope -> true
+    RsvTagScope tag -> elem tag tags
+    RsvAccountScope owner -> rsvAccountIs account owner
+
+@label "resolver: anyScopeVisible"
+@description "Phase 2d — whether any scope in the list is visible to this frame (rsvScopeVisible). Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values" "rights"
+@category "engine-internal"
+rsvAnyScopeVisible : (scopes: List RsvInstanceScope) -> (tags: List String) -> (account: Maybe String) -> Bool
+rsvAnyScopeVisible scopes tags account =
+  case head scopes of
+    Nothing -> false
+    Just s ->
+      if rsvScopeVisible s tags account then true
+      else rsvAnyScopeVisible (rsvRestOf scopes) tags account
+
+-- rsvGeneralVisible — a general row (some argument not a string) of this class
+-- is visible to the frame. Such a row may be the better instance and cannot be
+-- compared as a tuple here, so its visibility makes complete selection
+-- unsupported; an invisible one changes nothing.
+@label "resolver: generalVisible"
+@description "Phase 2d — whether a general row of the class (some argument not a string; indexed with its scope in generalScopeIdx) is visible to this frame. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvGeneralVisible : (table: a) -> (cls: String) -> (tags: List String) -> (account: Maybe String) -> Bool
+rsvGeneralVisible table cls tags account =
+  case mapGet table.generalScopeIdx cls of
+    Nothing -> false
+    Just scopes -> rsvAnyScopeVisible scopes tags account
+
+-- rsvRowsWithArgs — the rows whose complete tuple equals the query (order kept).
+@label "resolver: rowsWithArgs"
+@description "Phase 2d — the rows (registry order kept) whose complete tuple equals the queried tuple. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvRowsWithArgs : (rows: List a) -> (typeArgs: List String) -> List a
+rsvRowsWithArgs rows typeArgs =
+  case head rows of
+    Nothing -> []
+    Just r ->
+      if rsvArgsMatch r.args typeArgs then concat [r] (rsvRowsWithArgs (rsvRestOf rows) typeArgs)
+      else rsvRowsWithArgs (rsvRestOf rows) typeArgs
+
+-- rsvCompleteRows — the exact bucket for (cls, first argument), read directly
+-- (NOT through rsvInstancesFor, which yields [] for a general class), filtered
+-- to the rows with the complete tuple. An empty tuple has no bucket.
+@label "resolver: completeRows"
+@description "Phase 2d — read the exact bucket for (class, first type argument) directly (not rsvInstancesFor) and keep the rows whose complete tuple equals the query. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvCompleteRows : (table: a) -> (cls: String) -> (typeArgs: List String) -> List b
+rsvCompleteRows table cls typeArgs =
+  case head typeArgs of
+    Nothing -> []
+    Just first ->
+      case mapGet table.instanceIdx cls of
+        Nothing -> []
+        Just byKey ->
+          case mapGet byKey first of
+            Nothing -> []
+            Just rows -> rsvRowsWithArgs rows typeArgs
+
+-- rsvCompletePooled — the pooled rows: visibility, maximum priority, a conflict
+-- on a visible top tie, else the first row at the top priority (exactly
+-- rsvResolveKey's pooled arm), then the method.
+@label "resolver: completePooled"
+@description "Phase 2d — pooled complete selection: visible rows with the complete tuple, maximum priority, Conflicted (tuple label, tie count) on a visible top-priority tie, else the first at the top priority; then project the method. rsvResolveKey's pooled arm over complete tuples. Internal helper."
+@tags "engine" "internal" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvCompletePooled : (table: a) -> (cls: String) -> (name: String) -> (typeArgs: List String) -> (tags: List String) -> (account: Maybe String) -> ResolveOutcome
+rsvCompletePooled table cls name typeArgs tags account =
+  let visible = rsvVisible (rsvCompleteRows table cls typeArgs) tags account
+  case head visible of
+    Nothing -> NoInstance
+    Just top ->
+      let maxPriority = rsvMaxPriorityFrom (rsvRestOf visible) top.priority
+      if rsvConflict visible then Conflicted (rsvArgsLabel typeArgs) (rsvCountAt visible maxPriority)
+      else
+        case rsvFirstAt visible maxPriority of
+          Nothing -> NoInstance
+          Just inst -> rsvProjectMethod inst.methods name
+
+-- rsvResolveComplete — the ENTRY for complete selection of `cls typeArgs`:
+-- block frames innermost-first (rsvCompleteFrame), then CompleteUnsupported when
+-- a visible general row of the class exists, else the pooled exact rows.
+@label "resolver: resolveComplete"
+@description "Phase 2d — the complete-type resolver entry: select the instance of `cls t1 … tk` by its whole type-argument tuple. Block frames innermost-first (same tuple wins; a same-class frame without a complete tuple gives CompleteUnsupported); a visible general row of the class gives CompleteUnsupported; else visible pooled rows with the same tuple by priority (Conflicted on a top tie), then project the method. Threaded args: the projected RoutingTable, the class, the method name, the complete tuple, the block frames (innermost-first), the active tags, and the frame's own account as a Maybe."
+@tags "engine" "dispatch" "resolution-substrate" "modules-as-values"
+@category "engine-internal"
+rsvResolveComplete : (table: a) -> (cls: String) -> (name: String) -> (typeArgs: List String) -> (frames: List b) -> (tags: List String) -> (account: Maybe String) -> ResolveOutcome
+rsvResolveComplete table cls name typeArgs frames tags account =
+  case rsvCompleteFrame frames cls name typeArgs of
+    Just outcome -> outcome
+    Nothing ->
+      if rsvGeneralVisible table cls tags account then CompleteUnsupported (concat (concat "a general instance of " cls) " is visible here; complete-type selection cannot compare it with the written type")
+      else rsvCompletePooled table cls name typeArgs tags account

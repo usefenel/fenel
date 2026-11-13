@@ -1,0 +1,271 @@
+module ImportDemo where
+
+using std (chars, charCode, charFromCode, length, isString, fold, filter, concat, appendItem, join, toString, bindResult, max, not, head, map)
+using engine (Pat)
+
+-- Bounded S-expression reading, not a Lisp evaluator or a complete dialect.
+-- Symbols retain their spelling, including numeric-looking symbols. Lists,
+-- strings and apostrophe quotes are recursive ordinary data. No dotted pairs,
+-- comments, reader dispatch, quasiquote/unquote or escaped/barred symbols.
+-- Whitespace is ASCII space/tab/CR/LF. Strings admit quote/backslash/n/r/t
+-- escapes; raw controls and lone UTF-16 surrogate halves refuse everywhere.
+-- Source offsets are zero-based Unicode code-point positions; finish is exclusive.
+-- Bound before the existing recursive Pat/parseG owner: 512 source code points,
+-- 24 tokens, 8 nested lists and 8 quote prefixes in the entire input.
+
+LispTokenKind = LispSymbolToken | LispStringToken | LispOpenToken | LispCloseToken | LispQuoteToken
+LispToken = LispToken kind: LispTokenKind text: String start: Nat finish: Nat
+LispLexMode = LispBetween | LispBare | LispQuoted | LispEscaped
+LispLexState = LispLexState mode: LispLexMode current: String start: Nat offset: Nat tokens: List LispToken failure: Maybe String
+LispBalance = LispBalance depth: Nat maximum: Nat opens: Nat closes: Nat quotes: Nat pendingQuote: Bool failure: Maybe String
+
+@label "Lisp node"
+@description "A read symbol, decoded string, list or apostrophe quote. No node is evaluated. Positions count Unicode code points from zero, with an exclusive finish."
+LispNode = LispSymbol text: String start: Nat finish: Nat | LispString text: String start: Nat finish: Nat | LispList items: List LispNode start: Nat finish: Nat | LispQuote item: LispNode start: Nat finish: Nat
+
+LispCounts = LispCounts nodes: Nat lists: Nat atoms: Nat strings: Nat quotes: Nat maximumDepth: Nat
+
+@label "Lisp inspection"
+@description "Exact source, recursive typed forms and actual structure counts. Atom count includes symbols and strings. Root nodes have depth zero. Parenthesis counts cover syntax outside strings; apostrophe quotes do not add parentheses."
+LispInspection = LispInspection source: String forms: List LispNode nodeCount: Nat listCount: Nat atomCount: Nat stringCount: Nat quoteCount: Nat maximumDepth: Nat openingParentheses: Nat closingParentheses: Nat maximumListNesting: Nat explanation: String
+
+-- A4: public profiles omit executable engine functions. This bridge forwards
+-- the bounded Fenel-authored grammar/tokens to the shipped parseG owner only.
+-- Reductions produce plain temporary records; the public Fenel projection
+-- constructs LispNode in its own exact constructor frame after the handoff.
+@native
+@category "engine-internal"
+lispToolParse : (grammar: List ({ name: String, pat: Pat Any })) -> (tokens: List LispToken) -> Maybe (List Any)
+
+lispErrorAt : (offset: Nat) -> (reason: String) -> String
+lispErrorAt offset reason = join ["At code-point position ", toString offset, ": ", reason] ""
+
+lispWhitespace : (character: String) -> Bool
+lispWhitespace character = character == " " || character == "\t" || character == "\n" || character == charFromCode 13
+
+lispDelimiter : (character: String) -> Bool
+lispDelimiter character = lispWhitespace character || character == "(" || character == ")" || character == "'" || character == "\""
+
+lispScalar : (character: String) -> Bool
+lispScalar character =
+  let code = charCode character
+  code >= 32 && not (code >= 127 && code <= 159) && not (code >= 55296 && code <= 57343)
+
+lispSymbolCharacter : (character: String) -> Bool
+lispSymbolCharacter character = lispScalar character && character != ";" && character != "#" && character != "`" && character != "," && character != "[" && character != "]" && character != "{" && character != "}" && character != "\\" && character != "|"
+
+lispLexNext : (state: LispLexState) -> (mode: LispLexMode) -> (current: String) -> (start: Nat) -> (tokens: List LispToken) -> (failure: Maybe String) -> LispLexState
+lispLexNext state mode current start tokens failure = LispLexState { mode = mode, current = current, start = start, offset = state.offset + 1, tokens = tokens, failure = failure }
+
+lispLexRefuse : (state: LispLexState) -> (reason: String) -> LispLexState
+lispLexRefuse state reason = lispLexNext state state.mode state.current state.start state.tokens (Just (lispErrorAt state.offset reason))
+
+lispLexEmit : (state: LispLexState) -> (kind: LispTokenKind) -> (text: String) -> (start: Nat) -> (finish: Nat) -> LispLexState
+lispLexEmit state kind text start finish =
+  if length state.tokens >= 24 then lispLexRefuse state "Use at most 24 tokens, including parentheses and quote prefixes."
+  else lispLexNext state LispBetween "" finish (appendItem (LispToken { kind = kind, text = text, start = start, finish = finish }) state.tokens) Nothing
+
+lispLexBetween : (state: LispLexState) -> (character: String) -> LispLexState
+lispLexBetween state character =
+  if lispWhitespace character then lispLexNext state LispBetween "" (state.offset + 1) state.tokens Nothing
+  else if character == "(" then lispLexEmit state LispOpenToken character state.offset (state.offset + 1)
+  else if character == ")" then lispLexEmit state LispCloseToken character state.offset (state.offset + 1)
+  else if character == "'" then lispLexEmit state LispQuoteToken character state.offset (state.offset + 1)
+  else if character == "\"" then lispLexNext state LispQuoted "" state.offset state.tokens Nothing
+  else if lispSymbolCharacter character then lispLexNext state LispBare character state.offset state.tokens Nothing
+  else lispLexRefuse state "This bounded reader excludes comments, dispatch, quasiquote/unquote, brackets/braces, escaped symbols and control characters."
+
+lispLexEndSymbol : (state: LispLexState) -> LispLexState
+lispLexEndSymbol state =
+  if state.current == "." then lispLexRefuse state "Dotted pairs are outside this reader; a standalone dot is refused."
+  else if length state.tokens >= 24 then lispLexRefuse state "Use at most 24 tokens, including parentheses and quote prefixes."
+  else LispLexState { mode = LispBetween, current = "", start = state.offset, offset = state.offset, tokens = appendItem (LispToken { kind = LispSymbolToken, text = state.current, start = state.start, finish = state.offset }) state.tokens, failure = Nothing }
+
+lispStringEscape : (character: String) -> Maybe String
+lispStringEscape character = case character of
+  "\"" -> Just "\""
+  "\\" -> Just "\\"
+  "n" -> Just "\n"
+  "r" -> Just (charFromCode 13)
+  "t" -> Just "\t"
+  _ -> Nothing
+
+lispLexCharacter : (state: LispLexState) -> (character: String) -> LispLexState
+lispLexCharacter state character = case state.failure of
+  Just _ -> state
+  Nothing -> case state.mode of
+    LispBetween -> lispLexBetween state character
+    LispBare ->
+      if lispDelimiter character then
+        let flushed = lispLexEndSymbol state
+        case flushed.failure of
+          Just _ -> flushed
+          Nothing -> lispLexBetween flushed character
+      else if lispSymbolCharacter character then lispLexNext state LispBare (concat state.current character) state.start state.tokens Nothing
+      else lispLexRefuse state "Unsupported reader syntax or control character inside a symbol."
+    LispQuoted ->
+      if character == "\"" then lispLexEmit state LispStringToken state.current state.start (state.offset + 1)
+      else if character == "\\" then lispLexNext state LispEscaped state.current state.start state.tokens Nothing
+      else if lispScalar character then lispLexNext state LispQuoted (concat state.current character) state.start state.tokens Nothing
+      else lispLexRefuse state "Use escaped n/r/t for string line breaks and tabs; raw controls and lone surrogate halves refuse."
+    LispEscaped -> case lispStringEscape character of
+      Just decoded -> lispLexNext state LispQuoted (concat state.current decoded) state.start state.tokens Nothing
+      Nothing -> lispLexRefuse state "String escapes are limited to quote, backslash, n, r and t."
+
+lispTokens : (text: String) -> Result String (List LispToken)
+lispTokens text =
+  let initial = LispLexState { mode = LispBetween, current = "", start = 0, offset = 0, tokens = [], failure = Nothing }
+  let scanned = fold lispLexCharacter initial (chars text)
+  let finished = case scanned.mode of
+    LispBare -> case scanned.failure of
+      Nothing -> lispLexEndSymbol scanned
+      Just _ -> scanned
+    _ -> scanned
+  case finished.failure of
+    Just reason -> Err reason
+    Nothing -> case finished.mode of
+      LispQuoted -> Err (lispErrorAt finished.start "Unclosed double-quoted string.")
+      LispEscaped -> Err (lispErrorAt finished.offset "A backslash at the end of a string needs an escape character and closing quote.")
+      _ -> Ok finished.tokens
+
+lispBalanceNext : (state: LispBalance) -> (depth: Nat) -> (maximum: Nat) -> (opens: Nat) -> (closes: Nat) -> (quotes: Nat) -> (pendingQuote: Bool) -> (failure: Maybe String) -> LispBalance
+lispBalanceNext state depth maximum opens closes quotes pendingQuote failure = LispBalance { depth = depth, maximum = maximum, opens = opens, closes = closes, quotes = quotes, pendingQuote = pendingQuote, failure = failure }
+
+lispBalanceToken : (state: LispBalance) -> (token: LispToken) -> LispBalance
+lispBalanceToken state token = case state.failure of
+  Just _ -> state
+  Nothing -> case token.kind of
+    LispOpenToken ->
+      let next = state.depth + 1
+      lispBalanceNext state next (max next state.maximum) (state.opens + 1) state.closes state.quotes false (if next > 8 then Just (lispErrorAt token.start "Use at most 8 nested lists.") else Nothing)
+    LispCloseToken ->
+      if state.pendingQuote then lispBalanceNext state state.depth state.maximum state.opens state.closes state.quotes false (Just (lispErrorAt token.start "An apostrophe quote needs an expression before the closing parenthesis."))
+      else if state.depth == 0 then lispBalanceNext state state.depth state.maximum state.opens state.closes state.quotes false (Just (lispErrorAt token.start "Closing parenthesis has no matching opening parenthesis."))
+      else lispBalanceNext state (state.depth - 1) state.maximum state.opens (state.closes + 1) state.quotes false Nothing
+    LispQuoteToken -> lispBalanceNext state state.depth state.maximum state.opens state.closes (state.quotes + 1) true (if state.quotes >= 8 then Just (lispErrorAt token.start "Use at most 8 apostrophe quote prefixes in the whole input.") else Nothing)
+    _ -> lispBalanceNext state state.depth state.maximum state.opens state.closes state.quotes false Nothing
+
+lispBalanced : (tokens: List LispToken) -> Result String LispBalance
+lispBalanced tokens =
+  let initial = LispBalance { depth = 0, maximum = 0, opens = 0, closes = 0, quotes = 0, pendingQuote = false, failure = Nothing }
+  let checked = fold lispBalanceToken initial tokens
+  case checked.failure of
+    Just reason -> Err reason
+    Nothing ->
+      if checked.pendingQuote then Err "An apostrophe quote at the end of input needs an expression."
+      else if checked.depth > 0 then Err (join ["Missing ", toString checked.depth, " closing parenthesis or parentheses."] "")
+      else Ok checked
+
+lispTokenPattern : (tokens: List LispToken) -> (kind: LispTokenKind) -> Pat Any
+lispTokenPattern tokens kind = PMatch { ws = { tag = "WsEnum", values = filter (\token -> token.kind == kind) tokens } }
+
+-- Exact pair/value reductions of the shipped Pattern owner. Two named
+-- productions only; Forms uses explicit cons reduction, never PRep's pairs.
+lispGrammar : (tokens: List LispToken) -> List ({ name: String, pat: Pat Any })
+lispGrammar tokens =
+  let symbol = PRed (lispTokenPattern tokens LispSymbolToken) (\token -> { kind = "symbol", text = token.text, start = token.start, finish = token.finish, children = [] })
+  let string = PRed (lispTokenPattern tokens LispStringToken) (\token -> { kind = "string", text = token.text, start = token.start, finish = token.finish, children = [] })
+  let list = PRed (PSeq (lispTokenPattern tokens LispOpenToken) (PSeq (PRef "Forms") (lispTokenPattern tokens LispCloseToken))) (\pair -> { kind = "list", text = "", start = pair.fst.start, finish = pair.snd.snd.finish, children = pair.snd.fst })
+  let quoted = PRed (PSeq (lispTokenPattern tokens LispQuoteToken) (PRef "Expr")) (\pair -> { kind = "quote", text = "", start = pair.fst.start, finish = pair.snd.finish, children = [pair.snd] })
+  let expression = PAlt symbol (PAlt string (PAlt list quoted))
+  let forms = PAlt (PRed (PSeq (PRef "Expr") (PRef "Forms")) (\pair -> concat [pair.fst] pair.snd)) (PEpsV [])
+  [{ name = "Expr", pat = expression }, { name = "Forms", pat = forms }]
+
+lispTypedNode : (node: Any) -> Result String LispNode
+lispTypedNode node =
+  if node.kind == "symbol" then Ok (LispSymbol { text = node.text, start = node.start, finish = node.finish })
+  else if node.kind == "string" then Ok (LispString { text = node.text, start = node.start, finish = node.finish })
+  else if node.kind == "list" then bindResult (lispTypedNodes node.children) (\items -> Ok (LispList { items = items, start = node.start, finish = node.finish }))
+  else if node.kind == "quote" && length node.children == 1 then case head node.children of
+    Just child -> bindResult (lispTypedNode child) (\item -> Ok (LispQuote { item = item, start = node.start, finish = node.finish }))
+    Nothing -> Err "The grammar returned a quote without its required child."
+  else Err "The grammar returned a node outside its declared S-expression fragment."
+
+lispTypedNodes : (nodes: List Any) -> Result String (List LispNode)
+lispTypedNodes nodes = fold (\result node -> bindResult result (\items -> bindResult (lispTypedNode node) (\item -> Ok (appendItem item items)))) (Ok []) nodes
+
+lispCountNode : (depth: Nat) -> (counts: LispCounts) -> (node: LispNode) -> LispCounts
+lispCountNode depth counts node =
+  let nextDepth = max depth counts.maximumDepth
+  case node of
+    LispSymbol text start finish -> LispCounts { nodes = counts.nodes + 1, lists = counts.lists, atoms = counts.atoms + 1, strings = counts.strings, quotes = counts.quotes, maximumDepth = nextDepth }
+    LispString text start finish -> LispCounts { nodes = counts.nodes + 1, lists = counts.lists, atoms = counts.atoms + 1, strings = counts.strings + 1, quotes = counts.quotes, maximumDepth = nextDepth }
+    LispList items start finish ->
+      let entered = LispCounts { nodes = counts.nodes + 1, lists = counts.lists + 1, atoms = counts.atoms, strings = counts.strings, quotes = counts.quotes, maximumDepth = nextDepth }
+      fold (\acc child -> lispCountNode (depth + 1) acc child) entered items
+    LispQuote item start finish ->
+      let entered = LispCounts { nodes = counts.nodes + 1, lists = counts.lists, atoms = counts.atoms, strings = counts.strings, quotes = counts.quotes + 1, maximumDepth = nextDepth }
+      lispCountNode (depth + 1) entered item
+
+lispInspection : (source: String) -> (balance: LispBalance) -> (rawForms: List Any) -> Result String LispInspection
+lispInspection source balance rawForms =
+  bindResult (lispTypedNodes rawForms) (\forms -> lispInspectionTyped source balance forms)
+
+lispInspectionTyped : (source: String) -> (balance: LispBalance) -> (forms: List LispNode) -> Result String LispInspection
+lispInspectionTyped source balance forms =
+  let empty = LispCounts { nodes = 0, lists = 0, atoms = 0, strings = 0, quotes = 0, maximumDepth = 0 }
+  let counts = fold (\acc node -> lispCountNode 0 acc node) empty forms
+  Ok (LispInspection { source = source, forms = forms, nodeCount = counts.nodes, listCount = counts.lists, atomCount = counts.atoms, stringCount = counts.strings, quoteCount = counts.quotes, maximumDepth = counts.maximumDepth, openingParentheses = balance.opens, closingParentheses = balance.closes, maximumListNesting = balance.maximum, explanation = "Bounded S-expression reader only: symbols (including number spelling), double-quoted strings, lists and apostrophe quotes; multiple or empty top-level forms. No evaluation, comments, dotted pairs, reader dispatch or quasiquote/unquote. Atom count includes strings; root depth is zero. Source positions count Unicode code points, finish exclusive. Bounds: 512 source code points, 24 tokens, 8 nested lists and 8 quote prefixes in total." })
+
+@label "Inspect Lisp text"
+@description "Read a bounded S-expression fragment into typed lists, symbols, strings and apostrophe quotes. Inspect nested data, code-point positions and actual node/list/atom/depth/parenthesis counts. Supports multiple top-level forms and empty input. No evaluation or complete Lisp dialect. At most 512 code points, 24 tokens, 8 nested lists and 8 quote prefixes; unsupported reader syntax and malformed input return Err."
+@tags "utility" "lisp" "parse" "structure"
+inspectLispText : (text: String) -> Result String LispInspection
+inspectLispText text =
+  if not (isString text) || length text > 512 then Err "Use text with at most 512 Unicode code points."
+  else
+    let inspectTokens = \tokens -> do
+      let inspectBalance = \balance ->
+        case lispToolParse (lispGrammar tokens) tokens of
+          Nothing -> Err "The tokens do not form the advertised S-expression grammar; lists and quote prefixes need complete expressions."
+          Just forms -> lispInspection text balance forms
+      bindResult (lispBalanced tokens) inspectBalance
+    bindResult (lispTokens text) inspectTokens
+
+@label "Inspect Lisp text"
+@description "Paste the bounded Lisp/S-expression fragment in the shared multiline text editor. The result is ordinary typed tree data; no code is executed or saved."
+inspectLispInput : (input: ImportTextInput) -> Result String LispInspection
+inspectLispInput input = inspectLispText input.text
+
+lispFormatStringCharacter : (character: String) -> String
+lispFormatStringCharacter character =
+  if character == "\"" then "\\\""
+  else if character == "\\" then "\\\\"
+  else if character == "\n" then "\\n"
+  else if character == charFromCode 13 then "\\r"
+  else if character == "\t" then "\\t"
+  else character
+
+lispFormatNode : (node: LispNode) -> String
+lispFormatNode node = case node of
+  LispSymbol text start finish -> text
+  LispString text start finish -> join ["\"", join (map lispFormatStringCharacter (chars text)) "", "\""] ""
+  LispList items start finish -> join ["(", join (map lispFormatNode items) " ", ")"] ""
+  LispQuote item start finish -> concat "'" (lispFormatNode item)
+
+@label "Format Lisp text"
+@description "Format the existing bounded S-expression tree: one space between list items, no padding inside parentheses, adjacent apostrophe quotes and one top-level form per line. Preserve symbol spelling and decoded strings with quote/backslash/n/r/t escapes. The same reader refuses malformed or unsupported syntax and source limits; formatted output must also fit its 512-code-point limit. No evaluation or complete Lisp dialect."
+@tags "utility" "lisp" "format"
+formatLispText : (text: String) -> Result String String
+formatLispText text = case inspectLispText text of
+  Err reason -> Err reason
+  Ok inspected ->
+    let formatted = join (map lispFormatNode inspected.forms) "\n"
+    if length formatted <= 512 then Ok formatted
+    else Err "Formatted text would exceed the reader's 512 Unicode code-point limit."
+
+@label "Format Lisp"
+@description "Paste the bounded Lisp/S-expression fragment in the shared multiline text editor. Normalize list spacing and put each top-level form on its own line, preserving symbols, strings and apostrophe quotes. No code is executed or saved."
+@tags "utility" "lisp" "format"
+formatLispInput : (input: ImportTextInput) -> Result String String
+formatLispInput input = formatLispText input.text
+
+@label "Sample Lisp text"
+lispSampleText : String
+lispSampleText = "(define (square x) (* x x))\n'(square 5 \"hello (world)\")"
+
+lispDemoStartingInputs : List ({ function: Any, arguments: List Any })
+lispDemoStartingInputs = [
+  { function = inspectLispInput, arguments = [ImportTextInput { text = lispSampleText () }] },
+  { function = formatLispInput, arguments = [ImportTextInput { text = "( define  (square x)\n (* x x) )   '(square  5 \"hello (world)\")" }] }
+]

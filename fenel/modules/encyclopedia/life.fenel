@@ -1,0 +1,443 @@
+module Encyclopedia where
+
+using std (map, filter, fold, concat, flatten, elem, drop, take, length, unique, some, all, not, fromMaybe, capitalize, head, join)
+using set (contains, decideSubset, decideDisjoint)
+using engine (SetExpr)
+
+-- The tree of life of this collection: every living thing it names, from all
+-- life at the root down to the species, as ONE closed variant of nullary
+-- constructors (ledger workstreams/kinds/notes/2026-11-11-tree-of-life-ledger.md,
+-- D1). Identity is the constructor; facts sit beside it in rows
+-- (life-data.fenel), pictures beside it in Picturable instances
+-- (life-pictures.fenel). A tree value never carries an Image.
+--
+-- Rank is a fact and each row states its full ancestry (D2). Which leaf sits
+-- under which item is read structurally from the stated ancestry; every
+-- inclusion of an item in its stated parent, every "the children are apart"
+-- and every "the children cover the parent" is the set judgment's own verdict
+-- (decideSubset / decideDisjoint over finite enumerations of nullary
+-- constructors), so a wrong row shows as "not a subset" instead of being
+-- drawn. Undecided stays Nothing.
+--
+-- Cost (measured, see the ledger's cost plan): no all-pairs comparison. Each
+-- item is judged against its own stated parent only; siblings are judged each
+-- against ONE flat enumeration of the earlier siblings; cover is one subset
+-- judgment per group. Per-item walks use map / filter / fold only (no
+-- head/tail self-recursion: the browser worker's stack holds a few hundred
+-- nested calls).
+
+@label "Rank"
+@description "A rank of the tree of life, from all life down to the species. This collection uses life, kingdom, class, family and species."
+LifeRank = RankLife | RankKingdom | RankPhylum | RankClass | RankOrder | RankFamily | RankGenus | RankSpecies
+
+@label "Taxon Facts"
+@description "One living thing of this collection: its rank, accepted scientific name, common names, the groups it sits in from the root down (its stated ancestry), and the source of these facts."
+@fieldLabel "thing" "Taxon"
+@fieldLabel "rank" "Rank"
+@fieldLabel "scientificName" "Scientific Name"
+@fieldLabel "commonNames" "Common Names"
+@fieldLabel "within" "Within"
+@fieldLabel "source" "Source"
+LivingThingFacts = LivingThingFacts thing: LivingThing rank: LifeRank scientificName: Maybe String commonNames: List String within: List LivingThing source: UrlStr
+
+@label "Inclusion"
+@description "Whether this set is a subset of the group its facts name as its parent: the set judgment's verdict. Nothing means undecided."
+@fieldLabel "whole" "Parent"
+@fieldLabel "within" "Is a Subset"
+LifeSetInclusion = LifeSetInclusion whole: LivingThing within: Maybe Bool
+
+@label "Partition"
+@description "For a group: whether the sets of its children are pairwise apart, and whether together they cover the group. Both are the set judgment's verdicts; Nothing means undecided."
+@fieldLabel "apart" "Children Apart"
+@fieldLabel "cover" "Children Cover"
+LifeSetPartition = LifeSetPartition apart: Maybe Bool cover: Maybe Bool
+
+@label "Taxon Set"
+@description "One item of the tree of life as the set of the species of this collection below it (a species is its own singleton), with its judged inclusion in its parent, the judged partition into its children, and the foods it gives."
+@fieldLabel "item" "Taxon"
+@fieldLabel "name" "Name"
+@fieldLabel "scientificName" "Scientific Name"
+@fieldLabel "rank" "Rank"
+@fieldLabel "parents" "Parents"
+@fieldLabel "members" "Species"
+@fieldLabel "constraint" "Set"
+@fieldLabel "parts" "Partition"
+@fieldLabel "gives" "Gives"
+@fieldLabel "source" "Source"
+LifeSet = LifeSet item: LivingThing name: String scientificName: Maybe String rank: LifeRank parents: List LifeSetInclusion members: List LivingThing constraint: SetExpr parts: Maybe LifeSetPartition gives: List Foodstuff source: UrlStr
+
+@label "Answer Against a Group"
+@description "A set made by people compared with one group that holds some of its members: whether it lies wholly inside the group, and which of its members the group holds. Both are decided by the set judgment; Nothing means undecided."
+@fieldLabel "whole" "Group"
+@fieldLabel "within" "Is a Subset"
+@fieldLabel "shared" "Shared"
+LifeCrossAnswer = LifeCrossAnswer whole: LivingThing within: Maybe Bool shared: Maybe (List LivingThing)
+
+@label "Set Across the Tree"
+@description "A set made by people, not by the tree: its members can come from several branches. It is answered only against the groups that hold its members."
+@fieldLabel "name" "Name"
+@fieldLabel "meaning" "Meaning"
+@fieldLabel "members" "Species"
+@fieldLabel "constraint" "Set"
+@fieldLabel "answers" "Answers"
+LifeCrossSet = LifeCrossSet name: String meaning: String members: List LivingThing constraint: SetExpr answers: List LifeCrossAnswer
+
+@label "Tree of Life"
+@description "The living things of this collection as nested sets, read top to bottom from all life, with sets made by people that cut across the tree."
+@fieldLabel "coverage" "Coverage"
+@fieldLabel "sets" "Sets"
+@fieldLabel "crossSets" "Sets Across the Tree"
+LifeClassification = LifeClassification coverage: String sets: List LifeSet crossSets: List LifeCrossSet
+
+_ : Viewable LifeClassification
+_ = Viewable { defaultView = "nested-sets", defaultInlineView = "nested-sets" }
+
+-- Generic tree machinery, shared by the tree of life and the foods. A node is
+-- { node, ancestry, leaf, members }: members are the leaves at or below it.
+
+@label "Tri-State And"
+@description "Both verdicts: Just false as soon as one is Just false, Just true when both are Just true, otherwise Nothing."
+@fieldLabel "left" "Left"
+@fieldLabel "right" "Right"
+encyclopediaTriAnd : (left: Maybe Bool) -> (right: Maybe Bool) -> Maybe Bool
+encyclopediaTriAnd left right = case left of
+  Just true -> right
+  Just false -> Just false
+  _ -> case right of
+    Just false -> Just false
+    _ -> Nothing
+
+encyclopediaSetsApartStep : (state: { seen: List a, verdict: Maybe Bool }) -> (part: List a) -> { seen: List a, verdict: Maybe Bool }
+encyclopediaSetsApartStep state part =
+  let earlier = SeEnum { values = state.seen }
+  let current = SeEnum { values = part }
+  let judged = set.decideDisjoint current earlier
+  let verdict = encyclopediaTriAnd state.verdict judged
+  let seen = concat state.seen part
+  { seen = seen, verdict = verdict }
+
+@label "Sets Are Apart"
+@description "Whether finite sets are pairwise disjoint, judged without comparing every pair: each set against one enumeration of all the sets before it. Nothing when a judgment is undecided."
+@fieldLabel "parts" "Sets"
+encyclopediaSetsApart : (parts: List (List a)) -> Maybe Bool
+encyclopediaSetsApart parts =
+  let decided = Just true
+  let start = { seen = [], verdict = decided }
+  let final = fold encyclopediaSetsApartStep start parts
+  final.verdict
+
+@label "Sets Cover"
+@description "Whether the finite sets together hold every member of the whole: the subset judgment of the whole against one enumeration of all their members."
+@fieldLabel "whole" "Whole"
+@fieldLabel "parts" "Sets"
+encyclopediaSetsCover : (whole: List a) -> (parts: List (List a)) -> Maybe Bool
+encyclopediaSetsCover whole parts =
+  let everything = SeEnum { values = whole }
+  let joined = SeEnum { values = flatten parts }
+  set.decideSubset everything joined
+
+@label "Select With Decided Membership"
+@description "Keep the candidates the predicate decides in; Nothing as soon as one is undecided. A fold, so it holds long lists."
+@fieldLabel "predicate" "Membership"
+@fieldLabel "candidates" "Candidates"
+encyclopediaSelectDecided : (predicate: a -> Maybe Bool) -> (candidates: List a) -> Maybe (List a)
+encyclopediaSelectDecided predicate candidates = fold (encyclopediaSelectDecidedStep predicate) (Just []) candidates
+
+encyclopediaSelectDecidedStep : (predicate: a -> Maybe Bool) -> (kept: Maybe (List a)) -> (candidate: a) -> Maybe (List a)
+encyclopediaSelectDecidedStep predicate kept candidate = case kept of
+  Just chosen -> case predicate candidate of
+    Just true -> Just (concat chosen [candidate])
+    Just false -> Just chosen
+    _ -> Nothing
+  _ -> Nothing
+
+-- The stated parent of a node: the last entry of its ancestry, as a list of
+-- zero or one item (never `at`, never a raw null).
+encyclopediaStatedParent : (ancestry: List a) -> List a
+encyclopediaStatedParent ancestry = drop (length ancestry - 1) ancestry
+
+encyclopediaTreeUnder : (group: a) -> (node: { node: a, ancestry: List a, leaf: Bool, payload: p }) -> Bool
+encyclopediaTreeUnder group node = if elem group node.ancestry then true else elem group [node.node]
+
+encyclopediaTreeEntry : (leaves: List ({ node: a, ancestry: List a, leaf: Bool, payload: p })) -> (node: { node: a, ancestry: List a, leaf: Bool, payload: p }) -> { node: a, ancestry: List a, leaf: Bool, payload: p, members: List a }
+encyclopediaTreeEntry leaves node =
+  let below = if node.leaf then [node.node] else map (\leaf -> leaf.node) (filter (\leaf -> encyclopediaTreeUnder node.node leaf) leaves)
+  { node = node.node, ancestry = node.ancestry, leaf = node.leaf, payload = node.payload, members = below }
+
+@label "Tree Entries"
+@description "Each node with the leaves at or below it, read from the stated ancestries (no judgment)."
+@fieldLabel "nodes" "Nodes"
+encyclopediaTreeEntries : (nodes: List ({ node: a, ancestry: List a, leaf: Bool, payload: p })) -> List ({ node: a, ancestry: List a, leaf: Bool, payload: p, members: List a })
+encyclopediaTreeEntries nodes =
+  let leaves = filter (\node -> node.leaf) nodes
+  map (encyclopediaTreeEntry leaves) nodes
+
+encyclopediaTreeInclusion : (groups: List ({ node: a, ancestry: List a, leaf: Bool, payload: p, members: List a })) -> (entry: { node: a, ancestry: List a, leaf: Bool, payload: p, members: List a }) -> (parent: a) -> { whole: a, within: Maybe Bool }
+encyclopediaTreeInclusion groups entry parent =
+  let stated = head (filter (\group -> elem group.node [parent]) groups)
+  let judged = encyclopediaTreeJudgeInclusion entry.members stated
+  { whole = parent, within = judged }
+
+encyclopediaTreeJudgeInclusion : (inner: List a) -> (stated: Maybe ({ node: a, ancestry: List a, leaf: Bool, payload: p, members: List a })) -> Maybe Bool
+encyclopediaTreeJudgeInclusion inner stated = case stated of
+  Just group -> set.decideSubset (SeEnum { values = inner }) (SeEnum { values = encyclopediaRotateTo inner group.members })
+  _ -> Nothing
+
+-- The same members, rotated to start where the first inner member stands
+-- (the whole list when it is absent). The set is unchanged; the subset
+-- judgment's member scan then finds a contiguous inner block at the front,
+-- so judging a child against its parent costs about the child's size squared
+-- instead of the child's size times the parent's (measured: about 1 ms per
+-- element comparison of tagged values today).
+encyclopediaRotateTo : (inner: List a) -> (outer: List a) -> List a
+encyclopediaRotateTo inner outer =
+  let first = take 1 inner
+  let start = { found = false, before = [], rest = [] }
+  let split = fold (encyclopediaRotateStep first) start outer
+  concat split.rest split.before
+
+encyclopediaRotateStep : (first: List a) -> (state: { found: Bool, before: List a, rest: List a }) -> (candidate: a) -> { found: Bool, before: List a, rest: List a }
+encyclopediaRotateStep first state candidate =
+  let found = if state.found then true else elem candidate first
+  let before = if found then state.before else concat state.before [candidate]
+  let rest = if found then concat state.rest [candidate] else state.rest
+  { found = found, before = before, rest = rest }
+
+@label "Judged Parents"
+@description "The node's inclusion in the parent its ancestry states, as the subset judgment of the two finite sets. A parent with no row of its own stays undecided."
+@fieldLabel "groups" "Groups"
+@fieldLabel "entry" "Node"
+encyclopediaTreeParents : (groups: List ({ node: a, ancestry: List a, leaf: Bool, payload: p, members: List a })) -> (entry: { node: a, ancestry: List a, leaf: Bool, payload: p, members: List a }) -> List ({ whole: a, within: Maybe Bool })
+encyclopediaTreeParents groups entry = map (encyclopediaTreeInclusion groups entry) (encyclopediaStatedParent entry.ancestry)
+
+@label "Judged Partition"
+@description "For a group whose children are all leaves (a family of species): whether its children are apart and whether they cover it, as set judgments. Nothing for a leaf and for a group of groups: judging those enumerations costs the square of the leaves below (measured), so their inclusions are judged and their partitions are not asked."
+@fieldLabel "entries" "Nodes"
+@fieldLabel "entry" "Node"
+encyclopediaTreeParts : (entries: List ({ node: a, ancestry: List a, leaf: Bool, payload: p, members: List a })) -> (entry: { node: a, ancestry: List a, leaf: Bool, payload: p, members: List a }) -> Maybe ({ apart: Maybe Bool, cover: Maybe Bool })
+encyclopediaTreeParts entries entry = if entry.leaf then Nothing else encyclopediaTreeGroupParts entries entry
+
+encyclopediaTreeGroupParts : (entries: List ({ node: a, ancestry: List a, leaf: Bool, payload: p, members: List a })) -> (entry: { node: a, ancestry: List a, leaf: Bool, payload: p, members: List a }) -> Maybe ({ apart: Maybe Bool, cover: Maybe Bool })
+encyclopediaTreeGroupParts entries entry =
+  let children = filter (\child -> elem entry.node (encyclopediaStatedParent child.ancestry)) entries
+  if all children (\child -> child.leaf) then encyclopediaTreeLeafParts entry children else Nothing
+
+encyclopediaTreeLeafParts : (entry: { node: a, ancestry: List a, leaf: Bool, payload: p, members: List a }) -> (children: List ({ node: a, ancestry: List a, leaf: Bool, payload: p, members: List a })) -> Maybe ({ apart: Maybe Bool, cover: Maybe Bool })
+encyclopediaTreeLeafParts entry children =
+  let parts = map (\child -> child.members) children
+  let apart = encyclopediaSetsApart parts
+  let cover = encyclopediaSetsCover entry.members parts
+  let found = { apart = apart, cover = cover }
+  Just found
+
+-- The tree of life.
+
+@label "Living Thing of a Described Plant"
+@description "A row of the tree of life for one of the plant species already described in this collection: its name, common names and source are copied from the species record, never retyped."
+@fieldLabel "subject" "Taxon"
+@fieldLabel "ancestry" "Within"
+@fieldLabel "species" "Species"
+encyclopediaLivingThingOfPlant : (subject: LivingThing) -> (ancestry: List LivingThing) -> (species: PlantSpecies) -> LivingThingFacts
+encyclopediaLivingThingOfPlant subject ancestry species =
+  let named = Just species.scientificName
+  LivingThingFacts { thing = subject, rank = RankSpecies, scientificName = named, commonNames = species.commonNames, within = ancestry, source = species.source }
+
+@label "Taxon Row"
+@description "A row of the tree of life with a scientific name."
+@fieldLabel "subject" "Taxon"
+@fieldLabel "level" "Rank"
+@fieldLabel "scientific" "Scientific Name"
+@fieldLabel "names" "Common Names"
+@fieldLabel "ancestry" "Within"
+@fieldLabel "url" "Source"
+encyclopediaLifeRow : (subject: LivingThing) -> (level: LifeRank) -> (scientific: String) -> (names: List String) -> (ancestry: List LivingThing) -> (url: UrlStr) -> LivingThingFacts
+encyclopediaLifeRow subject level scientific names ancestry url =
+  let named = Just scientific
+  LivingThingFacts { thing = subject, rank = level, scientificName = named, commonNames = names, within = ancestry, source = url }
+
+encyclopediaLifeIsLeaf : (row: LivingThingFacts) -> Bool
+encyclopediaLifeIsLeaf row = elem row.rank [RankSpecies]
+
+encyclopediaLifeNode : (row: LivingThingFacts) -> { node: LivingThing, ancestry: List LivingThing, leaf: Bool, payload: LivingThingFacts }
+encyclopediaLifeNode row =
+  let leaf = encyclopediaLifeIsLeaf row
+  { node = row.thing, ancestry = row.within, leaf = leaf, payload = row }
+
+@label "Species Below a Group"
+@description "The species of the given rows at or below the group, read from their stated ancestries."
+@fieldLabel "rows" "Rows"
+@fieldLabel "group" "Group"
+encyclopediaLifeMembers : (rows: List LivingThingFacts) -> (group: LivingThing) -> List LivingThing
+encyclopediaLifeMembers rows group =
+  let leaves = filter encyclopediaLifeIsLeaf rows
+  map (\row -> row.thing) (filter (\row -> encyclopediaTreeUnder group (encyclopediaLifeNode row)) leaves)
+
+-- The display name: the first common name, else the scientific name.
+encyclopediaLifeName : (row: LivingThingFacts) -> String
+encyclopediaLifeName row = case head row.commonNames of
+  Just first -> capitalize first
+  _ -> fromMaybe "All life" row.scientificName
+
+encyclopediaLifeGives : (foods: List FoodFacts) -> (row: LivingThingFacts) -> List Foodstuff
+encyclopediaLifeGives foods row = if encyclopediaLifeIsLeaf row then encyclopediaFoodsFromThing foods row.thing else []
+
+encyclopediaFoodsFromThing : (foods: List FoodFacts) -> (giver: LivingThing) -> List Foodstuff
+encyclopediaFoodsFromThing foods giver =
+  let wanted = Just giver
+  let given = filter (\edible -> elem edible.source [wanted]) foods
+  map (\edible -> edible.food) (filter (\edible -> elem edible.rank [FoodRankFood]) given)
+
+encyclopediaLifeInclusionOf : (pair: { whole: LivingThing, within: Maybe Bool }) -> LifeSetInclusion
+encyclopediaLifeInclusionOf pair = LifeSetInclusion { whole = pair.whole, within = pair.within }
+
+encyclopediaLifePartitionOf : (parts: Maybe ({ apart: Maybe Bool, cover: Maybe Bool })) -> Maybe LifeSetPartition
+encyclopediaLifePartitionOf parts = case parts of
+  Just found -> Just (LifeSetPartition { apart = found.apart, cover = found.cover })
+  _ -> Nothing
+
+encyclopediaLifeSetOf : (entries: List ({ node: LivingThing, ancestry: List LivingThing, leaf: Bool, payload: LivingThingFacts, members: List LivingThing })) -> (groups: List ({ node: LivingThing, ancestry: List LivingThing, leaf: Bool, payload: LivingThingFacts, members: List LivingThing })) -> (foods: List FoodFacts) -> (entry: { node: LivingThing, ancestry: List LivingThing, leaf: Bool, payload: LivingThingFacts, members: List LivingThing }) -> LifeSet
+encyclopediaLifeSetOf entries groups foods entry =
+  let row = entry.payload
+  let label = encyclopediaLifeName row
+  let judgedParents = map encyclopediaLifeInclusionOf (encyclopediaTreeParents groups entry)
+  let constraint = SeEnum { values = entry.members }
+  let partition = encyclopediaLifePartitionOf (encyclopediaTreeParts entries entry)
+  let given = encyclopediaLifeGives foods row
+  LifeSet { item = row.thing, name = label, scientificName = row.scientificName, rank = row.rank, parents = judgedParents, members = entry.members, constraint = constraint, parts = partition, gives = given, source = row.source }
+
+-- Cross sets: answered only against the groups that hold their members.
+
+encyclopediaLifeAncestorsOf : (rows: List LivingThingFacts) -> (members: List LivingThing) -> List LivingThing
+encyclopediaLifeAncestorsOf rows members =
+  let holding = filter (\row -> elem row.thing members) rows
+  unique (flatten (map (\row -> drop 1 row.within) holding))
+
+encyclopediaLifeCrossAnswer : (groups: List ({ node: LivingThing, ancestry: List LivingThing, leaf: Bool, payload: LivingThingFacts, members: List LivingThing })) -> (cross: SetExpr) -> (crossMembers: List LivingThing) -> (group: LivingThing) -> LifeCrossAnswer
+encyclopediaLifeCrossAnswer groups cross crossMembers group =
+  let stated = head (filter (\candidate -> elem candidate.node [group]) groups)
+  let groupMembers = encyclopediaTreeMembersOf stated
+  let whole = SeEnum { values = groupMembers }
+  let judged = set.decideSubset cross whole
+  let shared = encyclopediaSelectDecided (\member -> set.contains whole member) crossMembers
+  LifeCrossAnswer { whole = group, within = judged, shared = shared }
+
+@label "Set Across the Tree"
+@description "A set made by people from the given species, answered against every group of the tree that holds one of them."
+@fieldLabel "rows" "Rows"
+@fieldLabel "groups" "Groups"
+@fieldLabel "setName" "Name"
+@fieldLabel "setMeaning" "Meaning"
+@fieldLabel "chosen" "Species"
+encyclopediaLifeCrossSet : (rows: List LivingThingFacts) -> (groups: List ({ node: LivingThing, ancestry: List LivingThing, leaf: Bool, payload: LivingThingFacts, members: List LivingThing })) -> (setName: String) -> (setMeaning: String) -> (chosen: List LivingThing) -> LifeCrossSet
+encyclopediaLifeCrossSet rows groups setName setMeaning chosen =
+  let constraint = SeEnum { values = chosen }
+  let ancestors = encyclopediaLifeAncestorsOf rows chosen
+  let answers = map (encyclopediaLifeCrossAnswer groups constraint chosen) ancestors
+  LifeCrossSet { name = setName, meaning = setMeaning, members = chosen, constraint = constraint, answers = answers }
+
+encyclopediaTreeMembersOf : (stated: Maybe ({ node: a, ancestry: List a, leaf: Bool, payload: p, members: List a })) -> List a
+encyclopediaTreeMembersOf stated = case stated of
+  Just found -> found.members
+  _ -> []
+
+encyclopediaMaybeAsList : (value: Maybe a) -> List a
+encyclopediaMaybeAsList value = case value of
+  Just found -> [found]
+  _ -> []
+
+encyclopediaLifeCalled : (word: String) -> (row: LivingThingFacts) -> Bool
+encyclopediaLifeCalled word row = some row.commonNames (\commonName -> encyclopediaNameEndsWith word commonName)
+
+encyclopediaLifeFennels : (rows: List LivingThingFacts) -> (groups: List ({ node: LivingThing, ancestry: List LivingThing, leaf: Bool, payload: LivingThingFacts, members: List LivingThing })) -> LifeCrossSet
+encyclopediaLifeFennels rows groups =
+  let called = map (\row -> row.thing) (filter (\row -> encyclopediaLifeCalled "fennel" row) (filter encyclopediaLifeIsLeaf rows))
+  encyclopediaLifeCrossSet rows groups "Fennels" (encyclopediaFennelsMeaning ()) called
+
+-- One cross set per kind of food: the living things that give a food of it.
+encyclopediaLifeKindSources : (rows: List LivingThingFacts) -> (groups: List ({ node: LivingThing, ancestry: List LivingThing, leaf: Bool, payload: LivingThingFacts, members: List LivingThing })) -> (foods: List FoodFacts) -> (kind: FoodFacts) -> LifeCrossSet
+encyclopediaLifeKindSources rows groups foods kind =
+  let ofKind = filter (\edible -> elem kind.food edible.within) foods
+  let givers = unique (flatten (map (\edible -> encyclopediaMaybeAsList edible.source) ofKind))
+  let setName = join ["Sources of ", kind.name] ""
+  let setMeaning = join ["The living things of this collection that give a food of the kind ", kind.name, ". A set made by people, not by the tree: it can cut across kingdoms and families."] ""
+  encyclopediaLifeCrossSet rows groups setName setMeaning givers
+
+@label "Classify Living Things"
+@description "The tree of life of the given rows: one set per row (a species is its own singleton), each judged against its stated parent, the species of each family judged apart and covering it; then the fennels, answered against the groups that hold them. The foods given by each species are read from the food rows."
+@fieldLabel "rows" "Rows"
+@fieldLabel "foods" "Foods"
+encyclopediaLifeClassification : (rows: List LivingThingFacts) -> (foods: List FoodFacts) -> LifeClassification
+encyclopediaLifeClassification rows foods =
+  let entries = encyclopediaTreeEntries (map encyclopediaLifeNode rows)
+  let groups = filter (\entry -> if entry.leaf then false else true) entries
+  let sets = map (encyclopediaLifeSetOf entries groups foods) entries
+  let fennels = encyclopediaLifeFennels rows groups
+  let crossSets = [fennels]
+  LifeClassification { coverage = "These sets contain the living things described in this collection. Other species are not listed here.", sets = sets, crossSets = crossSets }
+
+@label "Tree of life"
+@description "All life, then kingdoms, classes, families and species, with the pictures we made: each set judged inside the one above it, the species of each family judged apart and covering it, and the foods each species gives. Then a set made by people across the tree: the fennels."
+@tags "encyclopedia" "living-things" "sets"
+encyclopediaTreeOfLife : LifeClassification
+encyclopediaTreeOfLife = encyclopediaLifeClassification (encyclopediaLivingThingFacts ()) (encyclopediaFoodFacts ())
+
+@label "Every species in the tree"
+@description "The species of the tree of life, as a grid of their pictures."
+@tags "encyclopedia" "living-things"
+encyclopediaTreeOfLifeLeaves : List LivingThing
+encyclopediaTreeOfLifeLeaves = map (\row -> row.thing) (filter encyclopediaLifeIsLeaf (encyclopediaLivingThingFacts ()))
+
+@label "Species below a group"
+@description "The species of the tree of life at or below one group, as a grid of their pictures."
+@fieldLabel "group" "Group"
+encyclopediaLeavesOf : (group: LivingThing) -> List LivingThing
+encyclopediaLeavesOf group = encyclopediaLifeMembers (encyclopediaLivingThingFacts ()) group
+
+@label "Living things by the food they give"
+@description "One set per kind of food: the living things of the tree of life that give a food of that kind (fruits come from several plant families, meat from mammals and a bird). Each is a set made by people, answered against the groups of the tree that hold its members."
+@tags "encyclopedia" "living-things" "foods" "sets"
+encyclopediaFoodSourceSets : List LifeCrossSet
+encyclopediaFoodSourceSets = encyclopediaLifeFoodSourceSets (encyclopediaLivingThingFacts ()) (encyclopediaFoodFacts ())
+
+@label "Living Things by Kind of Food"
+@description "For the given rows and foods: one set across the tree per kind of food, of the living things that give a food of it."
+@fieldLabel "rows" "Rows"
+@fieldLabel "foods" "Foods"
+encyclopediaLifeFoodSourceSets : (rows: List LivingThingFacts) -> (foods: List FoodFacts) -> List LifeCrossSet
+encyclopediaLifeFoodSourceSets rows foods =
+  let entries = encyclopediaTreeEntries (map encyclopediaLifeNode rows)
+  let groups = filter (\entry -> if entry.leaf then false else true) entries
+  let kinds = filter (\edible -> elem edible.rank [FoodRankKind]) foods
+  let leafFoods = filter (\edible -> elem edible.rank [FoodRankFood]) foods
+  map (encyclopediaLifeKindSources rows groups leafFoods) kinds
+
+-- A branch of the tree of life read on its own: the rows at or below one
+-- group, their ancestry cut so the group is the root, judged the same way and
+-- with the foods each species gives. Used for the nightshades and their foods
+-- (the FoodsFromGroup record has no presentation of its own).
+encyclopediaLifeBranchRow : (depth: Number) -> (row: LivingThingFacts) -> LivingThingFacts
+encyclopediaLifeBranchRow depth row =
+  let cut = drop depth row.within
+  LivingThingFacts { thing = row.thing, rank = row.rank, scientificName = row.scientificName, commonNames = row.commonNames, within = cut, source = row.source }
+
+@label "Branch of the Tree of Life"
+@description "One group of the tree of life with everything below it, as nested sets: each set judged inside the one above it, the species of each family judged apart and covering it, and the foods each species gives."
+@fieldLabel "group" "Group"
+encyclopediaLifeBranch : (group: LivingThing) -> LifeClassification
+encyclopediaLifeBranch group =
+  let rows = encyclopediaLivingThingFacts ()
+  let foods = encyclopediaFoodFacts ()
+  let own = filter (\row -> elem row.thing [group]) rows
+  let depth = fold (\known row -> length row.within) 0 own
+  let below = filter (\row -> encyclopediaTreeUnder group (encyclopediaLifeNode row)) rows
+  let branch = map (encyclopediaLifeBranchRow depth) below
+  let entries = encyclopediaTreeEntries (map encyclopediaLifeNode branch)
+  let groups = filter (\entry -> if entry.leaf then false else true) entries
+  let sets = map (encyclopediaLifeSetOf entries groups foods) entries
+  LifeClassification { coverage = "These sets contain the living things of this group described in this collection, with the foods each gives. Other species are not listed here.", sets = sets, crossSets = [] }
+
+@label "Nightshades and their foods"
+@description "The nightshade family (Solanaceae) of this collection: potato, tomato, aubergine and sweet pepper give foods (tomato, potato, aubergine, sweet pepper and chilli); cutleaf nightshade and thorn apple give none."
+@tags "encyclopedia" "living-things" "foods" "sets"
+encyclopediaNightshades : LifeClassification
+encyclopediaNightshades = encyclopediaLifeBranch Solanaceae

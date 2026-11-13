@@ -1,0 +1,463 @@
+-- =========================================================================
+-- Imports — import_profiles main C-body.
+--
+-- Phase 12d sub-step 7 of the ts-elimination workstream. THIS IS THE
+-- FINAL SUB-STEP OF PHASE 12d. Lifts core/src/actions/imports.ts:
+-- importProfilesHandler from ~75 LOC of TS orchestration to a thin
+-- Zod-parse + parse + map + invokeIOAction + Result-unwrap wrapper +
+-- a small Fenel C-body that owns the per-record dispatch loop + counter
+-- accumulation + profiles_imported event emit.
+--
+-- module-substrate Phase 3c (2026-05-30) — tier-1 pure Shape-B migration.
+-- This file is now the SOURCE OF TRUTH for the module's signatures +
+-- identity: it grew the `module imports where` header, the per-function
+-- `name : Type` sigs, and the `@label`/`@description`/`@tags`/`@ioAction`
+-- facet directives that the loader lifts into the same Codeable/Labelable/
+-- Describable/Categorizable/Taggable/IOInvokable ClassInstances the retired
+-- `engine/src/modules/imports.ts` defineFunction specs used to emit. The
+-- header keeps the LEGACY lowercase `imports:` id-prefix + `imports`
+-- category byte-identical (no fnId rename here — that PascalCase
+-- canonicalisation is a deferred coordinated sweep). The TS spec wrapper
+-- shrank to a thin `loadFenelModule` seam. (Old filename `manage.fenel`
+-- consolidated into `imports.fenel`.)
+--
+-- ADTs declared: none (per brief Decision E — `format` stays a string
+-- discriminator; only 2 formats today; Phase 5a-csv moved the format-fork
+-- itself INTO the body — `parseRows data format` — so the body, not the
+-- wrapper, resolves it).
+--
+-- Phase 5a-csv (2026-06-02) — THE F-PERMANENT OVERTURN. The 12d-7
+-- wrapper-side TS `parseCsv` + `splitCsvLine` + `JSON.parse` fork +
+-- `DEFAULT_MAPPING` literal are RETIRED. The CSV parser is now a pure Fenel
+-- char-fold (`splitCsvLine` via `std:fold` over `split line ""` — single-char
+-- Strings, no Char→String leaf needed); the JSON path is the new pure
+-- `std:parseJsonRows` leaf; the default-mapping merge is `withDefaultMapping`.
+-- Decisions A-DEVIATION + D + F below are SUPERSEDED (kept for history).
+--
+-- Substrate consumed:
+--   - dispatch:dispatchAction              (per-record create_or_merge_profile
+--                                           dispatch — sister of 12d-2/5/6)
+--   - state:appendEvent                    (profiles_imported event — write-
+--                                           only per Decision K)
+--   - std:head / std:tail / std:length / std:mergeRecords / std:entries
+--     std:lookup / std:assocRecord / std:fold / std:startsWith / std:slice
+--   - std:split / std:trim / std:concat / std:map / std:eq      (CSV parser)
+--   - std:parseJsonRows                    (NEW pure leaf — JSON fork)
+--
+-- Decisions resolved (per the brief):
+--   A-DEVIATION: parseCsv + splitCsvLine STAY WRAPPER-SIDE TS. The brief's
+--      lean was "Fenel-bodied first; fall back to substrate if too verbose"
+--      with the substrate-pivot documented as the cleanest fallback. The
+--      session-level resolution takes a third path: keep parseCsv +
+--      splitCsvLine as wrapper-internal TS helpers (NOT promoted to a
+--      Fenel-callable substrate primitive). Pure string-manipulation;
+--      legitimately irreducible host-string-handling.
+--   B (Phase 13a sub-step 2 LIFTED): applyMapping is now a Fenel D-helper
+--      using std:entries + std:lookup + std:assocRecord (all added 13a).
+--      Wrapper passes raw rows: List<Record<String,String>> + the merged
+--      mapping: Record<String,String>; body iterates per-row + builds the
+--      create_or_merge_profile params shape via case-arm cascade.
+--   C: Result {Err e, Ok a} sentinel — wrapper throws on
+--      Err mapping to the dispatch error path. Sister: 12d-3/4/5/6.
+--   D: JSON.parse stays wrapper-side TS (NO new substrate primitive).
+--      The pre-flight grep confirmed codec:jsonDecode exists but returns
+--      the wrapped JsonValue ADT — heavyweight for the import path which
+--      needs raw JS records flowing through Object.entries. Wrapper-side
+--      JSON.parse is the lowest-friction path; aligns with Decision A-
+--      deviation's wrapper-side parsing rationale.
+--   E: format stays string discriminator — only 2 formats today, ADT-lift
+--      would be over-engineered. Sister: 12d-3 enforce-mode + 12d-5
+--      provider-name string discriminators.
+--   F: default mapping wrapper-side TS literal (DEFAULT_MAPPING const stays
+--      as-is in core/actions/imports.ts; merged with caller-supplied
+--      overrides before invokeIOAction). Sister: 12d-5 env defaults.
+--   G: per-record dispatch error handling — trust dispatchAction (Option A).
+--      Pre-port has try/catch{skipped++}; dispatchAction returns
+--      {success, data, ...} and the body checks .success to increment the
+--      correct counter. Infrastructure errors during dispatch propagate
+--      (same behaviour as pre-port if dispatchAction itself rejects).
+--   H: preserve merged=0 verbatim (Decision H — pre-port always emits
+--      merged: 0; the counter looks vestigial. New deferred follow-up:
+--      aggregate mergedCount from each dispatch's result.data if a
+--      consumer surfaces).
+--   I: invokeIOAction async (body has HasStateIO + dispatch requires).
+--   J: Result Ok payload = {total, imported, skipped} — matches pre-port
+--      TS return data. The event payload separately keeps merged: 0
+--      (Decision H verbatim).
+--   K: preserve write-only event semantics — drop aggregateType /
+--      aggregateId / profileId from profiles_imported event (same as
+--      12d-3/4/5/6). Grep audit confirms no consumers query
+--      profiles_imported by aggregate. Reaffirms the deferred follow-up:
+--      extend state:appendEvent substrate with optional aggregate* Maybe
+--      params if a future consumer needs event provenance.
+--   L: empty-records short-circuit — body branches on `length records ==
+--      0` and short-circuits to Ok {total=0, imported=0, skipped=0}
+--      WITHOUT emitting profiles_imported (matches pre-port's `if
+--      records.length === 0 return {success: true, data: {imported: 0,
+--      skipped: 0}}` — no event emit on zero records).
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line (12a-3/4/7 surprise pattern; 12d-3/4/5/6 reaffirmed).
+-- =========================================================================
+
+module imports where
+
+-- NOTE (action-subsumption Phase 3, 2026-06-08): the `ImportFormat` enum the
+-- `import_profiles` action validates against is declared in fenel/modules/items/
+-- items.fenel, NOT here. `imports` is an oracle-backed MIGRATED module —
+-- module-migrate-imports.test.ts freezes `importsModule.entities` to `[]`
+-- (migration parity), so a type-decl here would drift its identity (the
+-- entity-analog of the Phase-2 `"action"`-tag oracle break). The global catalog
+-- resolves `{$ref:"ImportFormat"}` from any module's sig, so importProfiles'
+-- `format : ImportFormat` works with the type hosted in items (the cross-module
+-- shared-refinement host, cf. `Uuid`).
+
+-- importProfiles — main C-body. Receives raw rows + effective mapping
+-- (Phase 13a sub-step 2: the wrapper no longer pre-applies the mapping;
+-- the body does it per-row via std:entries + std:lookup + std:assocRecord).
+-- Branches on the empty-rows short-circuit (Decision L); otherwise
+-- iterates with a {imported, skipped} counter accumulator, emits the
+-- profiles_imported event with the final counters, returns Ok.
+-- action-subsumption Phase 3 (2026-06-08) — importProfiles IS the public
+-- import_profiles action now (D1 COLLAPSE): the public contract is (data, format,
+-- mapping?, tags?, adapter) with data : NonEmptyStr + format : ImportFormat; the
+-- `mapping ?? {}` / `tags ?? []` defaulting the TS handler did lifts INTO the body
+-- (Fenel-first), now over the public-named optional params. The vestigial
+-- `merge` field import_profiles_params carried (destructured-but-unused) is
+-- DROPPED — validate is lenient on extra keys, so a stray `merge` is ignored just
+-- as before. The DEFAULT_MAPPING merge residual stays body-side
+-- (withDefaultMapping). The TS handler is deleted; `adapter` stays a param (D4).
+importProfiles : NonEmptyStr -> ImportFormat -> Maybe ({}) -> Maybe (List String) -> String -> ActionResult
+@label "Import profiles"
+@description "Phase 5a-csv / action-subsumption Phase 3 — the public import_profiles action (no separate TS handler). Receives the RAW data + format + optional mapping/tags and owns the parse (CSV char-fold OR std:parseJsonRows) + the `mapping ?? {}` / `tags ?? []` defaulting + the DEFAULT_MAPPING merge in Fenel. Then reuses the unchanged importProfilesInner -> importEach -> applyMapping chain. Lifts the inner Result to ActionResult ADT (multi-record import has no single aggregate, so aggregateType/aggregateId/profileId remain Nothing)."
+@tags "imports" "bulk" "phase-13a"
+@ioAction "imports.import_profiles"
+importProfiles data format mapping tags adapter =
+  let mappingRaw = case mapping of
+    Nothing -> {}
+    Just m -> m
+  let tagsEff = case tags of
+    Nothing -> []
+    Just t -> t
+  let rows = parseRows data format
+  let mappingEff = withDefaultMapping mappingRaw
+  let r = importProfilesInner rows mappingEff format tagsEff adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { total = ok.total, imported = ok.imported, skipped = ok.skipped }, aggregateType = Nothing, aggregateId = Nothing, profileId = Nothing }
+
+-- importProfilesInner — pre-13a-1 entry-point logic; returns Result.
+importProfilesInner : List ({}) -> {} -> String -> List String -> String -> {}
+@label "Import profiles (inner — Result)"
+@description "Phase 13a sub-step 2 — pre-13a entry-point logic; returns Result. Branches on empty-rows short-circuit; otherwise threads {imported, skipped} accumulator through importEach + emits profiles_imported event."
+@tags "imports" "bulk" "phase-13a"
+importProfilesInner rows mapping format tags adapter =
+  if length rows == 0
+  then Ok { total = 0, imported = 0, skipped = 0 }
+  else importProfilesProceed rows mapping format tags adapter
+
+-- importProfilesProceed — non-empty path. Threads the {imported, skipped}
+-- accumulator through importEach; emits the profiles_imported event with
+-- the final counters; returns Ok.
+importProfilesProceed : List ({}) -> {} -> String -> List String -> String -> {}
+@label "Import profiles (proceed)"
+@description "Phase 12d sub-step 7 — if-else arm extraction from importProfiles (non-empty rows branch). Threads the {imported, skipped} accumulator through importEach + emits profiles_imported event with final counters + returns Ok payload. merged=0 preserved per Decision H."
+@tags "imports" "bulk" "phase-13a"
+importProfilesProceed rows mapping format tags adapter =
+  let acc0 = { imported = 0, skipped = 0 }
+  let finalCounters = importEach rows mapping adapter acc0
+  let total = length rows
+  let payload = { format = format, total = total, imported = finalCounters.imported, skipped = finalCounters.skipped, merged = 0, tags = tags }
+  let _e = appendEvent "profiles_imported" payload Nothing Nothing Nothing
+  Ok { total = total, imported = finalCounters.imported, skipped = finalCounters.skipped }
+
+-- importEach — recursive head/tail iteration over rows (sister of
+-- purchases:grantEach + profiles:mergeEach). Each iteration applies the
+-- mapping to the head row, dispatches create_or_merge_profile, increments
+-- the appropriate counter, recurses on the tail. Halts when rows is empty.
+importEach : List ({}) -> {} -> String -> {} -> {}
+@label "Import each (recursive)"
+@description "Phase 12d sub-step 7 — recursive head/tail iteration over rows. Sister of purchases:grantEach + profiles:mergeEach. Threads the {imported, skipped} accumulator through each iteration. Halts when rows is empty."
+@tags "imports" "bulk" "phase-13a"
+importEach rows mapping adapter acc =
+  case head rows of
+    Nothing -> acc
+    Just row -> importOneAndContinue row rows mapping adapter acc
+
+importOneAndContinue : {} -> List ({}) -> {} -> String -> {} -> {}
+@label "Import one and continue"
+@description "Phase 12d sub-step 7 — head-of-tail recursion driver. Dispatches create_or_merge_profile on the head row (after applyMapping); recurses on the tail via importEach with the updated accumulator."
+@tags "imports" "bulk" "phase-13a"
+importOneAndContinue row rows mapping adapter acc =
+  let accNext = importOneRecord row mapping adapter acc
+  case tail rows of
+    Nothing -> accNext
+    Just rest -> importEach rest mapping adapter accNext
+
+-- importOneRecord — apply mapping + single dispatch call. dispatchAction's
+-- result has a .success Bool field; success → incImported, else → incSkipped.
+-- Per Decision G we trust dispatchAction not to throw on handler-level
+-- errors (matches pre-port's try/catch + .success check).
+importOneRecord : {} -> {} -> String -> {} -> {}
+@label "Import one record"
+@description "Phase 13a sub-step 2 — applyMapping (Fenel-side) + single dispatch:dispatchAction 'create_or_merge_profile' call. On result.success increments imported; else increments skipped."
+@tags "imports" "dispatch" "phase-13a"
+importOneRecord row mapping adapter acc =
+  let mapped = applyMapping row mapping
+  let result = dispatchAction "create_or_merge_profile" mapped
+  if result.success
+  then incImported acc
+  else incSkipped acc
+
+-- applyMapping — Phase 13a sub-step 2 lift from wrapper-side TS
+-- Object.entries(mapping) iteration to Fenel via std:entries + std:lookup
+-- + std:assocRecord. Iterates mapping entries; per entry, looks up
+-- row[csvCol] and dispatches on fenelField via dispatchField cascade.
+-- Returns a Record { email?, handles, firstName?, lastName? } matching
+-- the createOrMergeProfileSchema shape that create_or_merge_profile
+-- expects via dispatch.
+applyMapping : {} -> {} -> {}
+@label "Apply mapping (Fenel)"
+@description "Phase 13a sub-step 2 — pure D helper. Lifts the 12d-7 wrapper-side TS Object.entries(mapping) iteration to Fenel via std:entries + std:lookup + std:assocRecord. Returns a Record { email?, handles, firstName?, lastName? } matching the createOrMergeProfileSchema shape consumed via dispatch."
+@tags "imports" "mapping" "pure" "phase-13a"
+applyMapping row mapping =
+  let acc0 = { handles = {} }
+  let folder = \acc entry -> applyOneMapping row acc entry
+  fold folder acc0 (entries mapping)
+
+-- applyOneMapping — per-mapping-entry step. Looks up the csvCol on the
+-- row; Nothing → no change. Just<v> → guard on truthy (empty / null
+-- skipped, matching pre-port `if (!value) continue`).
+applyOneMapping : {} -> {} -> {} -> {}
+@label "Apply one mapping entry"
+@description "Phase 13a sub-step 2 — pure D helper. Per-mapping-entry step within fold. Looks up the csvCol on the row via std:lookup; Nothing → no change; Just<v> → applyValueIfTruthy."
+@tags "imports" "mapping" "pure" "phase-13a"
+applyOneMapping row acc entry =
+  case lookup row entry.key of
+    Nothing -> acc
+    Just v -> applyValueIfTruthy acc entry.value v
+
+applyValueIfTruthy : {} -> String -> String -> {}
+@label "Apply value if truthy"
+@description "Phase 13a sub-step 2 — pure D helper. Guards on truthy v (empty / null → skip, matching pre-port `if (!value) continue`). When truthy, dispatches to dispatchField."
+@tags "imports" "mapping" "pure" "phase-13a"
+applyValueIfTruthy acc fenelField v =
+  if truthy v
+  then dispatchField acc fenelField v
+  else acc
+
+-- dispatchField — case-arm cascade on fenelField string. The 5 arms
+-- mirror the pre-port TS chain at applyMapping lines 122-134:
+--   "email"            → mergeRecords acc { email = v }
+--   "phone"            → setHandle "phone" v
+--   "handle:<plat>"    → setHandle <plat> v
+--   "firstName"        → mergeRecords acc { firstName = v }
+--   "lastName"         → mergeRecords acc { lastName = v }
+--   <anything else>    → drop (unmapped columns silently skipped, sister
+--                        of pre-port's missing-else-arm behavior)
+dispatchField : {} -> String -> String -> {}
+@label "Dispatch fenel field"
+@description "Phase 13a sub-step 2 — pure D helper. Case-arm cascade on fenelField string. The 5 arms mirror the pre-port TS chain at applyMapping lines 122-134: email / phone / handle:<plat> / firstName / lastName. Unmapped columns silently dropped."
+@tags "imports" "mapping" "pure" "phase-13a"
+dispatchField acc fenelField v =
+  if eq fenelField "email" then mergeRecords acc { email = v }
+  else if eq fenelField "phone" then setHandle acc "phone" v
+  else if startsWith fenelField "handle:" then setHandlePlatform acc fenelField v
+  else if eq fenelField "firstName" then mergeRecords acc { firstName = v }
+  else if eq fenelField "lastName" then mergeRecords acc { lastName = v }
+  else acc
+
+-- setHandlePlatform — strip the "handle:" prefix via std:slice, then
+-- write to handles via std:assocRecord. Pre-port:
+-- `const platform = fenelField.slice("handle:".length); handles[platform] = value`.
+setHandlePlatform : {} -> String -> String -> {}
+@label "Set handle (with prefix strip)"
+@description "Phase 13a sub-step 2 — pure D helper. Strips the 'handle:' prefix via std:slice; writes via setHandle. Pre-port: `const platform = fenelField.slice('handle:'.length); handles[platform] = value`."
+@tags "imports" "mapping" "pure" "phase-13a"
+setHandlePlatform acc fenelField v =
+  let platform = slice fenelField 7 (length fenelField)
+  setHandle acc platform v
+
+-- setHandle — dynamic-key handle write via std:assocRecord (added 13a-2,
+-- retires one of the 12c-core deferred follow-ups). Mirrors
+-- `handles[platform] = value` in the pre-port TS.
+setHandle : {} -> String -> String -> {}
+@label "Set handle"
+@description "Phase 13a sub-step 2 — pure D helper. Dynamic-key handle write via std:assocRecord. Mirrors `handles[platform] = value` in the pre-port TS."
+@tags "imports" "mapping" "pure" "phase-13a"
+setHandle acc platform v =
+  mergeRecords acc { handles = assocRecord acc.handles platform v }
+
+-- incImported — pure D helper. Bumps the imported counter by 1; leaves
+-- skipped unchanged. parseApp single-line constraint forces the extraction.
+incImported : {} -> {}
+@label "Increment imported counter"
+@description "Phase 12d sub-step 7 — pure D helper. Bumps imported by 1; leaves skipped unchanged. parseApp single-line constraint forces the extraction (the if-then-else branch in importOneRecord can't inline a 2-arg mergeRecords + record literal expression)."
+@tags "imports" "counter" "pure" "phase-12d"
+incImported acc =
+  mergeRecords acc { imported = acc.imported + 1 }
+
+-- incSkipped — pure D helper. Sister of incImported.
+incSkipped : {} -> {}
+@label "Increment skipped counter"
+@description "Phase 12d sub-step 7 — pure D helper. Sister of incImported."
+@tags "imports" "counter" "pure" "phase-12d"
+incSkipped acc =
+  mergeRecords acc { skipped = acc.skipped + 1 }
+
+-- =========================================================================
+-- Phase 5a-csv — the parse + mapping-merge surface (F-permanent overturn).
+-- =========================================================================
+
+-- parseRows — the format-fork, now Fenel (was the wrapper-side
+-- `format === "csv" ? parseCsv : JSON.parse` ternary). CSV → the Fenel
+-- char-fold parser; anything else → the std:parseJsonRows pure leaf.
+parseRows : String -> String -> List ({})
+@label "Parse rows by format"
+@description "Phase 5a-csv — the format-fork lifted from the wrapper. `format == \"csv\"` routes to the Fenel parseCsv char-fold; else to the std:parseJsonRows pure leaf (JSON.parse + array-coerce). Replaces the 12d-7 wrapper-side `format === 'csv' ? parseCsv : JSON.parse` ternary."
+@tags "imports" "parse" "phase-5a"
+parseRows data format =
+  if eq format "csv"
+  then parseCsv data
+  else parseJsonRows data
+
+-- withDefaultMapping — DEFAULT_MAPPING (the retired 12d-7 wrapper-side TS
+-- 12-key literal) + the `{...DEFAULT, ...override}` merge, now Fenel.
+-- std:mergeRecords is right-biased (b wins), so DEFAULTS-then-override
+-- preserves the TS override-wins precedence byte-for-byte.
+withDefaultMapping : {} -> {}
+@label "With default mapping"
+@description "Phase 5a-csv — the retired wrapper-side DEFAULT_MAPPING 12-key literal + the `{...DEFAULT, ...override}` merge, now Fenel. std:mergeRecords(a,b) is right-biased (b wins), so `mergeRecords DEFAULTS override` matches the TS override-wins precedence."
+@tags "imports" "mapping" "phase-5a"
+withDefaultMapping override =
+  mergeRecords { email = "email", phone = "phone", instagram = "handle:instagram", ig = "handle:instagram", ig_handle = "handle:instagram", telegram = "handle:telegram", tg = "handle:telegram", discord = "handle:discord", twitter = "handle:twitter", name = "firstName", first_name = "firstName", last_name = "lastName" } override
+
+-- parseCsv — port of the wrapper-side TS `parseCsv`. `split (trim text) "\n"`
+-- → lines; the head is the header row, the tail is the data rows; `< 2 lines`
+-- naturally yields `[]` (tailOrEmpty of a single-element list is `[]`, so the
+-- mapped data set is empty — matches the TS `if (lines.length < 2) return []`).
+-- NO embedded-newline handling (line-oriented, like the TS).
+parseCsv : String -> List ({})
+@label "Parse CSV"
+@description "Phase 5a-csv — port of the retired wrapper-side TS parseCsv. Splits on \\n after a whole-text trim; head = header row, tail = data rows. `< 2 lines` yields [] naturally (tailOrEmpty of a singleton is []). Line-oriented — NO embedded-newline support (parity with the TS, not RFC-4180)."
+@tags "imports" "csv" "parse" "phase-5a"
+parseCsv data =
+  let lines = split (trim data) "\n"
+  case head lines of
+    Nothing -> []
+    Just headerLine -> parseCsvBody headerLine (fromMaybe [] (tail lines))
+
+-- parseCsvBody — header-split + per-data-line zip. Mirrors the TS j-loop:
+-- each row maps `headers[j].trim()` → `(values[j] ?? "").trim()`.
+parseCsvBody : String -> List String -> List ({})
+@label "Parse CSV body"
+@description "Phase 5a-csv — splits the header line once, then maps each data line to a record via zipRowGo (headers ⨯ splitCsvLine line). Mirrors the TS inner j-loop over headers.length with `(values[j] ?? '').trim()`."
+@tags "imports" "csv" "parse" "phase-5a"
+parseCsvBody headerLine dataLines =
+  let headers = splitCsvLine headerLine
+  let mk = \line -> zipRowGo headers (splitCsvLine line) {}
+  map mk dataLines
+
+-- splitCsvLine — port of the wrapper-side TS char-loop quote-state machine.
+-- A left-fold over `split line ""` (single-char Strings). The TS look-ahead
+-- `line[i+1] === '"'` (for the `""` escape) can't peek forward in a fold, so
+-- it carries a `pending` flag: a `"` seen WHILE inQuote sets pending instead
+-- of toggling immediately; the NEXT char resolves it (escape if `"`, else the
+-- pending quote was a CLOSING quote → drop inQuote and re-process the char).
+-- A dangling pending at end-of-line = a closing quote (dropped). The final
+-- `result.push(current)` is the trailing `concat fields [current]`.
+splitCsvLine : String -> List String
+@label "Split CSV line"
+@description "Phase 5a-csv — port of the retired wrapper-side TS splitCsvLine char-loop quote-state machine. Left-fold over `split line \"\"` (single-char Strings, code-unit based like the TS line[i] loop). The `line[i+1]` look-ahead for the `\"\"`-escape becomes a `pending` fold-state flag resolved on the next char / at end-of-line. Handles quoted fields, embedded commas, `\"\"`→literal-`\"`, trailing empty field. NO embedded newlines."
+@tags "imports" "csv" "parse" "phase-5a"
+splitCsvLine line =
+  let init = { fields = [], current = "", inQuote = False, pending = False }
+  let final = fold stepCsvChar init (split line "")
+  concat final.fields [final.current]
+
+-- stepCsvChar — the fold step. Routes on the pending flag.
+stepCsvChar : {} -> String -> {}
+@label "Step CSV char"
+@description "Phase 5a-csv — pure D helper. The splitCsvLine fold step. If a pending (deferred) quote is carried, resolvePending decides escape-vs-close; otherwise stepNormal handles the char."
+@tags "imports" "csv" "pure" "phase-5a"
+stepCsvChar st c =
+  if st.pending
+  then resolvePending st c
+  else stepNormal st c
+
+-- resolvePending — the look-ahead-as-state resolution. A pending `"` (seen
+-- while inQuote) followed by another `"` is the `""` escape → append a literal
+-- `"`, stay inQuote, clear pending. Followed by anything else, the pending `"`
+-- was a CLOSING quote → drop inQuote, clear pending, then re-process this char
+-- under the now-closed state via stepNormal.
+resolvePending : {} -> String -> {}
+@label "Resolve pending quote"
+@description "Phase 5a-csv — pure D helper. Resolves a deferred `\"` seen while inQuote. Next char `\"` ⇒ `\"\"`-escape (append literal `\"`, stay inQuote). Else ⇒ the pending `\"` was a closing quote (inQuote→False), then re-process the char via stepNormal. This is the fold-side replacement for the TS `line[i+1]` look-ahead."
+@tags "imports" "csv" "pure" "phase-5a"
+resolvePending st c =
+  if eq c "\""
+  then { fields = st.fields, current = concat st.current "\"", inQuote = True, pending = False }
+  else stepNormal { fields = st.fields, current = st.current, inQuote = False, pending = False } c
+
+-- stepNormal — the non-pending char handler (TS loop body sans look-ahead).
+-- `"` while inQuote defers (sets pending); `"` while NOT inQuote opens a quote
+-- (inQuote→True). `,` routes to csvMaybeSplit. Else append the char.
+stepNormal : {} -> String -> {}
+@label "Step CSV char (normal)"
+@description "Phase 5a-csv — pure D helper. The non-pending splitCsvLine char handler. A `\"` sets inQuote=True with pending=(was inQuote) — so a quote while inQuote DEFERS (pending) and a quote while outside OPENS. `,` routes to csvMaybeSplit (split only when outside quotes). Else append."
+@tags "imports" "csv" "pure" "phase-5a"
+stepNormal st c =
+  if eq c "\""
+  then { fields = st.fields, current = st.current, inQuote = True, pending = st.inQuote }
+  else if eq c ","
+  then csvMaybeSplit st c
+  else { fields = st.fields, current = concat st.current c, inQuote = st.inQuote, pending = False }
+
+-- csvMaybeSplit — a comma splits the field ONLY when not inQuote (TS:
+-- `ch === "," && !inQuote`); a comma inside quotes is a literal char.
+csvMaybeSplit : {} -> String -> {}
+@label "CSV maybe split"
+@description "Phase 5a-csv — pure D helper. A `,` splits the field (push current, reset) ONLY when outside quotes; inside quotes it is a literal char appended to current. Mirrors the TS `else if (ch === ',' && !inQuote)` vs the `else` append."
+@tags "imports" "csv" "pure" "phase-5a"
+csvMaybeSplit st c =
+  if st.inQuote
+  then { fields = st.fields, current = concat st.current c, inQuote = st.inQuote, pending = False }
+  else { fields = concat st.fields [st.current], current = "", inQuote = st.inQuote, pending = False }
+
+-- zipRowGo — lockstep walk over headers ⨯ values building the row record.
+-- Walks headers (the TS j-loop is over headers.length); each header takes the
+-- aligned value or "" (TS `values[j] ?? ""`); both keys + values are trimmed.
+zipRowGo : List String -> List String -> {} -> {}
+@label "Zip row (recurse)"
+@description "Phase 5a-csv — pure D helper. Lockstep recursion over headers ⨯ values; halts when headers is exhausted (the TS j-loop bounds on headers.length, so extra values are ignored). Returns the accumulated row record."
+@tags "imports" "csv" "pure" "phase-5a"
+zipRowGo headers values acc =
+  case head headers of
+    Nothing -> acc
+    Just h -> zipRowStep h headers values acc
+
+-- zipRowStep — one (header, value) pairing: assoc trimmed-header →
+-- trimmed-(value-or-""), then recurse on both tails.
+zipRowStep : String -> List String -> List String -> {} -> {}
+@label "Zip row step"
+@description "Phase 5a-csv — pure D helper. One header⨯value pairing within zipRowGo: assocRecord acc (trim h) (trim (value-or-\"\")); recurse on `fromMaybe [] (tail …)` of both lists. Mirrors `row[headers[j].trim()] = (values[j] ?? '').trim()`."
+@tags "imports" "csv" "pure" "phase-5a"
+zipRowStep h headers values acc =
+  let acc2 = assocRecord acc (trim h) (trim (headOrEmpty values))
+  zipRowGo (fromMaybe [] (tail headers)) (fromMaybe [] (tail values)) acc2
+
+-- headOrEmpty — head of a String list with "" as the empty default (the TS
+-- `values[j] ?? ""`).
+headOrEmpty : List String -> String
+@label "Head or empty string"
+@description "Phase 5a-csv — pure D helper. std:head of a String list, defaulting to \"\" on empty. Encodes the TS `values[j] ?? ''`."
+@tags "imports" "list" "pure" "phase-5a"
+headOrEmpty values =
+  case head values of
+    Nothing -> ""
+    Just v -> v
+
+-- FM-retire-4 Step 1: the local `tailOrEmpty` helper RETIRED — it was the
+-- monomorphized `fromMaybe [] (tail xs)`, duplicated here and in forms/submit.
+-- Both call sites above now use the general std:fromMaybe directly.

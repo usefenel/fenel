@@ -1,0 +1,177 @@
+module engine where
+
+-- structural-dispatch Phase 1 — the predicate-bounded dispatch matcher.
+--
+-- The NEW dispatch logic (design/structural-dispatch.md, roadmap Phase 1):
+-- a typeclass/effect instance registered with a `ByPattern { predicate }`
+-- key resolves at dispatch for EVERY type its predicate accepts. After the
+-- nominal block -> tag -> global cascade misses, the TS seam in
+-- effect-dispatch.ts (resolveEffect) hands this body the structural rules
+-- for the class — each `{ predicate, methods }` with `predicate` already
+-- lifted to a callable `{$ref: fnId}` value — plus the dispatched type as a
+-- marshalled `TraversalType` (the $-key barrier crossing: a `.fenel` body
+-- cannot read a raw `$record`/`$variant` object, so the seam marshals it via
+-- `marshalTraversalType`, the same boundary adapter the type-algebra bodies
+-- use). The DECISION lives here: run each predicate over the type in priority
+-- order; the first `True` wins.
+--
+-- Fenel-first split (roadmap D1-D4 + the Phase-1 brief): the scan + first-match
+-- is this body; the TS seam does only enumeration / type-resolution /
+-- marshalling / memoisation (no decision logic). The rules arrive
+-- priority-sorted (descending) from the seam, so a plain head-to-tail fold IS
+-- the priority order — first matching rule wins (the v1 overlap rule; the
+-- registration-time disjointness *warning* is deferred, it needs set-algebra
+-- subsumption).
+--
+-- Recursion / purity fence: a predicate is a pure `TraversalType -> Bool`
+-- (no `requires`) for Phase 1 — running one must not re-enter structural
+-- dispatch. The seam additionally guards the (class, type) key against
+-- re-entrant scans; this body assumes purity and does not re-check.
+
+-- matchStructural — fold the priority-ordered structural rules; apply each
+-- rule's predicate to that rule's OWN marshalled type `r.ty`; first `True`
+-- yields its methods.
+-- `rules`'s element is the seam's `{ predicate, methods, ty }` record (predicate
+-- is a callable `{$ref}` value; `ty` is the dispatched type marshalled into the
+-- VIEW this predicate consumes), kept opaque (`a`) here — we only apply
+-- `predicate` to `r.ty` and project `methods`.
+-- Phase 5c — each rule carries its OWN marshalled `r.ty` (the per-rule marshal
+-- reconciliation, mirroring Phase-2's per-bound `b.ty`): a KIND predicate (over
+-- `KindType`) gets the `marshalKindType` view, a STRUCTURAL predicate (over
+-- `TraversalType`) the `marshalTraversalType` view — the seam selects per rule
+-- from the predicate's declared param type. The shared `ty` param is retained
+-- (signature-stable, structural-dispatch-oracle byte-green) but vestigial — the
+-- decision reads `r.ty`. For a structural rule `r.ty` IS the same
+-- `marshalTraversalType` value the shared `ty` carried, so behaviour is identical.
+-- List iteration is via the `head` / `tail` Maybe-returning natives (the
+-- engine-body idiom; the array-repr List does not pattern-match Nil / Cons).
+-- The predicate is a callable `{$ref}` value carried in a plain field, so it is
+-- applied via `$` (low-precedence application) — bare juxtaposition `r.predicate
+-- r.ty` would parse `r.predicate` as a call-by-NAME fnId, not a field deref.
+matchStructural : (rules: List a) -> (ty: TraversalType) -> Maybe b
+matchStructural rules ty =
+  case head rules of
+    Nothing -> Nothing
+    Just r ->
+      if (r.predicate $ r.ty)
+        then Just r.methods
+        else
+          case tail rules of
+            Nothing -> Nothing
+            Just rest -> matchStructural rest ty
+
+-- isRecordType — the canonical worked example from the design: a structural
+-- predicate over the marshalled type. `TtRecord` is the marshalled `$record`
+-- shape. A genuinely useful structural recognizer (records as a universe), and
+-- the predicate the Phase-1 round-trip test bounds its `ByPattern` rule by.
+isRecordType : (t: TraversalType) -> Bool
+isRecordType t = case t of
+  TtRecord { fields = _ } -> True
+  _ -> False
+
+-- A callable's checked arrow type shares one structural representation.
+-- Nominal/value representations retain precedence in the scoped resolver.
+isArrowType : (t: TraversalType) -> Bool
+isArrowType t = case t of
+  TtArrow { params = _, returns = _ } -> True
+  _ -> False
+
+-- isMapShaped — array-substrate Phase 1a: the structural recognizer for the
+-- `$map`/`Map k` former (`TtMap` is the marshalled `$map` shape). This is the
+-- predicate the `$map` algebra ByPattern rules (Functor/Foldable/Traversable
+-- (Map k), system-entities.ts) bound on: ANY `$map`-shaped type — `Vec n a =
+-- $map (Fin n) a`, `Array`, a user `Map String User` — is a member of the
+-- algebra through ONE structural instance, no per-type code. Sibling of
+-- `isRecordType` (the design's worked structural-predicate template); a pure
+-- total `TraversalType -> Bool`, no `requires` (the Phase-1 purity fence).
+isMapShaped : (t: TraversalType) -> Bool
+isMapShaped t = case t of
+  TtMap { values = _ } -> True
+  _ -> False
+
+-- structural-dispatch Phase 2 — the monomorphic predicate-BOUND check.
+--
+-- A function signature can carry a predicate-bound on a type parameter
+-- (`f : isRecordType a => a -> b`), riding the SAME `requires`/`=>` constraint
+-- machinery supers + effects already use (a bound is "∃ a type satisfying P").
+-- At a MONOMORPHIC call site (`f x`, `x`'s type known) the bound is CHECKED by
+-- running the predicate over the call-site type — the LIGHT arm (just run a
+-- total `TraversalType -> Bool`, no decider). The polymorphic ⊆-subsumption arm
+-- (one bound's accepted type-set ⊆ another's) is the deferred, solver-HEAVY 2b.
+--
+-- This is the SAME operation Phase 1's matcher performs (apply a marshalled-type
+-- predicate); Phase 2 reuses the `match-structural.fenel` seam wholesale. The
+-- decision logic — iterate the bounds, short-circuit on the first violation,
+-- report WHICH bound failed — lives here (Fenel-first); the TS seam only resolves
+-- the call-site type, marshals it across the `$`-key barrier, lifts each bound's
+-- predicate fn-id to a callable `{$ref}` value, and raises the error.
+
+-- checkPredicateBound — the monomorphic-light CORE: run one predicate over one
+-- marshalled call-site type. The predicate is a callable `{$ref}` value carried
+-- in a param, so it is applied via `$` (low-precedence application) — bare
+-- juxtaposition would parse `predicate` as a call-by-NAME fnId (the Phase-1
+-- idiom).
+checkPredicateBound : (predicate: a) -> (ty: TraversalType) -> Bool
+checkPredicateBound predicate ty = predicate $ ty
+
+-- checkPredicateBounds — fold the call-site's predicate-bounds; each bound is the
+-- seam's `{ predicate, ty, label }` record (predicate a `{$ref}` callable, ty the
+-- bound param's marshalled concrete type, label the predicate fn-id for the error
+-- message). `Nothing` = every bound holds; `Just label` = the FIRST violated
+-- bound (short-circuit). Each bound carries its own marshalled `ty` because
+-- different bounds may constrain different type-params bound to different concrete
+-- types at the call site. List iteration via the `head` / `tail` Maybe-returning
+-- natives (the engine-body idiom; the array-repr List does not pattern-match Nil /
+-- Cons).
+checkPredicateBounds : (bounds: List a) -> Maybe b
+checkPredicateBounds bounds =
+  case head bounds of
+    Nothing -> Nothing
+    Just b ->
+      if checkPredicateBound b.predicate b.ty
+        then
+          case tail bounds of
+            Nothing -> Nothing
+            Just rest -> checkPredicateBounds rest
+        else Just b.label
+
+-- structural-dispatch Phase 4b — the INVERSE view `structuralInstancesFor`.
+--
+-- matchStructural answers `(class, type) → methods` (ONE class's rules, scanned
+-- for the first acceptance). structuralInstancesFor is the INVERSE / the
+-- transposition of `resolveStructural`: given a marshalled type + the FULL list
+-- of `ByPattern` rules across ALL classes, return the classes whose predicate
+-- ACCEPTS the type. This is what the editor's `RepresentationsPanel` surfaces
+-- READ-ONLY next to a type's nominal instances — the instances a type gets
+-- STRUCTURALLY because its shape matches a derived rule's predicate.
+--
+-- Each `rules` element is the seam's `{ typeName, predicate, predicateId, ty }`
+-- record: `predicate` is the lifted `{$ref}` callable (applied via `$`, the
+-- Phase-1 idiom), `predicateId` the predicate fn-id String kept for the
+-- provenance label, `ty` the dispatched type marshalled into the VIEW this
+-- predicate consumes (Phase 5c — `marshalKindType` for a kind predicate,
+-- `marshalTraversalType` for a structural one; selected per rule at the seam).
+-- The result element is a PLAIN-keyed `{ typeName, predicate }`
+-- record (the body cannot author `$`-prefixed keys; `predicate` here is the
+-- fnId String for display, NOT the callable). LIGHT — it RUNS each predicate, no
+-- decider (the Phase-1 contract). List iteration is the `head` / `tail` +
+-- `appendItem` engine-body idiom. The shared `ty` param is retained
+-- (signature-stable) but vestigial — each rule's `r.ty` is the decision input.
+structuralInstancesFor : (rules: List a) -> (ty: TraversalType) -> List b
+structuralInstancesFor rules ty =
+  structuralInstancesForFold rules ty []
+
+-- The head/tail fold behind structuralInstancesFor: walk the marshalled rule
+-- list, append `{ typeName, predicate = predicateId }` whenever the rule's
+-- predicate accepts the marshalled type. Internal helper.
+structuralInstancesForFold : (rules: List a) -> (ty: TraversalType) -> (acc: List b) -> List b
+structuralInstancesForFold rules ty acc =
+  case head rules of
+    Nothing -> acc
+    Just r ->
+      let acc2 = if (r.predicate $ r.ty)
+                   then appendItem { typeName = r.typeName, predicate = r.predicateId } acc
+                   else acc
+      case tail rules of
+        Nothing -> acc2
+        Just rest -> structuralInstancesForFold rest ty acc2

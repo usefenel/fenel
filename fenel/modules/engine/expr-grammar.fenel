@@ -1,0 +1,1216 @@
+module engine where
+
+-- =========================================================================
+-- The EXPRESSION GRAMMAR in Fenel — `Pattern Token` productions + value-
+-- carrying reductions → registered `Syntax` values. parser-substrate Phase 3b
+-- (brief: `workstreams/parser-substrate/briefs/phase-3b-expr-grammar-tiers.md`;
+-- parent `briefs/phase-3-expression-grammar.md`).
+--
+-- This is the consumer of P1's algebra (`pattern-algebra.fenel` — `parseG`,
+-- `Pat` ctors, `derivPat`, least-fixpoint nullability) + P2's lexer/layout
+-- (`lexer.fenel` / `layout.fenel`) + Step-1's fixity resolver
+-- (`fixity-resolve.fenel` — `resolveOpSeq`). It turns the layout-virtual token
+-- stream into the `Syntax` ADT (`fenel/std/syntax.fenel`, 11 ctors), parity-
+-- matched against the SHIPPED `jsonLogicToSyntax(parse(src))` oracle.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- DESIGN E — the locked token-matching mechanism (probe-proven 2026-06-12,
+-- do NOT re-open). Fenel `eq` is reference-equality on records and `lt`/`gt`
+-- are numeric-only, so the algebra alphabet MUST be scalar strings matched by
+-- `WsEnum` eq-scan:
+--   1. Encode every token to ONE string `tk.t ++ SEP ++ tk.v` (SEP =
+--      charFromCode 0; values never contain \0; split on the FIRST sep).
+--      Static classes are fixed singletons (`"("` ⇒ "(\0(", `vopen` ⇒
+--      "vopen\0"); ln/col are DROPPED (Syntax carries no positions).
+--   2. Value-bearing classes (num str ident bool …) match by their TYPE TAG =
+--      the encoded string's PREFIX `cls\0`: each value class is a `WsPrefix
+--      "cls\0"` marker whose membership is `startsWith x "cls\0"`. The value
+--      rides IN-BAND — leaf reductions recover it past the first SEP
+--      (`splitVal`). 7g PERF REFINEMENT (semantics-preserving, NOT a Design-E
+--      re-open — the parity differentials are the proof): the original encoding
+--      used a per-INPUT `WsEnum [every encoded token of that class in THIS
+--      input]`, so matching ONE token was O(group) (an eq-scan over the whole
+--      group's vocabulary) ⇒ O(group²·productions) per group — the super-linear
+--      curve. The prefix marker is O(prefix), identical on the actual input
+--      alphabet (a token is in `vocabFor toks cls` ⟺ its encoded form starts
+--      with `cls\0`; \0 never appears in values so the type tag is an
+--      unambiguous prefix), and needs NO per-group vocab build. The two
+--      non-pure-prefix classes keep exact membership via the existing
+--      combinators: argIdentCls = `WsIntersect [WsPrefix ident, ¬WsEnum{and,or}]`,
+--      opCls = `WsUnion [WsEnum{statics,and,or}, WsPrefix op]` (the static
+--      punct singletons carry their own type tag, not `op\0`).
+--   3. `parseG` runs over the ENCODED token list (`encodeToks toks`); the
+--      WsEnum vocabularies hold encoded strings too, so wsMember's eq-scan
+--      matches. `wsMember`/`derivPat`/all P1 drivers stay byte-untouched.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- ROOT WRAPPING (decision 2): `layoutTokens` opens the program context at the
+-- first token, so a bare expression arrives as `vopen <toks> vclose eof`.
+-- Root = `vopen Stmts vclose eof`, keeping the single statement's value. T1
+-- Stmts = a single Expr (multi-statement vsemi ⇒ SDo is T3/T4).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE FORM-MAP TABLE (the Phase-4/5 parity contract — pinned by RUNNING
+-- `jsonLogicToSyntax(parse(src))`, NOT by reading the adapter; transcribed
+-- from the roadmap Phase-3 completion notes, Step 0.2):
+--
+--   | source            | TS JSON-Logic            | Syntax                  |
+--   |-------------------|--------------------------|-------------------------|
+--   | 42 / 1.5 / 1.5e3  | the JS number            | SLit value=<n>          |
+--   | .5 / 1.           | 0.5 / 1                  | SLit value=<n>          |
+--   | 0xFF/0o17/0b101   | TS toNumber ⇒ 0          | FENCED (Fenel ⇒ 255/…)  |
+--   | "hi" / true/false | the JS value             | SLit value=…            |
+--   | x / bot.token     | {var:"x"}/{var:"bot…"}   | SVar name=… (dotted)    |
+--   | ()                | null                     | SLit value=nullValue    |
+--   | (1)               | 1                        | SLit value=1 (transp.)  |
+--   | (x : Int)         | {ann:[{var:"x"},         | SAnn expr=SVar x type=  |
+--   |                   |  {$ref:"Int"}]}          |  {mk:ref,name:Int}      |
+--   | [] / [1,2,3]      | [] / [1,2,3]             | SLit []/ appendItem chn |
+--   | {} / {a=1,b=2}    | {} / {a:1,b:2}           | SRecord [] / SRecord    |
+--   | {token=1}         | {token:1}                | SCall "token" [SLit 1]  |
+--   |                   |                          | (JL single-key collapse)|
+--   | f x / f x y       | {call:["f",…]}           | SCall fnId="f" args=…   |
+--   | Nothing / Just 5  | {construct:["Nothing"…]} | SConstruct ctor args    |
+--   | f Nothing         | {call:["f",            | SCall f [SConstruct     |
+--   |                   |  {construct:["Nothing"]}]} |  "Nothing" []]        |
+--   |                   |  (uppercase lift applies | (the arg-lift = the     |
+--   |                   |   to ARGS too now)       |  bug-(c) fix)           |
+--   | Bot {token=1}     | {construct:["Bot",{…}]}  | SConstruct args=[SCall  |
+--   |                   |  (NO-ctorDef adapter)    |  "token" [SLit 1]]      |
+--
+-- T2 (the operator tier — landed): OpSeq parses FLAT (`Operand (op|backtick
+-- Operand)*`), the reduction calls `resolveOpSeq` (fixity-resolve.fenel, the
+-- Step-1 spine). T2 recon pins (oracle-run 2026-06-12):
+--   • `not` is PLAIN APPLICATION (`fenel-parser.ts:1563` — parseNot just
+--     delegates): `not f x` ⇒ {call:["not",f,x]}; `not a and b` ⇒
+--     and(not(a), b) falls out of the word-op argument exclusion. NO not-arm.
+--   • word-ops = {and, or} EXACTLY (`a cat b` ⇒ application a(cat,b) — `cat`
+--     is NOT in WORD_INFIX). The application-ARGUMENT ident class excludes
+--     and/or (`f and g` ⇒ and(f,g)); the HEAD ident class keeps them
+--     (`and a b` ⇒ SCall and [a,b]).
+--   • unary minus: `Operand = "-" Operand | App` (parseUnary `:1572` — binds
+--     the App, tighter than ops: `-x * y` ⇒ mul(negate x, y); `1 - -2` ⇒
+--     sub(1, negate 2)).
+--   • backtick-infix is NOT a flat prec-0 row (`:1548`): the TS bt-loop runs
+--     unconditionally AFTER the op-climb breaks, at the CURRENT depth, rhs
+--     re-entering at 0 (`1 + x ``add`` y` ⇒ add(1, add(x,y)); `a * b ``f`` c`
+--     ⇒ mul(a, f(b,c))). Flat encoding: items carry `bt = true` and
+--     `resolveFrom`'s bt-arm bypasses the prec test + re-enters at 0
+--     (notation IS the fnName — no table lookup).
+--   • `(op)` sections (parsePrimary `:1674`): `(` op `)` ⇒ SLambda ["a","b"]
+--     body SCall (fixityOf table op).fnId — the table row's fnId IS
+--     getInfixNotationToCodename ∪ key-as-fnId ((+) ⇒ add, (++) ⇒ ++, (.) ⇒
+--     ., (and) ⇒ and). Section arm sits BEFORE the paren arm in Primary (the
+--     `(and)` tiebreak — TS opOf fires before parseExpr).
+--   • op-token class = static singletons [+ - * / % == != < > <= >= $ .] +
+--     ident\0and/or + the per-input `vocabFor "op"` (covers && || ++ <?> … —
+--     value-bearing custom runs). `|>` `&` `|` `in` excluded (fenced /
+--     opOf-undefined); `>>=`/`<>` ride vocabFor "op" but stay OUT of the
+--     differential (adapter mis-keys them — fenced).
+--
+-- T3 (the binder tier — landed, Phase 3c): Root = `vopen Stmts vclose eof`
+-- (the multi-statement re-nest). Stmts = `Stmt (vsemi Stmt)*`; Stmt = a let
+-- binding (`let ident = vopen Expr vclose` — the `=` opener) / a `<-` do-bind
+-- (`ident <- Expr`) / a bare Expr. `buildStmts` re-nests the statement list
+-- EXACTLY as the adapter's jlsDoOp does (the oracle re-nests the TS parser's
+-- flat `{do:[...]}`): single ⇒ unwrap; ≥2 ⇒ leading lets ⇒ SLet over the rest,
+-- mid-stream lets nest recursively, pure segments ⇒ SDo. Binder Exprs:
+--   • lambda `\Params -> body` — TWO arms: a layout body (`vopen Expr vclose`,
+--     standalone) and a bare body (`Expr`, the bracket/paren-SUSPENDED context
+--     where `->` does NOT open a virtual). Only lambda gets the bare arm.
+--   • if/then/else — same-line (`if C then vopen T else vopen E vclose vclose`,
+--     the deferred-vclose nest: `else` rides INSIDE the then-context, both
+--     close at the end) + broken single-else (`... vclose vsemi else vopen E
+--     vclose`). Same-line else-if CHAINS fall out recursively (Else = Expr).
+--
+-- T4 (the case / pattern / do tier — landed, Phase 3c):
+--   • case `case Expr of vopen Arms vclose`; Arms = `Arm (vsemi Arm)*`; Arm =
+--     `Pattern -> vopen Expr vclose` ⇒ SMatch { scrutinee, arms = [{pattern,
+--     body}] }. The case body is a full Expr (⊇ case ⇒ nested case works).
+--   • the pattern sub-grammar (no ctorDefs ⇒ the no-`fields` shape): Pattern =
+--     `ident PatArgs` (uppercase ⇒ PatConstruct, lowercase ⇒ PatVar via
+--     `buildConPat`) | literal (PatLit num/str/bool) | `( Pattern )`; PatArgs =
+--     a list of atom patterns (literal / ident / paren) — `Cons (Just y) t`
+--     nests through the paren arm.
+--   • do `do vopen Stmts (end)? vclose` — `do x end` ≡ x (the one-stmt unwrap,
+--     `end` consumed before vclose); multi-stmt ⇒ SDo via the SAME Stmts
+--     machinery; do-binds re-nest like let.
+--
+-- ENV: 20 NAMED productions after T3 (Primary/ArgPrimary/Field INLINED as
+-- values — the fixpoint cost is ~quadratic in NAMED count, P3b surprise 1), 24
+-- after T4 (+ Pattern / PatArgs / Arms / ArmTail), 25 after the 7e Sn=3
+-- backtick-TEMPLATE arm (+ the ONE recursive TemplTail row — Template itself is
+-- inlined into primaryPat to keep the quadratic cost minimal). Lambda/if/case/do
+-- are inlined Pat VALUES in the Expr alternation (keyword-disambiguated, no
+-- ambiguity with the OpSeq arm). ~0.6–0.8 tok/sec interpreted.
+--
+-- FENCES (parity over coverage, documented divergences — the differential
+-- inputs avoid them):
+--   • type annotation `( Expr : Type )` — LANDED (modules-as-values Phase 2d,
+--     amending D-C): pParen's `:` arm ⇒ `SAnn { expr, type }` (the oracle's
+--     `{ann:[e, T]}`; the adapter's jlsAnn lift). One colon, ONE parenthesised
+--     expression; `::` stays a reserved token no production reads, so `x :: T`
+--     fails on both sides. The type is the TyExpr sub-grammar (`typeGrammar`,
+--     bound once in each environment) as a `{mk}` marker, normalised by
+--     `annTypeMarker` (the oracle's `liftDepApp`: a lowercase-headed
+--     application's lowercase args are VALUE refs); the loader marshal authors
+--     the FenelType. In the Syntax-space differential the two sides carry the
+--     type differently (marker vs the adapter's opaque JsonLogic image), so the
+--     tests compare the annotation types after the marshal. NO fences: this
+--     TyExpr is the annotation-type language, and the TS annotation arm reads
+--     its type with `parseAnnotationType` (fenel-parser.ts), a strict mirror
+--     of these productions — never the wider declaration `parseTypeExpr`. So
+--     both parsers refuse a `T where p` refinement (TyExpr has no refinement
+--     arm), `()` / `(x: A)` without an arrow, the nullary arrow `() -> T`, a
+--     keyword as a param name, a bracketed application head (`[A] B`), a
+--     number in angle brackets, a trailing comma in a param list, and `>>`
+--     (`Maybe<List<X>>` — one op token; `> >` parses on both); and both read
+--     `f<a>` as `f a` (value-dependent), `(A -> B, C) -> D` as ONE tuple
+--     parameter, a mixed named/positional param list, `Maybe {a: A}`. A string
+--     in angle brackets is an entity name only as `EntityRef<"X">`: the loader
+--     marshal refuses it anywhere else and the TS arm refuses the same input.
+--     Pinned both ways in modules-as-values-phase-2d-annotation-syntax.test.ts.
+--   • function-level `where` (`{where:…}`) — LANDED (fenel-surface-extensions
+--     Phase 4): a bare-expr statement may carry `where vopen Bindings vclose`
+--     (`whereOptPat` on `exprStmt`), lowering to the oracle's `{where:[body,
+--     {…}]}` via the faithful `SWhere` Syntax case (`desugar` → let). No longer
+--     fenced. Both the `,`-single-line + the newline-block binding forms parse
+--     (WhereComma + WhereBindsTail); bindings are `name = Expr` (oracle parity —
+--     no params). `where` fits the Syntax-space differential (SWhere on BOTH
+--     sides — grammar's whereOptPat ≡ the adapter's jlsWhere lift).
+--   • `_` and the operational quoted "_" pattern both produce PatWildcard,
+--     matching the existing JSON-Logic runtime. Pattern egress restores "_"
+--     and drops a trailing unguarded default. A literal Core PatLit is unchanged.
+--   • guards (`| cond ->`) — LANDED (fenel-surface-extensions Phase 3): the
+--     case-`Arm` admits an optional `| Expr` before the `->` (`armGuarded`),
+--     lowering to the oracle's `{$guard:[pat,cond]}` (pattern position) via the
+--     ledgered match-pattern marshal's `PatGuard` arm. No longer fenced.
+--   • named-field record patterns `Just { _0 = b }` — parse (in TS) to the SAME
+--     `{$tag:"Just","_0":{$bind:"b"}}` as positional `Just b` ⇒ identical
+--     PatConstruct; the brace form is NOT in this grammar (positional covers
+--     the shape). Fenced from the differential.
+--   • broken-line else-IF CHAINS (`if a then 1\nelse if b then 2\nelse 3`) —
+--     the layout dedent interleaves the inner if's `else` as an OUTER sibling
+--     (not a clean nest); only same-line chains + broken single-else are
+--     proven. Fenced.
+--   • bracketed / parenthesised if / case / do (suspended ⇒ no body virtuals) —
+--     only lambda has the bare-body arm. Fenced.
+--   • the dedented `do\n stmts\n end` form (`end` a vsemi sibling) — only
+--     `do x end` (inline) + `do\n stmts` (no end) are supported. Fenced.
+--   • radix num literals (0x/0o/0b) — Fenel `toNumber` ≠ TS `parse`.
+--   • empty-parens call `f ()` — TS ⇒ {call:["f"]} (0-arg); this grammar's
+--     `()` is the Unit primary ⇒ SLit nullValue arg. Fenced.
+--   • a 1-field record whose name collides with a JL op key
+--     (var/if/let/do/fn/call/construct/match/and/or) — the single-key collapse
+--     would route to that op's adapter arm. Fenced.
+--   • trailing comma in list/record literals — the comma is a strict
+--     separator here (no trailing-comma production). Fenced.
+--   • a non-var application head (`(\x->x) 5`, `(f x) y` ⇒ {apply:…}) is T3
+--     surface; the buildApp `apply` arm emits the adapter's SCall "apply"
+--     shape for completeness but is not in the differential.
+--   • `x |> f` / `x & f` / `x in y` / `a >>= b` / `a <> b` — special-emission
+--     operators the adapter Errs / mis-keys on (Step-0.2 gaps). `|>`/`&`/`in`
+--     are NOT in the op class (grammar rejects); `>>=`/`<>` parse (vocabFor
+--     "op") but diverge from the oracle — differential-fenced.
+--
+-- ctorDefs are NOT threaded (the no-ctorDef adapter shape, decision 3 — the
+-- test calls `dispatchedJsonLogicToSyntax` WITHOUT ctorDefs).
+--
+-- NO new entities (Syntax registered; flat-seq intermediates + encoded tokens
+-- are plain values — decision 8). NO laws. The encode/split helpers + the
+-- production builders + reductions are all NEW Fenel fns here.
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- Token encoding (Design E step 1) + value recovery (the in-band slice).
+-- -------------------------------------------------------------------------
+
+@label "Encode token"
+@description "Encode one token to the Design-E scalar `tk.t ++ SEP ++ tk.v` (SEP = charFromCode 0). The grammar runs over these strings (the algebra alphabet must be scalars — Fenel `eq` is reference-equality on records). Internal expr-grammar helper. parser-substrate Phase 3b."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+encodeTok : (tk: a) -> String
+encodeTok tk = concat (concat tk.t (charFromCode 0)) tk.v
+
+@label "Encode tokens"
+@description "Encode a token list to the Design-E scalar strings (`map encodeTok`) — the alphabet `parseExprToks` feeds `parseG`. parser-substrate Phase 3b."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3"
+encodeToks : (toks: a) -> a
+encodeToks toks = map encodeTok toks
+
+@label "Separator index"
+@description "Index of the FIRST SEP (charFromCode 0) in an encoded token string, or the string length when absent (so the value slice is total). Internal expr-grammar helper. parser-substrate Phase 3b."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+sepIndex : (s: String) -> (i: a) -> a
+sepIndex s i =
+  if gte i (unitLen s) then unitLen s
+  else if eq (charAt s i) (charFromCode 0) then i
+  else sepIndex s (add i 1)
+
+@label "Split token value"
+@description "Recover the in-band VALUE of an encoded token — the substring after the first SEP (Design E step 2). `splitVal \"num\\042\" = \"42\"`. Leaf reductions call this to read the value class's payload. parser-substrate Phase 3b."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3"
+splitVal : (s: String) -> String
+splitVal s = slice s (add (sepIndex s 0) 1) (unitLen s)
+
+
+-- -------------------------------------------------------------------------
+-- Static + value-class matchers (Pat leaves). Static singletons build the
+-- encoded form inline (`encStatic`); value classes are closed-over WsEnum
+-- vocabularies built per-input by `exprGrammar`.
+-- -------------------------------------------------------------------------
+
+@label "Encode static token"
+@description "The encoded form of a static token whose `v` equals its type `t` (punctuation/keywords/operators: `(` ⇒ \"(\\0(\", `+` ⇒ \"+\\0+\"). Internal expr-grammar helper. parser-substrate Phase 3b."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+encStatic : (t: String) -> String
+encStatic t = concat (concat t (charFromCode 0)) t
+
+-- Field slots have a following `:` or `=` delimiter. Admit the lexer's
+-- structural keywords only there, as the existing text parser does; variable,
+-- binder, constructor-head and type-reference classes remain unchanged.
+@category "engine-internal"
+parserFieldNameClass : (identCls: a) -> a
+parserFieldNameClass identCls =
+  { tag = "WsUnion", branches = appendItem identCls (map (\keyword -> { tag = "WsPrefix", prefix = encVirt keyword }) ["let", "if", "then", "else", "case", "of", "do", "end", "where", "in", "infixl", "infixr", "infix"]) }
+
+@label "Encode virtual token"
+@description "The encoded form of a virtual / empty-`v` token (vopen/vclose/vsemi/eof ⇒ \"vopen\\0\" …). Internal expr-grammar helper. parser-substrate Phase 3b."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+encVirt : (t: String) -> String
+encVirt t = concat t (charFromCode 0)
+
+@label "Punctuation matcher"
+@description "A `PMatch` over the singleton WsEnum of a static (v==t) token's encoded form — `(`, `)`, `+`, `=`, … Internal expr-grammar helper. parser-substrate Phase 3b."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+pPunct : (t: String) -> (Pat Any)
+pPunct t = PMatch { tag = "WsEnum", values = appendItem (encStatic t) [] }
+
+@label "Virtual matcher"
+@description "A `PMatch` over the singleton WsEnum of a virtual / empty-`v` token's encoded form — vopen/vclose/vsemi/eof. Internal expr-grammar helper. parser-substrate Phase 3b."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+pVirt : (t: String) -> (Pat Any)
+pVirt t = PMatch { tag = "WsEnum", values = appendItem (encVirt t) [] }
+
+@label "Vocabulary for class"
+@description "The per-input WsEnum vocabulary `values` of a value-bearing token class `cls` — every encoded token of that class present in THIS token list (Design E step 2). Finite + eq-scannable; the value rides in-band. Internal expr-grammar helper. parser-substrate Phase 3b."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+vocabFor : (toks: a) -> (cls: String) -> a
+vocabFor toks cls = map encodeTok (filter (\tk -> eq tk.t cls) toks)
+
+
+-- -------------------------------------------------------------------------
+-- buildApp — the application / construct / var lift (parseApp parity,
+-- `fenel-parser.ts:1588`). A qualified-method head (`Foldable.foldr` —
+-- `qualifiedMethodParts` succeeds) ⇒ `SMethod cls method args`, checked FIRST
+-- (BEFORE the uppercase-construct lift, mirroring the oracle's :1644 qm check
+-- before the :1649 construct lift — `Foldable.foldr` is upper-initial, so the
+-- construct lift would otherwise steal it). The uppercase-ident ⇒ construct lift
+-- applies to the HEAD **and to each ARG** (`liftCtorArgs` — the bug-(c) fix: an
+-- uppercase ident in argument position is a nullary constructor, `Succ Zero` ⇒
+-- `SConstruct Succ [SConstruct Zero []]`, NOT `… [SVar "Zero"]`; mirrors the
+-- fenel-parser.ts `liftNullaryCtorArg` at parseApp's arg collection). A non-var
+-- head with args ⇒ the `{apply:…}` shape (the adapter lowers it to SCall
+-- "apply"). fenel-surface-extensions Phase 6 added the SMethod arm.
+-- -------------------------------------------------------------------------
+
+@label "Is uppercase name"
+@description "True when the first char of `n` is A–Z (the parseApp uppercase-head ⇒ construct test, `isUpperCase`). Internal expr-grammar helper. parser-substrate Phase 3b."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+isUpperName : (n: String) -> Boolean
+isUpperName n = elem (slice n 0 1) (chars "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+-- isLowerInitName — the method-segment test (isLowerInitial parity,
+-- fenel-parser.ts:2432): the first char is in [a-z_]. UNDERSCORE counts (the
+-- oracle's regex is `/[a-z_]/`). Used by `qualifiedMethodParts` to require a
+-- lower-initial method segment. fenel-surface-extensions Phase 6.
+@label "Is lower-initial name"
+@description "True when the first char of `n` is a–z OR underscore (the isLowerInitial parity, fenel-parser.ts:2432 — the qualified-method method-segment test). Internal expr-grammar helper. fenel-surface-extensions Phase 6."
+@tags "engine" "internal" "parser" "expr-grammar" "fenel-surface-extensions" "phase-6"
+@category "engine-internal"
+isLowerInitName : (n: String) -> Boolean
+isLowerInitName n = elem (slice n 0 1) (chars "abcdefghijklmnopqrstuvwxyz_")
+
+-- dotIndexFrom — the index of the first `.` at or after `i` in `s`, or `length
+-- s` when none. Mirrors `String.indexOf(".", i)` (returning length not -1 so the
+-- caller's bounds tests stay total). fenel-surface-extensions Phase 6.
+@label "Dot index from"
+@description "Index of the first `.` at or after `i` in `s`, or `length s` when absent (a total `indexOf('.', i)`). Internal expr-grammar helper. fenel-surface-extensions Phase 6."
+@tags "engine" "internal" "parser" "expr-grammar" "fenel-surface-extensions" "phase-6"
+@category "engine-internal"
+dotIndexFrom : (s: String) -> (i: a) -> a
+dotIndexFrom s i =
+  if gte i (length s) then length s
+  else if eq (charAt s i) "." then i
+  else dotIndexFrom s (add i 1)
+
+-- qualifiedMethodParts — the qualified-method-head discriminant (asQualifiedMethod
+-- parity, fenel-parser.ts:2451). Mirror the ORACLE EXACTLY (the byte-equality
+-- corpus-parity gate is authoritative): split `name` on the FIRST `.`; recognise
+-- a qualified method IFF there is EXACTLY ONE dot (NOT at position 0, NOT at the
+-- last position), the class segment is upper-initial AND the method segment is
+-- lower-initial. So `Foldable.foldr` ✓ (cls Foldable, method foldr); `Maybe.Just`
+-- ✗ (upper method); `bot.token` ✗ (lower class — stays SVar field-access);
+-- `std.map` ✗ (lower class — stays SCall key-as-fnId); `A.b.c` ✗ (TWO dots — the
+-- oracle requires EXACTLY ONE; NOTE the brief's "first-dot split ⇒ cls A method
+-- b.c" was WRONG, the code at :2454 rejects a second dot). Returns a PLAIN record
+-- `{found, cls, method}` — NOT a Maybe (the Phase-4 PEpsV-Nothing interpreter
+-- null-coercion lesson: a plain-record sentinel is the proven grammar-reduction
+-- idiom). fenel-surface-extensions Phase 6.
+@label "Qualified-method parts"
+@description "The qualified-method-head discriminant (asQualifiedMethod parity, fenel-parser.ts:2451): split on the FIRST `.`; ⇒ `{found = true, cls, method}` IFF exactly one dot (not first/last char), upper-initial class, lower-initial method, else `{found = false}`. `Foldable.foldr` ✓; `Maybe.Just`/`bot.token`/`std.map`/`A.b.c` ✗. A plain-record sentinel (NOT a Maybe). fenel-surface-extensions Phase 6."
+@tags "engine" "parser" "expr-grammar" "fenel-surface-extensions" "phase-6"
+qualifiedMethodParts : (name: String) -> a
+qualifiedMethodParts name =
+  let d = dotIndexFrom name 0
+  if or (eq d 0) (gte d (sub (length name) 1))
+  then { found = false }
+  else if lt (dotIndexFrom name (add d 1)) (length name)
+  then { found = false }
+  else
+    let cls = slice name 0 d
+    let method = slice name (add d 1) (length name)
+    if and (isUpperName cls) (isLowerInitName method)
+    then { found = true, cls = cls, method = method }
+    else { found = false }
+
+-- isCtorName — the constructor-name test of the application lift: an
+-- uppercase-initial name with NO dot. A dotted uppercase name is a qualified
+-- method (`Monad.bind`, tested first) or a dotted path (`Telegram.Update`,
+-- `Telegram.isoBase64.decode`), never a constructor tag (modules-as-values
+-- Phase 5c-1a; isConstructorName parity, fenel-parser.ts).
+@label "Is constructor name"
+@description "True for an uppercase-initial name with no dot: what the application lift turns into a constructor. A dotted uppercase name is a qualified method or a dotted path, never a constructor tag. modules-as-values Phase 5c-1a."
+@tags "engine" "internal" "parser" "expr-grammar" "modules-as-values"
+@category "engine-internal"
+isCtorName : (n: String) -> Boolean
+isCtorName n = and (isUpperName n) (gte (dotIndexFrom n 0) (length n))
+
+-- liftCtorArg / liftCtorArgs — a bare uppercase ident in ARGUMENT position is a
+-- NULLARY CONSTRUCTOR, not a variable (the Fenel convention "uppercase =
+-- constructor"; the SAME lift the application HEAD gets below). Without it
+-- `Succ Zero` left the arg `Zero` as `SVar "Zero"` and `Just True` as `SVar
+-- "True"` — a malformed literal masked by a frame-sensitive runtime var→ctor
+-- fallback that CORRUPTED under recursion. Lifting each arg makes the parse
+-- explicit + correct (parser-substrate; mirrors the fenel-parser.ts
+-- `liftNullaryCtorArg` applied at `parseApp`'s arg collection, kept byte-identical).
+@label "Lift a nullary-ctor arg"
+@description "An argument lifts like the head: a qualified-method SVar (`Monad.bind`) is a 0-arg SMethod, an undotted uppercase SVar a 0-arg SConstruct (the Fenel convention); a dotted uppercase name stays a dotted-path SVar. Anything else passes through. Internal expr-grammar helper. parser-substrate; SMethod and dotted arms modules-as-values Phase 5c-1a."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate"
+@category "engine-internal"
+liftCtorArg : (arg: a) -> a
+liftCtorArg arg =
+  case arg of
+    SVar { name = n } ->
+      if isUpperName n
+      then
+        let qm = qualifiedMethodParts n
+        if qm.found
+        then SMethod { cls = qm.cls, method = qm.method, args = [] }
+        else if isCtorName n then SConstruct { ctor = n, args = [] } else arg
+      else arg
+    other -> arg
+
+@label "Lift nullary-ctor args"
+@description "Map liftCtorArg over an argument list (uppercase SVar args ⇒ 0-arg SConstruct). Internal expr-grammar helper. parser-substrate."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate"
+@category "engine-internal"
+liftCtorArgs : (args: a) -> a
+liftCtorArgs args = map liftCtorArg args
+
+@label "Build application"
+@description "Fold an application head + argument list into Syntax (parseApp parity): a qualified-method SVar head (`Foldable.foldr`) ⇒ SMethod (checked FIRST, before the construct lift); no args ⇒ an uppercase SVar lifts to a 0-arg SConstruct, else the head passes through; with args ⇒ uppercase SVar head ⇒ SConstruct, lowercase SVar ⇒ SCall, a non-var head ⇒ SCall \"apply\" [head, …args]. The arg LIST is run through liftCtorArgs first (uppercase-ident args ⇒ nullary SConstruct — the head lift, now applied to args too). parser-substrate Phase 3b; arg-lift = the bug-(c) fix; SMethod arm fenel-surface-extensions Phase 6."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3"
+buildApp : (head: a) -> (args0: a) -> a
+buildApp head args0 =
+  if and (eq head.identity true) (gt (length args0) 0)
+  then mapSet (SCall { fnId = head.name, args = liftCtorArgs args0 }) "identityHead" head
+  else if eq (length args0) 0
+  then
+    case head of
+      SVar { name = n } ->
+        let qm = qualifiedMethodParts n
+        if qm.found
+        then SMethod { cls = qm.cls, method = qm.method, args = [] }
+        else if isCtorName n then SConstruct { ctor = n, args = [] } else head
+      other -> head
+  else
+    let args = liftCtorArgs args0
+    case head of
+      SVar { name = n } ->
+        let qm = qualifiedMethodParts n
+        if qm.found
+        then SMethod { cls = qm.cls, method = qm.method, args = args }
+        else if isCtorName n
+        then SConstruct { ctor = n, args = args }
+        else SCall { fnId = n, args = args }
+      other -> SCall { fnId = "apply", args = concat (appendItem head []) args }
+
+-- isUnitLit — is `a` the unit primary `SLit { value = nullValue }`? (`()` lowers
+-- to it). Used to drop a SOLE unit argument so `f ()` is a NULLARY call.
+@label "Is unit literal"
+@description "True when `a` is the unit primary `SLit { value = nullValue }` (what `()` lowers to). parser-substrate Phase 4h."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-4h"
+@category "engine-internal"
+isUnitLit : (a: a) -> (nullValue: a) -> Boolean
+isUnitLit a nullValue =
+  case a of
+    SLit { value = v } -> eq v nullValue
+    other -> false
+
+-- buildAppU — buildApp with the `f ()` NULLARY-call rule: a SOLE unit argument
+-- (`()`) is DROPPED, but the head still becomes a CALL / CONSTRUCT (NOT the bare
+-- var/0-arg passthrough) — `f ()` ⇒ `SCall f []` (TS `{call:["f"]}`), `Foo ()`
+-- ⇒ `SConstruct Foo []`. Any other arg list delegates to buildApp. parser-
+-- substrate Phase 4h.
+@label "Build application (unit-aware)"
+@description "buildApp + the `f ()` nullary-call rule: a SOLE unit argument is dropped, the head becoming a nullary SCall (lowercase) / SConstruct (uppercase). A qualified method keeps an applied carrier so its projection is invoked, distinct from the bare function value. Other arg lists delegate to buildApp."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-4h"
+buildAppU : (head: a) -> (args: a) -> (nullValue: a) -> a
+buildAppU head args nullValue =
+  if (if eq (length args) 1 then isUnitLit (at args 0) nullValue else false)
+  then
+    if eq head.identity true
+    then mapSet (SCall { fnId = head.name, args = [] }) "identityHead" head
+    else case head of
+      SVar { name = n } ->
+        let qm = qualifiedMethodParts n
+        if qm.found
+        -- Like SCall's list-literal carrier, applied is parser metadata, not
+        -- a new Syntax constructor or a class-specific dispatch instruction.
+        then mapSet (SMethod { cls = qm.cls, method = qm.method, args = [] }) "applied" true
+        else if isCtorName n then SConstruct { ctor = n, args = [] } else SCall { fnId = n, args = [] }
+      other -> SCall { fnId = "apply", args = appendItem head [] }
+  else buildApp head args
+
+
+-- -------------------------------------------------------------------------
+-- buildList — the JlArray ⇒ nested `appendItem` SCall chain over `SLit {value
+-- = []}` (jlsArrayItems parity: each item wraps the acc as `SCall appendItem
+-- [item, acc]`, left-to-right). parser-substrate Phase 3b. Since 2026-11-08 it
+-- builds through the shared `syntaxListLiteral`: a list of plain data is one
+-- pureData-marked SLit (same JSON, same desugared Expr, linear inference).
+-- -------------------------------------------------------------------------
+
+@label "Build list literal"
+@description "Lower a list of item Syntaxes through the shared `syntaxListLiteral` (jlsArrayItems parity): one pureData SLit for plain data, else the nested `appendItem`-chain of SCalls over a `SLit {value = []}` base (jlsArrayItems parity — args are [item, acc], left-folded). parser-substrate Phase 3b."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3"
+buildList : (items: a) -> a
+buildList items = syntaxListLiteral items
+
+@label "Build list (go)"
+@description "buildList's left-fold: wrap the accumulator with `SCall appendItem [item, acc]` for each item in order. Internal expr-grammar helper. parser-substrate Phase 3b."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+buildListGo : (items: a) -> (acc: a) -> a
+buildListGo items acc =
+  case head items of
+    Nothing -> acc
+    Just it ->
+      -- `lit = true` MARKS this `appendItem` SCall as a LIST-LITERAL desugar (vs
+      -- a genuine `appendItem x [lit]` application). parser-substrate Phase 7k
+      -- Class A: list literals and `appendItem` calls produce IDENTICAL Syntax,
+      -- so `syntaxToJsonLogic` (collectList) could not tell them apart and
+      -- flattened BOTH to a JSON array — silently mis-marshalling the call
+      -- `appendItem entry []` to `[entry]`. The marker lets the marshal flatten
+      -- ONLY list literals (lit-marked) and keep genuine calls as `{call:[…]}`.
+      -- The oracle adapter (`jlsArrayItems`) sets the same marker for JlArrays so
+      -- the Syntax-space differential stays byte-identical; the marker is STRIPPED
+      -- at marshal (never reaches the JSON-Logic IR) so nothing downstream sees it.
+      -- The marker is added via `mapSet` (NOT a constructor field): `lit` is not a
+      -- declared `SCall` formal, so `SCall { …, lit = true }` would mis-parse as a
+      -- POSITIONAL `SCall { _0 = {…} }` (keys ≠ formals ⇒ positional record) which
+      -- the marshal's `SCall { fnId, args }` pattern can't match. `mapSet` adds the
+      -- key onto the flat `{$tag:"SCall", fnId, args}` record, preserving the shape.
+      let base = SCall { fnId = "appendItem", args = concat (appendItem it []) (appendItem acc []) }
+      let acc2 = mapSet base "lit" true
+      buildListGo (tailOr items) acc2
+
+
+-- -------------------------------------------------------------------------
+-- buildRecord — explicit source record fields always retain record intent.
+-- The legacy raw-IR adapter cannot distinguish a one-key list-valued record
+-- from a key-as-function call. That adapter's compatibility heuristic must
+-- not discard the unambiguous record intent carried by source `{name = value}`.
+-- List-literal markers remain on the field values for syntaxToJsonLogic;
+-- genuine appendItem applications remain ordinary calls inside those fields.
+-- -------------------------------------------------------------------------
+
+@label "Build record literal"
+@description "Lower explicit source `{name = value}` fields to SRecord regardless of field count or value shape. Preserve list-literal markers and genuine appendItem calls for the source-to-IR marshal; legacy raw-IR key-as-function compatibility belongs to its separate adapter."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3" "phase-7c"
+buildRecord : (fields: a) -> a
+buildRecord fields = SRecord { fields = fields }
+
+
+-- -------------------------------------------------------------------------
+-- buildTemplate — the backtick-TEMPLATE reduction (parseInterp parity,
+-- `fenel-parser.ts:1729`). A hole-template `` `C0 ${E0} C1 ${E1} … Cn` `` lexes
+-- to `str_begin C0`, then per hole an `Expr` + a `str_mid Ci` (or `str_end Cn`
+-- for the last chunk). Interleave the chunks + exprs in SOURCE ORDER, DROP
+-- empty-string chunks (TS pushes a chunk only when `seg.v` is truthy), and wrap
+-- the remainder in `SOp { op = "cat", operands }` — the operator-key carrier the
+-- loader marshal (`syntaxToJsonLogic`'s SOp arm) lowers to the oracle's
+-- `{cat:[…]}` (NOT `{call:["cat",…]}` — explicit `cat x y` stays an SCall
+-- application). A hole-LESS backtick lexes to a single `str` ⇒ the existing
+-- string-literal primary (NOT a cat). parser-substrate Phase 7e Sn=3.
+-- -------------------------------------------------------------------------
+
+@label "Build template string"
+@description "Lower a backtick template (begin chunk `C0`, first interpolation `E0`, the `[{chunk, expr}]` mid pairs, the final `end` chunk) to `SOp { op = \"cat\", operands }` (the operator-key carrier ⇒ the oracle's `{cat:[…]}`). Chunks become `SLit` operands; EMPTY-string chunks are DROPPED (parseInterp pushes a chunk only when its `v` is truthy); exprs are kept verbatim. parser-substrate Phase 7e Sn=3."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-7e"
+buildTemplate : (begin: String) -> (e0: a) -> (pairs: a) -> (endChunk: String) -> a
+buildTemplate begin e0 pairs endChunk =
+  let opsBegin = if eq begin "" then [] else appendItem (SLit { value = begin }) []
+  let opsHead = concat opsBegin (appendItem e0 [])
+  let opsEnd = if eq endChunk "" then [] else appendItem (SLit { value = endChunk }) []
+  SOp { op = "cat", operands = concat (concat opsHead (templPairsOps pairs)) opsEnd }
+
+@label "Template pairs to operands"
+@description "Flatten the template mid pairs `[{chunk, expr}]` into the `cat` operand tail in source order — each pair contributes the chunk `SLit` (DROPPED when the chunk is the empty string) then its interpolation expr. Internal expr-grammar helper. parser-substrate Phase 7e Sn=3."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-7e"
+@category "engine-internal"
+templPairsOps : (pairs: a) -> a
+templPairsOps pairs =
+  case head pairs of
+    Nothing -> []
+    Just pr ->
+      let chunkOps = if eq pr.chunk "" then [] else appendItem (SLit { value = pr.chunk }) []
+      concat (concat chunkOps (appendItem pr.expr [])) (templPairsOps (tailOr pairs))
+
+
+-- -------------------------------------------------------------------------
+-- buildSection — the `(op)` operator-as-function section (opAsLambda parity,
+-- `fenel-parser.ts:2650`): SLambda ["a","b"] over `SCall fnId [a, b]` where
+-- fnId = the fixity row's emission codeName (table rows ⇒ add/mul/…; custom
+-- miss ⇒ key-as-fnId — exactly getInfixNotationToCodename ∪ fallback).
+-- -------------------------------------------------------------------------
+
+@label "Build operator section"
+@description "Lower a `(op)` section to the opAsLambda shape (fenel-parser.ts:2650): SLambda { params = [a, b], body = SCall fnId [SVar a, SVar b] } with fnId = (fixityOf table notation).fnId — the table row's emission codeName, key-as-fnId on a custom-op miss. `enc` is the operator's encoded token (Design E); notation recovered via splitVal. parser-substrate Phase 3b (T2)."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3"
+buildSection : (table: a) -> (enc: String) -> a
+buildSection table enc =
+  let fix = fixityOf table (splitVal enc)
+  SLambda { params = ["a", "b"], body = SCall { fnId = fix.fnId, args = [SVar { name = "a" }, SVar { name = "b" }] } }
+
+
+-- -------------------------------------------------------------------------
+-- buildStmts — the Stmts-list ⇒ Syntax re-nesting (T3). MIRRORS the adapter's
+-- jlsDoOp / jlsCollectLeadingLets / jlsTailExprs (json-logic-to-syntax.fenel)
+-- because the parity oracle is `jsonLogicToSyntax(parse src)`: the TS parser
+-- emits a FLAT `{do:[...]}` for ≥2 statements (single statement unwrapped) and
+-- the adapter re-nests it. So the grammar produces the SAME re-nested Syntax
+-- directly from a list of statement ITEMS. Each item is `{letb = true, bnd =
+-- {name, value}}` (a `let ident = rhs` / `ident <- rhs` binding) or `{letb =
+-- false, expr = <Syntax>}` (a bare expression). The re-nesting:
+--   • 1 statement ⇒ the bare value (TS unwraps single statements): an expr ⇒
+--     its Syntax; a lone let ⇒ SLet bindings, body = SVar lastName (jlsLetOp).
+--   • ≥2 ⇒ jlsDoOp: leading consecutive lets ⇒ SLet bindings scoping over the
+--     rest; the tail walks with mid-stream lets nesting recursively; pure
+--     segments ⇒ SDo (no singleton-unwrap — that lowering stays in desugar).
+-- parser-substrate Phase 3c (T3).
+-- -------------------------------------------------------------------------
+
+@label "Build statements"
+@description "Re-nest a Stmts-list (statement ITEMS — let/bind bindings `{letb=true, bnd}` or bare exprs `{letb=false, expr}`) into Syntax, mirroring the adapter's jlsDoOp (the oracle re-nests the TS parser's flat `{do:[...]}`). 1 statement ⇒ the bare value (TS unwraps); ≥2 ⇒ leading lets ⇒ SLet over the rest, mid-stream lets nest recursively, pure segments ⇒ SDo. parser-substrate Phase 3c."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3"
+buildStmts : (stmts: a) -> a
+buildStmts stmts =
+  if eq (length stmts) 1
+  then
+    case head stmts of
+      Nothing -> SDo { exprs = [] }
+      Just s ->
+        if s.letb
+        then SLet { bindings = appendItem s.bnd [], body = SVar { name = s.bnd.name } }
+        else s.expr
+  else doStmts stmts
+
+@label "Re-nest do statements"
+@description "The ≥2-statement re-nest (jlsDoOp mirror): collect leading lets into SLet bindings; if nothing follows ⇒ SLet with body = SVar lastName; else the tail ⇒ SDo (mid-stream lets nest recursively), wrapped in SLet when leading bindings exist. Internal expr-grammar helper. parser-substrate Phase 3c."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+doStmts : (stmts: a) -> a
+doStmts stmts =
+  let lead = collectLeads stmts []
+  if eq (length lead.rest) 0
+  then SLet { bindings = lead.bindings, body = SVar { name = lastBindingName lead.bindings } }
+  else
+    let body = SDo { exprs = tailStmts lead.rest [] }
+    if eq (length lead.bindings) 0
+    then body
+    else SLet { bindings = lead.bindings, body = body }
+
+@label "Collect leading lets"
+@description "Walk from the head of a statement list, accumulating consecutive let/bind bindings (`s.bnd`) into a list; stop at the first non-let. Returns `{bindings, rest}` (jlsCollectLeadingLets mirror). Internal expr-grammar helper. parser-substrate Phase 3c."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+collectLeads : (stmts: a) -> (acc: a) -> a
+collectLeads stmts acc =
+  case head stmts of
+    Nothing -> { bindings = acc, rest = [] }
+    Just s ->
+      if s.letb
+      then collectLeads (tailOr stmts) (appendItem s.bnd acc)
+      else { bindings = acc, rest = stmts }
+
+@label "Tail statements"
+@description "Walk the post-leading-let tail of a statement list, collecting expr Syntaxes; a mid-stream let triggers a recursive doStmts on the remaining items (nested SLet scope) and stops (jlsTailExprs mirror). Internal expr-grammar helper. parser-substrate Phase 3c."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+tailStmts : (stmts: a) -> (acc: a) -> a
+tailStmts stmts acc =
+  case head stmts of
+    Nothing -> acc
+    Just s ->
+      if s.letb
+      then appendItem (doStmts stmts) acc
+      else tailStmts (tailOr stmts) (appendItem s.expr acc)
+
+
+-- -------------------------------------------------------------------------
+-- buildConPat — the case-arm head pattern reduction (T4). An ident matched in
+-- pattern position is an UPPERCASE constructor (PatConstruct, args = the
+-- positional atom patterns) or a LOWERCASE binder (PatVar — args always empty
+-- in valid input). Mirrors jlsPattern / jlsTaggedPattern with NO ctorDefs (the
+-- no-ctorDef adapter shape: PatConstruct carries no `fields` key). parser-
+-- substrate Phase 3c (T4).
+-- -------------------------------------------------------------------------
+
+@label "Build constructor pattern"
+@description "The case-arm head-pattern reduction: an UPPERCASE ident ⇒ PatConstruct { ctor, args } (no-ctorDef shape — no `fields`); the underscore ⇒ PatWildcard; any other lowercase ident ⇒ PatVar { name }. Mirrors jlsTaggedPattern's positional fallback. parser-substrate Phase 3c (T4)."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3"
+buildConPat : (name: String) -> (args: a) -> a
+buildConPat name args =
+  if isUpperName name
+  then PatConstruct { ctor = name, args = args }
+  else if eq name "_"
+  then PatWildcard
+  else PatVar { name = name }
+
+-- buildNamedConPat — a NAMED-FIELD constructor pattern (`VdHasDisc { disc = d }`
+-- ⇒ `PatConstruct { ctor, args, fields }`; the marshal authors `{$tag:ctor,
+-- <field>:<subpat>}` — the `fields[i]` key path in marshalPatterns). `fields` =
+-- `[{name, pat}]`; args ride in field order, `fields` carries the names. parser-
+-- substrate Phase 4h (the P3c named-field-pattern fence, now in coverage).
+@label "Build named-field constructor pattern"
+@description "A named-field constructor pattern (`Ctor { f = p, … }`) ⇒ `PatConstruct { ctor, args, fields }` (args in field order, `fields` the field-name list) — the marshal authors `{$tag:ctor, <field>:<subpat>}` via marshalPatterns' `fields[i]` key. parser-substrate Phase 4h."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-4h"
+buildNamedConPat : (name: String) -> (fields: a) -> a
+buildNamedConPat name fields = PatConstruct { ctor = name, args = map (\f -> f.pat) fields, fields = map (\f -> f.name) fields }
+
+-- applyWhereOpt — the statement-level `where`-clause attach (fenel-surface-
+-- extensions Phase 4). A bare-expr statement may be followed by `where vopen
+-- Bindings vclose` (the layout-opener block); `binds` is the bindings list
+-- (`[{name, value}]`), EMPTY when no `where` clause is present (the `PEpsV []`
+-- sentinel — the proven env idiom; a real `where` always has ≥1 binding, so the
+-- empty list unambiguously means "no where"). Non-empty ⇒ wrap the body in the
+-- faithful additive `SWhere` case (NO parse-time desugar — D3; `desugar` lowers
+-- SWhere → let); empty ⇒ the bare body passes through byte-identically (the
+-- non-`where` path is unchanged). The bindings shape is SLet's `[{name, value}]`
+-- (D1) so SWhere reuses the SLet lowering + the wire `{where:[body, {…}]}` folds
+-- via syntaxToJsonLogic's sRecordToJl. (The LIST sentinel — NOT a Maybe — mirrors
+-- the env's PEpsV-[] convention: a `PEpsV Nothing` sentinel hit an interpreter
+-- coercion that returned native null for the bare-body path; the list is clean.)
+@label "Apply where clause"
+@description "The statement-level `where`-clause attach: a non-empty bindings list ⇒ `SWhere { body, bindings }` (the faithful additive case `desugar` lowers to let), an EMPTY list (no `where`) ⇒ the bare body unchanged. fenel-surface-extensions Phase 4."
+@tags "engine" "parser" "expr-grammar" "fenel-surface-extensions" "phase-4"
+applyWhereOpt : (body: a) -> (binds: a) -> a
+applyWhereOpt body binds =
+  if eq (length binds) 0
+  then body
+  else SWhere { body = body, bindings = binds }
+
+
+-- -------------------------------------------------------------------------
+-- typeGrammar — expression annotations use the Ty profile. Declarations use
+-- the refinement-enabled DeclTy profile from the same typeGrammarProfile
+-- builder. Distinct production names preserve the established annotation
+-- fragment, including inside expressions nested in a declaration predicate.
+-- Inline atoms/applications/arrows are built once per profile, without a
+-- second grammar implementation. The number/string classes use WsPrefix.
+-- -------------------------------------------------------------------------
+
+@label "Type grammar"
+@description "The expression-annotation profile of the shared type grammar builder: seven named Ty productions plus tyAtom, tyAppAngle and arrowLHS, emitting plain-record type markers. Annotations retain their established no-refinement fragment. Declarations bind a separately named DeclTy profile of the same builder with inline refinements, so declaration support does not widen annotation syntax."
+@tags "engine" "parser" "expr-grammar" "decl-grammar" "modules-as-values" "phase-2d"
+typeGrammar : (identCls: a) -> a
+typeGrammar identCls = typeGrammarProfile identCls "Ty" false
+
+-- Declaration types admit inline refinements; expression annotations keep
+-- their established smaller fragment. Both use this same grammar builder.
+@category "engine-internal"
+typeGrammarProfile : (identCls: a) -> (prefix: String) -> (refinements: Boolean) -> a
+typeGrammarProfile identCls prefix refinements =
+  let strClsT = { tag = "WsPrefix", prefix = encVirt "str" }
+  let numClsT = { tag = "WsPrefix", prefix = encVirt "num" }
+  -- TypeExpr atoms (inlined VALUE): ref / record / tuple / `[T]` list-sugar /
+  -- paren. `[T]` ⇒ `List T` (the parser's list-type sugar, both sig + ctor-field).
+  let identityClsT = { tag = "WsPrefix", prefix = encVirt "identity" }
+  let tyIdentity = PRed (PMatch identityClsT) (\e -> { mk = "ref", name = splitVal e })
+  let tyRef = PRed (PMatch identCls) (\e -> { mk = "ref", name = splitVal e })
+  let delimitedType = if refinements then concat prefix "Arrow" else concat prefix "Expr"
+  let tyParen = PRed (PSeq (pPunct "(") (PSeq (PRef (concat prefix "Expr")) (pPunct ")"))) (\p -> p.snd.fst)
+  let tyTuple = PRed (PSeq (pPunct "(") (PSeq (PRef delimitedType) (PSeq (pPunct ",") (PSeq (PRef (concat prefix "ExprList")) (pPunct ")"))))) (\p -> { mk = "tuple", items = concat (appendItem p.snd.fst []) p.snd.snd.snd.fst })
+  let tyRecord = PRed (PSeq (pPunct "{") (PSeq (PRef (concat prefix "Fields")) (pPunct "}"))) (\p -> { mk = "record", fields = p.snd.fst })
+  let tyList = PRed (PSeq (pPunct "[") (PSeq (PRef (concat prefix "Expr")) (pPunct "]"))) (\p -> { mk = "app", head = "List", args = appendItem p.snd.fst [] })
+  -- Only a NAME heads a type application (angle or juxtaposition): the
+  -- non-name atoms (record / tuple / list / paren) stand alone. Before
+  -- modules-as-values Phase 2d a bracketed head took arguments too (`(Maybe)
+  -- Int`, `[Int] Int`, `{a: Int}<B>`), reducing to an app marker with no
+  -- head name; the TS parser refuses all of them (only a `$ref` atom heads
+  -- its `parseTypeApp`), so both parsers now reject them.
+  let tyAtomNoRef = PAlt tyIdentity (PAlt tyRecord (PAlt tyTuple (PAlt tyList tyParen)))
+  let tyAtom = PAlt tyRef tyAtomNoRef
+  -- fenel-surface-extensions Phase 8 (D-G follow-up) — VALUE-level dependent
+  -- type-arguments in juxtaposition arg position (the dormant `parseTypeAppArg`
+  -- value-arg slice). A numeric literal (`Vec a 0`) rides as the RAW number (the
+  -- oracle's `$el` arg IS the raw number ⇒ the `walkType` non-marker passthrough
+  -- is byte-exact); a parenthesised VALUE-expr (`Vec a (n + 1)`) rides as a
+  -- `{mk = "valexpr", syntax}` marker (the `predicateBody` precedent — KEEP the
+  -- Syntax; the frame-lowering deep-walk `lowerValExprs` lowers it to `$`-free
+  -- JSON-Logic BEFORE the marshal, keeping `syntaxToJsonLogic` OUT of the parser
+  -- closure). `tyArgAtom` is used ONLY in the arg list (NOT `tyAtom`) — the
+  -- oracle's parseTypeAppArg-vs-parseTypeAtom split (D1). `tyAtom` is tried BEFORE
+  -- `valParenArg` (first-Just) so a type-shaped paren (`Vec a (Maybe b)` /
+  -- `Vec a (Succ n)`) matches `tyParen` first; the value-paren only wins when the
+  -- `( TyExpr )` parse can't reach `)` (`( n + 1 )` — `+` is not a TyExpr op) (D2).
+  let numLitArg = PRed (PMatch numClsT) (\e -> toNumber (splitVal e))
+  let valParenArg = PRed (PSeq (pPunct "(") (PSeq (PRef "Expr") (pPunct ")"))) (\p -> { mk = "valexpr", syntax = p.snd.fst })
+  -- parser-substrate Phase 7j — a STRING-LITERAL value-arg in JUXTAPOSITION arg
+  -- position (`Infixable "std:add"` / `Codeable "std:and"` — std/parser-fixities,
+  -- the fixity bootstrap corpus). Like `numLitArg` (`Vec a 0`) it rides as the
+  -- RAW string (NOT the angle-`<>` `{mk:"strlit"}` marker — that authors the
+  -- `Id<X>` $tagged envelope; a JUXTAPOSITION head is a class applied to an id
+  -- STRING, lowering via `buildTyApp`→`walkType`'s non-container fallback to the
+  -- oracle's `{$el:{call:[head, "std:add"]}}`). 7j-S0 root-cause CORRECTION: the
+  -- brief §1 expected the angle strlitArg machinery; the oracle actually emits
+  -- the dependent `$el` value-arg, so it is the numLitArg sibling, not strlitArg.
+  let strValArg = PRed (PMatch strClsT) (\s -> splitVal s)
+  let tyArgAtom = PAlt numLitArg (PAlt strValArg (PAlt tyAtom valParenArg))
+  let tyArgsPat = PAlt (PRed (PSeq tyArgAtom (PRef (concat prefix "Args"))) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV [])
+  -- legacy `<>` angle-bracket generics (`Maybe < String >`, `Map < K, V >` —
+  -- the design/programming-fenel.md `Result<E, A>` backward-compat). `<`/`>` are single-char punct
+  -- tokens (`<=`/`<-` munch separately ⇒ no collision); the arg-list is the
+  -- DEDICATED `TyAngleArgs` (NOT TyExprList — which is tuple-only and has no
+  -- string atom); the marker is IDENTICAL to juxtaposition (`Maybe < a >` ≡
+  -- `Maybe a` ⇒ `{mk:app,head,args}`). The angle arm sits FIRST (first-Just-wins
+  -- — `<` is not a TyArg, so the juxtaposition arm would leave it unconsumed).
+  -- parser-substrate Phase 7a EXTENDS the arg-list with the STRING-LITERAL arg —
+  -- the `EntityRef<"profile">` form (the ONLY `<>` arg that is a string, NOT a
+  -- type; the marshal authors it as the `Id<X>` `$tagged` envelope). `strlitArg`
+  -- (a `{mk:"strlit", value}` marker — the ONE non-type TypeExpr atom) sits FIRST
+  -- in TyAngleArg so `"profile"` matches as a literal, not a (failing) type.
+  -- NESTED `<>` (`Maybe<List<X>>`) is FENCED: the trailing `>>` lexes as ONE op
+  -- token, which the single-char `>` arm cannot split (no corpus need — the
+  -- entity cluster is single-level `EntityRef<"X">` / `Maybe<X>`).
+  let strlitArg = PRed (PMatch strClsT) (\s -> { mk = "strlit", value = splitVal s })
+  let tyAngleArg = PAlt strlitArg (PRef (concat prefix "Expr"))
+  let tyAngleArgsPat = PAlt (PRed (PSeq tyAngleArg (PSeq (pPunct ",") (PRef (concat prefix "AngleArgs")))) (\p -> concat (appendItem p.fst []) p.snd.snd)) (PRed tyAngleArg (\t -> appendItem t []))
+  let tyAppAngle = PRed (PSeq tyRef (PSeq (pPunct "<") (PSeq (PRef (concat prefix "AngleArgs")) (pPunct ">")))) (\p -> buildTyApp p.fst p.snd.snd.fst)
+  let tyAppPat = PAlt tyAppAngle (PAlt (PRed (PSeq tyRef (PRef (concat prefix "Args"))) (\p -> buildTyApp p.fst p.snd)) tyAtomNoRef)
+  -- A comma after a bare `where` belongs to its predicates. Before a field,
+  -- parameter or tuple delimiter, a refinement therefore needs parentheses.
+  -- The unrefined root still admits those grouped atoms through tyParen.
+  let tyExprListPat = PAlt (PRed (PSeq (PRef delimitedType) (PSeq (pPunct ",") (PRef (concat prefix "ExprList")))) (\p -> concat (appendItem p.fst []) p.snd.snd)) (PRed (PRef (concat prefix "Expr")) (\t -> appendItem t []))
+  let tyParamNamed = PRed (PSeq (PMatch identCls) (PSeq (pPunct ":") (PRef (concat prefix "Expr")))) (\p -> { named = true, name = splitVal p.fst, type = p.snd.snd })
+  let tyParamNamedDelimited = PRed (PSeq (PMatch identCls) (PSeq (pPunct ":") (PRef delimitedType))) (\p -> { named = true, name = splitVal p.fst, type = p.snd.snd })
+  let tyParamBare = PRed (PRef (concat prefix "App")) (\t -> { named = false, type = t })
+  let tyParamVal = PAlt tyParamNamed tyParamBare
+  let tyParamsPat = PAlt (PRed (PSeq (PAlt tyParamNamedDelimited tyParamBare) (PSeq (pPunct ",") (PRef (concat prefix "Params")))) (\p -> concat (appendItem p.fst []) p.snd.snd)) (PRed tyParamVal (\p -> appendItem p []))
+  let tyFieldVal = PRed (PSeq (PMatch identCls) (PSeq (pPunct ":") (PRef (concat prefix "Expr")))) (\p -> { name = splitVal p.fst, type = p.snd.snd })
+  let tyFieldDelimited = PRed (PSeq (PMatch identCls) (PSeq (pPunct ":") (PRef delimitedType))) (\p -> { name = splitVal p.fst, type = p.snd.snd })
+  let tyFieldsPat = PAlt (PRed (PSeq tyFieldDelimited (PSeq (pPunct ",") (PRef (concat prefix "Fields")))) (\p -> concat (appendItem p.fst []) p.snd.snd)) (PAlt (PRed tyFieldVal (\f -> appendItem f [])) (PEpsV []))
+  -- Arrow LHS (inlined VALUE): the paren-param list (named/multi) FIRST so a
+  -- comma group `(A, B)` becomes _0/_1 params (not a single tuple param); else
+  -- a single bare TyApp param. first-Just-wins picks the paren arm on overlap.
+  let arrowParenLHS = PRed (PSeq (pPunct "(") (PSeq (PRef (concat prefix "Params")) (pPunct ")"))) (\p -> p.snd.fst)
+  let arrowAppLHS = PRed (PRef (concat prefix "App")) (\t -> appendItem { named = false, type = t } [])
+  let arrowLHS = PAlt arrowParenLHS arrowAppLHS
+  -- The `->` is a LAYOUT OPENER (like lambda/case `->`): `A -> B` lays out as
+  -- `A -> vopen B vclose`, and curried `A -> B -> C` ⇒ `A -> vopen B -> vopen C
+  -- vclose vclose` (the deferred-vclose NEST — P3c surprise 3). The recursive
+  -- `-> vopen TyExpr vclose` arm brackets each RHS exactly. The BARE arm covers
+  -- a bracket/paren-SUSPENDED context (`{ f: A -> B }` — no vopen), the lambda
+  -- two-arm precedent; the arms are disjoint on the `vopen`-after-`->` presence.
+  let arrowReturn = if refinements then concat prefix "Arrow" else concat prefix "Expr"
+  let tyArrowLayout = PRed (PSeq arrowLHS (PSeq (pPunct "->") (PSeq (pVirt "vopen") (PSeq (PRef arrowReturn) (pVirt "vclose"))))) (\p -> { mk = "arrow", params = p.fst, ret = p.snd.snd.snd.fst })
+  let tyArrowBare = PRed (PSeq arrowLHS (PSeq (pPunct "->") (PRef arrowReturn))) (\p -> { mk = "arrow", params = p.fst, ret = p.snd.snd })
+  let tyArrowPat = PAlt tyArrowLayout tyArrowBare
+  let tyUnrefinedPat = PAlt tyArrowPat (PRef (concat prefix "App"))
+  let tyPredicatesPat = PAlt (PRed (PSeq (PRef "Expr") (PSeq (pPunct ",") (PRef (concat prefix "Predicates")))) (\p -> concat (appendItem p.fst []) p.snd.snd)) (PRed (PRef "Expr") (\e -> appendItem e []))
+  let predicatesBare = PRef (concat prefix "Predicates")
+  let predicatesLayout = PRed (PSeq (pVirt "vopen") (PSeq predicatesBare (pVirt "vclose"))) (\p -> p.snd.fst)
+  let tyRefinedPat = PRed (PSeq tyUnrefinedPat (PSeq (pPunct "where") (PAlt predicatesLayout predicatesBare))) (\p -> { mk = "refined", base = p.fst, set = { mk = "where", syntax = if eq (length p.snd.snd) 1 then fromMaybe (SLit { value = false }) (head p.snd.snd) else SOp { op = "and", operands = p.snd.snd } } })
+  let tyExprPat = if refinements then PAlt tyRefinedPat tyUnrefinedPat else tyUnrefinedPat
+  let refinementRows = if refinements then [{ name = concat prefix "Arrow", pat = tyUnrefinedPat }, { name = concat prefix "Predicates", pat = tyPredicatesPat }] else []
+  { rows = concat refinementRows [ { name = concat prefix "Expr", pat = tyExprPat }
+           , { name = concat prefix "App", pat = tyAppPat }
+           , { name = concat prefix "Args", pat = tyArgsPat }
+           , { name = concat prefix "AngleArgs", pat = tyAngleArgsPat }
+           , { name = concat prefix "ExprList", pat = tyExprListPat }
+           , { name = concat prefix "Params", pat = tyParamsPat }
+           , { name = concat prefix "Fields", pat = tyFieldsPat }
+           ]
+  , tyAtom = tyAtom
+  , tyAppAngle = tyAppAngle
+  , arrowLHS = arrowLHS
+  }
+
+-- annTypeMarker — an annotation type's dependent-application rule, the TS
+-- parser's `liftDepApp` (fenel-parser.ts). Outside a declaration there is no
+-- binder, so a type application with a LOWERCASE head is a value-dependent type
+-- (`schemaOf typeId`) whose bare lowercase args are VALUE references: the
+-- `{mk = "value"}` marker (walkType ⇒ `{var}`). Applied at every depth (the TS
+-- lift runs at each parseTypeApp level); an uppercase head keeps its args as
+-- type refs. Only a name heads an application (`typeGrammar`), and the angle
+-- form `f<a>` has the same marker as `f a`, so both read value-dependently in
+-- both parsers (the TS arm mirrors this rule).
+@label "Annotation type marker"
+@description "Normalise an annotation's `{mk}` type marker like the TS parser's `liftDepApp`: in every `app` marker with a lowercase (non-A–Z) head, each bare lowercase-initial `ref` arg becomes a `{mk = \"value\"}` marker (a sibling value reference, walkType ⇒ `{var}`); applied recursively through app args, tuple items, arrow params/return and record fields. Uppercase-headed applications and every other marker pass through. modules-as-values Phase 2d."
+@tags "engine" "parser" "expr-grammar" "modules-as-values" "phase-2d"
+annTypeMarker : (m: a) -> a
+annTypeMarker m =
+  case lookup m "mk" of
+    Nothing -> m
+    Just k ->
+      if eq k "app" then
+        if not (isString m.head) then m
+        else if isUpperName m.head then mapSet m "args" (map annTypeMarker m.args)
+        else mapSet m "args" (map annDepArg (map annTypeMarker m.args))
+      else if eq k "tuple" then mapSet m "items" (map annTypeMarker m.items)
+      else if eq k "arrow" then mapSet (mapSet m "params" (map (\p -> mapSet p "type" (annTypeMarker p.type)) m.params)) "ret" (annTypeMarker m.ret)
+      else if eq k "record" then mapSet m "fields" (map (\f -> mapSet f "type" (annTypeMarker f.type)) m.fields)
+      else m
+
+@label "Annotation dependent arg"
+@description "One argument of a lowercase-headed annotation type application: a `{mk = \"ref\"}` marker whose name is lowercase-initial (a–z or `_`, the TS isLowerInitial) becomes the value marker `{mk = \"value\", name}`; anything else (an uppercase ref, a nested app, a raw number/string, a lowered value expression) passes through. modules-as-values Phase 2d."
+@tags "engine" "internal" "parser" "expr-grammar" "modules-as-values" "phase-2d"
+@category "engine-internal"
+annDepArg : (arg: a) -> a
+annDepArg arg =
+  case lookup arg "mk" of
+    Nothing -> arg
+    Just k ->
+      if and (eq k "ref") (isLowerInitName arg.name) then { mk = "value", name = arg.name }
+      else arg
+
+
+-- =========================================================================
+-- The grammar assembly — `exprGrammar` builds the production env `[{name,
+-- pat}]` per-input (the value-class vocabularies close over `toks`).
+-- T1 surface: literals / strings / bools / vars (dotted) / unit / parens /
+-- application / constructs / lists / records. T2 surface: the flat OpSeq +
+-- word-ops + unary minus + `(op)` sections + backtick-infix.
+-- =========================================================================
+
+@label "Primary pattern"
+@description "Build the Primary production's alternation (a Pat VALUE, not a named production): num / str / bool / var / unit `()` / `(op)` section / parens (with the `( Expr : Type )` annotation arm ⇒ SAnn, modules-as-values Phase 2d) / List / Record refs. Called TWICE by exprGrammar — once with the full ident vocabulary (the HEAD Primary: `and a b` parses as application) and once with the and/or-excluded vocabulary (ArgPrimary: `f and g` stops the juxtaposition, the WORD_INFIX mirror). The section arm sits BEFORE the paren arm (the `(and)` tiebreak — TS opOf fires before parseExpr). parser-substrate Phase 3b (T2)."
+@tags "engine" "internal" "parser" "expr-grammar" "parser-substrate" "phase-3"
+@category "engine-internal"
+primaryPat : (table: a) -> (nullValue: a) -> (numCls: a) -> (strCls: a) -> (boolCls: a) -> (identClsV: a) -> (secCls: a) -> (beginCls: a) -> (Pat Any)
+primaryPat table nullValue numCls strCls boolCls identClsV secCls beginCls =
+  let pNum = PRed (PMatch numCls) (\e -> SLit { value = toNumber (splitVal e) })
+  let pStr = PRed (PMatch strCls) (\e -> SLit { value = splitVal e })
+  let pBool = PRed (PMatch boolCls) (\e -> SLit { value = eq (splitVal e) "true" })
+  let pVar = PRed (PMatch identClsV) (\e -> SVar { name = splitVal e })
+  let identityCls = { tag = "WsPrefix", prefix = encVirt "identity" }
+  let pIdentity = PRed (PMatch identityCls) (\e -> mapSet (SVar { name = splitVal e }) "identity" true)
+  let pUnit = PRed (PSeq (pPunct "(") (pPunct ")")) (\p -> SLit { value = nullValue })
+  let pSec = PRed (PSeq (pPunct "(") (PSeq (PMatch secCls) (pPunct ")"))) (\p -> buildSection table p.snd.fst)
+  -- pParen — `( Expr )` (transparent) or the type ANNOTATION `( Expr : Type )`
+  -- (modules-as-values Phase 2d, amending D-C): one colon, ONE expression, then
+  -- the TyExpr sub-grammar (typeGrammar — bound in both environments). The
+  -- close is factored so `( Expr` derives once for both shapes; each close arm
+  -- yields a plain-record sentinel (two keys: a single-key record literal
+  -- collapses to a call when compiled). `(a, b : T)` has no arm (this grammar
+  -- has no tuple primary), matching the TS parser's error.
+  let parenClose = PAlt (PRed (pPunct ")") (\t -> { ann = false, ty = [] })) (PRed (PSeq (pPunct ":") (PSeq (PRef "TyExpr") (pPunct ")"))) (\p -> { ann = true, ty = p.snd.fst }))
+  let pParen = PRed (PSeq (pPunct "(") (PSeq (PRef "Expr") parenClose)) (\p -> if p.snd.snd.ann then SAnn { expr = p.snd.fst, type = annTypeMarker p.snd.snd.ty } else p.snd.fst)
+  -- pTmpl — the backtick-template primary (`str_begin Expr TemplTail`, the
+  -- hole case; hole-LESS `` `plain` `` is a `str` token ⇒ pStr). A template is a
+  -- PRIMARY (like a string literal); TemplTail collects the `[{chunk, expr}]`
+  -- mid pairs + the final `end` chunk. parser-substrate Phase 7e Sn=3.
+  let pTmpl = PRed (PSeq (PMatch beginCls) (PSeq (PRef "Expr") (PRef "TemplTail"))) (\p -> buildTemplate (splitVal p.fst) p.snd.fst p.snd.snd.pairs p.snd.snd.endc)
+  PAlt pIdentity (PAlt pNum (PAlt pStr (PAlt pTmpl (PAlt pBool (PAlt pVar (PAlt pUnit (PAlt pSec (PAlt pParen (PAlt (PRef "List") (PRef "Record"))))))))))
+
+@label "Expression grammar"
+@description "Build the per-input expression-grammar production env `[{name, pat}]` (Design E — the value-class WsEnum vocabularies are built from THIS token list). T1 surface: literals / strings / bools / vars / unit `()` / parens / juxtaposition application / constructs / list + record literals. T2 surface: the flat OpSeq (`Expr = Operand OpTail`, reduction = resolveOpSeq) + word-ops (head keeps and/or, ArgPrimary excludes them) + unary minus (`Operand = \"-\" Operand | App`) + `(op)` sections + backtick-infix (bt-marked items). Root = `vopen Expr vclose eof`; `nullValue` threads to the Unit primary; `table` is closure-captured by the OpSeq + section reductions. The non-recursive leaf matchers are INLINED into Primary/ArgPrimary (the whole-grammar derivative step's fixpoint cost is ~quadratic in NAMED production count — P3b surprise 1), so the env stays at 15 named productions. The binder / case tiers (T3+) extend this env; the seven TYPE rows (typeGrammar) join it for the `( Expr : Type )` annotation primary (modules-as-values Phase 2d). parser-substrate Phase 3b."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3"
+exprGrammar : (table: a) -> (nullValue: a) -> (toks: a) -> a
+exprGrammar table nullValue toks =
+  -- VALUE CLASSES via WsPrefix (Design E perf refinement, 7g): a value-bearing
+  -- token's class is its TYPE TAG = the encoded string's prefix `cls\0`, so
+  -- membership is `startsWith x "cls\0"` (O(prefix)), NOT a per-input `WsEnum`
+  -- eq-scan over the whole group's vocabulary (O(group)). `encVirt cls` = the
+  -- `cls\0` prefix. Semantics-identical on the actual input alphabet (a token is
+  -- in `vocabFor toks cls` ⟺ its encoded form starts with `cls\0`; \0 never
+  -- appears in values, so the type tag is an unambiguous prefix), proven by the
+  -- byte-green differentials.
+  let numCls = { tag = "WsPrefix", prefix = encVirt "num" }
+  let strCls = { tag = "WsPrefix", prefix = encVirt "str" }
+  let boolCls = { tag = "WsPrefix", prefix = encVirt "bool" }
+  let identCls = { tag = "WsPrefix", prefix = encVirt "ident" }
+  let fieldNameCls = parserFieldNameClass identCls
+  let encAnd = encodeTok { t = "ident", v = "and" }
+  let encOr = encodeTok { t = "ident", v = "or" }
+  -- modules-as-values Phase 5c-1a — `using` is reserved in expression and
+  -- block positions until the block form ships (5c-1b): it is never READ as a
+  -- variable or call head (varIdentCls), so `using t (a) in e` and `f using`
+  -- fail here as in the TS mirror (parsePrimary). Binders, record field names
+  -- and dotted segments are untouched (`x.using` is one ident token).
+  let encUsing = encodeTok { t = "ident", v = "using" }
+  let varIdentCls = { tag = "WsIntersect", branches = appendItem identCls (appendItem { tag = "WsComplement", inner = { tag = "WsEnum", values = appendItem encUsing [] } } []) }
+  -- argIdentCls = ident MINUS {and, or} (the WORD_INFIX exclusion) MINUS
+  -- `using` — expressed as the prefix INTERSECT the complement of the
+  -- exclusion enum (O(1)).
+  let argIdentCls = { tag = "WsIntersect", branches = appendItem identCls (appendItem { tag = "WsComplement", inner = { tag = "WsEnum", values = appendItem encAnd (appendItem encOr (appendItem encUsing [])) } } []) }
+  let staticOps = [encStatic "+", encStatic "-", encStatic "*", encStatic "/", encStatic "%", encStatic "==", encStatic "!=", encStatic "<", encStatic ">", encStatic "<=", encStatic ">=", encStatic "$", encStatic "."]
+  -- opCls = the static singletons + {and, or} (a fixed 15-element enum) UNION the
+  -- `op\0` prefix (the per-input custom-op runs — `&&` `||` `++` `<?>` … — covered
+  -- by the prefix, no enumeration). The statics carry their punct type-tag (`+\0+`),
+  -- NOT `op\0`, so they stay an enum; the union is exact.
+  let opCls = { tag = "WsUnion", branches = appendItem { tag = "WsEnum", values = concat staticOps (appendItem encOr (appendItem encAnd [])) } (appendItem { tag = "WsPrefix", prefix = encVirt "op" } []) }
+  -- backtick-template value classes (Design E — str_begin opens the pTmpl primary,
+  -- str_mid / str_end drive TemplTail) — also WsPrefix. parser-substrate 7e Sn=3 / 7g.
+  let beginCls = { tag = "WsPrefix", prefix = encVirt "str_begin" }
+  let midCls = { tag = "WsPrefix", prefix = encVirt "str_mid" }
+  let endCls = { tag = "WsPrefix", prefix = encVirt "str_end" }
+  let opItem = PRed (PSeq (PMatch opCls) (PRef "Operand")) (\p -> { notation = splitVal p.fst, operand = p.snd, bt = false })
+  -- A backtick name is a call head: it reads varIdentCls, so `using` is
+  -- refused there as well (1 `using` 2; the TS bt-loop throws the same).
+  let btItem = PRed (PSeq (pPunct "`") (PSeq (PMatch varIdentCls) (PSeq (pPunct "`") (PRef "Operand")))) (\p -> { notation = splitVal p.snd.fst, operand = p.snd.snd.snd, bt = true })
+  -- Primary / ArgPrimary / Field are INLINED as values (not named env rows) —
+  -- the whole-grammar derivative step's fixpoint cost is ~quadratic in NAMED
+  -- production count (P3b surprise 1), so the binder/case tiers buy headroom by
+  -- folding the non-recursive single-use alternations into their one consumer.
+  let primary = primaryPat table nullValue numCls strCls boolCls varIdentCls opCls beginCls
+  let argPrimary = primaryPat table nullValue numCls strCls boolCls argIdentCls opCls beginCls
+  let fieldPat = PRed (PSeq (PMatch fieldNameCls) (PSeq (pPunct "=") (PRef "Expr"))) (\p -> { name = splitVal p.fst, value = p.snd.snd })
+  let rootPat = PRed (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (pVirt "eof")))) (\p -> p.snd.fst)
+  let opExprPat = PRed (PSeq (PRef "Operand") (PRef "OpTail")) (\p -> resolveOpSeq table { first = p.fst, rest = p.snd })
+  let opTailPat = PAlt (PRed (PSeq (PAlt opItem btItem) (PRef "OpTail")) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV [])
+  let operandPat = PAlt (PRed (PSeq (pPunct "-") (PRef "Operand")) (\p -> SCall { fnId = "negate", args = appendItem p.snd [] })) (PRef "App")
+  let appPat = PRed (PSeq primary (PRef "Args")) (\p -> buildAppU p.fst p.snd nullValue)
+  let argsPat = PAlt (PRed (PSeq argPrimary (PRef "Args")) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV [])
+  let listPat = PRed (PSeq (pPunct "[") (PSeq (PRef "ListItems") (pPunct "]"))) (\p -> buildList p.snd.fst)
+  let listItemsPat = PAlt (PRed (PSeq (PRef "Expr") (PRef "ItemsRest")) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV [])
+  let itemsRestPat = PAlt (PRed (PSeq (pPunct ",") (PSeq (PRef "Expr") (PRef "ItemsRest"))) (\p -> concat (appendItem p.snd.fst []) p.snd.snd)) (PEpsV [])
+  let recordPat = PRed (PSeq (pPunct "{") (PSeq (PRef "RecFields") (pPunct "}"))) (\p -> buildRecord p.snd.fst)
+  let recFieldsPat = PAlt (PRed (PSeq fieldPat (PRef "FieldRest")) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV [])
+  let fieldRestPat = PAlt (PRed (PSeq (pPunct ",") (PSeq fieldPat (PRef "FieldRest"))) (\p -> concat (appendItem p.snd.fst []) p.snd.snd)) (PEpsV [])
+  let letStmt =PRed (PSeq (pPunct "let") (PSeq (PMatch identCls) (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PRef "Expr") (pVirt "vclose")))))) (\p -> { letb = true, bnd = { name = splitVal p.snd.fst, value = p.snd.snd.snd.snd.fst } })
+  let bindStmt = PRed (PSeq (PMatch identCls) (PSeq (pPunct "<-") (PRef "Expr"))) (\p -> { letb = true, bnd = { name = splitVal p.fst, value = p.snd.snd } })
+  -- where-clause productions (fenel-surface-extensions Phase 4) — a function-
+  -- level `where` is a layout OPENER (`layout.fenel:130`), so `body where\n h = …`
+  -- ⇒ `body where vopen h = vopen … vclose vclose` (the where-block nests inside
+  -- the body block; the per-binding `=` is ALSO an opener). The TS oracle's
+  -- `parseWhere` (fenel-parser.ts:1450) accepts BOTH the `,`-separated single-line
+  -- form (`x = 1, y = 2`) and the newline-block form, and bindings are
+  -- `name = Expr` ONLY (NO params — the oracle has no param loop). The two forms
+  -- lay out distinctly (token-stream-VERIFIED): the comma form NESTS the binding
+  -- value-blocks (vcloses pile at the end — `x = vopen 1 , y = vopen 2 vclose
+  -- vclose`), the newline form CLOSES each binding before a `vsemi` (`x = vopen 1
+  -- vclose vsemi y = vopen 2 vclose`). So `WhereComma` (the `=`-binding MINUS the
+  -- `let` keyword, reused from letStmt's shape) handles a comma-run via a RIGHT-
+  -- NESTED recursion (the inner binding's vclose closes first, the outer's last),
+  -- and `WhereBindsTail` separates comma-runs by `vsemi` — one `whereBindsVal`
+  -- covers single / comma / newline / mixed. ZERO `$`-key (`where` is a plain op
+  -- key) — the lowering authors it via syntaxToJsonLogic's `mapSet`.
+  let whereCommaTail = PAlt (PRed (PSeq (pPunct ",") (PRef "WhereComma")) (\p -> p.snd)) (PEpsV [])
+  let whereCommaPat = PRed (PSeq (PMatch identCls) (PSeq (pPunct "=") (PSeq (pVirt "vopen") (PSeq (PRef "Expr") (PSeq whereCommaTail (pVirt "vclose")))))) (\p -> concat (appendItem { name = splitVal p.fst, value = p.snd.snd.snd.fst } []) p.snd.snd.snd.snd.fst)
+  let whereBindsTailPat = PAlt (PRed (PSeq (pVirt "vsemi") (PSeq (PRef "WhereComma") (PRef "WhereBindsTail"))) (\p -> concat p.snd.fst p.snd.snd)) (PEpsV [])
+  let whereBindsVal = PRed (PSeq (PRef "WhereComma") (PRef "WhereBindsTail")) (\p -> concat p.fst p.snd)
+  let whereOptPat = PAlt (PRed (PSeq (pPunct "where") (PSeq (pVirt "vopen") (PSeq whereBindsVal (pVirt "vclose")))) (\p -> p.snd.snd.fst)) (PEpsV [])
+  let exprStmt = PRed (PSeq (PRef "Expr") whereOptPat) (\p -> { letb = false, expr = applyWhereOpt p.fst p.snd })
+  let stmtVal = PAlt letStmt (PAlt bindStmt exprStmt)
+  let stmtsPat = PRed (PSeq stmtVal (PRef "StmtTail")) (\p -> buildStmts (concat (appendItem p.fst []) p.snd))
+  let stmtTailPat = PAlt (PRed (PSeq (pVirt "vsemi") (PSeq stmtVal (PRef "StmtTail"))) (\p -> concat (appendItem p.snd.fst []) p.snd.snd)) (PEpsV [])
+  let paramsPat = PRed (PSeq (PMatch identCls) (PRef "ParamsTail")) (\p -> concat (appendItem (splitVal p.fst) []) p.snd)
+  let paramsTailPat = PAlt (PRed (PSeq (PMatch identCls) (PRef "ParamsTail")) (\p -> concat (appendItem (splitVal p.fst) []) p.snd)) (PEpsV [])
+  let lamLayout = PRed (PSeq (pPunct (charFromCode 92)) (PSeq (PRef "Params") (PSeq (pPunct "->") (PSeq (pVirt "vopen") (PSeq (PRef "Expr") (pVirt "vclose")))))) (\p -> SLambda { params = p.snd.fst, body = p.snd.snd.snd.snd.fst })
+  let lamBare = PRed (PSeq (pPunct (charFromCode 92)) (PSeq (PRef "Params") (PSeq (pPunct "->") (PRef "Expr")))) (\p -> SLambda { params = p.snd.fst, body = p.snd.snd.snd })
+  let lambdaPat = PAlt lamLayout lamBare
+  let ifSame = PRed (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pPunct "else") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (pVirt "vclose")))))))))) (\p -> SIf { cond = p.snd.fst, then = p.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.fst })
+  let ifBroken = PRed (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pVirt "vsemi") (PSeq (pPunct "else") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (pVirt "vclose"))))))))))) (\p -> SIf { cond = p.snd.fst, then = p.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.snd.snd.fst })
+  -- ifBroken2 (parser-substrate Phase 4h batch 2, S6): the `then` DEDENTS to the
+  -- `if`'s column, so a `vsemi` lands BEFORE `then` (in addition to the `vclose
+  -- vsemi else` of ifBroken) — `if Cond vsemi then vopen T vclose vsemi else vopen
+  -- E vclose` (`types/behavior`'s `cfApplicationNext`). Same SIf shape; the cond's
+  -- trailing `vsemi` is the only extra token.
+  let ifBroken2 = PRed (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pVirt "vsemi") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pVirt "vsemi") (PSeq (pPunct "else") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (pVirt "vclose")))))))))))) (\p -> SIf { cond = p.snd.fst, then = p.snd.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.snd.snd.snd.fst })
+  -- ifBare (parser-substrate Phase 7e Sn=2): a SUSPENDED / bracketed inline `if`
+  -- (inside parens, or a `\… -> …` lambda body that is itself an argument) —
+  -- `topSuspended` ⇒ the layout emits NO body vopens after `then`/`else`, so each
+  -- branch is a SINGLE `Expr` with NO `vopen`/`vclose`. The three layout if-arms
+  -- (ifSame/ifBroken/ifBroken2) all REQUIRE vopens ⇒ none match this no-vopen
+  -- shape. Ordered LAST in ifPat (the vopen-bearing arms win first — disjoint by
+  -- vopen presence, but ordering keeps it cheap + unambiguous). Same SIf shape
+  -- (`if` ⇒ SIf is symmetric ⇒ byte-matches the oracle through the EXISTING
+  -- marshal; nesting rides `Expr ⊇ ifPat`).
+  let ifBare = PRed (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pPunct "then") (PSeq (PRef "Expr") (PSeq (pPunct "else") (PRef "Expr")))))) (\p -> SIf { cond = p.snd.fst, then = p.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd })
+  -- ifBrokenML + MlElse (parser-substrate Phase 7e Sn=4): the broken-MULTILINE
+  -- `if` LAYOUT + the broken else-if CHAIN — the deepest grammar class (the
+  -- P3c/4h-b2 time-boxed fence). The layout dedents `then`/`else` onto their own
+  -- lines, splitting each inner `if` of an `else if` chain so the inner cond is
+  -- isolated in its OWN `vopen…vclose` while the inner `then`/`else` float to the
+  -- OUTER sibling level — a "broken nesting" the grammar repairs to nested SIf.
+  -- S0 enumerated THREE real-file chain variants (indentation determines the
+  -- virtuals; the A/B/C/M idealization missed two):
+  --   B  `⟨if C⟩ then ⟨T⟩ else …`            (then/else MORE-indented, NO vsemi)
+  --        — tryParseBoolean, core/locale; arms mlChainB / ifMlB
+  --   C  `⟨if C then ⟨T⟩⟩ ; else …`           (then-block stays in the cond block;
+  --        a vsemi precedes else) — registry, refine; arms mlChainC / ifMlC
+  --   D  `⟨if C⟩ ; then ⟨T⟩ ; else …`         (then/else same-column as if ⇒ a
+  --        vsemi BEFORE then AND else) — kernel, form-type-reflection; arms mlChainD / ifMlD
+  -- Each variant is its OWN explicit NON-NULLABLE arm (mlChainB/BMixed/C/D + ifMlB/C/D)
+  -- rather than folding B+D via a nullable `optSemi` factor — both encodings parse
+  -- identically and measure perf-NEUTRAL (the Sn=4 surprise: the closed files are
+  -- slow to Fenel-parse because they are inherently COMPLEX, surfaced now that they
+  -- are Fenel-driven not TS-fenced — NOT a tax this arm introduced; verified vs the
+  -- HEAD grammar on simple already-driven files), so the explicit shapes win on
+  -- clarity. `MlElse` is the single recursive named env row; branch bodies are
+  -- `Stmts` (Sn=1) so a let-block / multi-stmt branch re-nests via buildStmts.
+  -- DISJOINT + ordered LAST in ifPat (first-Just-wins): the chain steps key on the
+  -- token after the inner cond (`vclose` ⇒ B/BMixed/D, `then` ⇒ C), mlFinal on a COMPLETE
+  -- Stmts block; the outer arms overlap ifBroken/ifBroken2 only on the NON-chain
+  -- (final) case, where those earlier arms win identically. SIf ⇒ `{if:[c,t,e]}` is
+  -- symmetric ⇒ byte-matches the oracle through the EXISTING marshal (no change).
+  let mlChainB = PRed (PSeq (pVirt "vopen") (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pVirt "vclose") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pPunct "else") (PRef "MlElse")))))))))) (\p -> SIf { cond = p.snd.snd.fst, then = p.snd.snd.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.snd.snd })
+  -- A next-line `then` can close the condition block while the aligned `else`
+  -- still carries a separator: the same B chain with one vsemi before else.
+  let mlChainBMixed = PRed (PSeq (pVirt "vopen") (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pVirt "vclose") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pVirt "vsemi") (PSeq (pPunct "else") (PRef "MlElse"))))))))))) (\p -> SIf { cond = p.snd.snd.fst, then = p.snd.snd.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.snd.snd.snd })
+  let mlChainC = PRed (PSeq (pVirt "vopen") (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pVirt "vclose") (PSeq (pVirt "vsemi") (PSeq (pPunct "else") (PRef "MlElse"))))))))))) (\p -> SIf { cond = p.snd.snd.fst, then = p.snd.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.snd.snd.snd })
+  let mlChainD = PRed (PSeq (pVirt "vopen") (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pVirt "vclose") (PSeq (pVirt "vsemi") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pVirt "vsemi") (PSeq (pPunct "else") (PRef "MlElse")))))))))))) (\p -> SIf { cond = p.snd.snd.fst, then = p.snd.snd.snd.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.snd.snd.snd.snd })
+  let mlFinal = PRed (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (pVirt "vclose"))) (\p -> p.snd.fst)
+  let mlElsePat = PAlt mlChainB (PAlt mlChainBMixed (PAlt mlChainC (PAlt mlChainD mlFinal)))
+  let ifMlB = PRed (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pPunct "else") (PRef "MlElse")))))))) (\p -> SIf { cond = p.snd.fst, then = p.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd })
+  let ifMlC = PRed (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pVirt "vsemi") (PSeq (pPunct "else") (PRef "MlElse"))))))))) (\p -> SIf { cond = p.snd.fst, then = p.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.snd })
+  let ifMlD = PRed (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pVirt "vsemi") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pVirt "vsemi") (PSeq (pPunct "else") (PRef "MlElse")))))))))) (\p -> SIf { cond = p.snd.fst, then = p.snd.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.snd.snd })
+  let ifPat = PAlt ifSame (PAlt ifBroken (PAlt ifBroken2 (PAlt ifBare (PAlt ifMlB (PAlt ifMlC ifMlD)))))
+  let litPatVal = PAlt (PRed (PMatch numCls) (\e -> PatLit { value = toNumber (splitVal e) })) (PAlt (PRed (PMatch strCls) (\e -> if eq (splitVal e) "_" then PatWildcard else PatLit { value = splitVal e })) (PRed (PMatch boolCls) (\e -> PatLit { value = eq (splitVal e) "true" })))
+  let patAtomVal = PAlt litPatVal (PAlt (PRed (PMatch identCls) (\e -> buildConPat (splitVal e) [])) (PRed (PSeq (pPunct "(") (PSeq (PRef "Pattern") (pPunct ")"))) (\p -> p.snd.fst)))
+  let patArgsPat = PAlt (PRed (PSeq patAtomVal (PRef "PatArgs")) (\p -> concat (appendItem p.fst []) p.snd)) (PEpsV [])
+  -- named-field constructor patterns (`Ctor { f = p, … }` ⇒ buildNamedConPat).
+  -- The brace arm sits FIRST in patternPat (first-Just-wins — `{` is not a
+  -- PatArg, so the positional arm would leave it unconsumed). PatFields = `ident
+  -- = Pattern` comma-separated. parser-substrate Phase 4h.
+  -- S4 (parser-substrate Phase 7b) — named-field-pattern SHORTHAND: a BARE
+  -- `ident` in a field slot binds same-name (`User { accountId }` ≡ `User {
+  -- accountId = accountId }` — `auth/subject`). The full `ident = Pattern` arm is
+  -- FIRST; the bare arm fires when no `=` follows (first-Just). Validated by the
+  -- LOADER-direction marshal differential (the 4h-b1 surprise: `jsonLogicToSyntax`
+  -- is LOSSY for named-field patterns ⇒ the Syntax-space differential can't see it).
+  let patFieldFull = PRed (PSeq (PMatch fieldNameCls) (PSeq (pPunct "=") (PRef "Pattern"))) (\p -> { name = splitVal p.fst, pat = p.snd.snd })
+  let patFieldShort = PRed (PMatch identCls) (\e -> { name = splitVal e, pat = PatVar { name = splitVal e } })
+  let patFieldVal = PAlt patFieldFull patFieldShort
+  let patFieldsPat = PAlt (PRed (PSeq patFieldVal (PSeq (pPunct ",") (PRef "PatFields"))) (\p -> concat (appendItem p.fst []) p.snd.snd)) (PRed patFieldVal (\f -> appendItem f []))
+  let namedConPat = PRed (PSeq (PMatch identCls) (PSeq (pPunct "{") (PSeq (PRef "PatFields") (pPunct "}")))) (\p -> buildNamedConPat (splitVal p.fst) p.snd.snd.fst)
+  -- emptyConPat (parser-substrate Phase 7e Sn=2): an EMPTY-braces constructor
+  -- pattern `Ctor {}` (`auth/subject`'s `Anonymous {}`, `permissions`).
+  -- `patFieldsPat` has no empty arm, so `namedConPat` FAILS on `{}` (PatFields
+  -- can't consume `}`) ⇒ this arm fires (disjoint from namedConPat: it requires
+  -- `}` immediately after `{`; namedConPat requires ≥1 field). `buildNamedConPat
+  -- name []` ⇒ `PatConstruct { ctor, args = [], fields = [] }` ⇒ the marshal
+  -- authors `{$tag:ctor}` (args/fields empty ⇒ no field keys) — byte-matching the
+  -- oracle's `{$tag:ctor}`. Validated LOADER-direction (the Syntax-space oracle is
+  -- lossy for named-field/empty patterns — the 4h-b1 precedent).
+  let emptyConPat = PRed (PSeq (PMatch identCls) (PSeq (pPunct "{") (pPunct "}"))) (\p -> buildNamedConPat (splitVal p.fst) [])
+  let patternPat = PAlt namedConPat (PAlt emptyConPat (PAlt (PRed (PSeq (PMatch identCls) (PRef "PatArgs")) (\p -> buildConPat (splitVal p.fst) p.snd)) (PAlt litPatVal (PRed (PSeq (pPunct "(") (PSeq (PRef "Pattern") (pPunct ")"))) (\p -> p.snd.fst)))))
+  -- armGuarded (fenel-surface-extensions Phase 3): a GUARDED case arm `Pattern |
+  -- Expr -> body` (`n | n > 0 -> "pos"`). The `| Expr` sits BETWEEN the pattern
+  -- and the `->` (the layout opener) as an inline guard condition — a full Expr
+  -- up to the `->` (the oracle uses `parseExpr`; `fenel-parser.ts:1866-1870`). The
+  -- arm record gains an optional `guard` (a Syntax expr); guard-FREE arms keep the
+  -- bare `{pattern, body}` shape byte-identically (D1 = arm-level guard, option A —
+  -- a guard is an arm condition, not a pattern, so the 4 Pattern cases stay
+  -- structural). `|` is NOT an operator in the expression grammar (opCls excludes
+  -- it — the header FENCES list) so it is free as the guard separator here; case
+  -- arms and type-def `|`-variants live in different productions (disjoint
+  -- surfaces — verified via the byte-equality corpus-parity gate). Guarded FIRST
+  -- in armVal (first-Just): the `|`-vs-`->` token after the Pattern disambiguates,
+  -- so order is for clarity, not correctness. Lowers to the oracle's
+  -- `{$guard:[pat,cond]}` (pattern position) via matchArmsFlat ⇒ the ledgered
+  -- match-pattern `$`-key marshal (`PatGuard` marker); the wildcard `_ | cond ->`
+  -- rides the same path (`_` ⇒ PatWildcard ⇒ pattern egress restores bare `"_"`).
+  let armGuarded = PRed (PSeq (PRef "Pattern") (PSeq (pPunct "|") (PSeq (PRef "Expr") (PSeq (pPunct "->") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (pVirt "vclose"))))))) (\p -> { pattern = p.fst, guard = p.snd.snd.fst, body = p.snd.snd.snd.snd.snd.fst })
+  let armPlain = PRed (PSeq (PRef "Pattern") (PSeq (pPunct "->") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (pVirt "vclose"))))) (\p -> { pattern = p.fst, body = p.snd.snd.snd.fst })
+  -- armBrokenIf (parser-substrate Phase 7k Class B): a case ARM whose body is a
+  -- BROKEN-MULTILINE `if … then … else …` — the `if` sits on the `Pattern ->`
+  -- line and `then`/`else` DEDENT to their own (less-indented) lines, so the
+  -- arm-body opener `vopen` wraps ONLY `if Cond` (which then `vclose`s), leaving
+  -- `then`/`else` as siblings the plain `vopen Stmts vclose` arm can't reach.
+  -- Layout (token-stream-VERIFIED on identifiable's `displayCategory`/
+  -- `readStringField` + field-providers' `resolveEntityDecision`):
+  --   `Pattern -> vopen if Cond vclose then vopen Stmts vclose else MlElse`.
+  -- The then-body is `Stmts` (⊇ a nested `case`, the displayCategory shape); the
+  -- else-branch reuses `MlElse` (mlFinal `vopen Stmts vclose`, or a deeper
+  -- else-if chain) — the SAME repair the broken-multiline-if (7e Sn=4) arms use,
+  -- here lifted to the case-ARM level. DISJOINT from armPlain by the token after
+  -- the cond Expr: `vclose` (broken — armBrokenIf) vs `then` (a single-line/normal
+  -- `if`, which armPlain's Stmts→ifPat handles). Ordered BEFORE armPlain
+  -- (first-Just); a non-`if` arm body fails at the `if` punct ⇒ falls to armPlain.
+  -- NO new env row (an inline value alt like armGuarded; MlElse already exists).
+  let armBrokenIf = PRed (PSeq (PRef "Pattern") (PSeq (pPunct "->") (PSeq (pVirt "vopen") (PSeq (pPunct "if") (PSeq (PRef "Expr") (PSeq (pVirt "vclose") (PSeq (pPunct "then") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq (pVirt "vclose") (PSeq (pPunct "else") (PRef "MlElse")))))))))))) (\p -> { pattern = p.fst, body = SIf { cond = p.snd.snd.snd.snd.fst, then = p.snd.snd.snd.snd.snd.snd.snd.snd.fst, else = p.snd.snd.snd.snd.snd.snd.snd.snd.snd.snd.snd } })
+  let armVal = PAlt armGuarded (PAlt armBrokenIf armPlain)
+  let armsPat = PRed (PSeq armVal (PRef "ArmTail")) (\p -> concat (appendItem p.fst []) p.snd)
+  let armTailPat = PAlt (PRed (PSeq (pVirt "vsemi") (PSeq armVal (PRef "ArmTail"))) (\p -> concat (appendItem p.snd.fst []) p.snd.snd)) (PEpsV [])
+  let casePat = PRed (PSeq (pPunct "case") (PSeq (PRef "Expr") (PSeq (pPunct "of") (PSeq (pVirt "vopen") (PSeq (PRef "Arms") (pVirt "vclose")))))) (\p -> SMatch { scrutinee = p.snd.fst, arms = p.snd.snd.snd.snd.fst })
+  let endOpt = PAlt (pPunct "end") (PEpsV "")
+  let doPat = PRed (PSeq (pPunct "do") (PSeq (pVirt "vopen") (PSeq (PRef "Stmts") (PSeq endOpt (pVirt "vclose"))))) (\p -> p.snd.snd.fst)
+  -- TemplTail — the backtick-template tail (parser-substrate 7e Sn=3). ONE
+  -- recursive named row (keep the ~quadratic-in-NAMED-count fixpoint cost
+  -- minimal; Template itself is inlined into primaryPat). `str_mid Expr
+  -- TemplTail` collects a `{chunk, expr}` mid pair; `str_end` terminates with
+  -- the final `end` chunk. Returns `{pairs, end}` — buildTemplate interleaves.
+  let tmplTailPat = PAlt (PRed (PSeq (PMatch midCls) (PSeq (PRef "Expr") (PRef "TemplTail"))) (\p -> { pairs = concat (appendItem { chunk = splitVal p.fst, expr = p.snd.fst } []) p.snd.snd.pairs, endc = p.snd.snd.endc })) (PRed (PMatch endCls) (\e -> { pairs = [], endc = splitVal e }))
+  let exprPat = PAlt lambdaPat (PAlt ifPat (PAlt casePat (PAlt doPat opExprPat)))
+  -- The TYPE rows (typeGrammar) — the annotation primary refers to TyExpr, so
+  -- the expression environment binds them; declGrammar inherits them from here
+  -- (modules-as-values Phase 2d).
+  let ty = typeGrammar identCls
+  let baseRows = [ { name = "Root", pat = rootPat }
+                 , { name = "Stmts", pat = stmtsPat }
+                 , { name = "StmtTail", pat = stmtTailPat }
+                 , { name = "Expr", pat = exprPat }
+                 , { name = "OpTail", pat = opTailPat }
+                 , { name = "Operand", pat = operandPat }
+                 , { name = "App", pat = appPat }
+                 , { name = "Args", pat = argsPat }
+                 , { name = "List", pat = listPat }
+                 , { name = "ListItems", pat = listItemsPat }
+                 , { name = "ItemsRest", pat = itemsRestPat }
+                 , { name = "Record", pat = recordPat }
+                 , { name = "RecFields", pat = recFieldsPat }
+                 , { name = "FieldRest", pat = fieldRestPat }
+                 , { name = "Params", pat = paramsPat }
+                 , { name = "ParamsTail", pat = paramsTailPat }
+                 , { name = "Pattern", pat = patternPat }
+                 , { name = "PatArgs", pat = patArgsPat }
+                 , { name = "PatFields", pat = patFieldsPat }
+                 , { name = "Arms", pat = armsPat }
+                 , { name = "ArmTail", pat = armTailPat }
+                 , { name = "TemplTail", pat = tmplTailPat }
+                 , { name = "MlElse", pat = mlElsePat }
+                 , { name = "WhereComma", pat = whereCommaPat }
+                 , { name = "WhereBindsTail", pat = whereBindsTailPat }
+                 ]
+  concat baseRows ty.rows
+
+@label "Parse expression tokens"
+@description "The one-call expression-parse entry: encode the layout token stream (Design E), build the per-input grammar, and run `parseG` from the Root production. Returns `Just Syntax` on a full parse, Nothing otherwise. `table` = the fixity table (closure-captured by the OpSeq + section reductions — resolveOpSeq / buildSection); `nullValue` threads to the Unit primary. parser-substrate Phase 3b."
+@tags "engine" "parser" "expr-grammar" "parser-substrate" "phase-3"
+parseExprToks : (table: a) -> (nullValue: a) -> (toks: a) -> Maybe a
+parseExprToks table nullValue toks =
+  let enc = encodeToks toks
+  let g = exprGrammar table nullValue toks
+  parseG g "Root" enc

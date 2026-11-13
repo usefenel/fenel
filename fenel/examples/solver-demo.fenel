@@ -1,0 +1,1451 @@
+module SolverDemo where
+
+using engine (ReifyOutcome)
+using system (Anything)
+
+-- Solver surface demo.
+--
+-- This file is intentionally written against the live engine functions:
+--   solverDemoSolve          : Expr -> Maybe a
+--   solverDemoSolveAll       : Expr -> Maybe (List a)
+--   solverDemoSolveRel       : Expr -> facts -> Maybe bindings
+--   solverDemoSolveRelAll    : Expr -> facts -> Maybe (List bindings)
+--   solverDemoQueryRel       : Expr -> relDefs -> rules -> Maybe (List bindings)
+--   solverDemoQueryRelOne    : Expr -> relDefs -> rules -> Maybe bindings
+--   solverDemoEnumerableSet       : base -> SetExpr -> Maybe (List a)
+--   solverDemoEnumerableSolveAll  : base -> Expr -> Maybe (List a)
+--   solverDemoEnumerableInhabit   : refined-type-marker -> Maybe (List a)
+--   solverDemoEnumerableMinOfSet  : base -> SetExpr -> Maybe a
+--   solverDemoEnumerableMaxOfSet  : base -> SetExpr -> Maybe a
+--   solverDemoEnumerableSampleSet : base -> seed -> SetExpr -> Maybe a
+--   solverDemoSolveSymbolic       : effectFnIds -> Expr -> Maybe a
+--
+-- The ergonomic lambda wrapper `solveFn (\x -> ...)` is live through the
+-- TypeScript dispatch wrapper, which supplies the reify marshalling triple.
+-- In a plain example module, using Expr constructors is the most explicit
+-- way to show what the solver consumes today.
+
+-- -------------------------------------------------------------------------
+-- Tiny Expr builders, kept local so each example reads like a predicate.
+-- -------------------------------------------------------------------------
+
+lit : a -> Expr
+lit v = ELit { value = v }
+
+var : String -> Expr
+var name = EVar { name = name }
+
+callExpr : String -> a -> Expr
+callExpr fnId args = ECall { fnId = fnId, args = args }
+
+eqExpr : Expr -> Expr -> Expr
+eqExpr a b = callExpr "eq" [a, b]
+
+ltExpr : Expr -> Expr -> Expr
+ltExpr a b = callExpr "lt" [a, b]
+
+gtExpr : Expr -> Expr -> Expr
+gtExpr a b = callExpr "gt" [a, b]
+
+gteExpr : Expr -> Expr -> Expr
+gteExpr a b = callExpr "gte" [a, b]
+
+lteExpr : Expr -> Expr -> Expr
+lteExpr a b = callExpr "lte" [a, b]
+
+andExpr : a -> Expr
+andExpr args = callExpr "and" args
+
+orExpr : a -> Expr
+orExpr args = callExpr "or" args
+
+notExpr : Expr -> Expr
+notExpr expr = callExpr "not" [expr]
+
+effectExpr : String -> a -> Expr
+effectExpr fnId args = ECall { fnId = fnId, args = args }
+
+-- Tiny SetExpr builders for the typed enumerable examples below.
+
+solverDemoBound : a -> Bool -> Maybe ({ value: a, inclusive: Bool })
+solverDemoBound value inclusive = Just ({ value = value, inclusive = inclusive })
+
+intervalSet : a -> a -> SetExpr
+intervalSet lo hi =
+  SeInterval { interval = { lo = lo, hi = hi } }
+
+lowerBoundSet : a -> Bool -> SetExpr
+lowerBoundSet value inclusive =
+  intervalSet (solverDemoBound value inclusive) Nothing
+
+upperBoundSet : a -> Bool -> SetExpr
+upperBoundSet value inclusive =
+  intervalSet Nothing (solverDemoBound value inclusive)
+
+closedIntervalSetFrom : a -> a -> SetExpr
+closedIntervalSetFrom lo hi =
+  intervalSet (solverDemoBound lo true) (solverDemoBound hi true)
+
+openIntervalSetFrom : a -> a -> SetExpr
+openIntervalSetFrom lo hi =
+  intervalSet (solverDemoBound lo false) (solverDemoBound hi false)
+
+enumSet : a -> SetExpr
+enumSet values = SeEnum { values = values }
+
+intersectSet : a -> SetExpr
+intersectSet branches = SeIntersect { branches = branches }
+
+unionSet : a -> SetExpr
+unionSet branches = SeUnion { branches = branches }
+
+intBandExpr : Number -> Number -> Expr
+intBandExpr lo hi =
+  andExpr [
+    gteExpr (var "x") (lit lo),
+    lteExpr (var "x") (lit hi)
+  ]
+
+-- -------------------------------------------------------------------------
+-- 1. Single unknown, exact finite answer.
+-- Expected: Just 5.
+-- -------------------------------------------------------------------------
+
+solveSimpleEquality : Maybe Number
+solveSimpleEquality =
+  solverDemoSolve (eqExpr (var "x") (lit 5))
+
+-- -------------------------------------------------------------------------
+-- 2. Single unknown, affine arithmetic.
+-- Predicate: 2*x + 5 == 6.
+-- Expected: Just 0.5.
+-- -------------------------------------------------------------------------
+
+solveAffineEquation : Maybe Number
+solveAffineEquation =
+  let lhs =
+    callExpr "add" [
+      callExpr "mul" [lit 2, var "x"],
+      lit 5
+    ]
+  solverDemoSolve (eqExpr lhs (lit 6))
+
+-- -------------------------------------------------------------------------
+-- 3. Single unknown, range predicate.
+-- Predicate: x > 3 and x <= 7.
+-- Expected: Nothing. A numeric comparison keeps its native predicate (an
+-- ordered interval would also admit exact integer records the native `gt`
+-- refuses), so no interval bound is read as a witness. String bounds still
+-- lower to intervals (section 5, enumerateCharWindow).
+-- -------------------------------------------------------------------------
+
+solveRange : Maybe Number
+solveRange =
+  let pred =
+    andExpr [
+      callExpr "gt" [var "x", lit 3],
+      lteExpr (var "x") (lit 7)
+    ]
+  solverDemoSolve pred
+
+-- -------------------------------------------------------------------------
+-- 4. Find-all over a finite predicate.
+-- Expected: Just [5, 7].
+-- -------------------------------------------------------------------------
+
+solveFiniteChoices : Maybe a
+solveFiniteChoices =
+  let pred =
+    orExpr [
+      eqExpr (var "x") (lit 5),
+      eqExpr (var "x") (lit 7)
+    ]
+  solverDemoSolveAll pred
+
+-- Expected: Just [].
+-- This is different from Nothing: the query is decidable and empty.
+solveDecidableEmpty : Maybe a
+solveDecidableEmpty =
+  let pred =
+    andExpr [
+      eqExpr (var "x") (lit 1),
+      eqExpr (var "x") (lit 2)
+    ]
+  solverDemoSolveAll pred
+
+-- -------------------------------------------------------------------------
+-- 5. Typed find-all over discrete domains.
+-- `solverDemoSolveAll` still refuses to invent a base type for intervals; the typed
+-- sibling accepts the base explicitly. Char intervals enumerate. Int and Nat
+-- intervals abstain: a scalar range omits the exact digit records and pure
+-- constructor inhabitants those types also admit, so it cannot be claimed
+-- complete. For whole-number answers over a stated range use `solve` with
+-- WholeNumbers (section 13), which searches stated candidate values instead.
+-- -------------------------------------------------------------------------
+
+-- Expected: Nothing (Int intervals abstain from complete enumeration).
+enumerateSmallIntegerRange : Maybe a
+enumerateSmallIntegerRange =
+  solverDemoEnumerableSolveAll "Int" (intBandExpr 2 5)
+
+-- Expected: Nothing (Int intervals abstain from complete enumeration).
+enumerateDisjointIntegerBands : Maybe a
+enumerateDisjointIntegerBands =
+  solverDemoEnumerableSolveAll "Int" (orExpr [intBandExpr 2 3, intBandExpr 7 8])
+
+-- Expected: Just ["a", "b", "c", "d", "e"].
+enumerateCharWindow : Maybe a
+enumerateCharWindow =
+  let pred =
+    andExpr [
+      gteExpr (var "c") (lit "a"),
+      lteExpr (var "c") (lit "e")
+    ]
+  solverDemoEnumerableSolveAll "Char" pred
+
+mixedEnumAndIntervalSet : SetExpr
+mixedEnumAndIntervalSet =
+  unionSet [
+    enumSet [1],
+    intersectSet [
+      lowerBoundSet 5 true,
+      upperBoundSet 7 true
+    ]
+  ]
+
+-- Expected: Nothing (the Int interval branch abstains, so the union does).
+enumerateMixedEnumAndInterval : Maybe a
+enumerateMixedEnumAndInterval =
+  solverDemoEnumerableSet "Int" (mixedEnumAndIntervalSet ())
+
+openIntegerWindow : SetExpr
+openIntegerWindow =
+  openIntervalSetFrom 2 6
+
+-- Expected: Nothing. The public door does not admit Int or Nat bases for
+-- min / max / sample: at this commit the Int reader throws on a native integer
+-- carrier ("native carrier inspection is undecidable") instead of answering.
+minOpenIntegerWindow : Maybe Number
+minOpenIntegerWindow =
+  solverDemoEnumerableMinOfSet "Int" (openIntegerWindow ())
+
+-- Expected: Nothing, for the same reason as minOpenIntegerWindow.
+maxOpenIntegerWindow : Maybe Number
+maxOpenIntegerWindow =
+  solverDemoEnumerableMaxOfSet "Int" (openIntegerWindow ())
+
+-- Expected: Nothing (Int/Nat bases are not admitted by the public sample door).
+sampleSmallIntegerRange : Maybe Number
+sampleSmallIntegerRange =
+  solverDemoEnumerableSampleSet "Int" 1 (closedIntervalSetFrom 2 5)
+
+-- -------------------------------------------------------------------------
+-- 6. Refined-type inhabitants.
+-- This enumerates the values of a bounded refined type, not merely a predicate.
+-- An Int refinement abstains like an Int interval (section 5); a Char
+-- refinement enumerates.
+-- -------------------------------------------------------------------------
+
+digitTypeMarker : { tag: String, base: String, set: SetExpr }
+digitTypeMarker =
+  { tag = "InhRefined",
+    base = "Int",
+    set = closedIntervalSetFrom 0 9
+  }
+
+-- Expected: Nothing (an Int refinement abstains from complete enumeration).
+enumerateDigitInhabitants : Maybe a
+enumerateDigitInhabitants =
+  solverDemoEnumerableInhabit (digitTypeMarker ())
+
+vowelishTypeMarker : { tag: String, base: String, set: SetExpr }
+vowelishTypeMarker =
+  { tag = "InhRefined",
+    base = "Char",
+    set =
+      unionSet [
+        closedIntervalSetFrom "a" "c",
+        enumSet ["x", "z"]
+      ]
+  }
+
+-- Expected: Just ["a", "b", "c", "x", "z"].
+enumerateRefinedCharUnion : Maybe a
+enumerateRefinedCharUnion =
+  solverDemoEnumerableInhabit (vowelishTypeMarker ())
+
+-- -------------------------------------------------------------------------
+-- 7. Honest fences.
+-- Expected: Nothing. Quadratic equations are outside the current affine
+-- fragment, so the predicate lowers to the undecidable SeWhere case.
+-- -------------------------------------------------------------------------
+
+solveQuadraticFence : Maybe Number
+solveQuadraticFence =
+  let product = callExpr "mul" [var "x", var "x"]
+  let pred = eqExpr product (lit 4)
+  solverDemoSolve pred
+
+-- Expected: Nothing. Bare two-variable equality has no grounding relation,
+-- so it is unsafe for relational solving.
+solveUnsafeTwoVarFence : Maybe a
+solveUnsafeTwoVarFence =
+  let pred = eqExpr (var "x") (var "y")
+  solverDemoSolveRel pred { relations = [], rules = [] }
+
+-- -------------------------------------------------------------------------
+-- 8. Prolog-like finite relation solving.
+-- Conjunctive Datalog grew into finite DNF union and grounded antijoin.
+-- -------------------------------------------------------------------------
+
+parentFacts : { relations: List ({ name: String, arity: Number, rows: List (List String) }), rules: List Any }
+parentFacts =
+  { relations = [
+      { name = "parentOf", arity = 2, rows = [
+          ["anna", "bob"],
+          ["zoe", "bob"],
+          ["bob", "eleonora"],
+          ["carl", "dan"]
+        ] }
+    ],
+    rules = []
+  }
+
+grandparentExpr =
+  andExpr [
+    callExpr "parentOf" [var "x", var "y"],
+    callExpr "parentOf" [var "y", lit "eleonora"]
+  ]
+
+-- Expected: Just [{ name = "x", value = "anna" },
+--                 { name = "y", value = "bob" }]
+solveGrandparentOne : Maybe a
+solveGrandparentOne =
+  solverDemoSolveRel (grandparentExpr ()) (parentFacts ())
+
+-- Expected: Just [
+--   [{ name = "x", value = "anna" }, { name = "y", value = "bob" }],
+--   [{ name = "x", value = "zoe" },  { name = "y", value = "bob" }]
+-- ]
+solveGrandparentAll : Maybe a
+solveGrandparentAll =
+  solverDemoSolveRelAll (grandparentExpr ()) (parentFacts ())
+
+-- Rules are pre-expressed as Expr. Finite recursive rules are supported through
+-- stratified least-fixpoint materialization; this example needs only one step.
+grandparentRule : { name: String, params: List String, body: Expr }
+grandparentRule =
+  { name = "grandparentOf",
+    params = ["a", "c"],
+    body =
+      andExpr [
+        callExpr "parentOf" [var "a", var "b"],
+        callExpr "parentOf" [var "b", var "c"]
+      ]
+  }
+
+parentFactsWithRule : { relations: List ({ name: String, arity: Number, rows: List (List String) }), rules: List ({ name: String, params: List String, body: Expr }) }
+parentFactsWithRule =
+  let base = parentFacts ()
+  { relations = base.relations,
+    rules = [grandparentRule ()]
+  }
+
+-- Expected: Just [{ name = "x", value = "anna" }]
+solveGrandparentViaRule : Maybe a
+solveGrandparentViaRule =
+  let pred = callExpr "grandparentOf" [var "x", lit "eleonora"]
+  solverDemoSolveRel pred (parentFactsWithRule ())
+
+-- Expected: Just [{ name = "x", value = "anna" },
+--                 { name = "y", value = "bob" }]
+-- Grounded `not` is now negation-as-failure over the finite relation.
+solveGroundNegationAntiJoin : Maybe a
+solveGroundNegationAntiJoin =
+  let pred =
+    andExpr [
+      callExpr "parentOf" [var "x", var "y"],
+      notExpr (callExpr "parentOf" [var "y", var "x"])
+    ]
+  solverDemoSolveRel pred (parentFacts ())
+
+-- Expected: Just [
+--   [{ name = "x", value = "anna" }],
+--   [{ name = "x", value = "zoe" }],
+--   [{ name = "x", value = "eleonora" }]
+-- ]
+solveRelationalOrAll : Maybe a
+solveRelationalOrAll =
+  let pred =
+    orExpr [
+      callExpr "parentOf" [var "x", lit "bob"],
+      callExpr "parentOf" [lit "bob", var "x"]
+    ]
+  solverDemoSolveRelAll pred (parentFacts ())
+
+-- Expected: Just [
+--   [{ name = "x", value = "bob" },  { name = "y", value = "eleonora" }],
+--   [{ name = "x", value = "carl" }, { name = "y", value = "dan" }]
+-- ]
+solveAntijoinDropsRowsAll : Maybe a
+solveAntijoinDropsRowsAll =
+  let pred =
+    andExpr [
+      callExpr "parentOf" [var "x", var "y"],
+      notExpr (callExpr "parentOf" [var "y", lit "eleonora"])
+    ]
+  solverDemoSolveRelAll pred (parentFacts ())
+
+-- Unsafe negation, unstratifiable rules, arity mismatches and exhausted
+-- fixpoint fuel return Nothing. Safe finite recursion is supported.
+solveUnsafeNegationFence : Maybe a
+solveUnsafeNegationFence =
+  let pred =
+    andExpr [
+      callExpr "parentOf" [var "x", var "y"],
+      notExpr (callExpr "parentOf" [var "y", var "z"])
+    ]
+  solverDemoSolveRel pred (parentFacts ())
+
+-- -------------------------------------------------------------------------
+-- 9. Query layer: materialize relation definitions, then solverDemoSolve.
+-- This is the engine-side mock for "rows from state:listInstancesByName".
+-- -------------------------------------------------------------------------
+
+@label "Solver Customer"
+@description "A browser-local solver sample customer, with a string id and the day they joined."
+@fieldLabel "id" "ID"
+@fieldLabel "joinedDay" "Joined Day"
+SolverCustomer = SolverCustomer id: String joinedDay: Number
+
+@label "Solver Purchase"
+@description "A browser-local solver sample purchase, linking a customer id to a book."
+@fieldLabel "id" "ID"
+@fieldLabel "customerId" "Customer ID"
+@fieldLabel "book" "Book"
+SolverPurchase = SolverPurchase id: String customerId: String book: String
+
+customerRows : List SolverCustomer
+customerRows = [
+  SolverCustomer { id = "cust-1", joinedDay = 1 },
+  SolverCustomer { id = "cust-2", joinedDay = 5 },
+  SolverCustomer { id = "cust-3", joinedDay = 2 },
+  SolverCustomer { id = "cust-4", joinedDay = 1 }
+]
+
+purchaseRows : List SolverPurchase
+purchaseRows = [
+  SolverPurchase { id = "p-1", customerId = "cust-1", book = "book-b" },
+  SolverPurchase { id = "p-2", customerId = "cust-2", book = "book-b" },
+  SolverPurchase { id = "p-3", customerId = "cust-3", book = "book-b" },
+  SolverPurchase { id = "p-4", customerId = "cust-4", book = "book-a" }
+]
+
+-- Each relation projects its own declared row type through fieldOrder.
+solverDemoCommerceRelations : List SolverCustomer -> List SolverPurchase -> List ({ name: String, fieldOrder: List String, instances: List Any })
+solverDemoCommerceRelations customers purchases = [
+  { name = "customer", fieldOrder = ["id", "joinedDay"], instances = customers },
+  { name = "bought", fieldOrder = ["customerId", "book"], instances = purchases }
+]
+
+commerceRelDefs : List ({ name: String, fieldOrder: List String, instances: List Any })
+commerceRelDefs = solverDemoCommerceRelations (customerRows ()) (purchaseRows ())
+
+recentBookBuyerExpr =
+  andExpr [
+    callExpr "customer" [var "customerId", var "joinedDay"],
+    callExpr "bought" [var "customerId", lit "book-b"],
+    ltExpr (var "joinedDay") (lit 3)
+  ]
+
+-- Expected: Just bindings for cust-1 and cust-3.
+queryRecentBookBuyers : Maybe a
+queryRecentBookBuyers =
+  solverDemoQueryRel (recentBookBuyerExpr ()) (commerceRelDefs ()) []
+
+-- Expected: Just bindings for cust-1 only.
+queryRecentBookBuyerOne : Maybe a
+queryRecentBookBuyerOne =
+  solverDemoQueryRelOne (recentBookBuyerExpr ()) (commerceRelDefs ()) []
+
+-- -------------------------------------------------------------------------
+-- 10. Symbolic effect solving.
+-- Effects can be treated as unknowns and solved without performing IO.
+-- -------------------------------------------------------------------------
+
+stateGetExpr : String -> Expr
+stateGetExpr key =
+  effectExpr "$effect:HasStateIO:getInstance" [lit key]
+
+-- Expected: Just 42.
+-- The state read is rewritten to a fresh unknown; no state IO is performed.
+solveSymbolicCounterRead : Maybe Number
+solveSymbolicCounterRead =
+  solverDemoSolveSymbolic [] (eqExpr (stateGetExpr "counter") (lit 42))
+
+-- Expected: Just 7.
+-- Same idea, with the read on the right-hand side.
+solveSymbolicFlippedRead : Maybe Number
+solveSymbolicFlippedRead =
+  solverDemoSolveSymbolic [] (eqExpr (lit 7) (stateGetExpr "lucky"))
+
+-- -------------------------------------------------------------------------
+-- 11. Sibling readers over the canonical `Se*` SetExpr (decide-substrate
+--    Phase 1 retired the WitSet marker vocabulary — solverDemoSampleSet / solverDemoMinOfSet /
+--    solverDemoMaxOfSet read the registered `$tag` Se* ADT directly).
+-- -------------------------------------------------------------------------
+
+finiteNumberSet : SetExpr
+finiteNumberSet =
+  let vs = [3, 1, 2]
+  SeEnum { values = vs }
+
+sampleFiniteSet : Maybe Number
+sampleFiniteSet =
+  solverDemoSampleSet 1 (finiteNumberSet ())
+
+minFiniteSet : Maybe Number
+minFiniteSet =
+  solverDemoMinOfSet (finiteNumberSet ())
+
+maxFiniteSet : Maybe Number
+maxFiniteSet =
+  solverDemoMaxOfSet (finiteNumberSet ())
+
+closedIntervalSet : SetExpr
+closedIntervalSet =
+  let lo3 = Just ({ value = 3, inclusive = true })
+  let hi7 = Just ({ value = 7, inclusive = true })
+  let iv = { lo = lo3, hi = hi7 }
+  SeInterval { interval = iv }
+
+minClosedInterval : Maybe Number
+minClosedInterval =
+  solverDemoMinOfSet (closedIntervalSet ())
+
+maxClosedInterval : Maybe Number
+maxClosedInterval =
+  solverDemoMaxOfSet (closedIntervalSet ())
+
+-- -------------------------------------------------------------------------
+-- 12. Public, editable examples. These ordinary functions expose the same
+-- solver and declared commerce rows through the universal call/input surfaces.
+-- A displayed solver answer is not a kernel-verified proof certificate.
+-- -------------------------------------------------------------------------
+
+listAnswerMeaning : Maybe (List a) -> String
+listAnswerMeaning answer = case answer of
+  Nothing -> "Undecided: the solver abstained or its answer failed the re-check; this does not mean there are no answers."
+  Just rows -> if length rows == 0 then "Decidably empty: the solver returned Just []; there are no answers in this finite query." else "The solver returned every answer, each re-checked here. This is a solver result, not a proof certificate."
+
+numberAnswerMeaning : Maybe Number -> String
+numberAnswerMeaning answer = case answer of
+  Nothing -> "No witness returned. This does not prove that no solution exists."
+  Just witness -> "The solver returned a witness. This is a solver result, not a proof certificate."
+
+solverDemoQuadraticMeaning : Maybe Number -> String
+solverDemoQuadraticMeaning answer = case answer of
+  Nothing -> "Undecided: this quadratic fragment is unsupported. Nothing does not mean the equation has no solution."
+  Just witness -> numberAnswerMeaning answer
+
+-- Caller-frame re-checks (GP-12 clearance, 2026-11-06). The five labelled
+-- functions (affineEquation, quadraticEquation, finiteIntersection,
+-- grandparentsOf, bookBuyersBefore) check each answer here by ordinary
+-- evaluation, in this module's own frame, before it is shown; a failed check
+-- shows no answer. The direct solverDemo* calls re-check their non-relational
+-- answers inside the engine door, by set membership (2026-11-07). Completeness
+-- (an empty or full answer list) rests on the solver's complete-answer faces.
+
+solverDemoBinding : (row: List ({ name: String, value: a })) -> (name: String) -> Maybe a
+solverDemoBinding row name = case find (\b -> b.name == name) row of
+  Nothing -> Nothing
+  Just b -> Just b.value
+
+solverDemoSameCells : (left: List a) -> (right: List a) -> Bool
+solverDemoSameCells left right = case head left of
+  Nothing -> length right == 0
+  Just l -> case head right of
+    Nothing -> false
+    Just r -> if l == r then solverDemoSameCells (fromMaybe [] (tail left)) (fromMaybe [] (tail right)) else false
+
+solverDemoFactHolds : (rows: List (List a)) -> (cells: List a) -> Bool
+solverDemoFactHolds rows cells = case find (\row -> solverDemoSameCells row cells) rows of
+  Nothing -> false
+  Just row -> true
+
+solverDemoRelationRows : (facts: { relations: List ({ name: String, arity: Number, rows: List (List a) }), rules: List Any }) -> (name: String) -> List (List a)
+solverDemoRelationRows facts name = case find (\r -> r.name == name) facts.relations of
+  Nothing -> []
+  Just r -> r.rows
+
+solverDemoCheckedRows : (holds: (a -> Bool)) -> (answer: Maybe (List a)) -> Maybe (List a)
+solverDemoCheckedRows holds answer = case answer of
+  Nothing -> Nothing
+  Just rows -> if all rows holds then Just rows else Nothing
+
+solverDemoGrandparentRow : (parents: List (List String)) -> (descendant: String) -> (row: List ({ name: String, value: String })) -> Bool
+solverDemoGrandparentRow parents descendant row = case solverDemoBinding row "x" of
+  Nothing -> false
+  Just x -> case solverDemoBinding row "y" of
+    Nothing -> false
+    Just y -> solverDemoFactHolds parents [x, y] && solverDemoFactHolds parents [y, descendant]
+
+solverDemoCustomerJoined : (customers: List SolverCustomer) -> (customerId: Any) -> (joinedDay: Any) -> Bool
+solverDemoCustomerJoined customers customerId joinedDay = case find (\c -> c.id == customerId && c.joinedDay == joinedDay) customers of
+  Nothing -> false
+  Just c -> true
+
+solverDemoBoughtBook : (purchases: List SolverPurchase) -> (customerId: Any) -> (book: String) -> Bool
+solverDemoBoughtBook purchases customerId book = case find (\p -> p.customerId == customerId && p.book == book) purchases of
+  Nothing -> false
+  Just p -> true
+
+solverDemoBookBuyerRow : (book: String) -> (beforeDay: Number) -> (customers: List SolverCustomer) -> (purchases: List SolverPurchase) -> (row: List ({ name: String, value: Any })) -> Bool
+solverDemoBookBuyerRow book beforeDay customers purchases row = case solverDemoBinding row "customerId" of
+  Nothing -> false
+  Just who -> case solverDemoBinding row "joinedDay" of
+    Nothing -> false
+    Just day -> solverDemoCustomerJoined customers who day && solverDemoBoughtBook purchases who book && day < beforeDay
+
+@label "Solve an equation"
+@description "Change coefficient, offset and target in coefficient*x + offset = target. A proposed witness is admitted only if the original equation is exactly true at that value; otherwise no witness is returned. The result carries the exact predicate, the admitted witness and its meaning."
+@tags "demo" "solver"
+affineEquation : (coefficient: Number) -> (offset: Number) -> (target: Number) -> { coefficient: Number, offset: Number, target: Number, predicate: Expr, answer: Maybe Number, interpretation: String }
+affineEquation coefficient offset target =
+  let lhs = callExpr "add" [callExpr "mul" [lit coefficient, var "x"], lit offset]
+  let predicate = eqExpr lhs (lit target)
+  let candidate = solverDemoSolve predicate
+  let answer = case candidate of
+    Nothing -> Nothing
+    Just witness -> if eq (add (mul coefficient witness) offset) target then Just witness else Nothing
+  { coefficient = coefficient, offset = offset, target = target,
+    predicate = predicate, answer = answer, interpretation = numberAnswerMeaning answer }
+
+@label "Find grandparents"
+@description "Choose a descendant and find every grandparent in the finite parentOf facts. The result includes the same facts and predicate used by the solver."
+@tags "demo" "solver"
+grandparentsOf : (descendant: String) -> { descendant: String, facts: { relations: List ({ name: String, arity: Number, rows: List (List String) }), rules: List Any }, predicate: Expr, answer: Maybe (List (List ({ name: String, value: String }))), interpretation: String }
+grandparentsOf descendant =
+  let facts = parentFacts ()
+  let predicate = andExpr [
+    callExpr "parentOf" [var "x", var "y"],
+    callExpr "parentOf" [var "y", lit descendant]
+  ]
+  let candidate = solverDemoSolveRelAll predicate facts
+  let answer = solverDemoCheckedRows (solverDemoGrandparentRow (solverDemoRelationRows facts "parentOf") descendant) candidate
+  { descendant = descendant, facts = facts, predicate = predicate,
+    answer = answer, interpretation = listAnswerMeaning answer }
+
+@label "Find book buyers"
+@description "Change the book, join-day limit, typed SolverCustomer rows or typed SolverPurchase rows. Find customers who bought that book and joined before the limit. These are browser-local sample rows; no storage is read."
+@tags "demo" "solver"
+bookBuyersBefore : (book: String) -> (beforeDay: Number) -> (customers: List SolverCustomer) -> (purchases: List SolverPurchase) -> { book: String, beforeDay: Number, customers: List SolverCustomer, purchases: List SolverPurchase, predicate: Expr, answer: Maybe (List (List ({ name: String, value: Any }))), interpretation: String }
+bookBuyersBefore book beforeDay customers purchases =
+  let relations = solverDemoCommerceRelations customers purchases
+  let predicate = andExpr [
+    callExpr "customer" [var "customerId", var "joinedDay"],
+    callExpr "bought" [var "customerId", lit book],
+    ltExpr (var "joinedDay") (lit beforeDay)
+  ]
+  let candidate = solverDemoQueryRel predicate relations []
+  let answer = solverDemoCheckedRows (solverDemoBookBuyerRow book beforeDay customers purchases) candidate
+  { book = book, beforeDay = beforeDay, customers = customers, purchases = purchases,
+    predicate = predicate, answer = answer, interpretation = listAnswerMeaning answer }
+
+@label "Empty or undecided?"
+@description "Require one number to equal both chosen numbers. Different inputs give Just [], a definite empty finite answer; matching inputs give that number."
+@tags "demo" "solver"
+finiteIntersection : (left: Number) -> (right: Number) -> { left: Number, right: Number, predicate: Expr, answer: Maybe (List Number), interpretation: String }
+finiteIntersection left right =
+  let predicate = andExpr [eqExpr (var "x") (lit left), eqExpr (var "x") (lit right)]
+  let candidate = solverDemoSolveAll predicate
+  let answer = solverDemoCheckedRows (\x -> x == left && x == right) candidate
+  { left = left, right = right, predicate = predicate,
+    answer = answer, interpretation = listAnswerMeaning answer }
+
+@label "An unsupported equation"
+@description "Try x*x = target. The advertised quadratic fragment is unsupported and the solver abstains; Nothing must not be read as a definite empty answer."
+@tags "demo" "solver"
+quadraticEquation : (target: Number) -> { target: Number, predicate: Expr, answer: Maybe Number, interpretation: String }
+quadraticEquation target =
+  let predicate = eqExpr (callExpr "mul" [var "x", var "x"]) (lit target)
+  let candidate = solverDemoSolve predicate
+  let answer = case candidate of
+    Nothing -> Nothing
+    Just witness -> if eq (mul witness witness) target then Just witness else Nothing
+  { target = target, predicate = predicate, answer = answer,
+    interpretation = solverDemoQuadraticMeaning answer }
+
+-- -------------------------------------------------------------------------
+-- 13. One solve function (2026-11-06). `solve predicate domain` reads an
+-- ordinary predicate function as data (reflection in this reader; nothing is
+-- executed), routes it, and returns typed Solutions. Equations over all
+-- numbers go to the exact linear solver; every answer it reports is
+-- re-checked here, in this module's own frame, by exact fraction arithmetic
+-- on the equations it read. These are solver results with their exact check
+-- and derivation, not kernel certificates.
+-- -------------------------------------------------------------------------
+
+@label "Solve Binding"
+@description "One unknown of a predicate and its value in an answer. A linear answer's value is an exact fraction { num, den }."
+@fieldLabel "name" "Name"
+@fieldLabel "value" "Value"
+SolveBinding = SolveBinding name: String value: Anything
+
+@label "Where to Look"
+@description "Where solve looks for answers: AllNumbers solves equations exactly over the rationals; WholeNumbers searches every whole number from low to high for each unknown; ChoicesFor searches explicit candidate values (one list per unknown, or one list for all); FromFacts answers a relational query over typed rows and rules."
+@fieldLabel "WholeNumbers.low" "Low"
+@fieldLabel "WholeNumbers.high" "High"
+@fieldLabel "ChoicesFor.options" "Options"
+@fieldLabel "FromFacts.relations" "Relations"
+@fieldLabel "FromFacts.rules" "Rules"
+SolveDomain = AllNumbers
+  | WholeNumbers low: Number high: Number
+  | ChoicesFor options: List (List Anything)
+  | FromFacts relations: List Anything rules: List Anything
+
+-- The four domains' human names, keyed by the bare constructor tag as the species
+-- constructors are (encyclopedia/life-data.fenel); the code names stay.
+_ : Labelable "AllNumbers"
+_ = Labelable { label = "All numbers" }
+
+_ : Labelable "WholeNumbers"
+_ = Labelable { label = "Whole numbers" }
+
+_ : Labelable "ChoicesFor"
+_ = Labelable { label = "Choices" }
+
+_ : Labelable "FromFacts"
+_ = Labelable { label = "Facts and rules" }
+
+@label "Solve Evidence"
+@description "How an answer was found and checked: the method, the re-check this module ran, readable derivation steps and what the answer does not claim."
+@fieldLabel "method" "Method"
+@fieldLabel "checked" "Checked"
+@fieldLabel "steps" "Steps"
+@fieldLabel "note" "Note"
+SolveEvidence = SolveEvidence method: String checked: String steps: List String note: String
+
+@label "Solutions"
+@description "The typed answer of solve: exactly one answer; every answer in a finite domain; a family (a particular answer plus any multiples of the directions, one per free unknown); no answer; or unknown, with the reason."
+@fieldLabel "OneAnswer.answer" "Answer"
+@fieldLabel "OneAnswer.evidence" "Evidence"
+@fieldLabel "EveryAnswer.answers" "Answers"
+@fieldLabel "EveryAnswer.evidence" "Evidence"
+@fieldLabel "AnswerFamily.particular" "Particular Answer"
+@fieldLabel "AnswerFamily.directions" "Directions"
+@fieldLabel "AnswerFamily.free" "Free Unknowns"
+@fieldLabel "AnswerFamily.evidence" "Evidence"
+@fieldLabel "NoAnswer.evidence" "Evidence"
+@fieldLabel "UnknownAnswer.reason" "Reason"
+Solutions = OneAnswer answer: List SolveBinding evidence: SolveEvidence
+  | EveryAnswer answers: List (List SolveBinding) evidence: SolveEvidence
+  | AnswerFamily particular: List SolveBinding directions: List (List SolveBinding) free: List String evidence: SolveEvidence
+  | NoAnswer evidence: SolveEvidence
+  | UnknownAnswer reason: String
+
+-- Solutions are ordinary typed data; Viewable selects the shared answer body
+-- (the answers written as math, the evidence collapsed below them). The value
+-- itself stays inspectable through the structural reader.
+_ : Viewable Solutions
+_ = Viewable { defaultView = "solver-solutions", defaultInlineView = "solver-solutions" }
+
+@label "Solve"
+@description "Find the values of a predicate function's inputs for which it returns true. AllNumbers solves equations exactly over the rationals (one answer, a family, or none); WholeNumbers and ChoicesFor list every answer in a stated finite domain; FromFacts answers a query over named relations (typed rows and rules written as data). Returns typed Solutions with the evidence; Unknown says what was not decided."
+@tags "demo" "solver"
+@fieldLabel "predicate" "Predicate"
+@fieldLabel "domain" "Domain"
+solve : (predicate: Anything) -> (domain: SolveDomain) -> Solutions
+solve predicate domain = case domain of
+  AllNumbers -> solverDemoNumbersAnswer predicate (solverDemoLinear (solverDemoReflect predicate))
+  WholeNumbers { low = lo, high = hi } -> solverDemoWholeAnswer predicate lo hi
+  ChoicesFor { options = os } -> solverDemoChoicesAnswer predicate os
+  FromFacts { relations = rs, rules = rus } -> solverDemoFactsAnswer predicate rs rus
+
+-- Exact fractions { num, den } over safe integers, the same carrier the
+-- engine's linear solver returns; this module re-checks with its own copy of
+-- the arithmetic. A step outside the safe range gives the invalid 0/0, and
+-- every check involving it fails.
+
+solverDemoSafe : (n: Any) -> Bool
+solverDemoSafe n = isNumber n && numberIsFinite n && floor n == n && abs n <= 9007199254740991
+
+solverDemoGcd : (a: Number) -> (b: Number) -> Number
+solverDemoGcd a b = if b == 0 then a else solverDemoGcd b (mod a b)
+
+solverDemoFrac : (n: Number) -> (d: Number) -> Any
+solverDemoFrac n d =
+  if solverDemoSafe n && solverDemoSafe d && d != 0
+  then
+    let g = solverDemoGcd (abs n) (abs d)
+    let s = if d < 0 then 0 - 1 else 1
+    { num = s * n / g, den = s * d / g }
+  else { num = 0, den = 0 }
+
+solverDemoValid : (f: Any) -> Bool
+solverDemoValid f = solverDemoSafe f.num && solverDemoSafe f.den && f.den > 0
+
+solverDemoZero : (unit: Number) -> Any
+solverDemoZero unit = { num = 0, den = 1 }
+
+solverDemoOne : (unit: Number) -> Any
+solverDemoOne unit = { num = 1, den = 1 }
+
+solverDemoPlus : (a: Any) -> (b: Any) -> Any
+solverDemoPlus a b =
+  if solverDemoValid a && solverDemoValid b
+  then
+    let p = a.num * b.den
+    let q = b.num * a.den
+    if solverDemoSafe p && solverDemoSafe q then solverDemoFrac (p + q) (a.den * b.den) else { num = 0, den = 0 }
+  else { num = 0, den = 0 }
+
+solverDemoTimes : (a: Any) -> (b: Any) -> Any
+solverDemoTimes a b =
+  if solverDemoValid a && solverDemoValid b then solverDemoFrac (a.num * b.num) (a.den * b.den) else { num = 0, den = 0 }
+
+solverDemoSame : (a: Any) -> (b: Any) -> Bool
+solverDemoSame a b = solverDemoValid a && solverDemoValid b && a.num == b.num && a.den == b.den
+
+solverDemoIndices : (n: Number) -> List Number
+solverDemoIndices n = solverDemoRange 0 (n - 1)
+
+solverDemoRange : (low: Number) -> (high: Number) -> List Number
+solverDemoRange low high = if low > high then [] else concat [low] (solverDemoRange (low + 1) high)
+
+solverDemoDot : (xs: List Any) -> (ys: List Any) -> Any
+solverDemoDot xs ys = case head xs of
+  Nothing -> solverDemoZero 0
+  Just x -> case head ys of
+    Nothing -> solverDemoZero 0
+    Just y -> solverDemoPlus (solverDemoTimes x y) (solverDemoDot (fromMaybe [] (tail xs)) (fromMaybe [] (tail ys)))
+
+solverDemoHolds : (values: List Any) -> (equation: Any) -> Bool
+solverDemoHolds values equation = solverDemoSame (solverDemoDot equation.coefficients values) equation.constant
+
+solverDemoHomogeneous : (direction: List Any) -> (equation: Any) -> Bool
+solverDemoHomogeneous direction equation = solverDemoSame (solverDemoDot equation.coefficients direction) (solverDemoZero 0)
+
+solverDemoColumn : (equations: List Any) -> (j: Number) -> List Any
+solverDemoColumn equations j = map (\e -> at e.coefficients j) equations
+
+solverDemoCoefficientsFrom : (equations: List Any) -> (derived: Any) -> (j: Number) -> Bool
+solverDemoCoefficientsFrom equations derived j =
+  if j >= length derived.coefficients then true
+  else if solverDemoSame (solverDemoDot derived.multipliers (solverDemoColumn equations j)) (at derived.coefficients j) then solverDemoCoefficientsFrom equations derived (j + 1)
+  else false
+
+solverDemoDerivedFrom : (equations: List Any) -> (derived: Any) -> Bool
+solverDemoDerivedFrom equations derived =
+  let constants = map (\e -> e.constant) equations
+  solverDemoSame (solverDemoDot derived.multipliers constants) derived.constant && solverDemoCoefficientsFrom equations derived 0
+
+solverDemoUnitAt : (coefficients: List Any) -> (k: Number) -> (j: Number) -> Bool
+solverDemoUnitAt coefficients k j =
+  if j >= length coefficients then true
+  else
+    let expected = if j == k then solverDemoOne 0 else solverDemoZero 0
+    if solverDemoSame (at coefficients j) expected then solverDemoUnitAt coefficients k (j + 1) else false
+
+solverDemoFixes : (r: Any) -> (k: Number) -> Bool
+solverDemoFixes r k =
+  if k >= length r.variables then true
+  else
+    let d = at r.derived k
+    if solverDemoUnitAt d.coefficients k 0 && solverDemoSame d.constant (at r.values k) then solverDemoFixes r (k + 1) else false
+
+solverDemoUniqueChecked : (r: Any) -> Bool
+solverDemoUniqueChecked r =
+  length r.derived == length r.variables && all r.equations (solverDemoHolds r.values) && all r.derived (solverDemoDerivedFrom r.equations) && solverDemoFixes r 0
+
+solverDemoText : (r: Any) -> String
+solverDemoText r = if r.den == 1 then toString r.num else join [toString r.num, "/", toString r.den] ""
+
+solverDemoTerm : (c: Any) -> (name: String) -> String
+solverDemoTerm c name = if solverDemoSame c (solverDemoOne 0) then name else join [solverDemoText c, "·", name] ""
+
+solverDemoEquationText : (names: List String) -> (coefficients: List Any) -> (constant: Any) -> String
+solverDemoEquationText names coefficients constant =
+  let terms = filter (\t -> t != "") (map (\j -> if solverDemoSame (at coefficients j) (solverDemoZero 0) then "" else solverDemoTerm (at coefficients j) (at names j)) (solverDemoIndices (length coefficients)))
+  join [if length terms == 0 then "0" else join terms " + ", " = ", solverDemoText constant] ""
+
+solverDemoCombinationText : (multipliers: List Any) -> String
+solverDemoCombinationText multipliers =
+  let terms = filter (\t -> t != "") (map (\i -> if solverDemoSame (at multipliers i) (solverDemoZero 0) then "" else join ["(", solverDemoText (at multipliers i), ")·[", toString (i + 1), "]"] "") (solverDemoIndices (length multipliers)))
+  join terms " + "
+
+solverDemoStep : (names: List String) -> (derived: Any) -> String
+solverDemoStep names derived = join [solverDemoCombinationText derived.multipliers, " gives ", solverDemoEquationText names derived.coefficients derived.constant] ""
+
+solverDemoEquationLine : (r: Any) -> (i: Number) -> String
+solverDemoEquationLine r i =
+  let e = at r.equations i
+  join ["[", toString (i + 1), "] ", solverDemoEquationText r.variables e.coefficients e.constant] ""
+
+solverDemoEquationsText : (r: Any) -> List String
+solverDemoEquationsText r = map (\i -> solverDemoEquationLine r i) (solverDemoIndices (length r.equations))
+
+solverDemoBindings : (names: List String) -> (values: List Any) -> List SolveBinding
+solverDemoBindings names values = map (\k -> SolveBinding { name = at names k, value = at values k }) (solverDemoIndices (length names))
+
+solverDemoLinearEvidence : (r: Any) -> (why: String) -> SolveEvidence
+solverDemoLinearEvidence r why = SolveEvidence { method = "Exact Gauss–Jordan elimination over the rationals; each number is read as written (0.1 is 1/10).", checked = why, steps = concat (solverDemoEquationsText r) (map (solverDemoStep r.variables) r.derived), note = "A solver result with its exact re-check and derivation; it is not a kernel certificate." }
+
+solverDemoApply : (f: Any) -> (args: List Any) -> Any
+solverDemoApply f args =
+  if length args == 1 then f (at args 0)
+  else if length args == 2 then f (at args 0) (at args 1)
+  else if length args == 3 then f (at args 0) (at args 1) (at args 2)
+  else if length args == 4 then f (at args 0) (at args 1) (at args 2) (at args 3)
+  else false
+
+solverDemoIsWhole : (v: Any) -> Bool
+solverDemoIsWhole v = v.den == 1
+
+solverDemoApproximate : (v: Any) -> Number
+solverDemoApproximate v = v.num / v.den
+
+solverDemoFloatNote : (predicate: Any) -> (r: Any) -> String
+solverDemoFloatNote predicate r =
+  if all r.values solverDemoIsWhole
+  then (if solverDemoApply predicate (map solverDemoApproximate r.values) == true then " Calling the predicate itself at this whole-number answer also returns true." else " Calling the predicate itself at this answer returns false: its floating-point Number arithmetic is not exact, while the equations hold exactly over the rationals.")
+  else ""
+
+solverDemoUniqueAnswer : (predicate: Any) -> (r: Any) -> Solutions
+solverDemoUniqueAnswer predicate r =
+  if solverDemoUniqueChecked r
+  then solverDemoOneAnswer r (solverDemoFloatNote predicate r)
+  else UnknownAnswer { reason = "The solver's answer failed the exact re-check, so it is not shown." }
+
+solverDemoOneAnswer : (r: Any) -> (extra: String) -> Solutions
+solverDemoOneAnswer r extra = OneAnswer { answer = solverDemoBindings r.variables r.values, evidence = solverDemoLinearEvidence r (join ["Every equation holds exactly at this answer, and each value is derived from the equations as shown, so there is no other answer.", extra] "") }
+
+solverDemoLinearAnswer : (predicate: Any) -> (r: Any) -> Solutions
+solverDemoLinearAnswer predicate r =
+  if r.status == "unique" then solverDemoUniqueAnswer predicate r
+  else if r.status == "family" then solverDemoFamilyAnswer r
+  else if r.status == "none" then solverDemoNoAnswer r
+  else UnknownAnswer { reason = r.reason }
+
+solverDemoFreeIndex : (r: Any) -> (name: String) -> Number
+solverDemoFreeIndex r name = fromMaybe 0 (find (\j -> at r.variables j == name) (solverDemoIndices (length r.variables)))
+
+solverDemoDirectionShaped : (r: Any) -> (f: Number) -> Bool
+solverDemoDirectionShaped r f =
+  let d = at r.directions f
+  all (solverDemoIndices (length r.free)) (\g -> solverDemoSame (at d (solverDemoFreeIndex r (at r.free g))) (if g == f then solverDemoOne 0 else solverDemoZero 0))
+
+solverDemoFamilyChecked : (r: Any) -> Bool
+solverDemoFamilyChecked r =
+  let shaped = length r.directions == length r.free && length r.derived + length r.free == length r.variables
+  shaped && all r.equations (solverDemoHolds r.values) && all r.directions (\d -> all r.equations (solverDemoHomogeneous d)) && all r.derived (solverDemoDerivedFrom r.equations) && all (solverDemoIndices (length r.free)) (solverDemoDirectionShaped r)
+
+solverDemoFamilyAnswer : (r: Any) -> Solutions
+solverDemoFamilyAnswer r =
+  if solverDemoFamilyChecked r
+  then AnswerFamily { particular = solverDemoBindings r.variables r.values, directions = map (\d -> solverDemoBindings r.variables d) r.directions, free = r.free, evidence = solverDemoLinearEvidence r "The particular answer satisfies every equation exactly and each direction satisfies them with 0 on the right; the derived equations fix every other unknown from the free ones." }
+  else UnknownAnswer { reason = "The solver's family failed the exact re-check, so it is not shown." }
+
+solverDemoContradiction : (r: Any) -> Bool
+solverDemoContradiction r = case head r.derived of
+  Nothing -> false
+  Just d -> solverDemoDerivedFrom r.equations d && all d.coefficients (\c -> solverDemoSame c (solverDemoZero 0)) && not (solverDemoSame d.constant (solverDemoZero 0))
+
+solverDemoNoAnswer : (r: Any) -> Solutions
+solverDemoNoAnswer r =
+  if solverDemoContradiction r
+  then NoAnswer { evidence = solverDemoLinearEvidence r "Recomputing the shown combination of the equations gives 0 = a nonzero number, so no values satisfy all of them." }
+  else UnknownAnswer { reason = "The solver's contradiction failed the exact re-check, so no conclusion is shown." }
+
+@label "Tickets sold"
+@description "20 tickets were sold for 196 in total; adults pay 12 and children 8. Edit the numbers or replace this predicate in the solve call."
+@tags "demo" "solver" "linear"
+@fieldLabel "adults" "Adults"
+@fieldLabel "children" "Children"
+ticketsSold : (adults: Number) -> (children: Number) -> Bool
+ticketsSold adults children = adults + children == 20 && 12 * adults + 8 * children == 196
+
+@label "Exact fractions"
+@description "Two equations whose answer is a pair of fractions: 2x + 3y = 1 and x - y = 2."
+@tags "demo" "solver" "linear"
+@fieldLabel "x" "X"
+@fieldLabel "y" "Y"
+exactFractions : (x: Number) -> (y: Number) -> Bool
+exactFractions x y = 2 * x + 3 * y == 1 && x - y == 2
+
+@label "Mixing two solutions"
+@description "Mix a 10% and a 40% solution to get 3 litres at 20%. The decimals are read exactly; with floating-point Numbers, 0.1·2 + 0.4·1 is not exactly 0.6."
+@tags "demo" "solver" "linear"
+@fieldLabel "weak" "Weak Solution"
+@fieldLabel "strong" "Strong Solution"
+mixingSolutions : (weak: Number) -> (strong: Number) -> Bool
+mixingSolutions weak strong = weak + strong == 3 && 0.1 * weak + 0.4 * strong == 0.6
+
+@label "Three unknowns"
+@description "Three equations in x, y and z."
+@tags "demo" "solver" "linear"
+@fieldLabel "x" "X"
+@fieldLabel "y" "Y"
+@fieldLabel "z" "Z"
+threeUnknowns : (x: Number) -> (y: Number) -> (z: Number) -> Bool
+threeUnknowns x y z = x + y + z == 6 && 2 * x - y + z == 3 && x + 2 * y - z == 2
+
+@label "The same line twice"
+@description "Two equations that say the same thing: infinitely many answers, one free unknown."
+@tags "demo" "solver" "linear"
+@fieldLabel "x" "X"
+@fieldLabel "y" "Y"
+sameLineTwice : (x: Number) -> (y: Number) -> Bool
+sameLineTwice x y = x + y == 2 && 2 * x + 2 * y == 4
+
+@label "Contradictory totals"
+@description "Two totals that cannot both hold: x + y is 2 and also 3."
+@tags "demo" "solver" "linear"
+@fieldLabel "x" "X"
+@fieldLabel "y" "Y"
+contradictoryTotals : (x: Number) -> (y: Number) -> Bool
+contradictoryTotals x y = x + y == 2 && x + y == 3
+
+solverDemoFiniteEvidence : (r: Any) -> SolveEvidence
+solverDemoFiniteEvidence r = SolveEvidence { method = join ["Complete search of the stated domain: ", toString r.candidates, " candidate combinations."] "", checked = "The predicate itself was called here on every candidate combination, and the answers are exactly the combinations for which it returned true.", steps = [], note = "Complete only over the stated domain; it claims nothing about other values." }
+
+-- The candidate combinations for which the predicate itself returns true, in
+-- the order the solver lists them (the first unknown varies slowest). This
+-- check calls the function, so it does not depend on how its definition was
+-- read as data.
+solverDemoTrueCombos : (predicate: Any) -> (domains: List (List Any)) -> (prefix: List Any) -> List (List Any)
+solverDemoTrueCombos predicate domains prefix = case head domains of
+  Nothing -> if solverDemoApply predicate prefix == true then [prefix] else []
+  Just d -> fold (\acc v -> concat acc (solverDemoTrueCombos predicate (fromMaybe [] (tail domains)) (appendItem v prefix))) [] d
+
+solverDemoPerUnknown : (names: List String) -> (domains: List (List Any)) -> List (List Any)
+solverDemoPerUnknown names domains = if length domains == 1 then map (\n -> at domains 0) names else domains
+
+solverDemoAllCandidatesAgree : (predicate: Any) -> (domains: List (List Any)) -> (r: Any) -> Bool
+solverDemoAllCandidatesAgree predicate domains r =
+  let expected = solverDemoTrueCombos predicate (solverDemoPerUnknown r.variables domains) []
+  length expected == length r.answers && all (solverDemoIndices (length expected)) (\i -> map (\b -> b.value) (at r.answers i) == at expected i)
+
+solverDemoFiniteAnswer : (predicate: Any) -> (domains: List (List Any)) -> (r: Any) -> Solutions
+solverDemoFiniteAnswer predicate domains r =
+  if r.status == "complete"
+  then (if solverDemoAllCandidatesAgree predicate domains r then EveryAnswer { answers = r.answers, evidence = solverDemoFiniteEvidence r } else UnknownAnswer { reason = "The solver's answers did not match a check that called the predicate on every candidate, so none is shown." })
+  else UnknownAnswer { reason = r.reason }
+
+solverDemoWholeRange : (low: Number) -> (high: Number) -> Bool
+solverDemoWholeRange low high = isNumber low && isNumber high && floor low == low && floor high == high && low <= high && high - low <= 200
+
+solverDemoWholeAnswer : (predicate: Any) -> (low: Number) -> (high: Number) -> Solutions
+solverDemoWholeAnswer predicate low high =
+  if solverDemoWholeRange low high
+  then solverDemoFiniteAnswer predicate [solverDemoRange low high] (solverDemoFinite (solverDemoReflect predicate) [solverDemoRange low high])
+  else UnknownAnswer { reason = "Use whole numbers with low at most high and at most 201 values." }
+
+solverDemoChoicesAnswer : (predicate: Any) -> (options: List (List Any)) -> Solutions
+solverDemoChoicesAnswer predicate options = solverDemoFiniteAnswer predicate options (solverDemoFinite (solverDemoReflect predicate) options)
+
+solverDemoNumbersAnswer : (predicate: Any) -> (r: Any) -> Solutions
+solverDemoNumbersAnswer predicate r =
+  if r.status == "unsupported" then UnknownAnswer { reason = join [r.reason, " To list the answers in a finite domain, use WholeNumbers or ChoicesFor."] "" }
+  else solverDemoLinearAnswer predicate r
+
+@label "Circle of radius five"
+@description "x² + y² = 25. Over all numbers this circle has infinitely many points and is not linear; over whole numbers from -5 to 5 there are exactly twelve."
+@tags "demo" "solver" "finite"
+@fieldLabel "x" "X"
+@fieldLabel "y" "Y"
+circleOfRadiusFive : (x: Number) -> (y: Number) -> Bool
+circleOfRadiusFive x y = x * x + y * y == 25
+
+@label "Coins make 21"
+@description "Pay exactly 21 with coins of 5 and 2: how many of each? Over whole numbers from 0 to 10."
+@tags "demo" "solver" "finite"
+@fieldLabel "fives" "Fives"
+@fieldLabel "twos" "Twos"
+coinsMakeTwentyOne : (fives: Number) -> (twos: Number) -> Bool
+coinsMakeTwentyOne fives twos = 5 * fives + 2 * twos == 21
+
+@native
+solverDemoFinite : (outcome: ReifyOutcome) -> (domains: List (List Any)) -> Any
+
+-- -------------------------------------------------------------------------
+-- 14. Relational showcases (S3, 2026-11-06): a small typed rail map with a
+-- recursive "reachable" rule, and a meeting finder. The predicate is a query
+-- over named relations; FromFacts supplies typed rows (projected by field
+-- order) and rules written as data. Answers are complete over these rows.
+-- Base facts and comparisons in each answer are re-checked here; facts
+-- derived by a rule rest on the solver's complete fixpoint over these rows.
+-- -------------------------------------------------------------------------
+
+@label "City"
+@description "A city on the small rail map."
+City = Paris | Lyon | Marseille | Nice | Bordeaux | Toulouse | Lille
+
+@label "Rail Link"
+@description "A direct train from one city to another and its duration in minutes."
+@fieldLabel "origin" "Origin"
+@fieldLabel "destination" "Destination"
+@fieldLabel "minutes" "Minutes"
+RailLink = RailLink origin: City destination: City minutes: Number
+
+@label "Make a rail link"
+@description "One row of the rail map: a direct train from here to there taking the given minutes."
+@fieldLabel "here" "Origin"
+@fieldLabel "there" "Destination"
+@fieldLabel "time" "Time"
+railLink : (here: City) -> (there: City) -> (time: Number) -> RailLink
+railLink here there time = RailLink { origin = here, destination = there, minutes = time }
+
+@label "Rail links"
+@description "The small typed rail map. Edit these rows to change every answer below."
+@tags "demo" "solver" "relational"
+@fieldLabel "unit" "Unit"
+railLinks : (unit: Number) -> List RailLink
+railLinks unit = [
+  railLink Lille Paris 60,
+  railLink Paris Lyon 120,
+  railLink Paris Bordeaux 130,
+  railLink Paris Marseille 190,
+  railLink Lyon Marseille 100,
+  railLink Lyon Nice 270,
+  railLink Marseille Nice 150,
+  railLink Bordeaux Toulouse 120,
+  railLink Toulouse Marseille 230
+]
+
+solverDemoRailRelations : (links: List RailLink) -> List ({ name: String, fieldOrder: List String, instances: List Any })
+solverDemoRailRelations links = [{ name = "rail", fieldOrder = ["origin", "destination", "minutes"], instances = links }]
+
+@label "Reachable rule"
+@description "reachable a c holds when a direct train goes from a to c, or from a to some b from which c is reachable. A rule written as data; the solver computes its complete extension."
+@tags "demo" "solver" "relational"
+@fieldLabel "unit" "Unit"
+reachableRule : (unit: Number) -> { name: String, params: List String, body: Expr }
+reachableRule unit = {
+  name = "reachable",
+  params = ["a", "c"],
+  body = orExpr [
+    callExpr "rail" [var "a", var "c", var "m"],
+    andExpr [callExpr "rail" [var "a", var "b", var "m"], callExpr "reachable" [var "b", var "c"]]
+  ]
+}
+
+solverDemoRailFacts : (links: List RailLink) -> SolveDomain
+solverDemoRailFacts links = FromFacts { relations = solverDemoRailRelations links, rules = [reachableRule 0] }
+
+@label "Where can I go by train?"
+@description "Every city reachable from the start city on the rail map, directly or with changes."
+@tags "demo" "solver" "relational"
+@fieldLabel "start" "Start"
+@fieldLabel "links" "Links"
+destinationsFrom : (start: City) -> (links: List RailLink) -> Solutions
+destinationsFrom start links = solve (callExpr "reachable" [lit start, var "city"]) (solverDemoRailFacts links)
+
+@label "One change, under a time limit"
+@description "Trips from one city to another with exactly one change whose two legs together take less than the limit in minutes."
+@tags "demo" "solver" "relational"
+@fieldLabel "start" "Start"
+@fieldLabel "finish" "Finish"
+@fieldLabel "limit" "Time Limit"
+@fieldLabel "links" "Links"
+oneChangeTrips : (start: City) -> (finish: City) -> (limit: Number) -> (links: List RailLink) -> Solutions
+oneChangeTrips start finish limit links =
+  let firstLeg = callExpr "rail" [lit start, var "change", var "first"]
+  let secondLeg = callExpr "rail" [var "change", lit finish, var "second"]
+  let fastEnough = ltExpr (callExpr "add" [var "first", var "second"]) (lit limit)
+  solve (andExpr [firstLeg, secondLeg, fastEnough]) (solverDemoRailFacts links)
+
+@label "Reachable from one city but not another"
+@description "Cities reachable from the first start city but not from the second: the rule used positively and under not."
+@tags "demo" "solver" "relational"
+@fieldLabel "start" "Start"
+@fieldLabel "other" "Other Start"
+@fieldLabel "links" "Links"
+reachableOnlyFrom : (start: City) -> (other: City) -> (links: List RailLink) -> Solutions
+reachableOnlyFrom start other links =
+  let fromStart = callExpr "reachable" [lit start, var "city"]
+  let fromOther = callExpr "reachable" [lit other, var "city"]
+  solve (andExpr [fromStart, notExpr fromOther]) (solverDemoRailFacts links)
+
+@label "Free Slot"
+@description "A person who is free at a time slot."
+@fieldLabel "person" "Person"
+@fieldLabel "slot" "Slot"
+FreeSlot = FreeSlot person: String slot: String
+
+@label "Room Booking"
+@description "A room already booked at a time slot."
+@fieldLabel "room" "Room"
+@fieldLabel "slot" "Slot"
+RoomBooking = RoomBooking room: String slot: String
+
+@label "Make a free slot"
+@description "One row of the free slots: who is free at which time."
+@fieldLabel "who" "Person"
+@fieldLabel "time" "Time"
+freeSlot : (who: String) -> (time: String) -> FreeSlot
+freeSlot who time = FreeSlot { person = who, slot = time }
+
+@label "Free slots"
+@description "When each person is free. Edit these rows to change the answer."
+@tags "demo" "solver" "relational"
+@fieldLabel "unit" "Unit"
+freeSlots : (unit: Number) -> List FreeSlot
+freeSlots unit = [
+  freeSlot "Anna" "Mon 9:00",
+  freeSlot "Anna" "Tue 10:00",
+  freeSlot "Anna" "Wed 15:00",
+  freeSlot "Bob" "Mon 9:00",
+  freeSlot "Bob" "Mon 14:00",
+  freeSlot "Bob" "Wed 15:00",
+  freeSlot "Cleo" "Mon 9:00",
+  freeSlot "Cleo" "Tue 10:00",
+  freeSlot "Cleo" "Wed 15:00"
+]
+
+@label "Room bookings"
+@description "Slots at which a room is already taken."
+@tags "demo" "solver" "relational"
+@fieldLabel "unit" "Unit"
+roomBookings : (unit: Number) -> List RoomBooking
+roomBookings unit = [
+  RoomBooking { room = "Blue room", slot = "Mon 9:00" },
+  RoomBooking { room = "Green room", slot = "Wed 15:00" }
+]
+
+@label "Find a meeting slot"
+@description "Slots at which all three people are free and the room is not booked."
+@tags "demo" "solver" "relational"
+@fieldLabel "first" "First"
+@fieldLabel "second" "Second"
+@fieldLabel "third" "Third"
+@fieldLabel "room" "Room"
+@fieldLabel "available" "Available Slots"
+@fieldLabel "bookings" "Bookings"
+meetingSlots : (first: String) -> (second: String) -> (third: String) -> (room: String) -> (available: List FreeSlot) -> (bookings: List RoomBooking) -> Solutions
+meetingSlots first second third room available bookings =
+  solve (solverDemoMeetingQuery first second third room) (solverDemoMeetingFacts available bookings)
+
+solverDemoMeetingQuery : (first: String) -> (second: String) -> (third: String) -> (room: String) -> Expr
+solverDemoMeetingQuery first second third room =
+  let everyoneFree = andExpr [callExpr "free" [lit first, var "slot"], callExpr "free" [lit second, var "slot"], callExpr "free" [lit third, var "slot"]]
+  andExpr [everyoneFree, notExpr (callExpr "booked" [lit room, var "slot"])]
+
+solverDemoMeetingFacts : (available: List FreeSlot) -> (bookings: List RoomBooking) -> SolveDomain
+solverDemoMeetingFacts available bookings =
+  let defs = [{ name = "free", fieldOrder = ["person", "slot"], instances = available }, { name = "booked", fieldOrder = ["room", "slot"], instances = bookings }]
+  FromFacts { relations = defs, rules = [] }
+
+-- The facts route and its re-check of base facts and comparisons.
+
+solverDemoIsExpr : (v: Any) -> Bool
+solverDemoIsExpr v = case v of
+  ECall {} -> true
+  _ -> false
+
+solverDemoRuleNames : (rules: List Any) -> List String
+solverDemoRuleNames rules = map (\r -> r.name) rules
+
+solverDemoValueOf : (row: List SolveBinding) -> (e: Expr) -> Maybe Any
+solverDemoValueOf row e = case e of
+  ELit { value = v } -> Just v
+  EVar { name = n } -> solverDemoBinding row n
+  ECall { fnId = f, args = args } -> if f == "add" then solverDemoSum row args else Nothing
+  _ -> Nothing
+
+solverDemoSum : (row: List SolveBinding) -> (args: List Expr) -> Maybe Any
+solverDemoSum row args = case solverDemoValueOf row (at args 0) of
+  Nothing -> Nothing
+  Just a -> case solverDemoValueOf row (at args 1) of
+    Nothing -> Nothing
+    Just b -> if isNumber a && isNumber b then Just (a + b) else Nothing
+
+solverDemoCompare : (row: List SolveBinding) -> (f: String) -> (args: List Expr) -> Maybe Bool
+solverDemoCompare row f args = case solverDemoValueOf row (at args 0) of
+  Nothing -> Nothing
+  Just a -> case solverDemoValueOf row (at args 1) of
+    Nothing -> Nothing
+    Just b -> if f == "eq" then Just (a == b) else (if isNumber a && isNumber b then Just (solverDemoOrdered f a b) else Nothing)
+
+solverDemoOrdered : (f: String) -> (a: Number) -> (b: Number) -> Bool
+solverDemoOrdered f a b = if f == "lt" then a < b else if f == "lte" then a <= b else if f == "gt" then a > b else a >= b
+
+solverDemoCellsOf : (row: List SolveBinding) -> (args: List Expr) -> Maybe (List Any)
+solverDemoCellsOf row args = case head args of
+  Nothing -> Just []
+  Just a -> case solverDemoValueOf row a of
+    Nothing -> Nothing
+    Just v -> case solverDemoCellsOf row (fromMaybe [] (tail args)) of
+      Nothing -> Nothing
+      Just rest -> Just (concat [v] rest)
+
+solverDemoInstanceCells : (fieldOrder: List String) -> (item: Any) -> List Any
+solverDemoInstanceCells fieldOrder item = map (\f -> fromMaybe "" (lookup item f)) fieldOrder
+
+solverDemoAtomHolds : (defs: List Any) -> (row: List SolveBinding) -> (f: String) -> (args: List Expr) -> Maybe Bool
+solverDemoAtomHolds defs row f args = case find (\d -> d.name == f) defs of
+  Nothing -> Nothing
+  Just d -> case solverDemoCellsOf row args of
+    Nothing -> Nothing
+    Just cells -> Just (solverDemoFactHolds (map (solverDemoInstanceCells d.fieldOrder) d.instances) cells)
+
+solverDemoCheckAll : (defs: List Any) -> (ruleNames: List String) -> (row: List SolveBinding) -> (args: List Expr) -> Maybe Bool
+solverDemoCheckAll defs ruleNames row args =
+  let verdicts = map (\a -> solverDemoCheck defs ruleNames row a) args
+  if length (filter (\v -> v == Just false) verdicts) > 0 then Just false
+  else if length (filter (\v -> v == Nothing) verdicts) > 0 then Nothing
+  else Just true
+
+solverDemoCheck : (defs: List Any) -> (ruleNames: List String) -> (row: List SolveBinding) -> (e: Expr) -> Maybe Bool
+solverDemoCheck defs ruleNames row e = case e of
+  ECall { fnId = f, args = args } ->
+    if f == "and" then solverDemoCheckAll defs ruleNames row args
+    else if f == "not" then solverDemoNegate (solverDemoCheck defs ruleNames row (at args 0))
+    else if elem f ruleNames then Nothing
+    else if elem f ["eq", "lt", "lte", "gt", "gte"] then solverDemoCompare row f args
+    else solverDemoAtomHolds defs row f args
+  _ -> Nothing
+
+solverDemoNegate : (verdict: Maybe Bool) -> Maybe Bool
+solverDemoNegate verdict = case verdict of
+  Just b -> Just (not b)
+  Nothing -> Nothing
+
+solverDemoFactsEvidence : (count: Number) -> SolveEvidence
+solverDemoFactsEvidence count = SolveEvidence { method = join ["Relational solving over the supplied typed rows and rules (stratified least fixpoint): ", toString count, " answers."] "", checked = "Base facts and comparisons in each answer were re-checked against the rows here; facts derived by a rule rest on the solver's complete fixpoint over these rows.", steps = [], note = "Complete over these rows only (closed world): a fact absent from the rows is treated as false." }
+
+solverDemoFactsAnswer : (query: Any) -> (relations: List Any) -> (rules: List Any) -> Solutions
+solverDemoFactsAnswer query relations rules =
+  if solverDemoIsExpr query
+  then solverDemoFactsRows query relations rules (solverDemoQueryRel query relations rules)
+  else UnknownAnswer { reason = "FromFacts takes a query over named relations, built with the Expr helpers above." }
+
+solverDemoFactsRows : (query: Expr) -> (relations: List Any) -> (rules: List Any) -> (found: Maybe (List (List SolveBinding))) -> Solutions
+solverDemoFactsRows query relations rules found = case found of
+  Nothing -> UnknownAnswer { reason = "The relational solver abstained: the query or rows are outside its fragment, a condition could not be decided, or a variable is not grounded by a relation." }
+  Just rows -> if all rows (\row -> solverDemoCheck relations (solverDemoRuleNames rules) row query != Just false) then EveryAnswer { answers = rows, evidence = solverDemoFactsEvidence (length rows) } else UnknownAnswer { reason = "An answer failed the re-check against the rows, so none is shown." }
+
+-- Ready-made calls of solve, as ordinary data: each is one call on a
+-- predicate function above and a domain.
+
+@label "Solve: tickets sold"
+@description "solve ticketsSold AllNumbers: one exact answer, re-checked."
+@tags "demo" "solver" "linear"
+solveTicketsSold : Solutions
+solveTicketsSold = solve ticketsSold AllNumbers
+
+@label "Solve: the same line twice"
+@description "solve sameLineTwice AllNumbers: infinitely many answers, given as a family."
+@tags "demo" "solver" "linear"
+solveSameLineTwice : Solutions
+solveSameLineTwice = solve sameLineTwice AllNumbers
+
+@label "Solve: circle over whole numbers"
+@description "solve circleOfRadiusFive (WholeNumbers -5 5): every whole-number point of the circle x² + y² = 25."
+@tags "demo" "solver" "finite"
+solveCircleWholeNumbers : Solutions
+solveCircleWholeNumbers = solve circleOfRadiusFive (WholeNumbers { low = 0 - 5, high = 5 })
+
+@label "Solve: circle over all numbers"
+@description "solve circleOfRadiusFive AllNumbers: not linear, so the answer is Unknown, with the reason."
+@tags "demo" "solver" "finite"
+solveCircleAllNumbers : Solutions
+solveCircleAllNumbers = solve circleOfRadiusFive AllNumbers
+
+@native
+solverDemoReflect : (predicate: Any) -> ReifyOutcome
+
+@native
+solverDemoLinear : (outcome: ReifyOutcome) -> Any
+
+-- Starting arguments are ordinary data owned beside the functions. The
+-- callable is a function value, so consumers match identity, not an id string.
+-- One list per section keeps each declaration within the self-hosted
+-- parser's per-declaration budget.
+solverDemoStartingInputs : List ({ function: Any, arguments: List Any })
+solverDemoStartingInputs = flatten [solverDemoFirstInputs 0, solverDemoSolveInputs 0, solverDemoFiniteInputs 0, solverDemoRelationalInputs 0]
+
+solverDemoFirstInputs : (unit: Number) -> List ({ function: Any, arguments: List Any })
+solverDemoFirstInputs unit = [
+  { function = affineEquation, arguments = [2, 5, 6] },
+  { function = grandparentsOf, arguments = ["eleonora"] },
+  { function = bookBuyersBefore, arguments = ["book-b", 3, customerRows (), purchaseRows ()] },
+  { function = finiteIntersection, arguments = [1, 2] },
+  { function = quadraticEquation, arguments = [9] }
+]
+
+solverDemoSolveInputs : (unit: Number) -> List ({ function: Any, arguments: List Any })
+solverDemoSolveInputs unit = [
+  { function = solve, arguments = [ticketsSold, AllNumbers] },
+  { function = solve, arguments = [exactFractions, AllNumbers] },
+  { function = solve, arguments = [mixingSolutions, AllNumbers] },
+  { function = solve, arguments = [threeUnknowns, AllNumbers] },
+  { function = solve, arguments = [sameLineTwice, AllNumbers] },
+  { function = solve, arguments = [contradictoryTotals, AllNumbers] }
+]
+
+solverDemoFiniteInputs : (unit: Number) -> List ({ function: Any, arguments: List Any })
+solverDemoFiniteInputs unit = [
+  { function = solve, arguments = [circleOfRadiusFive, WholeNumbers { low = 0 - 5, high = 5 }] },
+  { function = solve, arguments = [circleOfRadiusFive, AllNumbers] },
+  { function = solve, arguments = [coinsMakeTwentyOne, WholeNumbers { low = 0, high = 10 }] }
+]
+
+solverDemoRelationalInputs : (unit: Number) -> List ({ function: Any, arguments: List Any })
+solverDemoRelationalInputs unit = [
+  { function = destinationsFrom, arguments = [Lille, railLinks 0] },
+  { function = oneChangeTrips, arguments = [Paris, Nice, 360, railLinks 0] },
+  { function = reachableOnlyFrom, arguments = [Bordeaux, Lyon, railLinks 0] },
+  { function = meetingSlots, arguments = ["Anna", "Bob", "Cleo", "Blue room", freeSlots 0, roomBookings 0] }
+]
+
+-- These declarations are the A4 host-evaluator re-entry boundary. Their
+-- implementations forward the supplied data to the existing curated engine
+-- harness; reasoning stays in its shipped Fenel bodies. No host act is added.
+@native
+solverDemoSolve : Expr -> Maybe Any
+
+@native
+solverDemoSolveAll : Expr -> Maybe (List Any)
+
+@native
+solverDemoSolveRelAll : Expr -> { relations: List ({ name: String, arity: Number, rows: List (List Any) }), rules: List Any } -> Maybe (List (List ({ name: String, value: Any })))
+
+@native
+solverDemoQueryRel : Expr -> List ({ name: String, fieldOrder: List String, instances: List Any }) -> List Any -> Maybe (List (List ({ name: String, value: Any })))
+
+@native
+solverDemoSolveRel : Expr -> { relations: List ({ name: String, arity: Number, rows: List (List Any) }), rules: List Any } -> Maybe (List ({ name: String, value: Any }))
+
+@native
+solverDemoQueryRelOne : Expr -> List ({ name: String, fieldOrder: List String, instances: List Any }) -> List Any -> Maybe (List ({ name: String, value: Any }))
+
+@native
+solverDemoSampleSet : Number -> SetExpr -> Maybe Any
+
+@native
+solverDemoMinOfSet : SetExpr -> Maybe Any
+
+@native
+solverDemoMaxOfSet : SetExpr -> Maybe Any
+
+@native
+solverDemoEnumerableSet : String -> SetExpr -> Maybe (List Any)
+
+@native
+solverDemoEnumerableSolveAll : String -> Expr -> Maybe (List Any)
+
+@native
+solverDemoEnumerableInhabit : { tag: String, base: String, set: SetExpr } -> Maybe (List Any)
+
+@native
+solverDemoEnumerableMinOfSet : String -> SetExpr -> Maybe Any
+
+@native
+solverDemoEnumerableMaxOfSet : String -> SetExpr -> Maybe Any
+
+@native
+solverDemoEnumerableSampleSet : String -> Number -> SetExpr -> Maybe Any
+
+@native
+solverDemoSolveSymbolic : List String -> Expr -> Maybe Any

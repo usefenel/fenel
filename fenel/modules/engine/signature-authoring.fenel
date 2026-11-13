@@ -1,0 +1,318 @@
+module engine where
+
+-- Runtime authoring checks reuse the existing validator/judgment. Its unknown
+-- diagnostics retain abstention; a definite validator refusal is negation.
+@category "engine-internal"
+authoringValidationMembership : (valid: Bool) -> (observations: List (Maybe Bool)) -> (plans: List ValidationAdmissionObservation) -> Maybe Bool
+authoringValidationMembership valid observations plans =
+  let exactPlan = \plan ->
+        case plan of
+          ValidationAdmissionExact {} -> true
+          _ -> false
+  case find exactPlan plans of
+    Just (ValidationAdmissionExact { verdict = verdict }) -> verdict
+    _ ->
+      let present = length plans > 0
+      let supportedPlan = \plan ->
+            case plan of
+              ValidationAdmissionNode { supported = supported } -> supported
+              _ -> true
+      let supported = std.all plans supportedPlan
+      let refutationPlan = \plan ->
+            case plan of
+              ValidationAdmissionNode { refutation = refutation } -> refutation
+              _ -> true
+      let refutation = std.all plans refutationPlan
+      let negativeObservation = \verdict ->
+            case verdict of
+              Just false -> true
+              _ -> false
+      let negativePlan = \plan ->
+            case plan of
+              ValidationAdmissionMember { verdict = Just false } -> true
+              _ -> false
+      let negative = std.some observations negativeObservation || std.some plans negativePlan
+      if valid && present && supported then Just true
+      else if not valid && present && supported && refutation && negative then Just false
+      else Nothing
+
+@category "engine-internal"
+authoringInvocationContractIssue : (scheme: JsonLogic Any) -> (supplied: Nat) -> Maybe String
+authoringInvocationContractIssue scheme supplied =
+  let body = abeGet scheme "body"
+  if length (abeItems (abeGet scheme "quantified")) > 0 || not (abeHas body "$arrow")
+  then Just "This function's invocation type is undecided in this reader."
+  else if not (eq supplied (length (abeItems (abeGet (abeGet body "$arrow") "params"))))
+    then Just "This function's input contract does not match its callable parameters."
+    else Nothing
+
+@category "engine-internal"
+authoringInvocationMembershipIssue : (verdict: Maybe Bool) -> (position: String) -> Maybe String
+authoringInvocationMembershipIssue verdict position = case verdict of
+  Just true -> Nothing
+  Just false -> Just (concat "This function's " (concat position " does not inhabit its declared type."))
+  _ -> Just (concat "Membership of this function's " (concat position " is undecided; the invocation was refused."))
+
+@category "engine-internal"
+authoringInvocationGroundScheme : (scheme: JsonLogic Any) -> Bool
+authoringInvocationGroundScheme scheme =
+  eq (length (abeItems (abeGet scheme "quantified"))) 0 && abeHas (abeGet scheme "body") "$arrow"
+
+@category "engine-internal"
+authoringInvocationHasDeclaration : (declaration: JsonLogic Any) -> Bool
+authoringInvocationHasDeclaration declaration =
+  std.all (abeItems (abeGet declaration "params")) (\slot -> eq (abeText (abeGet slot "$tag")) "Authored") && eq (abeText (abeGet (abeGet declaration "returns") "$tag")) "Authored"
+
+@category "engine-internal"
+authoringInvocationCallableMembership : (compatibility: String) -> Maybe Bool
+authoringInvocationCallableMembership compatibility =
+  if eq compatibility "compatible" then Just true
+  else if eq compatibility "incompatible" then Just false
+  else Nothing
+
+-- Ported from creation-validation.ts without changing Save behavior: an actual
+-- value's decided membership wins; abstention keeps the existing compatibility
+-- verdict and unknown tolerance. This is Save policy, not a membership proof.
+@category "engine-internal"
+authoringSaveResultVerdict : (compatibility: String) -> (membership: Maybe Bool) -> Maybe Bool
+authoringSaveResultVerdict compatibility membership = case membership of
+  Just verdict -> Just verdict
+  Nothing -> authoringInvocationCallableMembership compatibility
+
+-- Display only. Source-proven callable compatibility remains positive when
+-- arrow membership abstains. A nested exact Pattern's NotYet remains amber
+-- at its containing creation; it claims no common extension or membership.
+@category "engine-internal"
+authoringCreationFeedbackState : (verdict: Maybe Bool) -> (incomplete: Bool) -> (refused: Bool) -> (states: List HintRuleState) -> HintRuleState
+authoringCreationFeedbackState verdict incomplete refused states =
+  let blockedState = \state ->
+        case state of
+          HintBlocked -> true
+          _ -> false
+  let ongoingState = \state ->
+        case state of
+          HintNotYet -> true
+          _ -> false
+  let blocked = std.some states blockedState
+  let ongoing = std.some states ongoingState
+  if blocked then HintBlocked
+  else if incomplete then HintNotYet
+  else if ongoing then HintNotYet
+  else case verdict of
+    Just true -> if refused then HintNotMet else HintPass
+    Just false -> HintNotMet
+    Nothing -> if refused then HintNotMet else HintUnknown
+
+-- This is representation projection, not an arrow-membership proof. Each
+-- refinement encountered on the way is checked against the actual callable.
+@category "engine-internal"
+authoringInvocationTypeLayer : (body: JsonLogic Any) -> { kind: String, reference: String, path: List String, setPath: List String }
+authoringInvocationTypeLayer body =
+  if abeHas body "$arrow" then { kind = "arrow", reference = "", path = [], setPath = [] }
+  else if abeHas body "$ref" then { kind = "reference", reference = abeText (abeGet body "$ref"), path = [], setPath = [] }
+  else if abeHas body "$refined" then { kind = "refinement", reference = "", path = ["$refined", "base"], setPath = ["$refined", "set"] }
+  else if abeHas body "$opaque" || abeHas body "$record" || abeHas body "$variant" || abeHas body "$unit" || abeHas body "$void" || abeHas body "$tuple" || abeHas body "$map" || abeHas body "$type"
+    then { kind = "data", reference = "", path = [], setPath = [] }
+  else { kind = "unavailable", reference = "", path = [], setPath = [] }
+
+@category "engine-internal"
+authoringMembershipNominalHeadPath : (body: JsonLogic Any) -> Maybe (List String)
+authoringMembershipNominalHeadPath body =
+  if abeHas body "$ref" then Just ["$ref"]
+  else
+    let call = abeItems (abeGet (abeGet body "$el") "call")
+    case head call of
+      Just (JlString {}) -> Just ["$el", "call", "0"]
+      Just target -> if abeHas target "$ref" then Just ["$el", "call", "0", "$ref"] else Nothing
+      Nothing -> Nothing
+
+-- Editor declaration facts are ingress, before the existing inference engine
+-- has established any effective signature. An inferred result is Absent here;
+-- a preview never becomes declaration authority or inferred evidence.
+-- Scheme-match classification below is ported from call-guidance.ts. Its
+-- intentional correction checks complete schemes when either side carries
+-- nominal evidence; the old raw-body shortcut required evidence on both.
+-- Other classification and unresolved-reference abstentions are preserved.
+-- Result-refusal wording is ported from the Save and inline-editor templates.
+-- It now explains captured root declaration differences; unavailable or
+-- nested-only evidence keeps a general full-type message. Verdicts are unchanged.
+
+@category "engine-internal"
+authoringSignatureParameterSlots : (remaining: Nat) -> List String
+authoringSignatureParameterSlots remaining =
+  if lte remaining 0 then []
+  else concat ["authored"] (authoringSignatureParameterSlots (sub remaining 1))
+
+@label "Authoring signature ingress"
+@description "Produce explicit parameter declaration facts and an absent or authored result fact. Inference previews never supply declaration provenance."
+@tags "engine" "authoring" "signature"
+authoringSignatureIngressPlan : (parameterCount: Nat) -> (inferResult: Boolean) -> { params: List String, returns: String }
+authoringSignatureIngressPlan parameterCount inferResult =
+  { params = authoringSignatureParameterSlots parameterCount,
+    returns = if inferResult then "absent" else "authored" }
+
+@label "Authoring inference outcome"
+@description "Project the existing inference verdict for editor presentation. This neither infers a type nor creates signature trust."
+@tags "engine" "authoring" "signature"
+authoringInferenceOutcomePlan : (outcome: InferenceOutcome) -> { status: String, label: String, needsAnnotation: Boolean, invalid: Boolean }
+authoringInferenceOutcomePlan outcome =
+  case outcome of
+    Solved -> { status = "solved", label = "Inferred result", needsAnnotation = false, invalid = false }
+    AnnotationRequired -> { status = "annotation-required", label = "Result annotation needed", needsAnnotation = true, invalid = false }
+    Invalid -> { status = "invalid", label = "Invalid expression", needsAnnotation = false, invalid = true }
+
+@label "Authored expression contains an empty slot"
+@description "Check raw expression completeness before the canonical function inference request. Null and boundary-absent values are empty; every array item and object/tag payload is checked without inferring any type."
+@tags "engine" "authoring" "signature"
+authoringExpressionHasEmptySlot : (node: JsonLogic Any) -> Boolean
+authoringExpressionHasEmptySlot node = case node of
+  JlNull -> true
+  JlArray { items = items } -> fold (\empty item -> or empty (authoringExpressionHasEmptySlot item)) false items
+  JlObject { fields = fields } -> fold (\empty field -> or empty (authoringExpressionHasEmptySlot field.value)) false fields
+  JlTagged { fields = fields } -> fold (\empty field -> or empty (authoringExpressionHasEmptySlot field.value)) false fields
+  _ -> false
+
+@label "Authored function save verdict"
+@description "Project the existing canonical outcome for save admission: invalid always refuses; annotation-required requests an explicit result only while inference is selected. Explicit result annotations retain the existing undecided tolerance."
+@tags "engine" "authoring" "signature"
+authoringFunctionSaveVerdict : (inferResult: Boolean) -> (outcome: InferenceOutcome) -> { invalid: Boolean, needsAnnotation: Boolean }
+authoringFunctionSaveVerdict inferResult outcome = case outcome of
+  Invalid -> { invalid = true, needsAnnotation = false }
+  AnnotationRequired -> { invalid = false, needsAnnotation = inferResult }
+  Solved -> { invalid = false, needsAnnotation = false }
+
+-- The canonical equation abstains at a set former (Void, union, intersection,
+-- complement): `f : Anything = "abc"` does not unify, nor does `f : Void = 42`.
+-- An authored result is trusted without a body check once saved, so such an
+-- abstention cannot simply pass Save. The existing containment verdict of the
+-- body's own inferred result against the declared result then decides:
+-- "incompatible" refuses; any other answer keeps the explicit-result tolerance.
+
+@label "Authored function result needs a containment verdict"
+@description "True when an authored result met the canonical equation's set-former abstention, so Save must consult the existing containment verdict of the body's inferred result against the declared result."
+@tags "engine" "authoring" "signature"
+authoringFunctionResultNeedsContainment : (inferResult: Boolean) -> (outcome: InferenceOutcome) -> Boolean
+authoringFunctionResultNeedsContainment inferResult outcome =
+  if inferResult then false
+  else case outcome of
+    AnnotationRequired { diagnostics = diagnostics } -> std.some diagnostics (\diagnostic -> eq diagnostic.code "inference.set-former-indeterminate")
+    _ -> false
+
+@label "Authored function save verdict with result containment"
+@description "The save verdict, refusing an authored result that met a set-former abstention when the existing containment verdict of the body's inferred result is incompatible. Compatible and unknown keep the existing verdict."
+@tags "engine" "authoring" "signature"
+authoringFunctionCheckedSaveVerdict : (inferResult: Boolean) -> (outcome: InferenceOutcome) -> (resultCompatibility: String) -> { invalid: Boolean, needsAnnotation: Boolean }
+authoringFunctionCheckedSaveVerdict inferResult outcome resultCompatibility =
+  if and (authoringFunctionResultNeedsContainment inferResult outcome) (eq resultCompatibility "incompatible")
+  then { invalid = true, needsAnnotation = false }
+  else authoringFunctionSaveVerdict inferResult outcome
+
+-- Scheme matching consumes the existing containment/inference verdicts. A
+-- displayed compatibility body cannot erase declaration-owned nominal facts.
+
+@category "engine-internal"
+authoringInferenceMismatchOutcome : (outcome: InferenceOutcome) -> Boolean
+authoringInferenceMismatchOutcome outcome = case outcome of
+  Invalid { diagnostics = diagnostics } ->
+    std.some diagnostics (\diagnostic -> and (not (eq diagnostic.code "inference.kind-mismatch")) (or (contains diagnostic.code "mismatch") (or (contains diagnostic.code "occurs-check") (or (contains diagnostic.code "arity") (contains diagnostic.code "refinement-rejected")))))
+  _ -> false
+
+@category "engine-internal"
+authoringSchemeNominalHead : (scheme: JsonLogic Any) -> Maybe String
+authoringSchemeNominalHead scheme =
+  case find (\item -> eq (length (abeItems (abeGet item "path"))) 0) (abeItems (abeGet scheme "nominals")) of
+    Just owner -> Just (abeText (abeGet owner "identity"))
+    Nothing ->
+      case find (\item -> eq (length (abeItems (abeGet item "path"))) 0) (abeItems (abeGet scheme "applications")) of
+        Just application ->
+          case abeGet application "headRef" of
+            JlString { value = reference } -> Just (concat "ref:" reference)
+            _ -> Nothing
+        Nothing -> Nothing
+
+@label "Authoring result mismatch message"
+@description "Explain an already refused result using supplied display names and captured root declaration metadata. This presentation does not decide compatibility; unavailable transport or nested-only evidence retains a general full-type explanation."
+@category "engine-internal"
+authoringResultMismatchMessage : (actualName: String) -> (expectedName: String) -> (actual: JsonLogic Any) -> (wanted: JsonLogic Any) -> String
+authoringResultMismatchMessage actualName expectedName actual wanted =
+  if not (eq actualName expectedName) then
+    concat "This expression returns " (concat actualName (concat ". Finish with " (concat expectedName " before saving.")))
+  else
+    let finish = concat " Use the required " (concat expectedName " type before saving.")
+    let general = concat "Both types are displayed as " (concat expectedName ", but their full types do not match. Check the required type's structure and constraints before saving.")
+    if not (and (abeHas (abeGet actual "body") "$ref") (abeHas (abeGet wanted "body") "$ref")) then general
+    else case authoringSchemeNominalHead actual of
+      Nothing -> case authoringSchemeNominalHead wanted of
+        Nothing -> general
+        Just identity -> concat "This result is called " (concat actualName (concat ", but it is missing the required type's declaration." finish))
+      Just actualIdentity -> case authoringSchemeNominalHead wanted of
+        Nothing -> concat "This result carries the " (concat actualName (concat " declaration, but the required type does not share it." finish))
+        Just wantedIdentity ->
+          if eq actualIdentity wantedIdentity then general
+          else concat "Both types are called " (concat expectedName (concat ", but they come from different declarations." finish))
+
+@label "Authoring scheme checked match"
+@description "Project a completed canonical inference outcome without promoting unavailable evidence. The supplied success match is used only when the canonical checker solved the complete equation."
+@category "engine-internal"
+authoringSchemeCheckedMatch : (successMatch: String) -> (outcome: InferenceOutcome) -> String
+authoringSchemeCheckedMatch successMatch outcome = case outcome of
+  Solved -> successMatch
+  _ -> if authoringInferenceMismatchOutcome outcome then "mismatch" else "unavailable"
+
+@label "Authoring scheme match plan"
+@description "Plan authoring compatibility from the existing containment verdict and complete scheme evidence. Nominal facts on either side require canonical complete-scheme checking. Its specific set-former fence can retain proven containment of an existing intrinsic scalar into the exact universal target; other source forms remain fenced."
+@category "engine-internal"
+authoringSchemeMatchPlan : (actual: JsonLogic Any) -> (wanted: JsonLogic Any) -> (compatibility: String) -> (checked: Maybe InferenceOutcome) -> { needsInference: Boolean, match: String }
+authoringSchemeMatchPlan actual wanted compatibility checked =
+  if not (and (abeHas actual "body") (abeHas wanted "body")) then
+    case checked of
+      Nothing -> { needsInference = true, match = "unavailable" }
+      Just outcome -> { needsInference = false, match = authoringSchemeCheckedMatch "unavailable" outcome }
+  else
+    let actualVariables = abeItems (abeGet actual "quantified")
+    let wantedVariables = abeItems (abeGet wanted "quantified")
+    let hasOwners = or (gt (length (abeItems (abeGet actual "nominals"))) 0) (gt (length (abeItems (abeGet wanted "nominals"))) 0)
+    if and (eq compatibility "compatible") (not hasOwners) then
+      { needsInference = false, match = if abeHas (abeGet actual "body") "$var" then "adaptable" else "direct" }
+    else if and (eq compatibility "incompatible") (and (eq (length actualVariables) 0) (eq (length wantedVariables) 0)) then
+      { needsInference = false, match = "mismatch" }
+    else case checked of
+      Nothing -> { needsInference = true, match = "unavailable" }
+      Just outcome ->
+        -- The caller's fixed equation checks transport and sidecar consistency,
+        -- not owner acquisition or every value-position kind. Admit only the
+        -- existing intrinsic scalar identities at an exact nominal leaf: this
+        -- has no application or nested position that could be under-applied.
+        let groundScalar = case abeGet actual "body" of
+          JlObject { fields = fields } ->
+            if not (eq (length fields) 1) then false
+            else case abeGet (abeGet actual "body") "$ref" of
+              JlString { value = publicName } ->
+                case authoringSchemeNominalHead actual of
+                  Just identity -> inferenceGroundBuiltinNominalIdentity publicName identity
+                  Nothing -> false
+              _ -> false
+          _ -> false
+        let universalTarget = case abeGet wanted "body" of
+          JlObject { fields = outerFields } ->
+            if not (eq (length outerFields) 1) then false
+            else case abeGet (abeGet wanted "body") "$complement" of
+              JlObject { fields = innerFields } ->
+                if not (eq (length innerFields) 1) then false
+                else case abeGet (abeGet (abeGet wanted "body") "$complement") "$void" of
+                  JlBool { value = value } -> value
+                  _ -> false
+              _ -> false
+          _ -> false
+        let preparedSetFormerFence = case outcome of
+          AnnotationRequired { diagnostics = diagnostics } ->
+            eq (length diagnostics) 1 && std.all diagnostics (\diagnostic -> eq diagnostic.code "inference.set-former-indeterminate")
+          _ -> false
+        if eq compatibility "compatible" && groundScalar && universalTarget && preparedSetFormerFence then
+          { needsInference = false, match = "direct" }
+        else
+          let sameNominalHead = case authoringSchemeNominalHead actual of
+            Nothing -> false
+            Just identity -> eq (Just identity) (authoringSchemeNominalHead wanted)
+          let successMatch = if or (eq compatibility "compatible") (or sameNominalHead (eq (length actualVariables) 0)) then "direct" else "adaptable"
+          { needsInference = false, match = authoringSchemeCheckedMatch successMatch outcome }

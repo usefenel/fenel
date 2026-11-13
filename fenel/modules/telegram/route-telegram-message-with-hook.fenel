@@ -1,0 +1,139 @@
+-- routeTelegramMessageWithHook — handle an inbound user reply on
+-- an active form-fill conversation that carries an `onFieldFn` hook.
+--
+-- Semantics:
+--   - /cancel → cancel the conversation outright.
+--   - /back   → step to the previous field, drop its old answer,
+--               re-prompt.
+--   - else    → look up the current field, parse the reply, hand
+--               the result to the user hook, interpret the
+--               returned CollectorAction, and apply it (abort,
+--               skip_to, send_then_default, fall_through). The
+--               default behaviour (parse failure → reprompt;
+--               success → advance / confirm) lives in
+--               `defaultFieldHandling` so the hook's
+--               send_then_default and fall_through cases share
+--               the same downstream code path.
+--
+-- Returns Boolean — true iff a conversation was matched (this
+-- body does not run unless the caller already established a
+-- conversation; the boolean tracks "the bot acted on this reply").
+--
+-- module-substrate Phase 3o (2026-05-31) — migrated to `module telegram where`.
+-- The defineFunction spec + ROUTE_TELEGRAM_MESSAGE_WITH_HOOK_BODY extraction
+-- RETIRED; identity rides @facet directives. The two helpers (handleBackStep /
+-- defaultFieldHandling) stay directive-free → Codeable-only (3j default). Def
+-- name === codeName. `requires` INFERRED. Bodies UNCHANGED.
+
+module telegram where
+
+@label "Route Telegram reply (with onField hook)"
+@description "Handle a user reply on an active form-fill conversation that carries an onFieldFn hook. Handles /cancel and /back inline, then parses the field, calls the user hook with the parse result, interprets the returned CollectorAction, and applies one of: abort / skip_to / send_then_default / fall_through. The default behaviour (parse failure → reprompt; success → advance / confirm) is shared with the no-hook router via the helper bodies in the same .fenel file."
+@tags "telegram" "collector" "io" "form" "routing" "hook"
+@ioAction "telegram_form.route_message_with_hook"
+routeTelegramMessageWithHook : (botId: String) -> (chatId: Int) -> (userId: Int) -> (text: String) -> (messageDate: Maybe Int) -> Boolean
+-- messageDate is plumbed through but not yet gated on in this body —
+-- the no-hook path gets the stale-message gate first; this body will
+-- follow once we settle on hook semantics for stale-input handling.
+routeTelegramMessageWithHook botId chatId userId text messageDate =
+  let convMaybe = findActiveConversation botId chatId userId
+  case convMaybe of
+    Nothing -> false
+    Just conv ->
+      let botMaybe = findBotById botId
+      case botMaybe of
+        Nothing -> false
+        Just bot ->
+          if not bot.enabled
+          then false
+          else
+            let trimmed = lower (trim text)
+            if trimmed == "/cancel"
+            then
+              markConversationCancelled conv.id
+              sendMessageText bot.token chatId "Cancelled. Send /start to begin again."
+              true
+            else if trimmed == "/back"
+            then handleBackStep bot conv chatId
+            else
+              if conv.currentFieldIndex < 0 or conv.currentFieldIndex >= length conv.fields
+              then
+                markConversationCompleted conv.id
+                true
+              else
+                  let field = at conv.fields conv.currentFieldIndex
+                  let parsed = parseFieldInput text field
+                  let hookActionMaybe = case conv.hooks.onFieldFn of
+                    Nothing -> Nothing
+                    Just fn ->
+                      callHookFunctionRecord fn { fieldName = field.name, rawInput = text, result = parsed, partialValues = conv.partialValue }
+                  let decision = case hookActionMaybe of
+                    Nothing -> { kind = "fall_through" }
+                    Just action ->
+                      interpretCollectorAction action field parsed conv.fields conv.currentFieldIndex conv.partialValue
+                  case decision.kind of
+                    "abort" ->
+                      markConversationCancelled conv.id
+                      sendMessageText bot.token chatId "Conversation ended."
+                      true
+                    "skip_to" ->
+                      updateConversationProgress conv.id decision.newPartial decision.nextIndex
+                      sendFieldPrompt bot.token chatId decision.nextField
+                      true
+                    "send_then_default" ->
+                      sendMessageText bot.token chatId decision.message
+                      defaultFieldHandling bot conv chatId field parsed
+                    _ -> defaultFieldHandling bot conv chatId field parsed
+
+-- /back at field-fill: step to the previous field, drop its
+-- existing answer (so the prompt re-asks), and re-prompt. No-op
+-- when already on the first field (just a friendly message).
+
+-- Bot/conversation/field rows arrive through the deliberately dynamic `{}`
+-- state boundary. Index arithmetic is `Number`-based while the IO surface keeps
+-- its historical `Int` contract, so bounded exact inference cannot derive this
+-- helper without pretending either nominal congruence or row polymorphism.
+handleBackStep : ({}) -> ({}) -> Int -> Boolean
+handleBackStep bot conv chatId =
+  let prevIdx = conv.currentFieldIndex - 1
+  if prevIdx < 0
+  then
+    sendMessageText bot.token chatId "Already on the first question."
+    true
+  else if prevIdx >= length conv.fields
+  then true
+  else
+    let prevField = at conv.fields prevIdx
+    let partial = mapDelete conv.partialValue prevField.name
+    updateConversationProgress conv.id partial prevIdx
+    sendFieldPrompt bot.token chatId prevField
+    true
+
+-- Default field-fill behaviour, shared by the no-hook fall_through
+-- and send_then_default arms. Parse failure → reprompt with the
+-- field label and a /back hint. Parse success → advance or
+-- transition to the confirmation step on the last field.
+
+-- As above, the row-shaped inputs and Int/Number index transition are an honest
+-- annotation boundary for the shipped rank-1 exact-record fragment.
+defaultFieldHandling : ({}) -> ({}) -> Int -> ({}) -> FieldParseResult -> Boolean
+defaultFieldHandling bot conv chatId field parsed =
+  case parsed of
+    ParseFailed { error = err } ->
+      let label = fieldLabel field
+      sendMessageText bot.token chatId `${err}\n\nField: ${label}\nReply with a corrected value, or send /back to revisit a previous question.`
+      true
+    Parsed { value = v } ->
+      let nextValue = mapSet conv.partialValue field.name v
+      let nextIndex = conv.currentFieldIndex + 1
+      if nextIndex >= (length conv.fields)
+      then
+        updateConversationProgress conv.id nextValue nextIndex
+        markConversationConfirming conv.id
+        sendConfirmationSummary bot.token chatId conv.fields nextValue
+        true
+      else
+        let nextField = at conv.fields nextIndex
+        updateConversationProgress conv.id nextValue nextIndex
+        sendFieldPrompt bot.token chatId nextField
+        true

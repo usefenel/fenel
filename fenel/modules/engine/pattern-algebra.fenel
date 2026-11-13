@@ -1,0 +1,880 @@
+module engine where
+
+-- =========================================================================
+-- The Pattern algebra in Fenel — Brzozowski derivatives over `List a` lifted
+-- to a PARSER (named-production recursion + value-carrying reductions + the
+-- strict whole-grammar token step + least-fixpoint nullability). parser-
+-- substrate Phase 1 (brief:
+-- `workstreams/parser-substrate/briefs/phase-1-pattern-algebra.md`).
+--
+-- This is the algorithmic heart of the parser port. The shipped TS algebra
+-- (`engine/src/pattern.ts`) is a boolean recognizer + structured capture,
+-- generic over tokens, full SetExpr per element — it is the DIFFERENTIAL
+-- ORACLE on the shared fragment (match/seq/alt/rep over enum/interval
+-- predicates). What parsing needs and the TS algebra lacks, this file adds:
+--
+--   • reduction nodes (`PRed` — a Fenel lambda VALUE) + value-carrying eps
+--     (`PEpsV` — Might & Darais ε-with-a-tree, single-valued);
+--   • named-production recursion (`PRef` + a threaded `Grammar` assoc-list
+--     env) — left/mutual recursion that the strict step makes TERMINATE;
+--   • least-fixpoint nullability + parseNull (probe-5-proven the genuine
+--     hard bit: naive non-recursive nullability is UNSOUND);
+--   • `wsMember` — the missing Ws-marker membership decider (`WsWhere ⇒
+--     false`, the TS conservative-false posture exactly);
+--   • compaction via smart constructors (`mkRed (PEpsV v) f = PEpsV (f v)`
+--     is the load-bearing one).
+--
+-- SINGLE-RESULT (NO parse forest) — Fenel's grammar is unambiguous; first
+-- `Just` wins on `PAlt` (P0-locked).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- DON'T CONFLATE THE TWO `Pattern`s. The match-pattern ADT (`fenel/std/
+-- syntax.fenel`, expr-substrate P1) owns the name `Pattern`. The algebra ADT
+-- HERE is `Pat` (distinct on purpose); the threaded production env is the
+-- assoc list `[{ name, pat }]` (informally "Grammar").
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- PREDICATES = Ws MARKERS (the `$`-key barrier — a `.fenel` body cannot
+-- author `$`-prefixed-key objects, so `PMatch` carries a plain-record `Ws*`
+-- marker, NOT a `$`-keyed SetExpr — the same vocabulary `solve.fenel` builds
+-- and `enumerate.fenel`'s `setExtension` reads). The decidable fragment:
+--   { tag = "WsAll" }                       — universe (everything matches)
+--   { tag = "WsNone" }                      — empty
+--   { tag = "WsEnum", values = [v, …] }     — finite (eq-scan)
+--   { tag = "WsPrefix", prefix = "num\0" }  — string PREFIX (startsWith) — the
+--                                             7g perf refinement: a value class
+--                                             whose membership is "this token's
+--                                             TYPE tag is <cls>" is `startsWith x
+--                                             "<cls>\0"` (O(prefix)), NOT a
+--                                             per-input `WsEnum` eq-scan over the
+--                                             whole group's vocabulary (O(group)).
+--                                             Semantics-identical on the actual
+--                                             input alphabet (a token is in
+--                                             `vocabFor toks cls` ⟺ its encoded
+--                                             form starts with `cls\0`); see the
+--                                             Design-E note in expr-grammar.fenel.
+--   { tag = "WsInterval", lo = MB, hi = MB } — MB = Maybe { value, inclusive }
+--   { tag = "WsUnion", branches = [Ws, …] } — ∪
+--   { tag = "WsIntersect", branches = [Ws, …] } — ∩
+--   { tag = "WsComplement", inner = Ws }    — ¬
+--   { tag = "WsWhere" }                     — out-of-fragment ⇒ false (the TS
+--                                             `contains`→conservative-false)
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE STRICT WHOLE-GRAMMAR TOKEN STEP (no laziness anywhere — decision 5).
+-- Deriving w.r.t. a token rebuilds the env in ONE finite pass: every
+-- production reachable from the current pattern gets a derived sibling whose
+-- body is `derivPat` of its old body, where `derivPat (PRef m) = PRef m` — a
+-- ref to the (separately) derived production, NO recursion into refs. THAT is
+-- what makes left-recursion terminate strictly. Nullability consulted during
+-- the PSeq derivative reads the OLD env's fixpoint (`na`/`pa` threaded).
+-- Reachability-prune each step (only reachable productions are derived).
+--
+-- This implementation names derived productions by their LINEAGE `base@birth`
+-- (bounded, O(1)-length — parser-substrate 7h): the FIRST time an original
+-- `base` is referenced (step k) it spawns `base@k`; on every later step that
+-- lineage is re-derived UNDER THE SAME NAME (`bumpName` is idempotent on a name
+-- already carrying `@`). The originals stay live, un-derived, so a kept tail's
+-- `PRef base` re-enters a FRESH `base@k'`. Distinct lineages (`Expr@6` vs
+-- `Expr@7`, born at different steps) stay distinct — they are genuinely
+-- different parse states. The pre-7h version appended the WHOLE step history
+-- (`base@b1@b2@…@k`), an O(k)-long name; the bounded name shortens it. (S0 read
+-- the O(k) name as the dominant super-linear term, but S1a's measurement showed
+-- `eq` short-circuits so the name length is NOT the dominant cost — the floor is
+-- the linearly-growing `|g|` × the O(|g|) linear-scan env lookups. 7h S2 attacks
+-- THAT floor: every name-keyed lookup (`findEntry`-backed `lookupBool`/`lookupVal`/
+-- `bodyOf`) + the reachability/prune membership tests now read a `fromEntries`-built
+-- name→value INDEX via the O(1) `mapGet` native (the opaque-map perf branch, Rom-
+-- approved lever B) — the pure assoc-list stays the source of truth, the JS-object
+-- index is its perf rep, so the per-step cost drops O(|g|²) ⇒ ~O(|g|) and the corpus
+-- curve cubic ⇒ ~quadratic, byte-identically (env names are unique by the
+-- bumpName/dedup invariant ⇒ first-match `findEntry` ≡ the index read). Because a
+-- re-derived `base@birth` now shares its name with its prior-step row,
+-- `stepGrammarWith` DEDUPS the carried-forward env BY NAME (newSibs-first), which
+-- drops ONLY the superseded duplicates — the originals AND any prior derivative a
+-- kept tail still re-enters are carried forward intact. (parser-substrate Phase 8
+-- then ELIMINATES the dead `∅` rows this leaves reachable through opaque `PRef`s —
+-- see "Empty-language ELIMINATION" below — bounding `|g|` from O(k) rows to
+-- O(grammar), so the total parse goes ~LINEAR: it closes the 7h-S2 residual
+-- quadratic, native-free + byte-identical. The decisive S0 measurement that found
+-- this — distinct structural shapes plateau while `|g|` grows O(k), 44% dead rows
+-- — is in `workstreams/parser-substrate/notes/phase-8-feasibility.md`.)
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- FIXPOINTS = bounded Kleene iteration over the env, threaded (decision 6).
+-- `nullableFix` (Bool lattice, start all-false) and `parseNullFix` (Maybe-
+-- value lattice, start all-Nothing, first-Just-wins). Both monotone over a
+-- finite env ⇒ converge in ≤ |g| steps; we iterate `|g| + 1` (total, no
+-- equality-probe needed). first-Just-wins is deterministic: PAlt tries the
+-- left branch first and the recursive branch of a left-recursive production
+-- is non-nullable, so a production never flips Just→Just'.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- DELIBERATE DIVERGENCE FROM TS `mkSeq` (recognizer-only): TS collapses
+-- `seq eps b = b`. Here `mkSeq` collapses ONLY the `PEmpty` annihilations and
+-- KEEPS `PEps`/`PEpsV`, because the parse VALUE depends on the pair nesting
+-- (`PSeq` parseNulls to `{ fst, snd }`). Recognition is unaffected (the
+-- language is identical); the differential oracle stays green. The PSeq
+-- derivative captures the null value of `a` at DERIVATION time via a red
+-- (decision 7) — correctness does NOT rely on a `mkSeq` eps-collapse.
+--
+-- UNBOUNDED REP: `PRep`'s `max` is a plain number; `-1` (negate 1) is the
+-- unbounded sentinel (max ≥ min ≥ 0, so -1 is never a real bound). Mirrors
+-- `pattern.ts`'s `Infinity` arithmetic: decrement keeps -1, min floors at 0.
+--
+-- NO LAWS declared (the algebra's laws — D distributes over alt, etc. — are a
+-- later add); obligations stay put. `Pat` IS a registered ADT (decision 2) —
+-- so this phase MOVES lock/roster/matrix by a documented entity+fn delta.
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- The algebra ADT. Recursive sub-patterns are typed `Pat`; the opaque slots
+-- (`value` / `ws` / `min` / `max` / `fn`) are `a` (unconstrained): `ws` is a
+-- Ws marker, `fn` a Fenel lambda value, `value` a parsed tree, min/max
+-- numbers. `PRef name` is a String key into the threaded env.
+-- -------------------------------------------------------------------------
+
+Pat a =
+  PEmpty
+  | PEps
+  | PEpsV value: a
+  | PMatch ws: a
+  | PSeq left: Pat a right: Pat a
+  | PAlt left: Pat a right: Pat a
+  | PRep child: Pat a min: a max: a
+  | PRed child: Pat a fn: a
+  | PRef name: String
+
+
+-- =========================================================================
+-- wsMember — the decidable Ws-marker membership decider.
+-- =========================================================================
+
+@label "Ws member"
+@description "Decide `x ∈ ws` over the decidable Ws-marker fragment: WsAll ⇒ true; WsNone/WsWhere ⇒ false (WsWhere is the TS `contains`→conservative-false posture); WsEnum ⇒ eq-scan; WsPrefix ⇒ `startsWith x prefix` (the 7g O(prefix) value-class membership — see the Ws-fragment + Design-E notes); WsInterval ⇒ numeric compare honouring each bound's inclusivity + a missing (Nothing) bound = unbounded that side; WsUnion ⇒ any branch; WsIntersect ⇒ all branches; WsComplement ⇒ negation. The missing membership primitive the Ws vocabulary lacked (solve builds markers, enumerate reads extensions, nobody decided `v ∈ ws`). parser-substrate Phase 1."
+@tags "engine" "parser" "pattern-algebra" "set" "parser-substrate" "phase-1"
+wsMember : (ws: a) -> (x: a) -> Boolean
+wsMember ws x =
+  if eq ws.tag "WsAll" then true
+  else if eq ws.tag "WsNone" then false
+  else if eq ws.tag "WsWhere" then false
+  else if eq ws.tag "WsEnum" then anyEq ws.values x
+  else if eq ws.tag "WsPrefix" then startsWith x ws.prefix
+  else if eq ws.tag "WsInterval" then intervalMember ws.lo ws.hi x
+  else if eq ws.tag "WsUnion" then anyMember ws.branches x
+  else if eq ws.tag "WsIntersect" then allMember ws.branches x
+  else if eq ws.tag "WsComplement" then not (wsMember ws.inner x)
+  else false
+
+@label "Any eq"
+@description "True when some element of `vals` is `eq` to `x` (the WsEnum scan). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+anyEq : (vals: a) -> (x: a) -> Boolean
+anyEq vals x =
+  case head vals of
+    Nothing -> false
+    Just v ->
+      if eq v x then true
+      else
+        case tail vals of
+          Nothing -> false
+          Just rest -> anyEq rest x
+
+@label "Any member"
+@description "True when `x` is a wsMember of some branch (WsUnion). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+anyMember : (branches: a) -> (x: a) -> Boolean
+anyMember branches x =
+  case head branches of
+    Nothing -> false
+    Just b ->
+      if wsMember b x then true
+      else
+        case tail branches of
+          Nothing -> false
+          Just rest -> anyMember rest x
+
+@label "All member"
+@description "True when `x` is a wsMember of every branch (WsIntersect; empty ⇒ true). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+allMember : (branches: a) -> (x: a) -> Boolean
+allMember branches x =
+  case head branches of
+    Nothing -> true
+    Just b ->
+      if wsMember b x
+      then
+        case tail branches of
+          Nothing -> true
+          Just rest -> allMember rest x
+      else false
+
+@label "Interval member"
+@description "Decide membership in a WsInterval `lo`/`hi` (each a `Maybe { value, inclusive }`): a Nothing bound is unbounded that side; an inclusive bound uses gte/lte, exclusive uses gt/lt. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+intervalMember : (lo: a) -> (hi: a) -> (x: a) -> Boolean
+intervalMember lo hi x = and (lowerOk lo x) (upperOk hi x)
+
+@label "Lower bound ok"
+@description "The lower-bound half of intervalMember. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+lowerOk : (lo: a) -> (x: a) -> Boolean
+lowerOk lo x =
+  case lo of
+    Nothing -> true
+    Just b -> if b.inclusive then gte x b.value else gt x b.value
+
+@label "Upper bound ok"
+@description "The upper-bound half of intervalMember. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+upperOk : (hi: a) -> (x: a) -> Boolean
+upperOk hi x =
+  case hi of
+    Nothing -> true
+    Just b -> if b.inclusive then lte x b.value else lt x b.value
+
+
+-- =========================================================================
+-- Smart constructors — compaction on the fly (decision 7).
+-- =========================================================================
+
+@label "mkSeq"
+@description "Sequencing smart constructor: `PEmpty` on either side annihilates to `PEmpty`. EPS-VALUE COLLAPSE (6b lever-A rule 2): `mkSeq (PEpsV v) b = mkRed b (\\x -> { fst = v, snd = x })` and `mkSeq a (PEpsV v) = mkRed a (\\x -> { fst = x, snd = v })` — a settled left/right factor folds into a reduction over the other side, producing the EXACT `{ fst, snd }` nesting PSeq's parseNull builds (the pair-shape contract every grammar reduction reads). KEEPS bare `PEps` (valueless) as PSeq — only PEpsV appears mid-derivation (PMatch ⇒ PEpsV), so the PEps arms are unreachable (pinned, not assumed). Recognition is identical. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+mkSeq : (a: (Pat Any)) -> (b: (Pat Any)) -> (Pat Any)
+mkSeq a b =
+  case a of
+    PEmpty -> PEmpty
+    PEpsV v ->
+      case b of
+        PEmpty -> PEmpty
+        other -> mkRed b (\x -> { fst = v, snd = x })
+    other ->
+      case b of
+        PEmpty -> PEmpty
+        PEpsV w -> mkRed a (\x -> { fst = x, snd = w })
+        other2 -> PSeq a b
+
+@label "mkAlt"
+@description "Alternation smart constructor: a `PEmpty` branch drops out (the other wins); otherwise `PAlt`. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+mkAlt : (a: (Pat Any)) -> (b: (Pat Any)) -> (Pat Any)
+mkAlt a b =
+  case a of
+    PEmpty -> b
+    other ->
+      case b of
+        PEmpty -> a
+        other2 -> PAlt a b
+
+@label "mkRed"
+@description "Reduction smart constructor: `mkRed PEmpty f = PEmpty`; `mkRed (PEpsV v) f = PEpsV (f v)` (THE load-bearing eager compaction); `mkRed (PRed c g) f = mkRed c (\\x -> f (g x))` (RED-FUSION, 6b lever-A rule 1 — collapses stacked reduction layers so derivation-step PRed chains never accumulate; a plain composition lambda, NOT std:compose, since PRed lambdas-in-Pat are 6a-p3-proven); otherwise `PRed`. Arm order: PEmpty → PEpsV → PRed → catch-all. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+mkRed : (child: (Pat Any)) -> (fn: a) -> (Pat Any)
+mkRed child fn =
+  case child of
+    PEmpty -> PEmpty
+    PEpsV v -> PEpsV (fn v)
+    PRed c g -> mkRed c (\x -> fn (g x))
+    other -> PRed child fn
+
+
+-- =========================================================================
+-- Fixpoint convergence detectors (6b lever-A — the per-token fixpoint cache).
+--
+-- A0's growth pin (6b) showed compaction (rules 1-2) leaves NODE count ~flat
+-- but the dominant per-step cost is the env's two Kleene fixpoints iterating a
+-- FIXED `|g| + 1` rounds over a row set that grows ~linearly with input ⇒
+-- O(|g|) iterations × O(|g|) rows = O(|g|²) per token = the super-linear curve.
+--
+-- The fix: STOP as soon as the assumption map stops changing. Standard
+-- monotone-lattice convergence — both fixpoints are monotone over a finite
+-- lattice (Bool / Maybe-value with first-Just-wins), so a round that produces
+-- the same map as its input IS the least fixpoint (the next round is a
+-- deterministic function of the same input ⇒ identical) and every later round
+-- repeats it. `|g| + 1` stays the hard fuel ceiling (the longest ref chain
+-- needs that many rounds), but real grammars settle in ~2-4 rounds regardless,
+-- so the per-step fixpoint collapses from O(|g|²) to O(c·|g|), c small. The
+-- detector is positional (both maps are `map … g` over the SAME `g`, so same
+-- length + order) and cheap: Bool eq for nullability; Just/Nothing PRESENCE eq
+-- for parseNull (values never flip Just→Just' — the brief's determinism note —
+-- so presence stability ⇒ value stability). This is the 6a-brief "lever 1"
+-- (incremental fixpoint), here realised as the soundest possible variant: no
+-- stratification invariant, just Kleene early-exit.
+-- =========================================================================
+
+@label "Bool map stable"
+@description "Positional equality of two `[{ name, val: Bool }]` assumption maps (both built by `map … g` over the same env ⇒ same length + order). True ⇒ the Kleene nullability iteration has converged. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+boolMapStable : (xs: a) -> (ys: a) -> Boolean
+boolMapStable xs ys =
+  case head xs of
+    Nothing -> true
+    Just x ->
+      case head ys of
+        Nothing -> false
+        Just y ->
+          if eq x.val y.val
+          then
+            case tail xs of
+              Nothing -> true
+              Just xr ->
+                case tail ys of
+                  Nothing -> false
+                  Just yr -> boolMapStable xr yr
+          else false
+
+@label "Is Just"
+@description "True when a Maybe value is `Just _`. Internal helper (parseNull convergence presence test)."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+isJustVal : (v: a) -> Boolean
+isJustVal v =
+  case v of
+    Just w -> true
+    Nothing -> false
+
+@label "Value map stable"
+@description "Positional Just/Nothing-PRESENCE equality of two `[{ name, val: Maybe a }]` assumption maps. Presence stability ⇒ value stability (first-Just-wins, no Just→Just' flip), so this is a sound convergence test for the parseNull Kleene iteration. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+valueMapStable : (xs: a) -> (ys: a) -> Boolean
+valueMapStable xs ys =
+  case head xs of
+    Nothing -> true
+    Just x ->
+      case head ys of
+        Nothing -> false
+        Just y ->
+          if eq (isJustVal x.val) (isJustVal y.val)
+          then
+            case tail xs of
+              Nothing -> true
+              Just xr ->
+                case tail ys of
+                  Nothing -> false
+                  Just yr -> valueMapStable xr yr
+          else false
+
+
+-- =========================================================================
+-- Nullability fixpoint (Bool lattice).
+-- =========================================================================
+
+@label "Nullable under assume"
+@description "Does `pat` match the empty input, given a name→Bool INDEX (a `fromEntries`-built record) for `PRef`s? PEps/PEpsV ⇒ true; PEmpty/PMatch ⇒ false; PSeq ⇒ and; PAlt ⇒ or; PRep ⇒ min==0 or nullable child; PRed ⇒ nullable child; PRef ⇒ the assumption (default false). 7h S2: `idx` is the O(1) `mapGet` index built once at each fixpoint round / step boundary, not the O(|g|) assoc-list. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+nullableUnderAssume : (idx: a) -> (pat: (Pat Any)) -> Boolean
+nullableUnderAssume idx pat =
+  case pat of
+    PEmpty -> false
+    PEps -> true
+    PEpsV v -> true
+    PMatch w -> false
+    PSeq l r -> and (nullableUnderAssume idx l) (nullableUnderAssume idx r)
+    PAlt l r -> or (nullableUnderAssume idx l) (nullableUnderAssume idx r)
+    PRep c mn mx -> or (eq mn 0) (nullableUnderAssume idx c)
+    PRed c f -> nullableUnderAssume idx c
+    PRef n -> lookupBool idx n
+
+@label "Nullable fixpoint"
+@description "Bounded Kleene iteration for the Bool nullability fixpoint over the production env `g`: start all-false, iterate `|g| + 1` times (monotone over a finite env ⇒ converged). Returns the stable `[{ name, val }]` assumption map. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+nullableFix : (g: a) -> a
+nullableFix g = nullableIter g (map (\e -> { name = e.name, val = false }) g) (add (length g) 1)
+
+@label "Nullable iterate"
+@description "One-or-more Kleene steps of the Bool nullability fixpoint, fuel-bounded by `|g|+1` but EARLY-EXITING the moment a round reproduces its input map (converged — 6b lever-A). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+nullableIter : (g: a) -> (assume: a) -> (fuel: a) -> a
+nullableIter g assume fuel =
+  if eq fuel 0 then assume
+  else
+    let aidx = fromEntries (map (\e -> { key = e.name, value = e.val }) assume)
+    let next = map (\e -> { name = e.name, val = nullableUnderAssume aidx e.pat }) g
+    if boolMapStable assume next then next
+    else nullableIter g next (sub fuel 1)
+
+@label "Nullable G"
+@description "Does `pat` match the empty input under the env `g`'s nullability fixpoint? The recognizer's accept test. parser-substrate Phase 1."
+@tags "engine" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+nullableG : (g: a) -> (pat: (Pat Any)) -> Boolean
+nullableG g pat = nullableUnderAssume (fromEntries (map (\e -> { key = e.name, value = e.val }) (nullableFix g))) pat
+
+
+-- =========================================================================
+-- parseNull fixpoint (Maybe-value lattice, first-Just-wins).
+-- =========================================================================
+
+@label "Parse-null under assume"
+@description "The value `pat` yields on the empty input (Nothing if it doesn't match empty), given a name→(Maybe a) INDEX (a `fromEntries`-built record). PEps ⇒ Just {} (unit); PEpsV v ⇒ Just v; PEmpty/PMatch ⇒ Nothing; PSeq ⇒ Just { fst, snd } when both sides match empty; PAlt ⇒ first Just; PRep ⇒ Just [] when min==0, else min copies of the child's null value; PRed ⇒ fmap the reduction; PRef ⇒ the assumption (default Nothing). 7h S2: `idx` is the O(1) `mapGet` index, not the O(|g|) assoc-list. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+parseNullUnderAssume : (idx: a) -> (pat: (Pat Any)) -> Maybe a
+parseNullUnderAssume idx pat =
+  case pat of
+    PEmpty -> Nothing
+    PEps -> Just {}
+    PEpsV v -> Just v
+    PMatch w -> Nothing
+    PSeq l r ->
+      case parseNullUnderAssume idx l of
+        Nothing -> Nothing
+        Just lv ->
+          case parseNullUnderAssume idx r of
+            Nothing -> Nothing
+            Just rv -> Just { fst = lv, snd = rv }
+    PAlt l r ->
+      case parseNullUnderAssume idx l of
+        Just lv -> Just lv
+        Nothing -> parseNullUnderAssume idx r
+    PRep c mn mx ->
+      if eq mn 0 then Just []
+      else
+        case parseNullUnderAssume idx c of
+          Nothing -> Nothing
+          Just cv -> Just (replicateList mn cv)
+    PRed c f ->
+      case parseNullUnderAssume idx c of
+        Nothing -> Nothing
+        Just cv -> Just (f cv)
+    PRef n -> lookupVal idx n
+
+@label "Parse-null fixpoint"
+@description "Bounded Kleene iteration for the Maybe-value parseNull fixpoint over the env `g`: start all-Nothing, iterate `|g| + 1` times. first-Just-wins is deterministic (PAlt left-first; the recursive branch is non-nullable). Returns the stable `[{ name, val }]` assumption map. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+parseNullFix : (g: a) -> a
+parseNullFix g = parseNullIter g (map (\e -> { name = e.name, val = Nothing }) g) (add (length g) 1)
+
+@label "Parse-null iterate"
+@description "One-or-more Kleene steps of the Maybe-value parseNull fixpoint, fuel-bounded by `|g|+1` but EARLY-EXITING the moment a round reproduces its input map's Just/Nothing presence (converged — first-Just-wins ⇒ presence stability is value stability; 6b lever-A). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+parseNullIter : (g: a) -> (assume: a) -> (fuel: a) -> a
+parseNullIter g assume fuel =
+  if eq fuel 0 then assume
+  else
+    let aidx = fromEntries (map (\e -> { key = e.name, value = e.val }) assume)
+    let next = map (\e -> { name = e.name, val = parseNullUnderAssume aidx e.pat }) g
+    if valueMapStable assume next then next
+    else parseNullIter g next (sub fuel 1)
+
+@label "Parse-null G"
+@description "The value `pat` yields on the empty input under the env `g`'s parseNull fixpoint (Nothing if it doesn't match empty). The parser's accept-value. parser-substrate Phase 1."
+@tags "engine" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+parseNullG : (g: a) -> (pat: (Pat Any)) -> Maybe a
+parseNullG g pat = parseNullUnderAssume (fromEntries (map (\e -> { key = e.name, value = e.val }) (parseNullFix g))) pat
+
+@label "Null value under assume"
+@description "The unwrapped null value of `pat` under a name→(Maybe a) INDEX (`{}` when it doesn't match empty — only ever called where nullability is already established, so the default is unobservable). Captures `a`'s null parse at PSeq-derivation time. 7h S2: `idx` is the O(1) `mapGet` index. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+nullValueAssume : (idx: a) -> (pat: (Pat Any)) -> a
+nullValueAssume idx pat =
+  case parseNullUnderAssume idx pat of
+    Just v -> v
+    Nothing -> {}
+
+@label "Replicate list"
+@description "A list of `n` copies of `v` (n ≤ 0 ⇒ empty). Used for a min>0 PRep's null value. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+replicateList : (n: a) -> (v: a) -> a
+replicateList n v =
+  if lte n 0 then []
+  else appendItem v (replicateList (sub n 1) v)
+
+
+-- =========================================================================
+-- derivPat — the single-result Brzozowski derivative (decision 7).
+-- Threads the OLD env's fixpoint maps `na` (Bool) + `pa` (Maybe-value).
+-- =========================================================================
+
+@label "Derive pattern"
+@description "The single-result Brzozowski derivative of `pat` w.r.t. token `t`, at step suffix `k`, threading the OLD env's nullability (`naIdx`) + parseNull (`paIdx`) fixpoint INDEXES (7h S2: name→value `fromEntries`-built records read O(1) via `mapGet`, built once per step by the caller). PMatch ⇒ PEpsV t when `wsMember`, else PEmpty. PSeq with a nullable left captures the left's null VALUE at derivation time via a red (the M&D `δ(a)∘D(b)` rule); the right tail is KEPT LITERAL so its refs stay pointed at the FRESH (un-derived) productions — that is what lets `\"1\" S \"2\"` re-enter a fresh S. PRef m ⇒ PRef m@k (the derived SIBLING, NOT a recursion into m's body) — the strict-step that makes left/mutual recursion terminate. PRep mirrors `pattern.ts` (min floors at 0, the -1 unbounded sentinel stays -1). parser-substrate Phase 1."
+@tags "engine" "parser" "pattern-algebra" "derivative" "parser-substrate" "phase-1"
+derivPat : (naIdx: a) -> (paIdx: a) -> (t: a) -> (k: a) -> (pat: (Pat Any)) -> (Pat Any)
+derivPat naIdx paIdx t k pat =
+  case pat of
+    PEmpty -> PEmpty
+    PEps -> PEmpty
+    PEpsV v -> PEmpty
+    PMatch w -> if wsMember w t then PEpsV t else PEmpty
+    PSeq l r ->
+      if nullableUnderAssume naIdx l
+      then
+        let lv = nullValueAssume paIdx l
+        mkAlt (mkSeq (derivPat naIdx paIdx t k l) r) (mkRed (derivPat naIdx paIdx t k r) (\x -> { fst = lv, snd = x }))
+      else mkSeq (derivPat naIdx paIdx t k l) r
+    PAlt l r -> mkAlt (derivPat naIdx paIdx t k l) (derivPat naIdx paIdx t k r)
+    PRep c mn mx ->
+      if eq mx 0 then PEmpty
+      else mkSeq (derivPat naIdx paIdx t k c) (PRep c (maxNum 0 (sub mn 1)) (decMax mx))
+    PRed c f -> mkRed (derivPat naIdx paIdx t k c) f
+    PRef n -> PRef (bumpName n k)
+
+@label "Bump name"
+@description "The derived-sibling name of production `m` at step `k`, BOUNDED per-lineage (parser-substrate 7h): an ORIGINAL name (no `@`) gets ONE suffix `m@k` — a fresh lineage BORN at step k (the step at which the original was first referenced; re-entry into a fresh production). An ALREADY-derived name (`base@birth`, contains `@`) is returned UNCHANGED — same lineage, one more token consumed under the same stable name. So a derivative is named `base@birth` (O(1) length), NOT the cumulative `base@b1@b2@…@k` chain the pre-7h version appended every step (the O(k)-name-length term that was the dominant super-linear cost — S0 cubic diagnosis). The lineage `(base, birthStep)` is INVARIANT as the derivative consumes tokens, and collision-free: at any step there is exactly ONE live derivative per `(base, birth)` (deriveProductions maps over the deduped reach), and genuinely-distinct lineages (`Expr@6` vs `Expr@7`, born at different steps) stay distinct. Original production names never contain `@`, so the membership test is exact. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+bumpName : (m: String) -> (k: a) -> String
+bumpName m k = if elem "@" (chars m) then m else concat (concat m "@") (toString k)
+
+@label "Max number"
+@description "Numeric max of two numbers. Internal helper (min-bound floor in the rep derivative)."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+maxNum : (a: a) -> (b: a) -> a
+maxNum a b = if gt a b then a else b
+
+@label "Decrement max"
+@description "Decrement a PRep `max`, keeping the `-1` unbounded sentinel fixed. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+decMax : (mx: a) -> a
+decMax mx = if eq mx (negate 1) then negate 1 else sub mx 1
+
+
+-- =========================================================================
+-- The env: lookups + reachability (assoc list `[{ name, pat }]` / `[{ name,
+-- val }]`).
+-- =========================================================================
+
+@label "Find entry"
+@description "Linear scan a `[{ name, … }]` list for the first entry whose `.name` matches; Just it / Nothing. Shared by the grammar (`{ name, pat }`) and the assumption maps (`{ name, val }`). NOTE (7h S2): the hot per-step lookups (lookupBool/lookupVal/bodyOf) no longer go through this O(|g|) scan — they read a `fromEntries`-built name→value INDEX via the O(1) `mapGet` native (the opaque-map perf branch). `findEntry` stays as the general first-match assoc-list primitive (no longer on the parser's hot path). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+findEntry : (items: a) -> (name: String) -> Maybe a
+findEntry items name =
+  case head items of
+    Nothing -> Nothing
+    Just it ->
+      if eq it.name name then Just it
+      else
+        case tail items of
+          Nothing -> Nothing
+          Just rest -> findEntry rest name
+
+@label "Lookup bool"
+@description "The Bool value bound to `name` in a name→Bool INDEX (a `fromEntries`-built record; default false — an unbound PRef is conservatively non-nullable). 7h S2: O(1) `mapGet` read replacing the O(|g|) `findEntry` scan (the env-lookup de-superlinearization — the assoc-list stays the source of truth, this reads its opaque-map index). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+lookupBool : (idx: a) -> (name: String) -> Boolean
+lookupBool idx name =
+  case mapGet idx name of
+    Nothing -> false
+    Just v -> v
+
+@label "Lookup val"
+@description "The Maybe-value bound to `name` in a name→(Maybe a) INDEX (a `fromEntries`-built record; default Nothing). 7h S2: O(1) `mapGet` read replacing the O(|g|) `findEntry` scan. The stored value is itself a Maybe (the parseNull lattice), so a present key returns that Maybe directly. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+lookupVal : (idx: a) -> (name: String) -> Maybe a
+lookupVal idx name =
+  case mapGet idx name of
+    Nothing -> Nothing
+    Just v -> v
+
+@label "Seed bool map"
+@description "Build the seed Bool assumption map for env `g` from a PRIOR step's converged nullability map: an ORIGINAL name (no `@` — an un-derived production whose body NEVER changes) carries forward its prior value (identical body ⇒ identical fixpoint); a DERIVATIVE name (`@`) defaults false (⊥). The seed MUST be ≤ the least fixpoint pointwise (the Kleene iteration only moves UP, so a too-high seed would NOT be corrected). Under bounded `base@birth` naming (7h) a derivative KEEPS its name across steps while its body is RE-DERIVED each step, so carrying its prior value forward would seed the OLD body's fixpoint — generally > the new body's least fixpoint ⇒ UNSOUND (it silently mis-captured a nullable kept-tail's null value — an empty-record argument dropped a trailing arg). Seeding derivatives ⊥ recomputes them from scratch, exactly as the pre-7h cumulative naming did implicitly (a fresh per-step name always looked up ⊥). Originals stay the 6b incremental-fixpoint cache. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+seedBool : (g: a) -> (prior: a) -> a
+seedBool g prior =
+  let pidx = fromEntries (map (\e -> { key = e.name, value = e.val }) prior)
+  map (\e -> { name = e.name, val = if elem "@" (chars e.name) then false else lookupBool pidx e.name }) g
+
+@label "Seed value map"
+@description "Build the seed Maybe-value assumption map for env `g` from a PRIOR step's converged parseNull map: ORIGINAL names (no `@`, stable body) carry forward; DERIVATIVE names (`@`) default Nothing (⊥). Same 7h soundness reason as `seedBool` — under bounded `base@birth` naming a derivative keeps its name while its body is re-derived, so carrying its prior parseNull value forward seeds the OLD body's (too-high) value and the monotone Kleene iteration can't lower it ⇒ a nullable kept-tail captures the wrong null value (the empty-record-arg trailing-arg drop). Seeding derivatives ⊥ recomputes them, as cumulative naming did implicitly. Originals stay the 6b incremental-fixpoint cache. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+seedVal : (g: a) -> (prior: a) -> a
+seedVal g prior =
+  let pidx = fromEntries (map (\e -> { key = e.name, value = e.val }) prior)
+  map (\e -> { name = e.name, val = if elem "@" (chars e.name) then Nothing else lookupVal pidx e.name }) g
+
+@label "Body of"
+@description "The body pattern of production `name` in a name→Pat env INDEX (a `fromEntries`-built record; PEmpty when absent — an unbound ref is dead). 7h S2: O(1) `mapGet` read replacing the O(|g|) `findEntry` scan. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+bodyOf : (gidx: a) -> (name: String) -> (Pat Any)
+bodyOf gidx name =
+  case mapGet gidx name of
+    Nothing -> PEmpty
+    Just p -> p
+
+@label "Collect refs"
+@description "The list of `PRef` names directly inside `pat` (structural — recurses through Seq/Alt/Rep/Red but NOT through a ref's body, since PRef is a leaf here). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+collectRefs : (pat: (Pat Any)) -> a
+collectRefs pat =
+  case pat of
+    PSeq l r -> concat (collectRefs l) (collectRefs r)
+    PAlt l r -> concat (collectRefs l) (collectRefs r)
+    PRep c mn mx -> collectRefs c
+    PRed c f -> collectRefs c
+    PRef n -> [n]
+    other -> []
+
+@label "Dedup strings"
+@description "Order-preserving de-duplication of a string list. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+dedupStr : (xs: a) -> a
+dedupStr xs = dedupStrInto xs []
+
+@label "Dedup strings into"
+@description "dedupStr's accumulator pass: append each unseen element. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+@category "engine-internal"
+dedupStrInto : (xs: a) -> (acc: a) -> a
+dedupStrInto xs acc =
+  case head xs of
+    Nothing -> acc
+    Just h ->
+      let acc2 = if elem h acc then acc else appendItem h acc
+      case tail xs of
+        Nothing -> acc2
+        Just rest -> dedupStrInto rest acc2
+
+@label "Reachable names"
+@description "The transitive closure of production names reachable from `root` via `PRef` over env `g` (the reachability-prune frontier of the strict step — only these productions get derived). 7h S2: builds the name→Pat env INDEX once (`fromEntries`) and threads it to the worklist BFS so each `bodyOf` is an O(1) `mapGet`, not an O(|g|) scan. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+reachableNames : (g: a) -> (root: (Pat Any)) -> a
+reachableNames g root =
+  let gidx = fromEntries (map (\e -> { key = e.name, value = e.pat }) g)
+  let seed = dedupStr (collectRefs root)
+  growNames gidx seed seed
+
+@label "Grow names"
+@description "Worklist BFS over the reachability graph (6b lever-A — replaces the old whole-accumulator re-scan): `seen` is the accumulated reachable set, `frontier` the names discovered last round. Each round collects refs of ONLY the frontier's bodies (via the env index `gidx`), keeps the unseen ones (`notSeen`), and recurses with them as the new frontier — terminating when nothing fresh appears. 7h S2: `gidx` is the name→Pat index (O(1) bodyOf) and `notSeen` does O(1) set-membership, so a round is O(|frontier|·refs + |seen|) and the BFS is O(diameter·|g|) per step (the wide-shallow grammar's diameter is small) — replacing the prior O(|g|²)-per-step linear scans. No fuel bound needed (seen grows monotonically, bounded by |g|). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+growNames : (gidx: a) -> (seen: a) -> (frontier: a) -> a
+growNames gidx seen frontier =
+  let fresh = notSeen (dedupStr (refsOfNames gidx frontier)) seen
+  case head fresh of
+    Nothing -> seen
+    Just h -> growNames gidx (concat seen fresh) fresh
+
+@label "Not seen"
+@description "The elements of `xs` not already in `seen` (the worklist frontier filter). 7h S2: builds a name→True SET from `seen` (`fromEntries`) once per call, then tests membership O(1) via `mapGet`/`isJustVal` — byte-identical to the prior `elem`-scan filter (same order, same kept elements), just sub-linear. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+notSeen : (xs: a) -> (seen: a) -> a
+notSeen xs seen =
+  let seenSet = fromEntries (map (\n -> { key = n, value = true }) seen)
+  filter (\x -> not (isJustVal (mapGet seenSet x))) xs
+
+@label "Refs of names"
+@description "All refs in the bodies of the given production names (concatenated; bodies read from the env INDEX `gidx` via O(1) `bodyOf`). Internal helper for reachability growth."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+refsOfNames : (gidx: a) -> (names: a) -> a
+refsOfNames gidx names = refsOfNamesInto gidx names []
+
+@label "Refs of names into"
+@description "refsOfNames' accumulator pass: append each production body's refs (body via the env index `gidx`). Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+refsOfNamesInto : (gidx: a) -> (names: a) -> (acc: a) -> a
+refsOfNamesInto gidx names acc =
+  case head names of
+    Nothing -> acc
+    Just n ->
+      let acc2 = concat acc (collectRefs (bodyOf gidx n))
+      case tail names of
+        Nothing -> acc2
+        Just rest -> refsOfNamesInto gidx rest acc2
+
+
+-- =========================================================================
+-- The strict whole-grammar token step + the driver.
+-- =========================================================================
+
+@label "Derive productions"
+@description "Derive the bodies of the named (reachable) productions of `g` w.r.t. token `t` at step `k`, threading the fixpoint INDEXES `naIdx`/`paIdx` — the env half of the strict whole-grammar step. 7h S2: builds the env's name→Pat index once (`fromEntries`) so each `bodyOf` is O(1). Each reachable production `n` yields a derived sibling named `n@k`. Returns the new `[{ name, pat }]` siblings. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+deriveProductions : (g: a) -> (naIdx: a) -> (paIdx: a) -> (t: a) -> (k: a) -> (names: a) -> a
+deriveProductions g naIdx paIdx t k names =
+  let gidx = fromEntries (map (\e -> { key = e.name, value = e.pat }) g)
+  map (\n -> { name = bumpName n k, pat = derivPat naIdx paIdx t k (bodyOf gidx n) }) names
+
+
+-- =========================================================================
+-- Empty-language ELIMINATION — the Phase-8 de-superlinearization that bounds
+-- `|g|`. The strict step keeps DEAD (`∅`) productions reachable through opaque
+-- `PRef`s that the LOCAL smart constructors (`mkSeq`/`mkAlt`) cannot compact
+-- through — so `|g|` grows O(k) in the token count even though the live
+-- grammar has only O(grammar) DISTINCT residual languages (Brzozowski
+-- finiteness; measured: ~208 rows vs ~60 distinct shapes on a 64-step decl).
+-- This pass is the M&D `∅`-compaction this NAMED-production formulation must do
+-- explicitly: compute the empty-set fixpoint, simplify every body propagating
+-- emptiness (`PRef ∅ ⇒ PEmpty`, so `∅` factors annihilate + `∅` branches drop),
+-- drop the empty rows, re-prune reachable. Running it at the TAIL of every step
+-- keeps the env that flows to the NEXT step bounded ⇒ `combined` never grows
+-- O(k) ⇒ the per-step work is O(grammar) and the total is LINEAR (vs the 7h-S2
+-- residual quadratic). Language-and-value preserving (a `∅` production matches
+-- nothing + carries no reduction value) ⇒ `parseNull` is byte-identical; only
+-- the live grammar shrinks. NO new native — reuses `mkSeq`/`mkAlt`/`mkRed` +
+-- the 7h-S2 `mapGet`/`fromEntries` opaque-map index.
+-- =========================================================================
+
+@label "Body empty under"
+@description "Does `pat` denote the EMPTY language `∅` given a name→true INDEX `empt` of already-known-empty productions? PEmpty ⇒ true; PSeq ⇒ either side empty (`∅·x = ∅`); PAlt ⇒ both sides empty (`∅|∅ = ∅`); PRep ⇒ `∅` only when it REQUIRES ≥1 rep (`mn>0`) AND the child is `∅` (a `mn==0` rep matches ε ⇒ nullable, NOT `∅`; for valid `min≤max` reps `mx==0 ⇒ mn==0`, so the old `mx==0` shortcut wrongly emptied a nullable exhausted bounded-rep — the algebra-differential bug the all-unbounded-rep corpus missed); PRed ⇒ child empty; PRef ⇒ in `empt`; PEps/PEpsV/PMatch ⇒ false (they accept ε-with-value / a token). The boolean (non-allocating) form of `isPEmpty ∘ simplifyEmpty` — used to compute the empty-set without rebuilding trees. Internal helper. parser-substrate Phase 8."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-8"
+@category "engine-internal"
+bodyEmptyUnder : (empt: a) -> (pat: (Pat Any)) -> Boolean
+bodyEmptyUnder empt pat =
+  case pat of
+    PEmpty -> true
+    PSeq l r -> or (bodyEmptyUnder empt l) (bodyEmptyUnder empt r)
+    PAlt l r -> and (bodyEmptyUnder empt l) (bodyEmptyUnder empt r)
+    PRep c mn mx -> and (gt mn 0) (bodyEmptyUnder empt c)
+    PRed c f -> bodyEmptyUnder empt c
+    PRef n -> isJustVal (mapGet empt n)
+    other -> false
+
+@label "Empty body names"
+@description "The names of the productions of `g` whose body is `∅` under the current empty INDEX `empt` (name→true) — one round of the empty-set fixpoint. Internal helper. parser-substrate Phase 8."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-8"
+@category "engine-internal"
+emptyBodyNames : (g: a) -> (empt: a) -> a
+emptyBodyNames g empt =
+  map (\e -> e.name) (filter (\e -> bodyEmptyUnder empt e.pat) g)
+
+@label "Empty names iterate"
+@description "One-or-more rounds of the empty-set least fixpoint over `g`, fuel-bounded by `|g|+1` (the longest empty-propagation chain) but EARLY-EXITING once a round adds no new empty name. The set is monotone-INCREASING (a larger empty index can only make more bodies empty), so a round of the same length as its input IS the fixpoint. Internal helper. parser-substrate Phase 8."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-8"
+@category "engine-internal"
+emptyNamesIter : (g: a) -> (prev: a) -> (fuel: a) -> a
+emptyNamesIter g prev fuel =
+  if eq fuel 0 then prev
+  else
+    let empt = fromEntries (map (\n -> { key = n, value = true }) prev)
+    let cur = emptyBodyNames g empt
+    if eq (length cur) (length prev) then cur
+    else emptyNamesIter g cur (sub fuel 1)
+
+@label "Empty names fixpoint"
+@description "The least fixpoint of empty (`∅`) production names of `g`: start with none, iterate `emptyNamesIter` to convergence. Internal helper. parser-substrate Phase 8."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-8"
+@category "engine-internal"
+emptyNamesFix : (g: a) -> a
+emptyNamesFix g = emptyNamesIter g [] (add (length g) 1)
+
+@label "Simplify empty"
+@description "Rewrite a body PROPAGATING emptiness through references: a `PRef n` whose production is in the empty INDEX `empt` (name→true) becomes `PEmpty`, and the smart constructors re-fire bottom-up so `∅` factors annihilate (`mkSeq ∅ = ∅`) and `∅` branches drop (`mkAlt ∅ x = x`, preserving first-Just-wins since a `∅` branch never yields a Just). `PRep` just recurses into its child (NO `mx==0` collapse — that would wrongly empty a nullable exhausted rep; a genuinely-`∅` rep, `mn>0` over a `∅` child, is caught by `bodyEmptyUnder` at the production level + the row-drop). Only called in the elimination's empty-present branch (the common empty-free step keeps the OLD reachability prune verbatim). Language-and-value preserving. Internal helper. parser-substrate Phase 8."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-8"
+@category "engine-internal"
+simplifyEmpty : (empt: a) -> (pat: (Pat Any)) -> (Pat Any)
+simplifyEmpty empt pat =
+  case pat of
+    PSeq l r -> mkSeq (simplifyEmpty empt l) (simplifyEmpty empt r)
+    PAlt l r -> mkAlt (simplifyEmpty empt l) (simplifyEmpty empt r)
+    PRep c mn mx -> PRep (simplifyEmpty empt c) mn mx
+    PRed c f -> mkRed (simplifyEmpty empt c) f
+    PRef n -> if isJustVal (mapGet empt n) then PEmpty else PRef n
+    other -> other
+
+@label "Eliminate empty"
+@description "The empty-language ELIMINATION pass that bounds `|g|` (parser-substrate Phase 8). Compute the empty-set fixpoint of `g`; when EMPTY (the common case) keep the OLD reachability prune over `(g, root)` VERBATIM (byte-identical to the pre-8 `stepGrammarWith` tail). When there ARE empties: simplify the root + every kept body propagating them (refs to `∅` annihilate via the smart constructors), DROP the empty rows, and re-prune to the productions reachable from the simplified root. Returns `{ g, root }`. Sound — a `∅` production contributes to no accepting parse and carries no reduction value, so the residual root's `parseNull` is byte-identical; only the live grammar shrinks from O(k) rows to O(grammar). Internal helper. parser-substrate Phase 8."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-8"
+@category "engine-internal"
+eliminateEmpty : (g: a) -> (root: (Pat Any)) -> a
+eliminateEmpty g root =
+  let emptNames = emptyNamesFix g
+  if eq (length emptNames) 0
+  then
+    let keepNames = reachableNames g root
+    let keepSet = fromEntries (map (\n -> { key = n, value = true }) keepNames)
+    { g = filter (\e -> isJustVal (mapGet keepSet e.name)) g, root = root }
+  else
+    let empt = fromEntries (map (\n -> { key = n, value = true }) emptNames)
+    let root2 = simplifyEmpty empt root
+    let kept = filter (\e -> not (isJustVal (mapGet empt e.name))) g
+    let g1 = map (\e -> { name = e.name, pat = simplifyEmpty empt e.pat }) kept
+    let keepNames = reachableNames g1 root2
+    let keepSet = fromEntries (map (\n -> { key = n, value = true }) keepNames)
+    { g = filter (\e -> isJustVal (mapGet keepSet e.name)) g1, root = root2 }
+
+@label "Step grammar with"
+@description "The core strict whole-grammar derivative step at suffix `k`, taking the OLD env's PRECOMPUTED nullability (`na`) + parseNull (`pa`) fixpoints (so the caller can thread them incrementally across steps — the 6b cache). Derive the root + every reachable production w.r.t. `t` in one finite pass into bounded `base@birth` siblings (refs bump to the derived siblings; kept tails retain their fresh refs — so left/mutual recursion terminate AND re-enter fresh productions). The new env = `newSibs` ++ (the old env MINUS any row a newSib supersedes). DEDUP-BY-NAME, newSibs-first (7h): under bounded naming a re-derived `base@birth` shares its name with its prior-step row, so the naive `concat newSibs g` would carry BOTH (the fresh + the one-step-stale) and re-leak `|g|` — `findEntry`/`bodyOf` would still pick the fresh (first) one, but the stale copy bloats every per-step scan. Dropping ONLY the colliding old rows (those whose name is a newSib name) is correct AND complete: newSibs holds the freshest derivative of every reachable production, while the NON-colliding old rows (the originals the kept tails re-enter, PLUS any prior-step derivative NOT re-derived this step but still referenced by a kept tail — e.g. a multi-argument application's later-argument re-entry) MUST be carried forward (an earlier 7h draft that kept only the non-`@` originals dropped exactly those tails and lost a trailing call argument). With cumulative (pre-7h) names no row ever collided, so this is a no-op there — i.e. semantically identical to the old `concat newSibs g`, plus the bounded-name dedup. Then keep the rows still reachable from the new root, prune the rest. 7h S2 (env-lookup de-superlinearization): the OLD env's `na`/`pa` fixpoints arrive as the threaded assoc-lists and are indexed ONCE here (`naIdx`/`paIdx`, O(1) `mapGet`) for the whole step; the two row prunes (`combined`'s drop-superseded + `g2`'s keep-reachable) use name→True SETS (`newNamesSet`/`keepSet`) for O(1) membership instead of the prior O(|g|) `elem` scans — so the per-step cost drops from O(|g|²) to ~O(|g|) and the corpus curve from cubic toward quadratic. Returns `{ g, root }`. parser-substrate Phase 1 / 6b / 7h. Internal helper."
+@tags "engine" "internal" "parser" "pattern-algebra" "parser-substrate" "phase-1" "phase-7h"
+@category "engine-internal"
+stepGrammarWith : (g: a) -> (root: (Pat Any)) -> (t: a) -> (k: a) -> (na: a) -> (pa: a) -> a
+stepGrammarWith g root t k na pa =
+  let naIdx = fromEntries (map (\e -> { key = e.name, value = e.val }) na)
+  let paIdx = fromEntries (map (\e -> { key = e.name, value = e.val }) pa)
+  let reach = reachableNames g root
+  let newSibs = deriveProductions g naIdx paIdx t k reach
+  let root2 = derivPat naIdx paIdx t k root
+  let newNames = map (\e -> e.name) newSibs
+  let newNamesSet = fromEntries (map (\n -> { key = n, value = true }) newNames)
+  let combined = concat newSibs (filter (\e -> not (isJustVal (mapGet newNamesSet e.name))) g)
+  -- parser-substrate Phase 8: the reachability prune AND the empty-language
+  -- elimination that bounds `|g|` (drops the dead `∅` rows the strict step keeps
+  -- reachable through opaque PRefs — the residual quadratic 7h-S2 banked). On a
+  -- step with no empties this is the OLD prune VERBATIM (byte-identical);
+  -- otherwise it shrinks the carried env from O(k) rows toward O(grammar), so the
+  -- env flowing to the next step stays bounded ⇒ the total parse goes LINEAR.
+  eliminateEmpty combined root2
+
+@label "Step grammar"
+@description "One strict whole-grammar derivative step at suffix `k`, computing the OLD env's fixpoints fresh then delegating to `stepGrammarWith`. The back-compat entry (the lexer's ref-free empty-env driver + the env-growth oracle call it; the grammar path uses the threaded `runSteps`). parser-substrate Phase 1."
+@tags "engine" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+stepGrammar : (g: a) -> (root: (Pat Any)) -> (t: a) -> (k: a) -> a
+stepGrammar g root t k = stepGrammarWith g root t k (nullableFix g) (parseNullFix g)
+
+@label "Run steps"
+@description "Fold the strict token step over an input list, threading `{ g, root }`, an incrementing step suffix `k`, AND the OLD env's nullability/parseNull fixpoints (`na`/`pa`) — the 6b INCREMENTAL-FIXPOINT cache: after each step the next env's fixpoints are reseeded from the prior converged maps (kept rows carry forward, fresh `@k` rows default ⊥) and re-converged by early-exit Kleene in a few frontier rounds, instead of recomputed from ⊥ over the deepening chain (O(|g|²) ⇒ O(|g|) per step). Short-circuits once the root is PEmpty (dead). parser-substrate Phase 1 / 6b."
+@tags "engine" "parser" "pattern-algebra" "parser-substrate" "phase-1"
+runSteps : (g: a) -> (root: (Pat Any)) -> (k: a) -> (toks: a) -> (na: a) -> (pa: a) -> a
+runSteps g root k toks na pa =
+  case head toks of
+    Nothing -> { g = g, root = root }
+    Just t ->
+      case root of
+        PEmpty -> { g = g, root = PEmpty }
+        other ->
+          let stepped = stepGrammarWith g root t k na pa
+          case tail toks of
+            Nothing -> stepped
+            Just rest ->
+              let na2 = nullableIter stepped.g (seedBool stepped.g na) (add (length stepped.g) 1)
+              let pa2 = parseNullIter stepped.g (seedVal stepped.g pa) (add (length stepped.g) 1)
+              runSteps stepped.g stepped.root (add k 1) rest na2 pa2
+
+@label "Recognize G"
+@description "Does the token list `toks` match production `start` of grammar `g`? Folds the strict whole-grammar derivative over `toks` (suffixes start at 1, fixpoints threaded incrementally), then tests nullability of the residual root under the residual env. Single-result; left/mutual recursion terminate. The differential oracle wraps a ref-free root as a singleton grammar. parser-substrate Phase 1."
+@tags "engine" "parser" "pattern-algebra" "recognizer" "parser-substrate" "phase-1"
+recognizeG : (g: a) -> (start: String) -> (toks: a) -> Boolean
+recognizeG g start toks =
+  let final = runSteps g (PRef start) 1 toks (nullableFix g) (parseNullFix g)
+  nullableG final.g final.root
+
+@label "Parse G"
+@description "Parse the token list `toks` against production `start` of grammar `g`, returning the reduced value (`Just value` on a full match, Nothing otherwise). Folds the strict derivative over `toks` (fixpoints threaded incrementally), then reads the residual root's parseNull value under the residual env — so reductions (`PRed`) build a real `Syntax`-shaped tree end-to-end. parser-substrate Phase 1."
+@tags "engine" "parser" "pattern-algebra" "parser" "parser-substrate" "phase-1"
+parseG : (g: a) -> (start: String) -> (toks: a) -> Maybe a
+parseG g start toks =
+  let final = runSteps g (PRef start) 1 toks (nullableFix g) (parseNullFix g)
+  parseNullG final.g final.root

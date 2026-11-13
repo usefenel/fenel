@@ -1,0 +1,262 @@
+module dashboard where
+
+-- =========================================================================
+-- Dashboard /typeclass-instances + /triggers + /functions/:fnId/instances/
+-- :instId/timeline routes.
+--
+-- Phase 12a sub-step 6 of the ts-elimination workstream. Ten route bodies
+-- + supporting per-route helpers. All return Maybe / anonymous-record
+-- shapes — no new ADT entity (Decision Z reuse existing wire-shapes; the
+-- Maybe + Result envelopes cover the discriminations needed).
+--
+-- Each route body wraps state:* / dispatch:* substrate primitives added
+-- in 12a-6 + reuses dashboard:flattenSubscriptionToTrigger /
+-- dashboard:readMetadata (12a-1). The typeclass-instance writes compose
+-- the per-row mutation + dispatch:refreshAccountInstances so the
+-- in-memory registry reflects the new state after each CRUD operation.
+--
+-- Naming convention: each route body has a unique codeName distinct from
+-- the underlying substrate primitive (e.g. listSpecInstancesAll,
+-- not listSpecInstances) so the function-call resolution from inside
+-- the body doesn't accidentally recurse onto itself. Same pattern as
+-- registry.fenel's listTypesMerged vs state:listTypes.
+-- =========================================================================
+
+-- ---- Typeclass-instance CRUD --------------------------------------------
+
+-- GET /typeclass-instances?class=… — thin Maybe pass-through.
+@label "List typeclass instances (account)"
+@description "GET /typeclass-instances?class=… body. Thin pass-through to state:listSpecInstances; the TS wrapper extracts the ?class query param and frames {typeclassInstances}."
+@tags "dashboard" "typeclass" "route" "list" "phase-12a"
+listSpecInstancesAll : (typeName: Maybe (String)) -> List ({})
+listSpecInstancesAll typeName =
+  listSpecInstances typeName
+
+-- GET /typeclass-instances/:id — Maybe row.
+@label "Get typeclass instance by id"
+@description "GET /typeclass-instances/:id body. Thin pass-through to state:getSpecInstance; the TS wrapper maps Nothing → 404 and frames {definition}."
+@tags "dashboard" "typeclass" "route" "get" "phase-12a"
+getSpecInstanceById : (id: String) -> Maybe ({})
+getSpecInstanceById id =
+  getSpecInstance id
+
+-- POST /typeclass-instances — create + refresh dispatch. Side-effect
+-- sequencing via let-binding (the refresh's Unit return is ignored;
+-- the row binding is what we return).
+@label "Create account typeclass instance"
+@description "POST /typeclass-instances body. Persists the row + composes dispatch:refreshAccountInstances so the in-memory typeclass registry reflects the new state on the next dispatch. Returns the created row."
+@tags "dashboard" "typeclass" "route" "create" "phase-12a"
+createAccountSpecInstance : (body: {}) -> {}
+createAccountSpecInstance body =
+  let row = createSpecInstance body
+  let _refresh = refreshAccountInstances ()
+  row
+
+-- PUT /typeclass-instances/:id — update + refresh dispatch.
+@label "Update account typeclass instance"
+@description "PUT /typeclass-instances/:id body. Updates the row's instance + refreshes dispatch. Returns the updated row."
+@tags "dashboard" "typeclass" "route" "update" "phase-12a"
+updateAccountSpecInstance : (id: String) -> (body: {}) -> {}
+updateAccountSpecInstance id body =
+  let row = updateSpecInstance id body
+  let _refresh = refreshAccountInstances ()
+  row
+
+-- DELETE /typeclass-instances/:id — delete + refresh dispatch. Returns
+-- the refresh's Unit (the TS wrapper just frames {ok: true}).
+@label "Delete account typeclass instance"
+@description "DELETE /typeclass-instances/:id body. Deletes the row + refreshes dispatch. Returns Unit; the TS wrapper frames {ok: true}."
+@tags "dashboard" "typeclass" "route" "delete" "phase-12a"
+deleteAccountSpecInstance : (id: String) -> (expectedInstance: Maybe a) -> Unit
+deleteAccountSpecInstance id expectedInstance =
+  let _del = deleteSpecInstance id expectedInstance
+  refreshAccountInstances ()
+
+-- ---- Triggers ------------------------------------------------------------
+
+-- GET /functions/:name/triggers — function lookup → subscription list.
+-- Returns Maybe<List Row>; Nothing → 404 in the TS wrapper (function
+-- name unknown). The TS wrapper does the sort + map(flatten) (no
+-- std:sortBy primitive yet).
+@label "List function triggers"
+@description "GET /functions/:name/triggers body. Function lookup → subscription list; returns Maybe<List Row>. The TS wrapper does the sort + map(flatten) (no std:sortBy primitive yet) and maps Nothing → 404."
+@tags "dashboard" "triggers" "route" "list" "phase-12a"
+listFunctionTriggers : (name: String) -> Maybe (List ({}))
+listFunctionTriggers name =
+  case getFunction name of
+    Just dbFn -> Just (listSubscriptionsByHandler dbFn.id)
+    _ -> Nothing
+
+-- POST /functions/:name/triggers — function lookup + create subscription
+-- + flatten. Returns Maybe<Trigger>; Nothing → 404. The TS wrapper does
+-- the Zod-style validation + the crypto.randomUUID slug generation and
+-- passes them in.
+@label "Create function trigger"
+@description "POST /functions/:name/triggers body. Function lookup + create subscription + flatten. Returns Maybe<Trigger>; Nothing → 404. The TS wrapper does the Zod validation + the crypto.randomUUID slug generation and passes them in as params."
+@tags "dashboard" "triggers" "route" "create" "phase-12a"
+createFunctionTrigger : (name: String) -> (slug: String) -> (eventType: String) -> (triggerBody: {}) -> (cancelWhen: {}) -> (args: {}) -> (active: Boolean) -> Maybe ({})
+createFunctionTrigger name slug eventType triggerBody cancelWhen args active =
+  case getFunction name of
+    Just dbFn ->
+      let meta = { trigger = triggerBody, cancelWhen = cancelWhen, args = args }
+      let row = createSubscription { slug = slug, source = "event", eventType = eventType, handlerFunctionId = dbFn.id, enabled = active, metadata = meta }
+      Just (flattenSubscriptionToTrigger row)
+    _ -> Nothing
+
+-- Per-field metadata merge — Maybe-aware. parseApp doesn't continue arg
+-- accumulation across newlines so each conditional is its own helper
+-- (12a-3 surprise #1 / 12a-4 surprise #2 / 12a-5 surprise #3 pattern).
+@label "Apply trigger metadata field"
+@description "Per-field Maybe-aware metadata merge helper. Just v → overwrite meta.trigger with v; Nothing → preserve. Extracted because parseApp doesn't continue arg lists across newlines, so multi-arm case-of forms need their own helper."
+@tags "dashboard" "triggers" "metadata" "pure" "phase-12a"
+applyMetaTrigger : (meta: {}) -> (opt: Maybe ({})) -> {}
+applyMetaTrigger meta opt =
+  case opt of
+    Just v -> mergeRecords meta { trigger = v }
+    _ -> meta
+
+@label "Apply cancelWhen metadata field"
+@description "Sister of applyMetaTrigger for the cancelWhen field."
+@tags "dashboard" "triggers" "metadata" "pure" "phase-12a"
+applyMetaCancelWhen : (meta: {}) -> (opt: Maybe ({})) -> {}
+applyMetaCancelWhen meta opt =
+  case opt of
+    Just v -> mergeRecords meta { cancelWhen = v }
+    _ -> meta
+
+@label "Apply args metadata field"
+@description "Sister of applyMetaTrigger for the args field."
+@tags "dashboard" "triggers" "metadata" "pure" "phase-12a"
+applyMetaArgs : (meta: {}) -> (opt: Maybe ({})) -> {}
+applyMetaArgs meta opt =
+  case opt of
+    Just v -> mergeRecords meta { args = v }
+    _ -> meta
+
+-- mergeTriggerMetadata — fold the 3 maybe-fields into the existing
+-- metadata record. Each Just overwrites the matching key; each Nothing
+-- preserves it.
+@label "Merge trigger metadata"
+@description "Fold three Maybe<Record> fields into the existing metadata record. Each Just overwrites the matching key; each Nothing preserves it. Used by PUT /triggers/:id to compose the merged metadata before passing to state:updateSubscription."
+@tags "dashboard" "triggers" "metadata" "pure" "phase-12a"
+mergeTriggerMetadata : (existing: {}) -> (trig: Maybe ({})) -> (cw: Maybe ({})) -> (args: Maybe ({})) -> {}
+mergeTriggerMetadata existing trig cw args =
+  let m1 = applyMetaTrigger existing trig
+  let m2 = applyMetaCancelWhen m1 cw
+  applyMetaArgs m2 args
+
+-- defaultToLocal — local null-coalesce (same shape as dashboard:defaultTo
+-- but kept local to this module per the 12a-5 io.fenel precedent — each
+-- .fenel file's defs are co-located with their callers).
+@label "Default to (local)"
+@description "Local null-coalesce for the typeclass-triggers-timeline helpers. Same shape as dashboard:defaultTo (helpers.fenel) and dashboard:defaultToIo (io.fenel) — kept local since each .fenel file's defs are co-located with their callers."
+@tags "dashboard" "helper" "pure" "phase-12a"
+defaultToLocal dflt x = ifElse (isNull x) dflt x
+
+-- newTriggerEventType — when the body's trigger record has a `.type`
+-- field, use it; else preserve the column's existing value. Mirrors the
+-- legacy `body.trigger?.type ? body.trigger.type : existing.eventType`.
+@label "New trigger event type"
+@description "PUT /triggers/:id eventType selector. When the body's trigger record has a non-null `.type`, use it; else preserve the column's existing value. Mirrors the legacy `body.trigger?.type ? body.trigger.type : existing.eventType`."
+@tags "dashboard" "triggers" "pure" "phase-12a"
+newTriggerEventType : (existing: String) -> (trig: Maybe ({})) -> String
+newTriggerEventType existing trig =
+  case trig of
+    Just t -> defaultToLocal existing t.type
+    _ -> existing
+
+-- PUT /triggers/:id — existing lookup + metadata merge + update + flatten.
+-- Returns Maybe<Trigger>; Nothing → 404 (either the row doesn't exist OR
+-- belongs to a different account OR was deleted between read and update).
+@label "Update trigger by id"
+@description "PUT /triggers/:id body. Existing lookup + metadata merge + update + flatten. Returns Maybe<Trigger>; Nothing → 404 (row doesn't exist OR belongs to a different account OR was deleted between read and update)."
+@tags "dashboard" "triggers" "route" "update" "phase-12a"
+updateTriggerById : (id: String) -> (trig: Maybe ({})) -> (cw: Maybe ({})) -> (args: Maybe ({})) -> (active: Maybe (Boolean)) -> Maybe ({})
+updateTriggerById id trig cw args active =
+  case getSubscription id of
+    Just existing ->
+      let mergedMeta = mergeTriggerMetadata (readMetadata existing.metadata) trig cw args
+      let eventType = newTriggerEventType existing.eventType trig
+      case updateSubscription id { eventType = eventType, enabled = active, metadata = mergedMeta } of
+        Just updated -> Just (flattenSubscriptionToTrigger updated)
+        _ -> Nothing
+    _ -> Nothing
+
+-- DELETE /triggers/:id — Boolean return; TS maps false → 404, true → ok.
+@label "Delete trigger by id"
+@description "DELETE /triggers/:id body. Returns Boolean — true on hit, false on miss / cross-account. The TS wrapper maps false → 404 and true → {ok: true}."
+@tags "dashboard" "triggers" "route" "delete" "phase-12a"
+deleteTriggerById : (id: String) -> Boolean
+deleteTriggerById id =
+  deleteSubscriptionById id
+
+-- ---- Timeline ------------------------------------------------------------
+
+-- projectTimelineInstance — drizzle function_instance row → the timeline
+-- route's `instance` wire shape (drops accountId; keeps everything else).
+@label "Project timeline instance"
+@description "Drizzle function_instance row → the timeline route's `instance` wire shape (drops accountId; keeps everything else)."
+@tags "dashboard" "timeline" "projection" "pure" "phase-12a"
+projectTimelineInstance : (inst: {}) -> {}
+projectTimelineInstance inst = {
+  id = inst.id,
+  functionId = inst.functionId,
+  profileId = inst.profileId,
+  status = inst.status,
+  currentStepPath = inst.currentStepPath,
+  variables = inst.variables,
+  startedAt = inst.startedAt,
+  completedAt = inst.completedAt
+}
+
+-- projectTimelineEvent — events row → wire shape (drops accountId etc.).
+@label "Project timeline event"
+@description "events row → wire shape ({id, type, aggregateType, aggregateId, payload, createdAt})."
+@tags "dashboard" "timeline" "projection" "pure" "phase-12a"
+projectTimelineEvent : (e: {}) -> {}
+projectTimelineEvent e = {
+  id = e.id,
+  type = e.type,
+  aggregateType = e.aggregateType,
+  aggregateId = e.aggregateId,
+  payload = e.payload,
+  createdAt = e.createdAt
+}
+
+-- maybeCompletedAt — wrap inst.completedAt in a Maybe so the substrate
+-- primitive's open-ended-time-range Maybe parameter receives the right
+-- shape. Nothing → events SQL has no upper bound; Just ts → SQL `<=` ts.
+-- The paren around (Nothing) is load-bearing: per 12a-5 surprise #2,
+-- argument-position uppercase ident parses as {var: name} (returning null
+-- at runtime) — the paren wraps the bare ident into a parenthesized
+-- expression so parseApp lifts uppercase to {construct: [name]}.
+@label "Maybe completed-at"
+@description "Wrap inst.completedAt in a Maybe so the substrate primitive's open-ended-time-range Maybe parameter receives the right shape. Nothing → events SQL has no upper bound; Just ts → SQL `<=` ts."
+@tags "dashboard" "timeline" "pure" "phase-12a"
+maybeCompletedAt : (inst: {}) -> Maybe (String)
+maybeCompletedAt inst =
+  ifElse (isNull inst.completedAt) (Nothing) (Just inst.completedAt)
+
+-- eventsForInstance — gated on profileId. The legacy route only reads
+-- profile-scoped events; instances without a profileId return [].
+@label "Events for instance"
+@description "Gated on profileId — instances without a profileId return []. Otherwise reads profile-scoped events bounded by [startedAt, completedAt?] via state:listEventsByAggregate."
+@tags "dashboard" "timeline" "phase-12a"
+eventsForInstance : (inst: {}) -> List ({})
+eventsForInstance inst =
+  ifElse (isNull inst.profileId) [] (listEventsByAggregate "profile" inst.profileId inst.startedAt (maybeCompletedAt inst) 200)
+
+-- GET /functions/:fnId/instances/:instId/timeline — instance lookup → if
+-- found, fan out traces + events reads + project the 3-part wire shape.
+-- Returns Maybe<TimelineResponse>; Nothing → 404.
+@label "Function instance timeline"
+@description "GET /functions/:fnId/instances/:instId/timeline body. Instance lookup → if found, fan out traces + events reads + project the 3-part wire shape `{instance, traces, events}`. Returns Maybe<TimelineResponse>; Nothing → 404."
+@tags "dashboard" "timeline" "route" "phase-12a"
+functionInstanceTimeline : (instId: String) -> Maybe ({})
+functionInstanceTimeline instId =
+  case getFunctionInstance instId of
+    Just inst ->
+      let traces = listTracesByInstance instId
+      let events = eventsForInstance inst
+      Just { instance = projectTimelineInstance inst, traces = traces, events = map projectTimelineEvent events }
+    _ -> Nothing

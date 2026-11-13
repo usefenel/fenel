@@ -1,0 +1,812 @@
+module engine where
+
+-- =========================================================================
+-- euf — congruence closure over `Expr` term-singletons (decide-substrate
+-- Phase 5; brief: `workstreams/decide-substrate/briefs/phase-5-euf-congruence.md`;
+-- design: `design/deciding.md` §8, Rung 2 of the ambition axis).
+--
+-- Ground equational logic over UNINTERPRETED applications: input = a
+-- conjunction of equalities (and, for sat-checking, disequalities) between
+-- `Expr` TERMS; congruence closure decides which term-singletons {s} and {t}
+-- are forced equal. All verdicts ride `Tri` (`Maybe Boolean`); every `Just`
+-- answer is SOUND over EVERY interpretation; `Nothing` is the honest default.
+--
+-- THE ENABLER (partial-evaluator-substrate Phase 2 "rides 1 + EUF"): the
+-- read-to-read symbolic dependency — `read(k1) == read(k2)` when `k1 == k2`
+-- — is exactly `f(a) == f(b)` congruence over the lifted `Expr`. euf.fenel is
+-- the pure equational core; the PE/symbolize layer owns the memory-model
+-- discipline (which read-sites may be presented as the same term).
+--
+-- ─── THE TERM ALGEBRA over the 7 Expr cases (all choices SOUND-BY-WEAKNESS —
+-- treating more things as opaque atoms only loses completeness, never
+-- soundness):
+--   • ELit value        — interpreted CONSTANT atom. Two type-distinct or
+--                          value-distinct ground lits forced into one class =
+--                          CONFLICT (unsat); the only refutation source in v1.
+--   • EVar name          — uninterpreted atom.
+--   • ECall fnId args     — congruent application, signature (fnId, arity):
+--                          congruence axiom — args pairwise-congruent ⇒
+--                          applications congruent.
+--   • EConstruct c args fs — congruent application, signature (ctor, arity)[+ the
+--                          field-NAME list]; children = positional args ++ the
+--                          named-field VALUES. Constructor injectivity/
+--                          distinctness is NOT used in v1 (no `Just x ≠ Nothing`
+--                          refutation — a flagged widening, §6 of the brief).
+--   • ERecord fields      — congruent application, signature = the ordered
+--                          field-name list; children = the field values.
+--   • ELambda / EMatch     — OPAQUE atoms: syntactically identical terms
+--                          (eufValEq) are equal, no congruence UNDER binders
+--                          (classical ground EUF).
+--
+-- ─── TERM IDENTITY (`eufValEq`) — a TYPE-DISCRIMINATED structural deep-eq (NOT
+-- the printer, NOT `std eq`, NOT `deepEqValue`). Two reasons it is bespoke:
+--   1. `std eq` is JS-LOOSE (`"1" == 1` ⇒ true) and `deepEqValue` bottoms out
+--      in it, so both would MERGE `ELit "1"` with `ELit 1` (the peTruthy bug
+--      class — partial-evaluator-substrate Phase 1 finding #4; regression-pinned
+--      in euf.test). `eufValEq` gates every scalar leaf on SAME-TYPE first
+--      (isNumber/isString/isBoolean/isNull), so `"1" ≠ 1`.
+--   2. The decider dispatch ctx (`dispatchSetAlgebraDecider` / the merged
+--      `dispatchEngineBodyWithDeciderCtx`) is a CLONE of the harness ctx, under
+--      which `Number` values arrive OPAQUE-WRAPPED and the polymorphic
+--      `toString` native renders them `"[object Object]"` (numeric natives —
+--      eq / add / length — still unwrap correctly). A string-key serializer
+--      built on `toString` would therefore collapse ALL numbers to one key
+--      under the very ctx the decider arm runs in. So union-find is keyed by
+--      the term's INDEX in the deduped universe (a raw Number, compared with
+--      the working `eq`), and identity/dedup/conflict all route through
+--      `eufValEq` — ZERO reliance on number stringification.
+-- Records/variants compare key-set + per-key recursion (order-robust — two
+-- deepEq-equal objects with different key order ARE equal here; that is sound,
+-- record key order carries no meaning). The one string-valued key euf DOES
+-- build (`eufSig`, the head signature) is fnId/ctor/field-NAMES only — all
+-- strings, never a number — so it survives the opaque-number ctx.
+--
+-- ─── PERFORMANCE. Each universe term is ANNOTATED ONCE with its head signature
+-- + its children's universe INDICES (`eufChildIxs`), so the O(|U|³) congruence
+-- fixpoint's inner loop is pure Number `eq` + assoc-list `find` over precomputed
+-- indices — NO deep-structural compares in the hot path (the naive re-`indexOf`
+-- was measured ~seconds on a depth-8 chain; the precompute makes it ~ms). Round
+-- counter bounded by `length universe + 1` (each productive round merges ≥1
+-- class ⇒ total by construction — structural fuel, no arbitrary constant).
+-- Union-find = assoc-list parent map (prepend-shadow + first-match read),
+-- fuel-bounded find (no path compression v1). The compiled-artifact perf branch
+-- is the ledgered escape hatch IF ever measured at scale.
+--
+-- ─── THE SOUNDNESS CONTRACT. EUF treats every head as a MATHEMATICAL FUNCTION.
+-- Congruence over effectful call sites is the CALLER's modeling responsibility
+-- (the PE/symbolize layer decides when two `read(k)` sites may be the same
+-- term); euf.fenel itself is pure equational reasoning over the terms it is
+-- handed — it does NOT fence effects. The DECIDER ARM (`eufDecideWhere`, wired
+-- into set-algebra-deciders' public `setAlgebraDecideEmpty`) additionally
+-- fences `$effect:`-prefixed heads defensively, since it congruence-merges
+-- terms under the ambient decider without a memory model.
+--
+-- ─── VERDICTS (each `Just` sound over every domain + interpretation):
+--   • eufEntails eqs l r = Just true  ⟺ after closing eqs, find(l) == find(r).
+--   • eufEntails …       = Just false ⟺ closing eqs ∪ {l = r} yields a
+--                          lit-conflict (E ⊨ l ≠ r by grounding).
+--   • eufSat eqs neqs     = Just false (unsat) ⟺ closure of eqs has a
+--                          lit-conflict, OR some (l ≠ r) ∈ neqs collapses
+--                          (find(l) == find(r)).
+--   • eufSat …            = Just true = EUF-CONSISTENCY (a model over the free
+--                          term universe). The JUDGMENT adapter maps EUF-sat to
+--                          Nothing for typed emptiness (a typed domain can be
+--                          finite — Bool!); only unsat ⇒ empty flows through.
+--
+-- NO ENTITY DECLS (the law-freeze / cheap-gate rule — the partial-evaluate.fenel
+-- entity-free precedent): env + verdicts are plain records / `Maybe Boolean`.
+-- FENCED in the parse-cache (TS-parsed, byte-identical) — the natural
+-- named-field `case`-over-Expr idiom of its siblings (comprehend / partial-
+-- evaluate / desugar / analyze), whose grammar exceeds the Fenel parser's caps.
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- eufValEq — the TYPE-DISCRIMINATED structural equality (term identity).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "euf: valEq"
+@description "decide-substrate Phase 5 — TYPE-DISCRIMINATED structural deep-equality over two values: scalar leaves (number/string/bool/null) must be SAME TYPE and equal (so `\"1\" ≠ 1` — unlike JS-loose `std eq` / `deepEqValue`); arrays compare element-wise; records/variants compare by key-set + per-key recursion (order-robust). The euf term-identity + lit-distinctness comparator; native-free. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufValEq : (a: x) -> (b: y) -> Boolean
+eufValEq a b =
+  if isArray a then (if isArray b then eufEntriesEq (entries a) (entries b) else false)
+  else if isArray b then false
+  else if isNull a then isNull b
+  else if isNull b then false
+  else if isNumber a then (if isNumber b then eq a b else false)
+  else if isNumber b then false
+  else if isString a then (if isString b then eq a b else false)
+  else if isString b then false
+  else if isBoolean a then (if isBoolean b then eq a b else false)
+  else if isBoolean b then false
+  else eufEntriesEq (entries a) (entries b)
+
+@label "euf: entriesEq"
+@description "decide-substrate Phase 5 — structural equality of two `entries` lists (record/variant/array as {key,value} pairs): equal length AND every entry of the first finds a same-key entry in the second with eufValEq-equal value (key-set semantics, order-robust). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufEntriesEq : (ea: a) -> (eb: b) -> Boolean
+eufEntriesEq ea eb =
+  if eq (length ea) (length eb) then eufEntriesAllEq ea eb else false
+
+@label "euf: entriesAllEq"
+@description "decide-substrate Phase 5 — true when EVERY {key,value} entry of the first list finds a same-key entry in the second whose value is eufValEq-equal (the per-key half of eufEntriesEq; lengths pre-checked equal). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufEntriesAllEq : (ea: a) -> (eb: b) -> Boolean
+eufEntriesAllEq ea eb =
+  case head ea of
+    Nothing -> true
+    Just e ->
+      case eufFindEntry eb e.key of
+        Nothing -> false
+        Just other -> if eufValEq e.value other.value then eufEntriesAllEq (eufRest ea) eb else false
+
+@label "euf: findEntry"
+@description "decide-substrate Phase 5 — first {key,value} entry of an entries list whose `.key` matches (Just / Nothing) — the key-set lookup for eufEntriesAllEq. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufFindEntry : (es: List ({ key: String, value: a })) -> (k: String) -> Maybe ({ key: String, value: a })
+eufFindEntry es k =
+  case head es of
+    Nothing -> Nothing
+    Just e ->
+      if eq e.key k then Just e
+      else case tail es of
+             Nothing -> Nothing
+             Just rest -> eufFindEntry rest k
+
+@label "euf: rest"
+@description "decide-substrate Phase 5 — the tail of a list or [] (the un-Maybe'd `std tail` — a spelling helper used across the euf loops). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufRest : (xs: a) -> a
+eufRest xs =
+  case tail xs of
+    Nothing -> []
+    Just r -> r
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The application decomposition (head signature + children).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "euf: isApp"
+@description "decide-substrate Phase 5 — true when an Expr is a CONGRUENT application (ECall / EConstruct / ERecord — the shapes congruence closure pairs by head+arity); ELit / EVar / ELambda / EMatch are atoms. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufIsApp : (e: (Expr Any)) -> Boolean
+eufIsApp e =
+  case e of
+    ECall {} -> true
+    EConstruct {} -> true
+    ERecord {} -> true
+    _ -> false
+
+@label "euf: sig"
+@description "decide-substrate Phase 5 — the STRING head signature of an application term (the congruence antecedent's function-symbol part): ECall ⇒ `C|fnId`; EConstruct ⇒ `K|ctor|fieldNames`; ERecord ⇒ `R|fieldNames`. All-string (fnId/ctor/names) — never a number — so it survives the opaque-number decider ctx (positional arity is compared separately via the precomputed child-index count). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufSig : (e: (Expr Any)) -> String
+eufSig e =
+  case e of
+    ECall { fnId = f } -> concat "C|" f
+    EConstruct { ctor = c } -> concat "K|" (concat c (concat "|" (eufJoinNames (eufConstructFields e))))
+    ERecord { fields = fs } -> concat "R|" (eufJoinNames fs)
+    _ -> ""
+
+@label "euf: joinNames"
+@description "decide-substrate Phase 5 — comma-joined `.name` over a field list (the ordered field-name part of an EConstruct/ERecord signature). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufJoinNames : (fs: a) -> String
+eufJoinNames fs =
+  case head fs of
+    Nothing -> ""
+    Just f ->
+      case tail fs of
+        Nothing -> f.name
+        Just rest -> concat f.name (concat "," (eufJoinNames rest))
+
+@label "euf: constructFields"
+@description "decide-substrate Phase 5 — the named-field list of an EConstruct, or [] when the construct is purely positional (no `fields` slot). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufConstructFields : (e: (Expr Any)) -> a
+eufConstructFields e =
+  case e of
+    EConstruct { fields = fs } -> fs
+    _ -> []
+
+@label "euf: children"
+@description "decide-substrate Phase 5 — the ordered congruence children of an application term: ECall ⇒ its args; EConstruct ⇒ args ++ named-field values (that order); ERecord ⇒ the field values. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufChildren : (e: (Expr Any)) -> a
+eufChildren e =
+  case e of
+    ECall { args = a } -> a
+    EConstruct { args = a, fields = fs } -> concat a (eufFieldValues fs)
+    EConstruct { args = a } -> a
+    ERecord { fields = fs } -> eufFieldValues fs
+    _ -> []
+
+@label "euf: fieldValues"
+@description "decide-substrate Phase 5 — the `.value` list of a field list, order-preserved (the named-field congruence children of EConstruct/ERecord). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufFieldValues : (fs: a) -> a
+eufFieldValues fs =
+  case head fs of
+    Nothing -> []
+    Just f ->
+      let v = f.value
+      case tail fs of
+        Nothing -> appendItem v []
+        Just rest -> concat (appendItem v []) (eufFieldValues rest)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Subterms + the deduped, INDEXED, ANNOTATED universe.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "euf: subterms"
+@description "decide-substrate Phase 5 — a term and its proper subterms (self ++ recursively the subterms of its congruence children; ELit/EVar/ELambda/EMatch contribute themselves only). The universe basis. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufSubterms : (e: (Expr Any)) -> a
+eufSubterms e =
+  if eufIsApp e
+  then concat (appendItem e []) (eufSubtermsOfList (eufChildren e))
+  else appendItem e []
+
+@label "euf: subtermsOfList"
+@description "decide-substrate Phase 5 — concat eufSubterms over a term list (the children-descent of eufSubterms). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufSubtermsOfList : (xs: a) -> a
+eufSubtermsOfList xs =
+  case head xs of
+    Nothing -> []
+    Just x ->
+      case tail xs of
+        Nothing -> eufSubterms x
+        Just rest -> concat (eufSubterms x) (eufSubtermsOfList rest)
+
+@label "euf: allSubterms"
+@description "decide-substrate Phase 5 — every subterm of every equation's two sides ++ every extra query term (the raw, un-deduped universe basis). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufAllSubterms : (eqs: a) -> (extras: b) -> c
+eufAllSubterms eqs extras =
+  concat (eufSubtermsOfEqs eqs) (eufSubtermsOfList extras)
+
+@label "euf: subtermsOfEqs"
+@description "decide-substrate Phase 5 — every subterm of both sides of every equation (concatenated; deduped later by eufUniverse). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufSubtermsOfEqs : (eqs: a) -> b
+eufSubtermsOfEqs eqs =
+  case head eqs of
+    Nothing -> []
+    Just q ->
+      let here = concat (eufSubterms q.lhs) (eufSubterms q.rhs)
+      case tail eqs of
+        Nothing -> here
+        Just rest -> concat here (eufSubtermsOfEqs rest)
+
+@label "euf: universe"
+@description "decide-substrate Phase 5 — the deduped, INDEXED, ANNOTATED term universe as `List { ix, expr, app, sig, childIxs }`: every subterm of every equation's sides ++ the extra query terms, deduped by eufValEq (index = the union-find node id, a raw Number). Each app term is annotated ONCE with its head signature (eufSig) + its children's universe indices (eufChildIxs) so the congruence fixpoint is pure Number comparison. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufUniverse : (eqs: a) -> (extras: b) -> c
+eufUniverse eqs extras =
+  let base = eufIndexUnique (eufAllSubterms eqs extras) [] 0
+  eufAnnotateAll base base
+
+@label "euf: indexUnique"
+@description "decide-substrate Phase 5 — dedup a term list by eufValEq, assigning each first-seen term a sequential index ⇒ `List { ix, expr }`. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufIndexUnique : (terms: a) -> (acc: b) -> (nextIx: Number) -> b
+eufIndexUnique terms acc nextIx =
+  case head terms of
+    Nothing -> acc
+    Just t ->
+      let seen = eufHasTerm acc t
+      let acc2 = if seen then acc else appendItem { ix = nextIx, expr = t } acc
+      let nextIx2 = if seen then nextIx else add nextIx 1
+      case tail terms of
+        Nothing -> acc2
+        Just rest -> eufIndexUnique rest acc2 nextIx2
+
+@label "euf: hasTerm"
+@description "decide-substrate Phase 5 — true when the indexed universe already carries an eufValEq-equal term (the dedup membership test). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufHasTerm : (acc: a) -> (t: (Expr Any)) -> Boolean
+eufHasTerm acc t =
+  case head acc of
+    Nothing -> false
+    Just u ->
+      if eufValEq u.expr t then true
+      else case tail acc of
+             Nothing -> false
+             Just rest -> eufHasTerm rest t
+
+@label "euf: annotateAll"
+@description "decide-substrate Phase 5 — annotate every deduped universe entry with its head signature + child indices (eufAnnotateOne), keeping the `base` list for the index lookups. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufAnnotateAll : (base: a) -> (entries: b) -> c
+eufAnnotateAll base entries =
+  case head entries of
+    Nothing -> []
+    Just u ->
+      let ann = eufAnnotateOne base u
+      case tail entries of
+        Nothing -> appendItem ann []
+        Just rest -> concat (appendItem ann []) (eufAnnotateAll base rest)
+
+@label "euf: annotateOne"
+@description "decide-substrate Phase 5 — annotate one universe entry: app terms get { app=true, sig, childIxs } (children resolved to their base indices); atoms get { app=false, sig=\"\", childIxs=[] }. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufAnnotateOne : (base: a) -> (u: b) -> c
+eufAnnotateOne base u =
+  if eufIsApp u.expr
+  then { ix = u.ix, expr = u.expr, app = true, sig = eufSig u.expr, childIxs = eufChildIxs base (eufChildren u.expr) }
+  else { ix = u.ix, expr = u.expr, app = false, sig = "", childIxs = [] }
+
+@label "euf: childIxs"
+@description "decide-substrate Phase 5 — the universe indices of a children list (each resolved via eufIndexOf) — the precomputed congruence-argument ids. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufChildIxs : (base: a) -> (children: b) -> c
+eufChildIxs base children =
+  case head children of
+    Nothing -> []
+    Just c ->
+      let ix = eufIndexOf base c
+      case tail children of
+        Nothing -> appendItem ix []
+        Just rest -> concat (appendItem ix []) (eufChildIxs base rest)
+
+@label "euf: indexOf"
+@description "decide-substrate Phase 5 — the universe index of a term (its eufValEq-match's `.ix`), or -1 if absent (never, for a complete universe). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufIndexOf : (universe: a) -> (t: (Expr Any)) -> Number
+eufIndexOf universe t =
+  case head universe of
+    Nothing -> sub 0 1
+    Just u ->
+      if eufValEq u.expr t then u.ix
+      else case tail universe of
+             Nothing -> sub 0 1
+             Just rest -> eufIndexOf rest t
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Union-find over INDICES (assoc-list parent map; prepend-shadow + first-match
+-- read; fuel-bounded find, no path compression v1).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "euf: lookup"
+@description "decide-substrate Phase 5 — first-match lookup of an index's parent edge in the assoc-list parent map (Just parent-index / Nothing). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufLookup : (parents: a) -> (k: Number) -> Maybe Number
+eufLookup parents k =
+  case head parents of
+    Nothing -> Nothing
+    Just p ->
+      if eq p.k k then Just p.v
+      else case tail parents of
+             Nothing -> Nothing
+             Just rest -> eufLookup rest k
+
+@label "euf: find"
+@description "decide-substrate Phase 5 — the union-find root index of a node: walk parent edges to a self-or-absent node, fuel-bounded by the map length + 1 (totality under no-TCO; the chain is acyclic by construction — union only ever points a root at another root). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufFind : (parents: a) -> (k: Number) -> Number
+eufFind parents k = eufFindFuel parents k (add (length parents) 1)
+
+@label "euf: findFuel"
+@description "decide-substrate Phase 5 — the fuel-guarded root walk (eufFind's worker): fuel 0 ⇒ the current index; else follow the parent edge unless it is self/absent. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufFindFuel : (parents: a) -> (k: Number) -> (fuel: Number) -> Number
+eufFindFuel parents k fuel =
+  if lte fuel 0 then k
+  else
+    case eufLookup parents k of
+      Nothing -> k
+      Just p -> if eq p k then k else eufFindFuel parents p (sub fuel 1)
+
+@label "euf: union"
+@description "decide-substrate Phase 5 — union two classes by their indices: find both roots; if equal, unchanged; else prepend the edge rootA → rootB (prepend-shadow so the newest binding reads first). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufUnion : (parents: a) -> (ka: Number) -> (kb: Number) -> a
+eufUnion parents ka kb =
+  let ra = eufFind parents ka
+  let rb = eufFind parents kb
+  if eq ra rb then parents else concat (appendItem { k = ra, v = rb } []) parents
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Congruence closure — seed the input equations, then fixpoint the congruence
+-- rule (round counter bounded by |universe| + 1: each productive round merges
+-- ≥1 class ⇒ total by construction). The inner loop is Number-only (precomputed
+-- signatures + child indices).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "euf: close"
+@description "decide-substrate Phase 5 — congruence closure of an equation set over a universe: seed (union each equation's sides), then fixpoint the congruence rule (eufCloseFix), bounded by |universe| + 1 rounds. Returns the final parent map. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufClose : (universe: a) -> (eqs: b) -> c
+eufClose universe eqs =
+  let seeded = eufSeed universe eqs []
+  eufCloseFix universe seeded (add (length universe) 1)
+
+@label "euf: seed"
+@description "decide-substrate Phase 5 — union each input equation's two sides (by universe index) into the parent map (the closure seed). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufSeed : (universe: a) -> (eqs: b) -> (parents: c) -> c
+eufSeed universe eqs parents =
+  case head eqs of
+    Nothing -> parents
+    Just q ->
+      let p1 = eufUnion parents (eufIndexOf universe q.lhs) (eufIndexOf universe q.rhs)
+      case tail eqs of
+        Nothing -> p1
+        Just rest -> eufSeed universe rest p1
+
+@label "euf: closeFix"
+@description "decide-substrate Phase 5 — the congruence fixpoint loop: run one congruence round; if it merged anything, recurse with one less fuel; else the map is closed. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufCloseFix : (universe: a) -> (parents: b) -> (rounds: Number) -> b
+eufCloseFix universe parents rounds =
+  if lte rounds 0 then parents
+  else
+    let r = eufCongruenceRound universe parents
+    if r.changed then eufCloseFix universe r.parents (sub rounds 1) else parents
+
+@label "euf: congruenceRound"
+@description "decide-substrate Phase 5 — one pass of the congruence rule: scan all ordered app-term pairs of the universe; a pair with equal signature + arg-count + pairwise-congruent child indices + not-yet-same-root ⇒ union. Returns { parents, changed }. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufCongruenceRound : (universe: a) -> (parents: b) -> c
+eufCongruenceRound universe parents = eufRoundOuter universe parents false
+
+@label "euf: roundOuter"
+@description "decide-substrate Phase 5 — the outer loop of a congruence round: for each app term of the universe, pair it against every term (eufRoundInner); non-app terms are skipped. Threads { parents, changed }. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufRoundOuter : (rest: a) -> (parents: b) -> (changed: Boolean) -> c
+eufRoundOuter rest parents changed =
+  case head rest of
+    Nothing -> { parents = parents, changed = changed }
+    Just u ->
+      let step = if u.app then eufRoundInner u (eufRest rest) parents changed else { parents = parents, changed = changed }
+      case tail rest of
+        Nothing -> step
+        Just more -> eufRoundOuter more step.parents step.changed
+
+@label "euf: roundInner"
+@description "decide-substrate Phase 5 — pair one app term u against the remaining universe terms v: v an app, congruent to u (eufCongruentPair — signature + child-index congruence) and not-yet-same-root ⇒ union. Threads { parents, changed }. Only later terms are scanned (the outer loop supplies the tail) — each unordered pair is tested once. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufRoundInner : (u: a) -> (rest: b) -> (parents: c) -> (changed: Boolean) -> d
+eufRoundInner u rest parents changed =
+  case head rest of
+    Nothing -> { parents = parents, changed = changed }
+    Just v ->
+      let step =
+            if and v.app (eufCongruentPair u v parents)
+            then
+              let ru = eufFind parents u.ix
+              let rv = eufFind parents v.ix
+              if eq ru rv then { parents = parents, changed = changed }
+              else { parents = eufUnion parents u.ix v.ix, changed = true }
+            else { parents = parents, changed = changed }
+      case tail rest of
+        Nothing -> step
+        Just more -> eufRoundInner u more step.parents step.changed
+
+@label "euf: congruentPair"
+@description "decide-substrate Phase 5 — true when two annotated app terms are congruent under the current parent map: equal head signature + equal arg count (eufHeadSigEq) AND pairwise same-root child indices (eufIxsCongruent). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufCongruentPair : (u: a) -> (v: b) -> (parents: c) -> Boolean
+eufCongruentPair u v parents =
+  if and (eq u.sig v.sig) (eq (length u.childIxs) (length v.childIxs))
+  then eufIxsCongruent u.childIxs v.childIxs parents
+  else false
+
+@label "euf: ixsCongruent"
+@description "decide-substrate Phase 5 — true when two equal-length child-index lists are pairwise same-root under the parent map (the congruence antecedent, Number-only). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufIxsCongruent : (xs: a) -> (ys: b) -> (parents: c) -> Boolean
+eufIxsCongruent xs ys parents =
+  case head xs of
+    Nothing -> true
+    Just x ->
+      case head ys of
+        Nothing -> false
+        Just y ->
+          if eq (eufFind parents x) (eufFind parents y)
+          then eufIxsCongruent (eufRest xs) (eufRest ys) parents
+          else false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Conflict — a class holding two type/value-distinct ground lits (the sole
+-- refutation source in v1).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "euf: conflict"
+@description "decide-substrate Phase 5 — true when the closed map forces two eufValEq-DISTINCT ELit values into one class (an inconsistency: distinct constants can't be equal). Scans the universe's lits pairwise. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufConflict : (universe: a) -> (parents: b) -> Boolean
+eufConflict universe parents = eufConflictScan (eufLits universe) parents
+
+@label "euf: lits"
+@description "decide-substrate Phase 5 — the ELit universe entries (annotated { ix, expr, … }) — the conflict-check candidates. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufLits : (universe: a) -> b
+eufLits universe =
+  case head universe of
+    Nothing -> []
+    Just u ->
+      let isLit = case u.expr of
+                    ELit {} -> true
+                    _ -> false
+      let rest = eufRest universe
+      if isLit then concat (appendItem u []) (eufLits rest) else eufLits rest
+
+@label "euf: conflictScan"
+@description "decide-substrate Phase 5 — pairwise scan of the lit list: any lit sharing a root with a later, eufValEq-distinct lit ⇒ conflict. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufConflictScan : (lits: a) -> (parents: b) -> Boolean
+eufConflictScan lits parents =
+  case head lits of
+    Nothing -> false
+    Just l ->
+      let rest = eufRest lits
+      if eufConflictWith l rest parents then true else eufConflictScan rest parents
+
+@label "euf: conflictWith"
+@description "decide-substrate Phase 5 — true when a lit shares a root with some other lit whose value is eufValEq-DISTINCT (one same-root distinct-value pair refutes). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufConflictWith : (l: a) -> (others: b) -> (parents: c) -> Boolean
+eufConflictWith l others parents =
+  case head others of
+    Nothing -> false
+    Just o ->
+      let same = eq (eufFind parents l.ix) (eufFind parents o.ix)
+      let distinct = not (eufValEq (eufLitValue l.expr) (eufLitValue o.expr))
+      if and same distinct then true
+      else case tail others of
+             Nothing -> false
+             Just rest -> eufConflictWith l rest parents
+
+@label "euf: litValue"
+@description "decide-substrate Phase 5 — the payload of an ELit (the value under conflict comparison); a non-ELit yields the term itself (never happens — eufLits filters). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufLitValue : (e: (Expr Any)) -> a
+eufLitValue e =
+  case e of
+    ELit { value = v } -> v
+    _ -> e
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The verdicts (§0). All total, all sound-per-Just.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "EUF entails"
+@description "decide-substrate Phase 5 — does the equation set E entail `lhs == rhs`? After closing E: find(lhs) == find(rhs) ⇒ Just true (proven equal). Else, if closing E ∪ {lhs = rhs} yields a lit-conflict ⇒ Just false (E ⊨ lhs ≠ rhs by grounding). Else Nothing (undecided — the honest default). Pure equational reasoning over the terms as handed (no effect fence — the caller owns the memory model)."
+@tags "engine" "euf" "solve" "prover" "decide-substrate" "phase-5"
+eufEntails : (eqs: a) -> (lhs: (Expr Any)) -> (rhs: (Expr Any)) -> Maybe Boolean
+eufEntails eqs lhs rhs =
+  let uni = eufUniverse eqs (concat (appendItem lhs []) (appendItem rhs []))
+  let p0 = eufClose uni eqs
+  if eq (eufFind p0 (eufIndexOf uni lhs)) (eufFind p0 (eufIndexOf uni rhs)) then Just true
+  else
+    let eqs2 = concat eqs (appendItem { lhs = lhs, rhs = rhs } [])
+    let p1 = eufClose uni eqs2
+    if eufConflict uni p1 then Just false else Nothing
+
+@label "EUF sat"
+@description "decide-substrate Phase 5 — is the conjunction of equalities `eqs` and disequalities `neqs` EUF-satisfiable? Unsat (Just false) ⟺ the closure of eqs has a lit-conflict OR some (l ≠ r) ∈ neqs collapses (find(l) == find(r)). Otherwise Just true = EUF-consistency (a model over the free term universe). The judgment adapter maps Just true ⇒ Nothing for typed emptiness (a typed domain can be finite); only unsat ⇒ empty flows through."
+@tags "engine" "euf" "solve" "prover" "decide-substrate" "phase-5"
+eufSat : (eqs: a) -> (neqs: b) -> Maybe Boolean
+eufSat eqs neqs =
+  let uni = eufUniverse eqs (eufNeqTerms neqs)
+  let p = eufClose uni eqs
+  if eufConflict uni p then Just false
+  else if eufNeqViolated uni neqs p then Just false
+  else Just true
+
+@label "euf: neqTerms"
+@description "decide-substrate Phase 5 — the lhs ++ rhs terms of every disequality (universe contributors for eufSat). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufNeqTerms : (neqs: a) -> b
+eufNeqTerms neqs =
+  case head neqs of
+    Nothing -> []
+    Just n ->
+      let rest = eufRest neqs
+      concat (concat (appendItem n.lhs []) (appendItem n.rhs [])) (eufNeqTerms rest)
+
+@label "euf: neqViolated"
+@description "decide-substrate Phase 5 — true when some disequality (l ≠ r) has find(l) == find(r) under the closed map (a collapsed disequality ⇒ unsat). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufNeqViolated : (universe: a) -> (neqs: b) -> (parents: c) -> Boolean
+eufNeqViolated universe neqs parents =
+  case head neqs of
+    Nothing -> false
+    Just n ->
+      if eq (eufFind parents (eufIndexOf universe n.lhs)) (eufFind parents (eufIndexOf universe n.rhs)) then true
+      else case tail neqs of
+             Nothing -> false
+             Just rest -> eufNeqViolated universe rest parents
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The decider arm — `eufDecideWhere` (the SeWhere leaf of the public
+-- setAlgebraDecideEmpty; §3 of the brief). unsat ⇒ Just true (empty), NEVER
+-- Just false (the finite-domain honesty).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "euf: decideWhere"
+@description "decide-substrate Phase 5 — the emptiness arm over a SeWhere predicate Expr: extract the and-spine's eq/neq atoms (eufWhereAtoms; non-extractable conjuncts DROPPED — unsat of a subset ⇒ unsat of the whole, so the verdict stays sound over mixed predicates); DEFENSIVELY fence any atom whose term tree carries an `$effect:` head (⇒ Nothing); zero atoms ⇒ Nothing. Then eufSat: unsat ⇒ Just true (empty over every domain + ambient env), else Nothing (never Just false — EUF-sat does not certify nonempty for a typed domain)."
+@tags "engine" "euf" "set-algebra" "decideEmpty" "decide-substrate" "phase-5"
+eufDecideWhere : (pred: (Expr Any)) -> Maybe Boolean
+eufDecideWhere pred =
+  let atoms = eufWhereAtoms pred
+  if eufAtomsEffectful atoms then Nothing
+  else if and (eq (length atoms.eqs) 0) (eq (length atoms.neqs) 0) then Nothing
+  else
+    case eufSat atoms.eqs atoms.neqs of
+      Just false -> Just true
+      _ -> Nothing
+
+@label "euf: whereAtoms"
+@description "decide-substrate Phase 5 — walk a predicate Expr's `and`-spine collecting `eq`/`neq` 2-arg atoms (+ `not(eq …)` ⇒ neq) into { eqs, neqs }; every non-extractable conjunct (ordered comparisons, or-subtrees, anything else) is DROPPED (sound — unsat of a subset entails unsat of the conjunction). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufWhereAtoms : (e: (Expr Any)) -> a
+eufWhereAtoms e = eufWhereFold e { eqs = [], neqs = [] }
+
+@label "euf: whereFold"
+@description "decide-substrate Phase 5 — the and-spine collector: `and` ⇒ recurse each arg; `eq` ⇒ add an eq atom; `neq` ⇒ add a neq atom; `not(eq …)` ⇒ add a neq atom; every other head ⇒ drop. Threads the { eqs, neqs } accumulator. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufWhereFold : (e: (Expr Any)) -> (acc: a) -> a
+eufWhereFold e acc =
+  case e of
+    ECall { fnId = f, args = a } ->
+      if eq f "and" then eufWhereFoldList a acc
+      else if eq f "eq" then eufAddEq a acc
+      else if eq f "neq" then eufAddNeq a acc
+      else if eq f "not" then eufWhereNot a acc
+      else acc
+    _ -> acc
+
+@label "euf: whereFoldList"
+@description "decide-substrate Phase 5 — fold eufWhereFold over an `and`'s operand list, threading the { eqs, neqs } accumulator. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufWhereFoldList : (args: a) -> (acc: b) -> b
+eufWhereFoldList args acc =
+  case head args of
+    Nothing -> acc
+    Just a ->
+      let acc1 = eufWhereFold a acc
+      case tail args of
+        Nothing -> acc1
+        Just rest -> eufWhereFoldList rest acc1
+
+@label "euf: addEq"
+@description "decide-substrate Phase 5 — add an `eq` atom (two args) to the accumulator's eqs list; a non-2-arg shape is dropped. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufAddEq : (a: b) -> (acc: c) -> c
+eufAddEq a acc =
+  case eufTwoArgs a of
+    Just pr -> { eqs = concat acc.eqs (appendItem { lhs = pr.lhs, rhs = pr.rhs } []), neqs = acc.neqs }
+    Nothing -> acc
+
+@label "euf: addNeq"
+@description "decide-substrate Phase 5 — add a `neq` atom (two args) to the accumulator's neqs list; a non-2-arg shape is dropped. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufAddNeq : (a: b) -> (acc: c) -> c
+eufAddNeq a acc =
+  case eufTwoArgs a of
+    Just pr -> { eqs = acc.eqs, neqs = concat acc.neqs (appendItem { lhs = pr.lhs, rhs = pr.rhs } []) }
+    Nothing -> acc
+
+@label "euf: whereNot"
+@description "decide-substrate Phase 5 — the `not` arm: `not(eq x y)` ⇒ a neq atom; any other negated head is dropped (no De Morgan over the and-spine in v1). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufWhereNot : (a: b) -> (acc: c) -> c
+eufWhereNot a acc =
+  case head a of
+    Nothing -> acc
+    Just inner ->
+      case inner of
+        ECall { fnId = g, args = ia } -> if eq g "eq" then eufAddNeq ia acc else acc
+        _ -> acc
+
+@label "euf: twoArgs"
+@description "decide-substrate Phase 5 — extract exactly the first two elements of an arg list as { lhs, rhs }; fewer than two ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufTwoArgs : (a: List item) -> Maybe ({ lhs: item, rhs: item })
+eufTwoArgs a =
+  case head a of
+    Nothing -> Nothing
+    Just x ->
+      case tail a of
+        Nothing -> Nothing
+        Just rest ->
+          case head rest of
+            Nothing -> Nothing
+            Just y -> Just { lhs = x, rhs = y }
+
+@label "euf: atomsEffectful"
+@description "decide-substrate Phase 5 — true when any extracted atom's term tree carries an `$effect:`-prefixed ECall head (the defensive fence: effectful sites must never be congruence-merged by the ambient decider). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufAtomsEffectful : (atoms: a) -> Boolean
+eufAtomsEffectful atoms =
+  if eufAtomListEffect atoms.eqs then true else eufAtomListEffect atoms.neqs
+
+@label "euf: atomListEffect"
+@description "decide-substrate Phase 5 — true when some atom in the list has an `$effect:` head anywhere in either side's term tree (eufTermHasEffect). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufAtomListEffect : (atoms: a) -> Boolean
+eufAtomListEffect atoms =
+  case head atoms of
+    Nothing -> false
+    Just at ->
+      if or (eufTermHasEffect at.lhs) (eufTermHasEffect at.rhs) then true
+      else case tail atoms of
+             Nothing -> false
+             Just rest -> eufAtomListEffect rest
+
+@label "euf: termHasEffect"
+@description "decide-substrate Phase 5 — true when any subterm of a term is an ECall whose fnId starts with `$effect:` (the effect-head scan over the subterm tree). Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufTermHasEffect : (e: (Expr Any)) -> Boolean
+eufTermHasEffect e = eufTermHasEffectList (eufSubterms e)
+
+@label "euf: termHasEffectList"
+@description "decide-substrate Phase 5 — true when any term in the subterm list is an ECall with an `$effect:`-prefixed head. Internal helper."
+@tags "engine" "internal" "euf" "decide-substrate" "phase-5"
+@category "engine-internal"
+eufTermHasEffectList : (terms: a) -> Boolean
+eufTermHasEffectList terms =
+  case head terms of
+    Nothing -> false
+    Just t ->
+      let hit = case t of
+                  ECall { fnId = f } -> startsWith f "$effect:"
+                  _ -> false
+      if hit then true
+      else case tail terms of
+             Nothing -> false
+             Just rest -> eufTermHasEffectList rest

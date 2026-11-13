@@ -1,0 +1,95 @@
+module notify where
+
+-- =========================================================================
+-- notify:sendTgDm — Fenel-bodied Telegram DM action body.
+--
+-- FM-retire-7 Step 2 (2026-06-06): spun out of telegram.ts (where it was the
+-- lone surviving `defineFunction`) into its own minimal `notify` module — the
+-- email-webhooks thin-`loadFenelModule` precedent. `module notify where` makes
+-- the fn id `notify:sendTgDm` (byte-identical to the retired spec id → 0
+-- consumer edits) and renames the 5 helpers `notify-bodies:*` → `notify:*`
+-- (Codeable-only). @category is OMITTED (category "notify" === the module-name
+-- prefix → the Phase-3j read-time-derives rule).
+--
+-- Phase 14a sub-step 2 of the ts-elimination workstream. Replaces the
+-- TS tgDmHandler in core/src/actions/notifications.ts that called
+-- getProfileHandles + getTransport().sendDM(). The Fenel body resolves
+-- the profile's Telegram handle, appends the tg_dm_sent event, and
+-- delivers via telegram:sendNotification when both a handle and a
+-- bot are resolvable.
+--
+-- Cross-process correctness gain (14a-1b surprise 2 ratified): because
+-- the body composes telegram:sendNotification directly, delivery now
+-- works from any process (API webhook handler, dashboard flow, bot
+-- polling). The pre-port Transport singleton path silently no-op'd
+-- when the action ran outside the bot process.
+-- =========================================================================
+
+-- isTelegramPlatform — predicate for filter; profile_handle has `platform`.
+isTelegramPlatform : ({}) -> Boolean
+isTelegramPlatform h = eq h.platform "telegram"
+
+-- pickTgRow — first telegram handle row, or Nothing.
+pickTgRow : List ({}) -> Maybe ({})
+pickTgRow handles = head (filter isTelegramPlatform handles)
+
+-- handleStrForEvent — empty string when no row found (matches pre-port
+-- payload shape: tgHandle is undefined-as-empty in the event log).
+handleStrForEvent : Maybe ({}) -> String
+handleStrForEvent tgRowM =
+  case tgRowM of
+    Nothing -> ""
+    Just row -> row.handle
+
+-- deliverIfNonEmpty — when handle is a non-empty string, resolve botId
+-- + dispatch sendNotification. Returns Bool delivered flag. Single-bot
+-- case (state:findBotIdForAccount enforces exactly-one Bot per account).
+deliverIfNonEmpty : String -> String -> NonEmptyStr -> List ButtonPayload -> Boolean
+deliverIfNonEmpty accountId handle message buttons =
+  if truthy handle
+  then deliverWithHandle accountId handle message buttons
+  else False
+
+-- `findBotIdForAccount` returns a phantom-tagged entity reference while the
+-- Telegram leaf retains its historical nominal BotId carrier; exact inference
+-- cannot equate those representations across this IO seam.
+deliverWithHandle : String -> String -> NonEmptyStr -> List ButtonPayload -> Boolean
+deliverWithHandle accountId handle message buttons =
+  let botM = findBotIdForAccount accountId
+  case botM of
+    Nothing -> False
+    Just botId ->
+      let _r = sendNotification botId handle message buttons
+      True
+
+-- sendTgDm — main entry. action-subsumption Phase 3b (2026-06-08): sendTgDm IS
+-- the public tg_dm action now (D1 COLLAPSE). The pre-port bespoke handler mapped
+-- this body's plain `{ profileId, delivered, hasTgHandle }` return into the TS
+-- ActionResult; that NORMALIZE now lives in the body — it returns `ActionOk { data
+-- = {profileId, delivered, hasTgHandle}, profileId = Just profileId }` so the
+-- generic dispatch fnRef path maps it via actionResultAdtToTs like every other
+-- action (no information lost). Public contract: profileId : Uuid, message :
+-- NonEmptyStr, buttons : Maybe (List ButtonPayload) (the `buttons ?? []` default the
+-- handler did is now body-side); accountId/adapter context-injected. The TS handler
+-- is deleted. (`@tags … "action" …` is FROZEN by the notify migration oracle — kept
+-- verbatim; the tag predates this port.)
+@label "Send Telegram DM (action body)"
+@description "Phase 14a sub-step 2 — Fenel-bodied tg_dm action body. Composes state:getProfileHandles + state:appendEvent + state:findBotIdForAccount + telegram:sendNotification. Cross-process correctness gain: the body delivers from any process (API, dashboard, bot) — the pre-port TS handler silently no-op'd unless the action ran inside the bot process where registerTransport fired."
+@tags "notify" "telegram" "dm" "action" "phase-14a"
+@ioAction "notify.send_tg_dm"
+@requires "HasStateIO"
+sendTgDm : (profileId: Uuid) -> (message: NonEmptyStr) -> (buttons: Maybe (List ButtonPayload)) -> (accountId: String) -> (adapter: String) -> ActionResult
+sendTgDm profileId message buttons accountId adapter =
+  let buttonsEff = case buttons of
+    Nothing -> []
+    Just bs -> bs
+  let handles = getProfileHandles accountId profileId
+  let tgRowM = pickTgRow handles
+  let tgHandleStr = handleStrForEvent tgRowM
+  let payload = { message = message, buttons = buttonsEff, tgHandle = tgHandleStr, adapter = adapter }
+  let _e = appendEvent "tg_dm_sent" payload (Just "profile") (Just profileId) (Just profileId)
+  let delivered = deliverIfNonEmpty accountId tgHandleStr message buttonsEff
+  let hasTg = case tgRowM of
+    Nothing -> False
+    Just _ -> True
+  ActionOk { data = { profileId = profileId, delivered = delivered, hasTgHandle = hasTg }, aggregateType = Nothing, aggregateId = Nothing, profileId = Just profileId }

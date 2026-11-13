@@ -1,0 +1,119 @@
+-- =========================================================================
+-- module crypto where — host-crypto IO leaves + sync natives.
+--
+-- typed-function-references Phase FM-retire-8 Step 2 (2026-06-07). Spun out of
+-- state.ts (where 7 `crypto:*` fns rode alongside the state substrate IO leaves).
+-- All 7 are bodyless `@native` foreign decls; whether an impl resolves via the
+-- runtime IO handler (registerCryptoHandlers — UNCHANGED) or the sync ctx-native
+-- map is decided by which seam map it lands in (axis #4 — no `.fenel` marker):
+--
+--   - 4 IO-backed (sha256Hex / verifyCalendlySignature / verifyTelegramSecret /
+--     verifyStripeSignature): `@ioAction "crypto.*"` + `@requires "HasStateIO"`,
+--     impl = runtime IO handler.
+--   - 3 sync natives (randomTokenHex / hashPassword / verifyPassword): NO
+--     ioAction / requires; impl = the 3 irreducible host-crypto bodies in
+--     ffi/crypto-ffi.ts (crypto-random, scrypt KDF, timing-safe compare),
+--     registered via the module's `nativeImplsCtx`. hashPassword/verifyPassword
+--     keep their divergent global codeName (scryptHash / scryptVerify) via
+--     `@codeName`.
+--
+-- Category for all 7 === `crypto` (=== the id prefix) → `@category` OMITTED
+-- (Phase-3j read-time derives it). The `crypto:` id-prefix is byte-identical to
+-- the retired specs, so every consumer (api routes / core/auth) needs 0 edits.
+-- =========================================================================
+
+module crypto where
+
+@native
+@label "SHA-256 hex digest"
+@description "Phase 12c-routes sub-step 2 — return the lowercase hex SHA-256 digest of an input string. Wraps node:crypto's createHash('sha256').update().digest('hex'). Used by the redirect route's visitor-IP hashing."
+@tags "crypto" "io" "hash" "phase-12c"
+@ioAction "crypto.sha256_hex"
+@requires "HasStateIO"
+sha256Hex : (input: String) -> String
+
+@native
+@label "Verify Calendly signature"
+@description "Phase 12c-routes sub-step 2 — HMAC-SHA256 verify over rawBody with secret. Parses calendly's `t=...,v1=...` signature envelope, extracts the v1 part, constant-time compares against the expected digest. Returns false on any malformed input. Calendly-specific scheme (per-provider HMAC schemes — same lesson as sub-step 1's per-provider verify pattern)."
+@tags "crypto" "io" "hmac" "calendly" "phase-12c"
+@ioAction "crypto.verify_calendly_signature"
+@requires "HasStateIO"
+verifyCalendlySignature : (signature: String) -> (rawBody: String) -> (secret: String) -> Boolean
+
+@native
+@label "Verify Telegram secret"
+@description "Phase 12c-routes sub-step 2 — constant-time string compare via timingSafeEqual. Telegram's contract: the bot stores a secret_token and Telegram echoes it verbatim in the X-Telegram-Bot-Api-Secret-Token header. NOT an HMAC (Risk 6 — common mis-implementation)."
+@tags "crypto" "io" "telegram" "phase-12c"
+@ioAction "crypto.verify_telegram_secret"
+@requires "HasStateIO"
+verifyTelegramSecret : (sentToken: String) -> (expectedToken: String) -> Boolean
+
+@native
+@label "Verify Stripe signature"
+@description "Phase 12d sub-step 5 — wraps stripeClient.webhooks.constructEvent. Verifies the Stripe-Signature envelope against the secret + returns the verified Stripe event as a Record (Just<event>) on success, Nothing on verification failure. The Stripe SDK does both sig-verify + event decode in one call (rolling-secret protocol — webhook secrets can rotate; the SDK accepts both old + new during the rotation window). Sister of crypto:verifyCalendlySignature (which uses HMAC-SHA256 directly because Calendly's envelope is simpler)."
+@tags "crypto" "io" "stripe" "webhook" "phase-12d"
+@ioAction "crypto.verify_stripe_signature"
+@requires "HasStateIO"
+verifyStripeSignature : (rawBody: String) -> (signature: String) -> (secret: String) -> Maybe ({  })
+
+@native
+@label "Random token (hex)"
+@description "Phase 12c-core sub-step 3 — irreducible IO leaf: wraps node:crypto's randomBytes(n).toString('hex'). Caller passes 32 for the canonical 64-char (256-bit) session-token form. Sync native (nativesCtx) so Fenel orchestrator bodies can construct fresh tokens without async indirection; the in-process evaluator dispatches it without IO yield."
+@requires "HasRandom"
+@tags "crypto" "random" "token" "phase-12c"
+randomTokenHex : (byteLength: Number) -> String
+
+@native
+@codeName "scryptHash"
+@label "Hash password (scrypt)"
+@description "Phase 12c-core sub-step 3 — irreducible IO leaf: scrypt KDF with a fresh 16-byte salt. Returns the canonical '<saltHex>:<hashHex>' storage form. codeName disambiguated from the TS surface hashPassword (TS exports a sync wrapper around this native). Sync native (nativesCtx)."
+@tags "crypto" "password" "scrypt" "phase-12c"
+hashPassword : (password: String) -> String
+
+@native
+@codeName "scryptVerify"
+@label "Verify password (scrypt)"
+@description "Phase 12c-core sub-step 3 — irreducible IO leaf: constant-time scrypt verify against the '<saltHex>:<hashHex>' storage form. Returns false on any malformed input (sep missing, wrong length, hex parse failure). codeName disambiguated from the TS surface verifyPassword. Sync native (nativesCtx)."
+@tags "crypto" "password" "scrypt" "phase-12c"
+verifyPassword : (password: String) -> (stored: String) -> Boolean
+
+-- storage-as-effect Phase 1 (2026-06-19) — the v4-UUID mint, in Fenel.
+--
+-- A v4 UUID is PURE: 128 random bits + string formatting + 2 fixed bit-fields
+-- (the HARD-RULE showcase — `design/storage-as-effect.md` D3). It composes the
+-- EXISTING `crypto:randomTokenHex` sync native (NO new random/UUID native — see
+-- [[feedback_zero_natives_means_justified_not_zero]]); `randomTokenHex 16` gives
+-- 32 lowercase-hex chars = exactly one UUID's worth of randomness.
+--
+-- Layout 8-4-4-4-12. The version nibble (char 12) is FORCED to '4'; the variant
+-- nibble (char 16) is mapped into {8,9,a,b} per RFC 4122 (top two bits `10`),
+-- which is `(hexVal mod 4) -> 8|9|a|b` — grouped via `contains` membership over
+-- the four mod-4 classes (048c / 159d / 26ae / else). The cascade is FACTORED
+-- into the `uuidVariantNibble` helper: a multi-`else if` chain bound to a `let`
+-- and then referenced by a LATER `let` trips the current Fenel parser (a
+-- parser-substrate grammar fence — `else-if` chains); keeping the chain as a
+-- standalone single-line body sidesteps it so this file stays Fenel-parser-
+-- driven (no FENCE_FALLBACK entry).
+--
+-- Effect: none — `randomTokenHex` is a no-`@requires` sync native, so `uuidV4`
+-- is pure-over-a-native. The formal `HasRandom.uuid` effect-class wiring is
+-- deferred to Phase 1b with the StorageHandler substrate; here it is a plain
+-- helper the `state:create*` bodies call to mint-before-store.
+@label "UUID v4 variant nibble"
+@description "Map a random lowercase-hex char to the RFC-4122 v4 variant nibble {8,9,a,b} by its value mod 4 (048c→8, 159d→9, 26ae→a, else→b). Helper for crypto:uuidV4 (storage-as-effect Phase 1)."
+@tags "crypto" "uuid" "storage-as-effect"
+uuidVariantNibble : (c: String) -> String
+uuidVariantNibble c = if contains "048c" c then "8" else if contains "159d" c then "9" else if contains "26ae" c then "a" else "b"
+
+@label "UUID v4"
+@description "Mint a fresh RFC-4122 version-4 UUID as a 36-char string (8-4-4-4-12). Pure: composes crypto:randomTokenHex (128 random bits) with the v4 version + variant bit-fields. The Fenel-bodied entity-identity mint that replaces Postgres gen_random_uuid() for state:create* (storage-as-effect Phase 1)."
+@tags "crypto" "uuid" "id" "storage-as-effect"
+uuidV4 : {} -> String
+uuidV4 input =
+  let hex = randomTokenHex 16
+  let s1 = slice hex 0 8
+  let s2 = slice hex 8 12
+  let s3 = concat "4" (slice hex 13 16)
+  let s4 = concat (uuidVariantNibble (slice hex 16 17)) (slice hex 17 20)
+  let s5 = slice hex 20 32
+  join [s1, s2, s3, s4, s5] "-"

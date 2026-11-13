@@ -1,0 +1,346 @@
+import type { FenelType, TypeScheme } from "../types";
+import { checkAuthoringSchemeStructure } from "../signature-inference";
+import { engineRequire } from "../engine-require";
+import {
+  inferAuthoringExpression,
+  peelToArrowType,
+  type AuthoringInferenceContext,
+  type AuthoringInferenceResult,
+  type AuthoringKernelContext,
+  type ExprNode,
+} from "./expression-authoring";
+import { projectAuthoringScheme } from "./scheme-projection";
+import { expectedTypeConsumer, inferCallScheme } from "./call-scheme";
+
+export type AuthoringLiteralMembership = NonNullable<AuthoringKernelContext["literalMembership"]> & {
+  /** Captured reader resolves written annotations to their complete owners.
+   * Absence or abstention cannot create a raw spelling-only annotation fact. */
+  resolveAnnotationScheme?: (type: FenelType) => TypeScheme | undefined;
+};
+export type AuthoringLiteralWitnessOptions = {
+  expectedScheme?: TypeScheme;
+  literalMembership?: AuthoringLiteralMembership;
+  /** Existing reader-scoped validation may observe scalar descendant checks.
+   * These retain refusals only; no descendant grants a whole-data fact. */
+  literalMembershipChecks?: (value: unknown, expected: TypeScheme) => readonly AuthoringLiteralCheck[];
+  /** Bounded syntax-to-data projection, never execution or source rewriting. */
+  expressionData?: (node: ExprNode) =>
+    | { $tag: "Concrete"; value: unknown }
+    | { $tag: "Residual"; expr: unknown };
+};
+export type AuthoringLiteralCheck = {
+  verdict: ReturnType<AuthoringLiteralMembership>;
+  path: string;
+};
+
+const structuralMarkers = new Set([
+  "__lambda", "__do", "__cat", "__let", "__match", "__ann", "__where",
+  "__evaluator", "__construct", "__record", "__list", "__apply", "__pipe", "__operator", "__withInstance",
+]);
+
+/** Descriptor inspection never invokes a user-data getter. Cyclic or hostile
+ * inputs stay with the ordinary inference boundary and its diagnostics. */
+function safeData(value: unknown, active = new Set<object>()): boolean {
+  if (typeof value === "function" || typeof value === "symbol") return false;
+  if (value === null || typeof value !== "object") return true;
+  if (active.has(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return false;
+  const next = new Set(active).add(value);
+  return Reflect.ownKeys(value).every((key) => {
+    if (typeof key !== "string") return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && Object.hasOwn(descriptor, "value") && safeData(descriptor.value, next);
+  });
+}
+
+function closedDataScheme(scheme: TypeScheme, context: AuthoringInferenceContext): boolean {
+  if (scheme.diagnostics?.length || scheme.applications?.some((application) => application.headVarId !== undefined)) return false;
+  const visit = (value: unknown): boolean => {
+    if (value === null || typeof value !== "object") return true;
+    if (Array.isArray(value)) return value.every(visit);
+    // No guessed type variables, function signatures, or type-valued literals.
+    if ("$var" in value || "$arrow" in value || "$type" in value) return false;
+    return Object.values(value).every(visit);
+  };
+  return safeData(scheme) && visit(scheme.body) && peelToArrowType(scheme.body, context) === undefined;
+}
+
+function literalData(value: unknown, context: AuthoringInferenceContext): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value !== "object") return ["string", "number", "boolean"].includes(typeof value);
+  if (Array.isArray(value)) return value.every((item) => literalData(item, context));
+  const keys = Object.keys(value);
+  // References, closures and editor structural markers have their own callable
+  // authority/semantics; a weak "is callable" membership check cannot type them.
+  if (keys.some((key) => key.startsWith("__") || key.startsWith("$") && key !== "$tag")) return false;
+  // Any one-key object can be a host function call, including a function not
+  // visible in this authoring frame. Only the canonical nullary ADT tag is
+  // unambiguously data in that shape; record builders retain their own syntax.
+  if (keys.length === 1 && keys[0] !== "$tag") return false;
+  return Object.values(value).every((item) => literalData(item, context));
+}
+
+/** Prepare facts for CHECKING only. The returned tree is never a persistence or
+ * evaluation representation. A membership callback must decide the complete
+ * expected type under its own registry, using canonical engine validation; it
+ * must not collapse unknown/degraded projections to true. */
+export function prepareAuthoringLiteralWitnesses(
+  node: ExprNode,
+  context: AuthoringInferenceContext = {},
+  options: AuthoringLiteralWitnessOptions = {},
+): { node: ExprNode; bindings: NonNullable<AuthoringInferenceContext["bindings"]>; literalChecks: AuthoringLiteralCheck[] } {
+  const original: { node: ExprNode; bindings: NonNullable<AuthoringInferenceContext["bindings"]>; literalChecks: AuthoringLiteralCheck[] } = { node, bindings: {}, literalChecks: [] };
+  try {
+    const contextSlots = Object.getOwnPropertyDescriptors(context);
+    const optionSlots = Object.getOwnPropertyDescriptors(options);
+    if ([...Object.values(contextSlots), ...Object.values(optionSlots)].some((slot) => !Object.hasOwn(slot, "value"))) return original;
+    const ownSlotValue = (slots: PropertyDescriptorMap, key: string) => Object.hasOwn(slots, key) ? slots[key]!.value : undefined;
+    original.bindings = ownSlotValue(contextSlots, "bindings") ?? {};
+    const membership: AuthoringLiteralMembership | undefined = ownSlotValue(optionSlots, "literalMembership") ?? ownSlotValue(contextSlots, "literalMembership");
+    const expressionData: AuthoringLiteralWitnessOptions["expressionData"] = ownSlotValue(optionSlots, "expressionData");
+    const membershipChecks: AuthoringLiteralWitnessOptions["literalMembershipChecks"] = ownSlotValue(optionSlots, "literalMembershipChecks");
+    if (!membership) return original;
+    const annotationSlot = Object.getOwnPropertyDescriptor(membership, "resolveAnnotationScheme");
+    const resolveAnnotationScheme: AuthoringLiteralMembership["resolveAnnotationScheme"] = annotationSlot && Object.hasOwn(annotationSlot, "value")
+      && typeof annotationSlot.value === "function" ? annotationSlot.value : undefined;
+    if (!safeData(node) || !safeData(original.bindings)) return original;
+    const reserved = new Set(Object.keys(original.bindings));
+    const collectStrings = (value: unknown): void => {
+      if (typeof value === "string") reserved.add(value);
+      else if (Array.isArray(value)) value.forEach(collectStrings);
+      else if (value !== null && typeof value === "object") Object.values(value).forEach(collectStrings);
+    };
+    collectStrings(node);
+    const bindings = { ...original.bindings };
+    const literalChecks: AuthoringLiteralCheck[] = [];
+    const saved = new Map<string, ExprNode | undefined>();
+    const isStructural = (value: unknown): value is Record<string, unknown> =>
+      value !== null && typeof value === "object" && !Array.isArray(value)
+      && Object.keys(value).some((key) => structuralMarkers.has(key));
+    const embedded = (value: unknown, rewrite: (node: ExprNode, path: string) => ExprNode, path = "$expression"): unknown => {
+      if (value === null || typeof value !== "object") return value;
+      if (Array.isArray(value)) return value.map((child, index) => embedded(child, rewrite, `${path}[${index}]`));
+      if (["literal", "call", "param", "ref"].includes((value as ExprNode).kind)) return rewrite(value as ExprNode, path);
+      return Object.fromEntries(Object.entries(value).map(([key, child]) =>
+        [key, key === "type" || key === "pattern" || key === "params" ? child : embedded(child, rewrite, `${path}.${key}`)]));
+    };
+    // Resolve saved expression data before allocating names so a reference
+    // cannot capture a freshly introduced checker binding.
+    const collectSaved = (current: ExprNode): void => {
+      if (current.kind === "call") current.args.forEach(collectSaved);
+      if (current.kind === "literal" && isStructural(current.value)) {
+        embedded(current.value, (child) => { collectSaved(child); return child; });
+      }
+      if (current.kind === "ref") {
+        const id = current.savedExprId;
+        if (!saved.has(id)) {
+          saved.set(id, undefined);
+          const target = context.resolveSavedExpr?.(id);
+          if (target && safeData(target)) {
+            saved.set(id, target);
+            collectStrings(target);
+            collectSaved(target);
+          }
+        }
+      }
+    };
+    collectSaved(node);
+    let ordinal = 0;
+    const bind = (scheme: TypeScheme): ExprNode => {
+      let name: string;
+      do { name = `\u0000authoring-literal-${ordinal++}`; } while (reserved.has(name));
+      reserved.add(name);
+      Object.defineProperty(bindings, name, { value: scheme, enumerable: true, configurable: true, writable: true });
+      return { kind: "param", name };
+    };
+    const activeRefs = new Set<string>();
+    const visit = (current: ExprNode, expected?: TypeScheme, path = "$expression"): ExprNode => {
+      if (expected && closedDataScheme(expected, context)) {
+        try {
+          let data: unknown;
+          let concrete = false;
+          if (current.kind === "literal" && literalData(current.value, context)) {
+            data = current.value;
+            concrete = true;
+          } else if (expressionData && (current.kind === "literal" || current.kind === "call")) {
+            const projection = expressionData(current);
+            if (safeData(projection) && projection.$tag === "Concrete"
+              && literalData(projection.value, context)) {
+              data = projection.value;
+              concrete = true;
+            }
+          }
+          if (concrete) {
+            const verdict = membership(data, expected);
+            if (safeData(verdict)) {
+              literalChecks.push({ verdict, path });
+              if (membershipChecks) {
+                try {
+                  const checks = membershipChecks(data, expected);
+                  if (safeData(checks)) for (const check of checks) {
+                    literalChecks.push({ verdict: check.verdict, path: check.path === "" ? path : `${path}.${check.path}` });
+                  }
+                } catch {
+                  // Failed observation cannot erase the existing verdict or
+                  // grant a fact for an undecided whole record/list.
+                }
+              }
+              if (verdict.$tag === "Just" && verdict._0 === true) return bind(expected);
+            }
+          }
+        } catch {
+          // A failed projection/check adds no fact and preserves prior refusals.
+        }
+      }
+      if (current.kind === "literal") {
+        if (isStructural(current.value)) {
+          const structure = current.value;
+          const fieldSchemes = new Map<string, TypeScheme>();
+          const construct = structure.__construct as {
+            tag?: string;
+            fields?: Array<{ name: string; value: ExprNode }>;
+          } | undefined;
+          if (typeof construct?.tag === "string" && Array.isArray(construct.fields)) {
+            let scheme: TypeScheme | undefined;
+            try {
+              const target = context.resolveConstructorTarget?.(construct.tag);
+              const entry = target === undefined ? undefined : context.getFunctionEntry?.(target);
+              if (entry && safeData(entry) && entry.kind === "constructor"
+                && entry.signatureOutcome?.$tag === "Solved") scheme = entry.scheme;
+            } catch {
+              // A failed captured lookup supplies no field fact and cannot
+              // discard a refusal already recorded for another literal.
+            }
+            const params = scheme?.body && typeof scheme.body === "object" && "$arrow" in scheme.body
+              && Array.isArray(scheme.body.$arrow?.params) ? scheme.body.$arrow.params : undefined;
+            if (scheme && params) construct.fields.forEach((field, fieldIndex) => {
+              // Names route the existing authoring wire slot; only the captured
+              // constructor's checked scheme supplies its identity and type.
+              const indices = params.flatMap((param, index) => param.name === field?.name ? [index] : []);
+              if (indices.length !== 1) return;
+              const projected = projectAuthoringScheme(scheme, ["$arrow", "params", String(indices[0]), "type"]);
+              if (projected) fieldSchemes.set(`${path}.__construct.fields[${fieldIndex}].value`, projected);
+            });
+          }
+          const rewritten = embedded(structure, (child, childPath) => visit(child, fieldSchemes.get(childPath), childPath), path) as Record<string, unknown>;
+          const annotation = structure.__ann as { expr?: ExprNode; type?: unknown } | undefined;
+          if (annotation?.expr && annotation.type && typeof annotation.type === "object" && !Array.isArray(annotation.type)) {
+            // B3: resolve the actual written declaration through the captured
+            // reader. A raw spelling never supplies its own nominal owner.
+            let declared: TypeScheme | undefined;
+            try {
+              declared = resolveAnnotationScheme?.(annotation.type as FenelType);
+            } catch {
+              // An unavailable later owner cannot erase earlier refusals.
+            }
+            if (declared && safeData(declared) && checkAuthoringSchemeStructure(declared).ok && declared.quantified.length === 0) {
+              const consumer = expectedTypeConsumer(declared);
+              // Existing owner-aware inference checks the original child, with
+              // no new literal facts. A widget's spelling cannot upgrade it.
+              const admitted = inferAuthoringExpression({ kind: "call", fnId: consumer.id, args: [annotation.expr] }, {
+                ...context, bindings: original.bindings,
+                getFunctionEntry: (id, arity) => id === consumer.id ? consumer : context.getFunctionEntry?.(id, arity),
+              });
+              if (admitted.outcome.$tag === "Solved") rewritten.__ann = {
+                ...rewritten.__ann as object,
+                expr: visit(annotation.expr, declared, `${path}.__ann.expr`),
+              };
+            }
+          }
+          const resultFields: Record<string, string> = { __where: "body", __evaluator: "body" };
+          for (const [marker, field] of Object.entries(resultFields)) {
+            const inner = structure[marker] as Record<string, unknown> | undefined;
+            if (inner?.[field]) rewritten[marker] = { ...rewritten[marker] as object, [field]: visit(inner[field] as ExprNode, expected, `${path}.${marker}.${field}`) };
+          }
+          if (Array.isArray(structure.__do) && structure.__do.length > 0) {
+            rewritten.__do = (structure.__do as ExprNode[]).map((child, index, children) => visit(child, index === children.length - 1 ? expected : undefined, `${path}.__do[${index}]`));
+          }
+          const lambda = structure.__lambda as { body?: ExprNode; params?: string[] } | undefined;
+          if (lambda?.body) rewritten.__lambda = {
+            ...rewritten.__lambda as object,
+            body: visit(lambda.body, expected ? projectAuthoringScheme(expected, ["$arrow", "returns"]) : undefined, `${path}.__lambda.body`),
+          };
+          return { ...current, value: rewritten };
+        }
+        return current;
+      }
+      if (current.kind === "ref") {
+        const target = saved.get(current.savedExprId);
+        if (!target || activeRefs.has(current.savedExprId)) return current;
+        activeRefs.add(current.savedExprId);
+        const result = visit(target, expected, path);
+        activeRefs.delete(current.savedExprId);
+        return result;
+      }
+      if (current.kind !== "call") return current;
+      const entry = context.getFunctionEntry?.(current.fnId, current.args.length);
+      if (entry !== undefined && !safeData(entry)) {
+        return { ...current, args: current.args.map((argument, index) => visit(argument, undefined, `${path}.args[${index}]`)) };
+      }
+      const scheme = entry?.signatureOutcome?.$tag === "Solved" ? entry.scheme : undefined;
+      const declared = current.args.map((_, index) => scheme
+        ? projectAuthoringScheme(scheme, ["$arrow", "params", String(index), "type"]) : undefined);
+      const args = current.args.map((argument, index) => visit(argument, declared[index], `${path}.args[${index}]`));
+      if (!entry || !scheme) return { ...current, args };
+      const isUnwitnessedData = (argument: ExprNode): boolean => {
+        if (argument.kind === "literal") return literalData(argument.value, context);
+        if (argument.kind === "ref") {
+          const target = saved.get(argument.savedExprId);
+          return target?.kind === "literal" && literalData(target.value, context);
+        }
+        return false;
+      };
+      const actualSchemes = args.map((argument, index) => {
+        // A broad inferred Number/record is not yet evidence against the
+        // contextual Nat/nominal record that this very literal may inhabit.
+        // Leave such open generic slots to the existing result/sibling solver.
+        if ((!declared[index] || !closedDataScheme(declared[index]!, context)) && isUnwitnessedData(current.args[index]!)) return undefined;
+        const inferred = inferAuthoringExpression(argument, { ...context, bindings });
+        return inferred.outcome.$tag === "Solved" ? inferred.scheme : undefined;
+      });
+      // Demand guidance only in a branch that consumes its argument scheme.
+      // Actual-argument inference and the final closed-slot checks stay live.
+      let guided: ReturnType<typeof inferCallScheme> | undefined;
+      const guidance = () => guided ??= inferCallScheme(entry, actualSchemes, expected);
+      return {
+        ...current,
+        args: current.args.map((argument, index) => declared[index] && closedDataScheme(declared[index]!, context)
+          ? args[index]!
+          : visit(argument, guidance().paramSchemes[index] ?? declared[index], `${path}.args[${index}]`)),
+      };
+    };
+    // Preserve late observation after saved-expression callbacks; a newly
+    // introduced accessor still cannot supply an expected scheme.
+    const expectedSlot = Object.getOwnPropertyDescriptor(options, "expectedScheme");
+    if (expectedSlot && !Object.hasOwn(expectedSlot, "value")) return original;
+    return { node: visit(node, expectedSlot?.value), bindings, literalChecks };
+  } catch {
+    // Membership uncertainty, resolver failure and hostile data never create a
+    // typing fact. Ordinary inference retains its own precise diagnostics.
+    return original;
+  }
+}
+
+export function inferAuthoringExpressionWithLiteralWitnesses(
+  node: ExprNode,
+  context: AuthoringInferenceContext = {},
+  options: AuthoringLiteralWitnessOptions = {},
+): AuthoringInferenceResult {
+  try {
+    if (Object.values(Object.getOwnPropertyDescriptors(context)).some((slot) => !Object.hasOwn(slot, "value"))) {
+      return inferAuthoringExpression(node, context);
+    }
+  } catch {
+    return inferAuthoringExpression(node, context);
+  }
+  const prepared = prepareAuthoringLiteralWitnesses(node, context, options);
+  if (prepared.literalChecks.length > 0) {
+    const { dispatchEngineBody } = engineRequire("engine-bodies-dispatch") as typeof import("../engine-bodies-dispatch");
+    const outcome = dispatchEngineBody("engine:inferenceAuthoringLiteralChecks", [prepared.literalChecks]) as
+      | { $tag: "Nothing" }
+      | { $tag: "Just"; _0: AuthoringInferenceResult["outcome"] };
+    if (outcome.$tag === "Just") return { outcome: outcome._0 };
+  }
+  return inferAuthoringExpression(prepared.node, { ...context, bindings: prepared.bindings });
+}

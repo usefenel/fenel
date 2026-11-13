@@ -1,0 +1,148 @@
+module std where
+
+-- List extrema — `minimum` / `maximum`, the honest `Maybe a` siblings of the
+-- binary `min` / `max`. (signature-substrate Phase 4+4b slice 3c-D2.)
+--
+-- WHY THIS FILE EXISTS. Both were bodyless `@native` decls declared
+-- `List a -> a` (native/collection-native.fenel) whose JS leaves returned host-
+-- `undefined` for the empty list AND for any pair the leaf cannot order — it
+-- supports only number/number and string/string, so a HOMOGENEOUS `List
+-- Boolean` or a list of records escapes exactly as a mixed list does. A value
+-- of declared type `a` that is host-`undefined` violates cornerstone 7 (no
+-- null; absence is `Nothing`) and falsifies **SC-sig** — "registered signatures
+-- are honest" — the side condition the arrow algebra's semantics rests on
+-- (design/cduce-arrows-soundness.md §3). It was also the counterexample that
+-- kept the TCB-ledger row `obs.var.undefined` MISSING.
+--
+-- The repair is ATOMIC: the declared return became `Maybe a` and BOTH
+-- implementations return the tagged value. A signature-only change would have
+-- left the lie intact.
+--
+-- THE INTENTIONAL DUAL (the same ledgered opaque-repr-for-functions pattern as
+-- hof.fenel and the fenel-parser.ts perf branch — ts-exceptions-ledger B4):
+-- these bodies are the SOURCE OF TRUTH; ffi/std-ffi.ts keeps
+-- `stdNatives.minimum` / `.maximum` as the PERF BRANCH, because both sit on the
+-- decider hot path (engine:minOfSet / engine:maxOfSet / engine:baseMinOfUnion /
+-- engine:baseMaxOfUnion fold whole enumerated extensions, where a per-element
+-- interpreted recursion would be quadratic-ish and deep). The SELECTOR is
+-- `invokeFunction`'s own order — nativesCtx → natives → body — so the native
+-- runs in the pure evaluator and these bodies are what the compiled targets
+-- evaluate. Neither function is higher-order, so unlike hof.fenel the
+-- effect-visibility purity gate plays no part. (These bodies are NOT
+-- native-free: they call the native-only leaves head / tail / isArray /
+-- isNumber / isString / lt / gt, so a registry with no natives at all cannot
+-- run them either. The dual is about WHICH implementation of minimum runs, not
+-- about eliminating the host.)
+--
+-- WHERE THE TWO BRANCHES ARE NOT INTERCHANGEABLE — stated rather than hidden,
+-- because an unqualified "they cannot diverge" would be false:
+--   * DEPTH. The native iterates; these bodies recurse once per element and
+--     `tail` slices each step. A long list (order 10^4) overflows the
+--     interpreted stack in the body and succeeds in the native. That is the
+--     accepted opaque-repr cost the deep-recursion note in the engine-bugs
+--     triage already records; it is an OPERATIONAL divergence, not a
+--     range-honesty one — neither branch ever returns a non-`Maybe a`.
+--   * HOSTILE HOST VALUES. A JS array with an overridden `slice`/`length`, a
+--     getter, or a Proxy can make `tail` disagree with the native's index walk.
+--     Such a value is not a conforming `List a` inhabitant; both branches stay
+--     range-honest on it, and neither is claimed to agree with the other.
+-- What IS claimed, and what this slice needs, is the RANGE claim: on every
+-- input, both branches return either `{$tag:"Nothing"}` or `{$tag:"Just",_0:x}`
+-- with `x` an element of the argument. That is what SC-sig is about.
+--
+-- TYPING HONESTY OF THE BODY ITSELF (do not overclaim). `minimumScan` calls
+-- `lt` / `maximumScan` calls `gt`, and those are DECLARED
+-- `Number -> Number -> Boolean` (native/logic-native.fenel) while their natives
+-- also order string/string pairs (ffi/std-ffi.ts). `orderablePair` establishes
+-- the runtime premise the implementation needs, but Fenel has no flow-sensitive
+-- narrowing, so the checker cannot see it: a registered-call check of these
+-- bodies ABSTAINS on the argument-fit premise rather than admitting them. The
+-- honest reading is that `lt`/`gt` carry a DECLARED-DOMAIN narrower than their
+-- implementation domain — a domain-honesty defect distinct from the range
+-- escape this slice repairs, recorded in the 3c taxonomy as deferred. Widening
+-- them to the `t -> t -> Boolean` shape `eq`/`neq` already carry is the
+-- unblocker, and it has decider-corpus blast radius that belongs in its own
+-- slice. Deliberately NOT worked around here by calling `ord.fenel`'s `strLt`
+-- in a string branch: `strLt` compares by code POINT while the native's `<`
+-- compares UTF-16 code UNITS, so that "fix" would buy typing tidiness by
+-- introducing a real value divergence between the two branches on non-BMP
+-- input. Branch coherence wins.
+--
+-- SEMANTICS, stated exactly. Both branches make byte-for-byte the same
+-- decisions the pre-repair native made; only the return REPRESENTATION changed:
+--   * `[]`                    => Nothing   -- no extremum of the empty set
+--   * `[x]`                   => Just x    -- a singleton is its own extremum
+--     under ANY order: no comparison is performed, so no orderability is
+--     claimed. (The pre-repair native returned `a[0]` unexamined here too.)
+--   * all numbers, or all strings  => Just <the extremum>
+--   * any pair the leaf cannot order (mixed number/string, booleans, records,
+--     nested lists, ...)      => Nothing   -- the honest fence, never a guess
+--   * a non-array argument (a String in its JS repr, say) => Nothing, because
+--     the native's `toArr` maps every non-array to `[]`. The `isArray` guard is
+--     what keeps the two branches COHERENT: without it these bodies would walk
+--     a String through the string-aware `head`/`tail` natives and answer
+--     `Just <char>` where the perf branch answers `Nothing`, and the honesty
+--     claim would depend on which branch ran.
+-- The empty-list and unsupported-comparison causes are semantically DISTINCT
+-- (nothing to compare vs. no order to compare with) and are separately tested;
+-- today they are the same range violation and so share the one `Nothing`.
+--
+-- NOT an `Ord a =>` scheme, deliberately. P2 has no qualified schemes and there
+-- is no `=>` surface (design/signatures-and-contracts.md), `Ord`'s comparisons
+-- return `Maybe Bool` rather than `Bool` (interfaces.fenel), and the leaf never
+-- dispatches `Ord` at all. Real `Ord` dispatch plus qualified-scheme authoring
+-- is out of scope for this slice; of the honest options the one chosen here is
+-- `List a -> Maybe a` with an unsupported comparison fencing to `Nothing`.
+--
+-- Body idiom: `case head arr of Nothing/Just h` + `fromMaybe [] (tail arr)`
+-- recursion — the hof.fenel / analyze.fenel array-repr walking idiom, NOT
+-- `Cons`/`Nil` cons-matching (matchPattern has no cons<->array-repr coercion,
+-- so cons patterns would never match runtime lists).
+
+@label "Minimum"
+@description "List minimum — the smallest element by natural ordering, or Nothing. ∀a. List a → Maybe a. Nothing for the empty list (no extremum of ∅) AND for any list carrying a pair the ordering leaf cannot compare — mixed number/string, or a homogeneous list of booleans/records/lists (only number/number and string/string are ordered). A singleton is its own extremum under any order, so `[x]` ⇒ `Just x` for every x. Compare with `min`, which is binary and Number-typed. signature-substrate slice 3c-D2 repaired this from `List a -> a` returning host-`undefined`, which violated SC-sig."
+@tags "list" "ordering" "aggregate"
+minimum : (arr: List a) -> Maybe a
+minimum arr = if isArray arr then minimumScan Nothing arr else Nothing
+
+@label "Maximum"
+@description "List maximum — the largest element by natural ordering, or Nothing. ∀a. List a → Maybe a. Nothing for the empty list AND for any list carrying a pair the ordering leaf cannot compare — mixed number/string, or a homogeneous list of booleans/records/lists (only number/number and string/string are ordered). A singleton is its own extremum under any order, so `[x]` ⇒ `Just x` for every x. Compare with `max`, which is binary and Number-typed. signature-substrate slice 3c-D2 repaired this from `List a -> a` returning host-`undefined`, which violated SC-sig."
+@tags "list" "ordering" "aggregate"
+maximum : (arr: List a) -> Maybe a
+maximum arr = if isArray arr then maximumScan Nothing arr else Nothing
+
+@label "Minimum scan"
+@description "The running fold behind `minimum`: `acc` is Nothing before the first element is seen and Just-the-running-minimum afterwards. Returns Nothing the moment a pair is not orderable, which is what short-circuits the unsupported-comparison fence. Ties keep the EARLIER element (strict `lt`), matching the pre-repair native. Internal helper."
+@tags "list" "ordering" "internal"
+minimumScan : (acc: Maybe a) -> (rest: List a) -> Maybe a
+minimumScan acc rest =
+  case head rest of
+    Nothing -> acc
+    Just x ->
+      case acc of
+        Nothing -> minimumScan (Just x) (fromMaybe [] (tail rest))
+        Just m ->
+          if orderablePair m x
+            then minimumScan (Just (if lt x m then x else m)) (fromMaybe [] (tail rest))
+            else Nothing
+
+@label "Maximum scan"
+@description "The running fold behind `maximum`: `acc` is Nothing before the first element is seen and Just-the-running-maximum afterwards. Returns Nothing the moment a pair is not orderable. Ties keep the EARLIER element (strict `gt`), matching the pre-repair native. Internal helper."
+@tags "list" "ordering" "internal"
+maximumScan : (acc: Maybe a) -> (rest: List a) -> Maybe a
+maximumScan acc rest =
+  case head rest of
+    Nothing -> acc
+    Just x ->
+      case acc of
+        Nothing -> maximumScan (Just x) (fromMaybe [] (tail rest))
+        Just m ->
+          if orderablePair m x
+            then maximumScan (Just (if gt x m then x else m)) (fromMaybe [] (tail rest))
+            else Nothing
+
+@label "Orderable pair"
+@description "True iff the ordering leaf can compare these two values: both numbers, or both strings. Every other pairing — mixed number/string, two booleans, two records, two lists — is NOT orderable, and `minimum`/`maximum` fence to Nothing rather than guess. This mirrors the `lt`/`gt` natives exactly: they return False (not an ordering) for every pair outside those two kinds, so without this guard a fold over them would silently report the first element as the extremum."
+@tags "ordering" "predicate"
+orderablePair : (x: a) -> (y: a) -> Boolean
+orderablePair x y = or (and (isNumber x) (isNumber y)) (and (isString x) (isString y))

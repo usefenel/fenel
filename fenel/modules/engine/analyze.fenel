@@ -1,0 +1,1334 @@
+module engine where
+
+-- =========================================================================
+-- analyze.fenel — the ANALYZE skeleton + the call-graph SCC discovery + the
+-- advisory totality census over a function registry.
+-- unified-static-analysis Phase 3f. Brief:
+-- `workstreams/unified-static-analysis/briefs/phase-3f-totality-gate-analyze-skeleton-scc-census.md`.
+--
+-- THE MEASUREMENT + INTEGRATION SLICE the kernel gate (3g) is conditioned on.
+-- Phases 1 / 3a / 3c / 3d / 3e shipped the whole termination band — rung-1
+-- (structural) → rung-2 (guarded measure) → rung-3a (lexicographic) → rung-3b
+-- (size-change graph closure, ONE function) → rung-3c (`checkMutualTotality`
+-- over a SET of functions). But `checkMutualTotality` takes the
+-- mutually-recursive set as an EXPLICIT input (3e D-3e-4: slice C does NOT
+-- discover WHICH functions form a cycle), and the checker has NEVER run over
+-- real code (the 51 totality tests are all hand-built `Expr` fixtures). THIS
+-- module closes both gaps:
+--   (a) the call-graph SCC DISCOVERY that feeds `checkMutualTotality` its groups
+--       (each strongly-connected component = one mutually-recursive group;
+--       a non-recursive function = a singleton SCC), and
+--   (b) the `analyze` SKELETON (registry functions → per-SCC totality verdict →
+--       a `Total / Unknown / Partial / Unanalyzable` census).
+-- It is kernel-SAFE: NO kernel mutation, NO `PropForall` wiring, NO
+-- `Unknown`→reject flip (that is the SUCCESSOR slice 3g, which the census
+-- informs). ADVISORY ONLY (D-3f-5).
+--
+-- WHY FENEL (the Fenel-first HARD rule). The call-graph builder + SCC pass +
+-- analyze skeleton are PURE graph/walk logic — no IO, no host primitive — so
+-- they are Fenel bodies. The SCC closure uses a finite node-count-derived exact
+-- fixpoint bound and a self-tail loop; the call-graph walk REUSES the
+-- `Expr` tree-walk SHAPE from `totality.fenel`. The ONLY new TS is the census
+-- RUNNER (`scripts/totality-census.ts`, test/tooling category) that gathers
+-- host-side registry data, lowers stored JSON-Logic bodies to core `Expr`
+-- (via the shipped `jsonLogicToExpr`), and prints the census — NO graph/analysis
+-- decision lives in TS.
+--
+-- SCC = MUTUAL-REACHABILITY CLOSURE, not Tarjan (D-3f-1). Two nodes `u, v` are
+-- in the same SCC iff `u →* v AND v →* u`. For an ADVISORY census correctness ≫
+-- performance, and the reachability formulation is the transitive closure of the
+-- call-graph edge relation — repeated squaring
+-- `R_{k+1} = R_k ∪ (R_k ; R_k)` until fixpoint. The finite node set supplies
+-- the exact `|V| + 1` round bound; the self-tail loop compiles stack-safe. Tarjan's
+-- explicit-stack lowlink DFS is faster but painful + error-prone in a pure
+-- functional body (mutable stack + index state) and buys nothing for an advisory
+-- pass. No repository-size constant or partial-closure fallback remains.
+--
+-- ONLY group-INTERNAL edges matter. The call graph's nodes are the registry's
+-- functions; an edge `f → g` exists iff `f`'s body calls `g` OR references it
+-- by name (`EVar` — effect-visibility Phase 1) AND `g` is a registry function.
+-- Stored bodies keep SOURCE spellings (bare code names, `Module.name`, var-head
+-- `$dyn:` calls) while ids are canonical `module:name`, so callees are matched
+-- through `anaSpellingTargets` (2026-10-02: the exact-membership test it
+-- replaced matched almost no real call, and every Fenel-bodied system function
+-- read Total at the kernel gate). A bare name over-approximates to every id
+-- with that code name; `totHeadMayName` applies the same normalization when the
+-- size-change walk matches call heads to group members. A call to a
+-- `std:`/native/`@native` LEAF (an id with no body) is a sink only when the leaf
+-- is certified (anaCertifiedNativeLeaves, decided by verdictTagForIn before the
+-- analysis; 2026-10-03 — before, every bodyless id was assumed total). A
+-- bound variable that shadows a function name is a conservative
+-- over-approximation (an extra harmless edge, never a missing obligation).
+--
+-- CENSUS vs GATE. The census (`analyzeFunctions` / `censusFunctions`) reports
+-- each SCC's OWN verdict: a group calling a non-total group outside itself, or
+-- an Unanalyzable body (excluded from the call graph, D-3f-4), still counts its
+-- own verdict, so the census is a per-group worklist, not a transitive
+-- certificate. The kernel-gate projection `verdictTagFor` IS transitive: every
+-- group the subject reaches must be Total, and a reached Unanalyzable body makes
+-- it Unknown. A partition that MERGES non-mutual functions only adds graphs (a
+-- false-`Unknown` at worst, never a false-`Total`).
+--
+-- INPUT. A function is the plain record `{ id, params, body, declaredPartial,
+-- analyzable }` (0 entity decls — the propagate.fenel/totality.fenel
+-- plain-record discipline):
+--   • id             : String       — the registry fn-id (the call-graph node key)
+--   • params         : List String  — parameter names (the `checkMutualTotality` shape)
+--   • body           : Expr         — the LOWERED core Expr (meaningless when not analyzable)
+--   • declaredPartial: Bool         — the `@partial` escape-hatch flag
+--   • analyzable     : Bool         — False when the stored JSON-Logic body did NOT
+--                                     lower to core `Expr` (the 56 `Err` cases); such
+--                                     a function is bucketed `Unanalyzable` and EXCLUDED
+--                                     from the census call graph (D-3f-4); the gate
+--                                     projection refuses any subject that reaches it.
+--                                     NEVER folded into Total.
+-- The lowering to core `Expr` happens in the census RUNNER (the `$`-key marshal
+-- barrier: a `.fenel` body cannot walk raw JSON-Logic, whose keys ARE evaluator
+-- ops); the Fenel bodies here see only core `Expr`.
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- A. The call-graph builder. `analyzeCallees` walks a core `Expr` body and
+-- collects every id of `knownIds` (the registry's function-id set) that an
+-- `ECall` head or an `EVar` reference may denote (spelling-normalized,
+-- `anaSpellingTargets`), deduped. The `EVar`
+-- arm (effect-visibility Phase 1) closes the var-blindness hole: a function
+-- referenced by BARE NAME — argument position (`map helper xs`) or let-value
+-- position (`let x = listSystemEntities`) — is a reach edge exactly like a
+-- call head; a non-member `EVar` stays a plain data var (no edge, and NO
+-- `$dyn` — the referent of a resolvable name is statically known, so its
+-- requires flow precisely). REUSES the `totality.fenel` walk shape (recurse the
+-- 7-case `Expr`); a spelling bound by an enclosing lambda or arm pattern is a
+-- local and adds no edge (exact), while a function parameter that shadows a
+-- function name is not visible to the walk and may yield a FALSE edge, which
+-- only ADDS requires / blocks purity — sound direction). A spelling that denotes no known id (a data var,
+-- a field read, a builtin op) adds nothing.
+-- -------------------------------------------------------------------------
+
+@label "analyze: add unique name"
+@description "Append `name` to `acc` only if not already present (dedup). Used to collect a deduped callee list."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaAddUnique : (name: String) -> (acc: a) -> a
+anaAddUnique name acc = if elem name acc then acc else appendItem name acc
+
+@label "analyze: collect callees in arg list"
+@description "Fold anaCalleesIn over a list of argument/child expressions, threading the deduped callee accumulator."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaCalleesInList : (knownIds: a) -> (acc: b) -> (args: c) -> b
+anaCalleesInList knownIds acc args =
+  fold (\current a -> anaCalleesIn knownIds current a) acc args
+
+@label "analyze: collect callees in match arms"
+@description "Fold anaCalleesIn over each match arm's guard (when present — it runs before the body) and body (arm pattern bindings do not affect callee collection — the conservative over-approx). Threads the accumulator."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaCalleesInArms : (knownIds: a) -> (acc: b) -> (arms: c) -> b
+anaCalleesInArms knownIds acc arms =
+  fold
+    (\current arm ->
+      case lookup arm "guard" of
+        Nothing -> anaCalleesIn knownIds current arm.body
+        Just guard -> anaCalleesIn knownIds (anaCalleesIn knownIds current guard) arm.body)
+    acc
+    arms
+
+@label "analyze: collect callees in record fields"
+@description "Fold anaCalleesIn over a record's field values ({name, value} records). Threads the accumulator."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaCalleesInFields : (knownIds: a) -> (acc: b) -> (fields: c) -> b
+anaCalleesInFields knownIds acc fields =
+  fold (\current f -> anaCalleesIn knownIds current f.value) acc fields
+
+@label "analyze: spelling targets"
+@description "The knownIds a call-head or variable spelling may denote. Stored bodies keep their source spellings (bare code names, `Module.name`, var-head `$dyn:` calls) while registry ids are canonical `module:name`, so an exact-membership test missed nearly every real call (2026-10-02: every Fenel-bodied system function, std:map included, was vacuously Total at the kernel gate). Normalization: strip `$dyn:`; the exact id; a dotted spelling is the id whose last dot reads as the colon (`publicdemo.statistics.f` ⇒ `publicdemo.statistics:f`); a bare name is EVERY id whose code name it is (an import or the module's own definition: over-approximated across modules, which only adds call-graph edges); any other colon spelling names nothing known. `joined` is anaJoinedIds knownIds, so a bare name costs one native substring test (and one split when it matches). A spelling that is a local variable may gain a spurious edge — harmless (the conservative direction). Field reads (`row.args`) find no id."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaSpellingTargets : (spelling: String) -> (knownIds: a) -> (joined: String) -> a
+anaSpellingTargets spelling knownIds joined =
+  let name = if startsWith spelling "$dyn:" then slice spelling 5 (length spelling) else spelling
+  if elem name knownIds then appendItem name []
+  else if contains name ":" then []
+  else if contains name "." then
+    let parts = split name "."
+    let canonical = concat (join (fromMaybe [] (init parts)) ".") (concat ":" (fromMaybe name (last parts)))
+    if elem canonical knownIds then appendItem canonical [] else []
+  else
+    let marker = concat ":" (concat name ",")
+    if not (contains joined marker) then []
+    else
+      let pieces = fromMaybe [] (init (split joined marker))
+      map (\piece -> concat (fromMaybe "" (last (split piece ","))) (concat ":" name)) pieces
+
+@label "analyze: add spelling targets"
+@description "Add every knownId a spelling may denote (anaSpellingTargets) to the deduped callee accumulator. `joined` is the comma-framed id list anaJoinedIds builds once per body."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaAddSpellingTargets : (spelling: String) -> (knownIds: a) -> (joined: String) -> (acc: b) -> b
+anaAddSpellingTargets spelling knownIds joined acc =
+  fold (\current target -> anaAddUnique target current) acc (anaSpellingTargets spelling knownIds joined)
+
+@label "analyze: joined ids"
+@description "The known ids framed as one comma-separated string with a leading and trailing comma (`,a:f,b:g,`). A bare spelling `n` denotes exactly the ids whose text is preceded by a comma and ends with `:n,`, so one native substring test settles the common no-match case (locals, builtins) and one native split recovers each matching module; registry ids hold no comma."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaJoinedIds : (knownIds: a) -> String
+anaJoinedIds knownIds = concat "," (concat (join knownIds ",") ",")
+
+@label "analyze: spellings in a body"
+@description "Walk the 7-case core Expr collecting every ECall head and every EVar name, deduped, in first-occurrence order: the raw spellings anaCalleesIn resolves once each. A list literal's synthetic `appendItem` (totIsListLiteral) is a construction, not a call: its elements are walked, its head is not collected. The apply form `$` is application, a language-core form the evaluator runs directly (never a call to the registry's `($)` function): its head is not collected, its callee and arguments are walked (the group audit judges what it invokes, totUncheckedApply). A variable, or a var-head (`$dyn:`) call, whose root (totSpellingRoot) an enclosing lambda or arm pattern binds is a local and is skipped (exact: such a spelling denotes the local, never a function; the function's own params are not visible here and stay conservative). ELambda/EMatch (arm guards included — a guard runs before its body)/EConstruct/ERecord recurse their subterms."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaSpellingsIn : (bound: a) -> (acc: a) -> (e: (Expr Any)) -> a
+anaSpellingsIn bound acc e =
+  case e of
+    ELit { value = _ } -> acc
+    EVar { name = n } -> if elem (totSpellingRoot n) bound then acc else anaAddUnique n acc
+    ECall { fnId = f, args = args } ->
+      let withHead = if eq f "$" then acc else if totIsListLiteral e then acc else if startsWith f "$dyn:" then (if elem (totSpellingRoot f) bound then acc else anaAddUnique f acc) else anaAddUnique f acc
+      fold (\current a -> anaSpellingsIn bound current a) withHead args
+    ELambda { params = ps, body = bd } -> anaSpellingsIn (totAppendAll ps bound) acc bd
+    EMatch { scrutinee = s, arms = arms } ->
+      fold
+        (\current arm ->
+          case lookup arm "guard" of
+            Nothing -> anaSpellingsIn (totCollectAllVars arm.pattern bound) current arm.body
+            Just guard -> anaSpellingsIn (totCollectAllVars arm.pattern bound) (anaSpellingsIn (totCollectAllVars arm.pattern bound) current guard) arm.body)
+        (anaSpellingsIn bound acc s)
+        arms
+    EConstruct { args = args } -> fold (\current a -> anaSpellingsIn bound current a) acc args
+    ERecord { fields = fields } -> fold (\current f -> anaSpellingsIn bound current f.value) acc fields
+
+@label "analyze: collect callees against a joined id list"
+@description "anaCalleesIn with the comma-framed id string (anaJoinedIds knownIds) supplied by the caller, so a caller resolving many bodies against one id list builds it once (verdictTagForIn)."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaCalleesJoined : (knownIds: a) -> (joined: String) -> (e: (Expr Any)) -> b
+anaCalleesJoined knownIds joined e =
+  fold (\current spelling -> anaAddSpellingTargets spelling knownIds joined current) [] (anaSpellingsIn [] [] e)
+
+@label "analyze: collect callees (walk)"
+@description "Collect every knownId an ECall head OR an EVar name of the core Expr may denote into the deduped accumulator: the body's distinct spellings (anaSpellingsIn, guards included) each resolved once through anaSpellingTargets, so canonical, dotted, bare and var-head spellings of one function all reach its id. EVar is the var-ref callee edge (effect-visibility Phase 1 — a fn referenced by name in argument/let-value position is a reach edge like a call head; a data var finds no id, no edge and no $dyn). A spelling bound by an enclosing lambda or arm pattern is skipped (it denotes the local); a function parameter that shadows a function name is not visible here and may add a false edge, which only adds requires or gathers one more function — sound. The TS perf-branch mirror is collectCalledFunctions(includeVarRefs) in constraint-inference.ts."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f" "effect-visibility" "phase-1"
+anaCalleesIn : (knownIds: a) -> (acc: b) -> (e: (Expr Any)) -> b
+anaCalleesIn knownIds acc e =
+  let joined = anaJoinedIds knownIds
+  fold (\current spelling -> anaAddSpellingTargets spelling knownIds joined current) acc (anaSpellingsIn [] [] e)
+
+@label "analyze: callees of a body"
+@description "The deduped list of registry-function callees of a core Expr body: the knownIds its call heads and EVar references may denote under spelling normalization (anaSpellingTargets; the effect-visibility Phase 1 var-ref edge included). Seeds anaCalleesIn with an empty accumulator. The directed call-graph edges out of a function; the kernel gate's reachable-set gather (kernel.ts subjectTotalityVerdict) follows exactly these."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f"
+analyzeCallees : (body: (Expr Any)) -> (knownIds: a) -> b
+analyzeCallees body knownIds = anaCalleesIn knownIds [] body
+
+
+-- -------------------------------------------------------------------------
+-- Function-list helpers — the id projection, the analyzable filter, the
+-- direct-edge build. An edge is the plain record `{ from, to }` (caller →
+-- callee, both registry function ids). 0 entity decls.
+-- -------------------------------------------------------------------------
+
+@label "analyze: map ids (tail)"
+@description "Recurse on the tail of the function list for anaMapIds (keeps it free of case-in-let)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaMapIdsTail : (functions: a) -> a
+anaMapIdsTail functions =
+  case tail functions of
+    Nothing -> []
+    Just rest -> anaMapIds rest
+
+@label "analyze: map ids"
+@description "Project the `id` field of every function in the list into a List String (the call-graph node set / a group's member-id list). Order-irrelevant (used as a set)."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f"
+anaMapIds : (functions: a) -> b
+anaMapIds functions = map (\f -> f.id) functions
+
+@label "analyze: filter analyzable (tail)"
+@description "Recurse on the tail of the function list for anaFilterAnalyzable (keeps it free of case-in-let)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaFilterAnalyzableTail : (functions: a) -> a
+anaFilterAnalyzableTail functions =
+  case tail functions of
+    Nothing -> []
+    Just rest -> anaFilterAnalyzable rest
+
+@label "analyze: filter analyzable"
+@description "Keep only the functions whose `analyzable` flag is True (a body that lowered to core Expr). The Unanalyzable functions (the 56 Err cases) are EXCLUDED from the call graph — their callers lose that edge (sound under-approx; D-3f-4) — and counted separately by anaCountUnanalyzable."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f"
+anaFilterAnalyzable : (functions: a) -> a
+anaFilterAnalyzable functions = filter (\f -> f.analyzable) functions
+
+@label "analyze: edges from one function"
+@description "Build the direct call-graph edges {from, to} out of one function: for each deduped callee `c`, an edge {from = fromId, to = c}. Edges built via a `let` then the literal (the inline-record-in-arg surprise)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaEdgesFrom : (fromId: String) -> (callees: a) -> (acc: b) -> b
+anaEdgesFrom fromId callees acc =
+  concat acc (map (\c -> { from = fromId, to = c }) callees)
+
+@label "analyze: build direct edges"
+@description "Build the full directed call-graph edge set {from, to} over a function list: for each function, its callees ∩ knownIds become edges. Concatenated across functions (order-irrelevant — used as a relation)."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f"
+anaBuildEdges : (functions: a) -> (knownIds: b) -> c
+anaBuildEdges functions knownIds =
+  fold
+    (\edges f -> anaEdgesFrom f.id (analyzeCallees f.body knownIds) edges)
+    []
+    functions
+
+
+-- -------------------------------------------------------------------------
+-- B. The reachability closure. The transitive closure of the {from, to} edge relation under
+-- composition: `R_{k+1} = R_k ∪ { {a, c} : {a, b} ∈ R_k ∧ {b, c} ∈ R_k }`,
+-- early-exit on no-change, with an exact finite `|V| + 1` caller bound. The
+-- fixpoint helper is self-tail so compiled execution uses a loop. An edge is a {from, to} record;
+-- a relation is a deduped `List {from, to}`.
+-- -------------------------------------------------------------------------
+
+@label "analyze: edge eq"
+@description "Equality of two call-graph edges: same `from` AND same `to` node. Drives dedup + set-equality of the reachability relation."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaEdgeEq : (e1: a) -> (e2: a) -> Bool
+anaEdgeEq e1 e2 = if eq e1.from e2.from then eq e1.to e2.to else False
+
+@label "analyze: edge member"
+@description "True when edge `e` (exact from/to) occurs in relation `r`. Fold anaEdgeEq over r."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaEdgeMember : (e: a) -> (r: b) -> Bool
+anaEdgeMember e r = fold (\found e2 -> if found then True else anaEdgeEq e e2) False r
+
+@label "analyze: add edge unique"
+@description "Insert edge `e` into relation `r` only if not already present (dedup). Keeps the relation a set."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaAddEdgeUnique : (e: a) -> (r: b) -> b
+anaAddEdgeUnique e r = if anaEdgeMember e r then r else appendItem e r
+
+@label "analyze: compose add"
+@description "Add the composed edge {from = e1.from, to = e2.to} (the path through the matching intermediate e1.to == e2.from) to the accumulator, deduped. Built via a `let` then the literal."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaComposeAdd : (e1: a) -> (e2: a) -> (acc: b) -> b
+anaComposeAdd e1 e2 acc =
+  let e = { from = e1.from, to = e2.to }
+  anaAddEdgeUnique e acc
+
+@label "analyze: compose pair"
+@description "If e1 and e2 meet at an intermediate (e1.to == e2.from), add the composed edge e1.from → e2.to; else leave the accumulator unchanged. One transitive-closure composition step."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaComposePair : (e1: a) -> (e2: a) -> (acc: b) -> b
+anaComposePair e1 e2 acc =
+  if eq e1.to e2.from then anaComposeAdd e1 e2 acc else acc
+
+@label "analyze: compose inner (e1 over r)"
+@description "Fold one edge e1 against every edge of r, adding each meeting composition to the accumulator. Inner loop of one closure round."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaComposeInner : (e1: a) -> (r: b) -> (acc: c) -> c
+anaComposeInner e1 r acc =
+  fold (\current e2 -> anaComposePair e1 e2 current) acc r
+
+@label "analyze: compose outer (r over r)"
+@description "Fold every edge of `gs` as e1 against the full relation `allR` (via anaComposeInner), accumulating the composed edges. Outer loop of one closure round."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaComposeOuter : (allR: a) -> (gs: b) -> (acc: c) -> c
+anaComposeOuter allR gs acc =
+  fold (\current e1 -> anaComposeInner e1 allR current) acc gs
+
+@label "analyze: reach round"
+@description "One closure round: `r` plus the composition of every meeting edge pair, deduped. Seeds the accumulator with `r` itself, so the round is non-shrinking (next ⊇ r)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaReachRound : (r: a) -> a
+anaReachRound r = anaComposeOuter r r r
+
+@label "analyze: edges subset"
+@description "True when every edge of relation `s1` occurs in `s2`. Half of the closure fixpoint stop-test."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaEdgesSubset : (s1: a) -> (s2: b) -> Bool
+anaEdgesSubset s1 s2 = fold (\contained e -> if contained then anaEdgeMember e s2 else False) True s1
+
+@label "analyze: edge set eq"
+@description "Set-equality of two relations (mutual edge-subset) — the closure fixpoint stop-test (the round added no new edge)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaEdgeSetEq : (s1: a) -> (s2: b) -> Bool
+anaEdgeSetEq s1 s2 = totAnd (anaEdgesSubset s1 s2) (anaEdgesSubset s2 s1)
+
+@label "analyze: reach close step"
+@description "Stack-safe self-tail fixpoint loop. Compute the next squaring round; return at equality, otherwise continue with the expanded relation until the exact node-derived round bound is exhausted. The self-tail call compiles to the standard loop form."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaReachCloseStep : (fuel: a) -> (r: b) -> b
+anaReachCloseStep fuel r =
+  let next = anaReachRound r
+  if anaEdgeSetEq next r then r else if eq fuel 0 then next else anaReachCloseStep (sub fuel 1) next
+
+@label "analyze: reach close (bounded exact fixpoint)"
+@description "The transitive closure of the call-graph edge relation under repeated squaring. Callers derive `fuel` from the finite node set (`|V| + 1`), which is an exact deterministic bound rather than a repository-size constant. The loop saturates in ceil(log2(longest-path)) rounds and anaReachCloseStep is self-tail/compiled stack-safe."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f"
+anaReachClose : (fuel: a) -> (r: b) -> b
+anaReachClose fuel r =
+  if eq fuel 0 then r else anaReachCloseStep (sub fuel 1) r
+
+
+-- -------------------------------------------------------------------------
+-- The SCC partition (mutual-reachability grouping). `u, v` are in the same SCC
+-- iff `u == v` OR (`u →* v` AND `v →* u`) over the reachability closure. A
+-- non-recursive function is a singleton group. Each group is exactly the
+-- `checkMutualTotality` input shape (the member records carry id/params/body —
+-- extra fields are ignored by the checker).
+-- -------------------------------------------------------------------------
+
+@label "analyze: reachable"
+@description "True when node `a` reaches node `b` in the closed relation `r` (the edge {from = a, to = b} is present). Built via a `let` then anaEdgeMember."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaReachable : (a: String) -> (b: String) -> (r: c) -> Bool
+anaReachable a b r =
+  let e = { from = a, to = b }
+  anaEdgeMember e r
+
+@label "analyze: same SCC"
+@description "True when `u` and `v` are in the same strongly-connected component: the same node (u == v), or MUTUALLY reachable (u →* v AND v →* u) in the closed relation. The SCC equivalence the partition groups by."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaSameScc : (u: String) -> (v: String) -> (r: a) -> Bool
+anaSameScc u v r =
+  if eq u v then True else totAnd (anaReachable u v r) (anaReachable v u r)
+
+@label "analyze: members of (tail)"
+@description "Recurse on the tail of the function list for anaMembersOf (keeps it free of case-in-let)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaMembersOfTail : (fid: String) -> (functions: a) -> (r: b) -> a
+anaMembersOfTail fid functions r =
+  case tail functions of
+    Nothing -> []
+    Just rest -> anaMembersOf fid rest r
+
+@label "analyze: members of"
+@description "Every function in the list that is in the same SCC as node `fid` (the SCC group of fid). Keeps the full function records (id/params/body/… — the checkMutualTotality input)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaMembersOf : (fid: String) -> (functions: a) -> (r: b) -> a
+anaMembersOf fid functions r = filter (\g -> anaSameScc fid g.id r) functions
+
+@label "analyze: group-by skip"
+@description "Advance to the tail of the `remaining` worklist, threading the `assigned` id-set unchanged. Used both for an already-assigned head and after emitting a group."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaGroupBySkip : (allFns: a) -> (remaining: b) -> (r: c) -> (assigned: d) -> e
+anaGroupBySkip allFns remaining r assigned =
+  case tail remaining of
+    Nothing -> []
+    Just rest -> anaGroupByGo allFns rest r assigned
+
+@label "analyze: group-by emit"
+@description "Emit the SCC group of the worklist head `f`: collect all members in f's SCC (anaMembersOf over the FULL function list), mark their ids assigned, and prepend the group to the partition built from the rest of the worklist (threading the grown assigned set)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaGroupByEmit : (allFns: a) -> (remaining: b) -> (r: c) -> (assigned: d) -> (f: e) -> g
+anaGroupByEmit allFns remaining r assigned f =
+  let members = anaMembersOf f.id allFns r
+  let memberIds = anaMapIds members
+  let assigned2 = totConcat memberIds assigned
+  let restGroups = anaGroupBySkip allFns remaining r assigned2
+  appendItem members restGroups
+
+@label "analyze: group-by walk"
+@description "Walk the worklist, emitting one group per not-yet-assigned head (its whole SCC) and skipping already-assigned heads. Threads the `assigned` id-set so each SCC is emitted once. Helper for sccPartition."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaGroupByGo : (allFns: a) -> (remaining: b) -> (r: c) -> (assigned: d) -> e
+anaGroupByGo allFns remaining r assigned =
+  let partitioned =
+        fold
+          (\state f ->
+            if elem f.id state.assigned then state
+            else
+              let members = anaMembersOf f.id allFns r
+              { groups = appendItem members state.groups, assigned = totConcat (anaMapIds members) state.assigned })
+          { groups = [], assigned = assigned }
+          remaining
+  partitioned.groups
+
+@label "analyze: SCC partition"
+@description "Partition a function list into its strongly-connected components (each SCC = one mutually-recursive group; a non-recursive function = a singleton group). Builds the direct call-graph edges (callees ∩ the function ids), takes the exact finite reachability closure using a node-count-derived bound, then groups by mutual reachability. Each group is exactly the checkMutualTotality input shape (its members carry id/params/body). The bridge from `a checker over a given group` (3e) to `a checker over the program` — the gap 3e left (D-3e-4)."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f"
+sccPartition : (functions: a) -> b
+sccPartition functions =
+  let knownIds = anaMapIds functions
+  let edges = anaBuildEdges functions knownIds
+  let closure = anaReachClose (add (length functions) 1) edges
+  anaGroupByGo functions functions closure []
+
+
+-- -------------------------------------------------------------------------
+-- C. The analyze skeleton. `analyzeGroup` runs `checkMutualTotality` over a
+-- group's members; the `@partial` fold makes a group `Partial` when ANY member
+-- is declared `@partial` (D-3f-3 — the escape-hatch is per-definition; the
+-- simplest sound aggregation). `analyzeFunctions` = sccPartition then
+-- analyzeGroup per group. `censusFunctions` aggregates into the count census +
+-- the `Unknown` id worklist.
+-- -------------------------------------------------------------------------
+
+@label "analyze: group has @partial member"
+@description "True when ANY member of the group is declared @partial (declaredPartial). The per-group @partial fold (D-3f-3)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaGroupHasPartial : (group: a) -> Bool
+anaGroupHasPartial group =
+  fold (\found m -> if found then True else m.declaredPartial) False group
+
+@label "analyze: analyze one group"
+@description "The verdict for ONE SCC group: Partial when any member is declared @partial (D-3f-3), else the rung-3c checkMutualTotality verdict (Total | Unknown) over the group's {id, params, body} members. Returns {ids, verdict} — the member ids the verdict covers, plus the three-valued Totality. The headline compose: SCC-discovery + checkMutualTotality certify (or flag) a real mutual group."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f"
+analyzeGroup : (group: a) -> b
+analyzeGroup group =
+  let ids = anaMapIds group
+  let verdict = if anaGroupHasPartial group then Partial { reason = "group has a declared @partial member" } else checkMutualTotality group
+  { ids = ids, verdict = verdict }
+
+@label "analyze: analyze each group (tail)"
+@description "Recurse on the tail of the group list for anaAnalyzeGroups (keeps it free of case-in-let)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaAnalyzeGroupsTail : (groups: a) -> b
+anaAnalyzeGroupsTail groups =
+  case tail groups of
+    Nothing -> []
+    Just rest -> anaAnalyzeGroups rest
+
+@label "analyze: analyze each group"
+@description "Map analyzeGroup over every SCC group, yielding a List {ids, verdict}."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaAnalyzeGroups : (groups: a) -> b
+anaAnalyzeGroups groups = map (\g -> analyzeGroup g) groups
+
+@label "analyze: analyze functions"
+@description "The analyze skeleton: filter the analyzable functions (the Unanalyzable bodies are excluded from the call graph — their callers lose that edge, sound under-approx), partition into SCCs (sccPartition), and run analyzeGroup per group. Returns a List {ids, verdict} — one entry per SCC. The per-function lowering of a stored JSON-Logic body to core Expr (via jsonLogicToExpr) happens in the census RUNNER BEFORE this (so both callee-extraction and the totality walk see core Expr)."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f"
+analyzeFunctions : (functions: a) -> b
+analyzeFunctions functions =
+  let analyzable = anaFilterAnalyzable functions
+  let groups = sccPartition analyzable
+  anaAnalyzeGroups groups
+
+
+-- -------------------------------------------------------------------------
+-- The census. Aggregate analyzeFunctions into the count census + the Unknown id
+-- worklist; the Unanalyzable functions are counted separately (NEVER folded into
+-- Total — D-3f-4). The counts are by MEMBER-ID COUNT (a 2-member Unknown group
+-- contributes 2 to `unknown`, not 1), so the census counts functions, not SCCs.
+-- The census record `{total, unknown, partial, unanalyzable, unknownIds}` is the
+-- phase's headline output.
+-- -------------------------------------------------------------------------
+
+@label "analyze: census bump total"
+@description "Add `n` to the census accumulator's `total` count, leaving the others. Returns the updated census record."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaBumpTotal : (acc: a) -> (n: b) -> a
+anaBumpTotal acc n =
+  { total = add acc.total n, unknown = acc.unknown, partial = acc.partial, unknownIds = acc.unknownIds }
+
+@label "analyze: census bump unknown"
+@description "Add `n` to the census accumulator's `unknown` count AND append the group's member ids to the Unknown worklist. Returns the updated census record."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaBumpUnknown : (acc: a) -> (n: b) -> (ids: c) -> a
+anaBumpUnknown acc n ids =
+  { total = acc.total, unknown = add acc.unknown n, partial = acc.partial, unknownIds = totConcat ids acc.unknownIds }
+
+@label "analyze: census bump partial"
+@description "Add `n` to the census accumulator's `partial` count, leaving the others. Returns the updated census record."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaBumpPartial : (acc: a) -> (n: b) -> a
+anaBumpPartial acc n =
+  { total = acc.total, unknown = acc.unknown, partial = add acc.partial n, unknownIds = acc.unknownIds }
+
+@label "analyze: census one group"
+@description "Fold one {ids, verdict} group result into the census accumulator: a Total group adds its member count to `total`; an Unknown group adds its count to `unknown` AND its ids to the Unknown worklist; a Partial group adds its count to `partial`. Counts by member-id count (the census counts functions, not SCCs)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaCensusOne : (r: a) -> (acc: b) -> b
+anaCensusOne r acc =
+  let n = length r.ids
+  case r.verdict of
+    Total -> anaBumpTotal acc n
+    Unknown {} -> anaBumpUnknown acc n r.ids
+    Partial {} -> anaBumpPartial acc n
+
+@label "analyze: census fold"
+@description "Fold anaCensusOne over every group result, threading the census accumulator."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaCensusGo : (results: a) -> (acc: b) -> b
+anaCensusGo results acc =
+  fold (\current r -> anaCensusOne r current) acc results
+
+@label "analyze: count unanalyzable"
+@description "Count the functions whose `analyzable` flag is False (the bodies that did not lower to core Expr — the 56 Err cases). Bucketed separately, NEVER folded into Total (D-3f-4)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaCountUnanalyzable : (functions: a) -> b
+anaCountUnanalyzable functions =
+  fold (\count f -> if f.analyzable then count else add count 1) 0 functions
+
+@label "analyze: count unanalyzable (tail)"
+@description "Recurse on the tail of the function list for anaCountUnanalyzable (keeps it free of case-in-let)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3f"
+@category "engine-internal"
+anaCountUnanalyzableTail : (functions: a) -> b
+anaCountUnanalyzableTail functions =
+  case tail functions of
+    Nothing -> 0
+    Just rest -> anaCountUnanalyzable rest
+
+@label "Totality census over a function registry"
+@description "The ADVISORY totality census (the phase's headline output): run the analyze skeleton over a function list and aggregate into {total, unknown, partial, unanalyzable, unknownIds} — the per-bucket function COUNTS plus the Unknown id worklist (the triage list for the 3g flip: each Unknown is either a real fence — ≠0/ℕ guard, non-sub measure, outside-the-abstraction — or a checker gap to close before the global Unknown→reject flip). Counts are by member-id count (a 2-member Unknown group contributes 2). The Unanalyzable functions (bodies that did not lower to core Expr) are counted separately and NEVER folded into Total (D-3f-4). SOUND: the finite graph's reachability closure is exact; conservative call-graph over/under-approximations and unlowerable bodies still push toward Unknown/Unanalyzable, never a false Total — so the census is a sound LOWER bound on the work remaining before the flip. ADVISORY ONLY — does not touch the kernel, does not flip any verdict (D-3f-5)."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3f"
+censusFunctions : (functions: a) -> b
+censusFunctions functions =
+  let results = analyzeFunctions functions
+  let seed = { total = 0, unknown = 0, partial = 0, unknownIds = [] }
+  let agg = anaCensusGo results seed
+  let unanalyzable = anaCountUnanalyzable functions
+  { total = agg.total, unknown = agg.unknown, partial = agg.partial, unanalyzable = unanalyzable, unknownIds = agg.unknownIds }
+
+
+-- -------------------------------------------------------------------------
+-- The KERNEL-GATE verdict projection (unified-static-analysis Phase 3g). The
+-- proof-path gate consults ONE subject function's totality verdict as a string
+-- TAG ("Total" | "Unknown" | "Partial"). `verdictTagFor` takes the subject +
+-- its (pre-gathered, reachable) function records, follows the subject's
+-- spelling-normalized forward reach, and returns Total only when every reached
+-- body lowered and every SCC group among them is Total (TRANSITIVE since
+-- 2026-10-02; before, only the subject's own group was read). A subject that did
+-- not lower or was not gathered ⇒ "Unknown" — the soundness-conservative
+-- default (NEVER a silent "Total"). The
+-- TS seam (`subjectTotalityVerdict` in `kernel.ts`) does only the host-boundary
+-- work a `.fenel` body cannot: resolve the registry's stored JSON-Logic bodies,
+-- lower them to core `Expr`, and BFS-bound the reachable set (the census-runner
+-- gather-host-data precedent). The DECISION — analyze + which group + which tag —
+-- is 100% Fenel, here. 0 entity decls (string returns).
+--
+-- SCOPE (Phase 3g, 2026-06-21): this projection feeds the PROOF-PATH gate only —
+-- it consults ONE subject function's verdict ON DEMAND (a bounded SCC), so it needs
+-- NO whole-registry census. The UNCONDITIONAL GLOBAL flip (the type-checker
+-- default-rejecting EVERY non-total function everywhere) STAYS DEFERRED: it would
+-- false-reject the engine's OWN functions, whose interpreted census OVERFLOWS the
+-- no-TCO host stack on the engine call graph (3f surprise #2 — `censusFunctions`
+-- above hits the same wall). The global flip is gated on the COMPILED engine census
+-- (a self-host / parser-substrate-adjacent track). See TODO.md `totality-checking`.
+-- -------------------------------------------------------------------------
+
+@label "analyze: verdict tag of a Totality"
+@description "Project a Totality verdict to its string tag: Total ⇒ \"Total\", Unknown ⇒ \"Unknown\", Partial ⇒ \"Partial\". The kernel-gate consumes the string (the `$`-key-free pre-computed fact the marshal seam threads into verifyProof). Internal helper."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3g"
+@category "engine-internal"
+anaVerdictToTag : (v: Totality) -> String
+anaVerdictToTag v =
+  case v of
+    Total -> "Total"
+    Unknown {} -> "Unknown"
+    Partial {} -> "Partial"
+
+@label "analyze: verdict tag of subject in results"
+@description "Find the {ids, verdict} group result whose member-ids include `subjectId` and return its verdict TAG; a subject absent from every group ⇒ \"Unknown\" (the soundness-conservative default — never a silent Total). Walks the analyzeFunctions results. Internal helper."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-3g"
+@category "engine-internal"
+anaVerdictTagOf : (subjectId: String) -> (results: a) -> String
+anaVerdictTagOf subjectId results =
+  let selected =
+        fold
+          (\state r ->
+            if state.found then state
+            else if elem subjectId r.ids
+            then { found = True, tag = anaVerdictToTag r.verdict }
+            else state)
+          { found = False, tag = "Unknown" }
+          results
+  selected.tag
+
+@label "analyze: reach step"
+@description "Level-synchronous forward reachability over an adjacency list ({id, callees} rows): add the not-yet-visited callees of the frontier, then continue from them. Returns every node reachable in one or more steps (a node is in its own result iff it lies on a cycle). Callers pass fuel = node count + 1, which every productive level reduces by at least one new node, so the bound is never reached on a closed adjacency; if it were, the marker `$reach-fuel-exhausted` is returned with the partial set so the caller can refuse instead of under-approximating. Self-tail."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaReachStep : (adjacency: a) -> (frontier: b) -> (visited: b) -> (fuel: c) -> b
+anaReachStep adjacency frontier visited fuel =
+  let next = fold (\acc id -> fold (\current callee -> if elem callee visited then current else anaAddUnique callee current) acc (fold (\found row -> if eq row.id id then row.callees else found) [] adjacency)) [] frontier
+  if eq (length next) 0 then visited
+  else if eq fuel 0 then appendItem "$reach-fuel-exhausted" (concat visited next)
+  else anaReachStep adjacency next (concat visited next) (sub fuel 1)
+
+@label "analyze: SCC groups of reached records"
+@description "Partition function records into strongly-connected groups from per-record forward reach sets ({id, reach} rows from anaReachStep): u and w share a group iff u == w, or each reaches the other. Each group is the checkMutualTotality input shape."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaReachedGroups : (records: a) -> (reaches: b) -> c
+anaReachedGroups records reaches =
+  let partitioned =
+        fold
+          (\state f ->
+            if elem f.id state.assigned then state
+            else
+              let reachOfF = fold (\found row -> if eq row.id f.id then row.reach else found) [] reaches
+              let members = filter (\g -> if eq g.id f.id then True else if elem g.id reachOfF then elem f.id (fold (\found row -> if eq row.id g.id then row.reach else found) [] reaches) else False) records
+              { groups = appendItem members state.groups, assigned = totConcat (anaMapIds members) state.assigned })
+          { groups = [], assigned = [] }
+          records
+  partitioned.groups
+
+@label "Totality verdict tag for a subject function"
+@description "THE KERNEL-GATE projection (unified-static-analysis Phase 3g): the totality verdict TAG (\"Total\" | \"Unknown\" | \"Partial\") for `subjectId`, run over the subject + its pre-gathered reachable function records (the {id, params, body, declaredPartial, analyzable} shape censusFunctions takes). TRANSITIVE (2026-10-02 — the earlier text claimed callee folding that analyzeFunctions never did, so a total caller of a non-terminating callee read Total): the call graph is built with spelling-normalized callees over EVERY gathered id (anaSpellingTargets — analyzable or not), the subject's forward reach is taken (anaReachStep), and the verdict is Total only when every reached record lowered (a reached Unanalyzable body ⇒ \"Unknown\") and every strongly-connected group among the reached records passes analyzeGroup (checkMutualTotality, or Partial for a declared @partial member). The subject's own group verdict is returned when it is not Total; a non-Total callee group makes a Total subject \"Unknown\" (callee groups are analyzed singletons first and only until the first non-Total one, since a multi-member size-change closure is the expensive step). A subject absent from the records, a reached id with no record, or an exhausted reach bound ⇒ \"Unknown\" — never a silent \"Total\". Ids outside the records stay sinks here: verdictTagForIn (the kernel entry) decides the bodyless natives the seam gathers before calling this, and passes only the bodied records. The TS seam threads the result into the kernel's SampleTestResult/PropForall arm, which REJECTS \"Unknown\"/\"Partial\" (vpSample). ADVISORY no longer — THIS is the consumer that makes the totality checker load-bearing."
+@tags "engine" "analyze" "unified-static-analysis" "phase-3g"
+verdictTagFor : (subjectId: String) -> (functions: a) -> String
+verdictTagFor subjectId functions =
+  let knownIds = anaMapIds functions
+  let adjacency = map (\f -> { id = f.id, callees = if f.analyzable then analyzeCallees f.body knownIds else [] }) functions
+  anaVerdictTagOver subjectId functions adjacency
+
+@label "analyze: verdict tag over an adjacency"
+@description "verdictTagFor's decision over a precomputed adjacency ({id, callees} rows whose callees are ids of `functions`): the subject's forward reach, the refusal of a missing or unlowered reached record, and the SCC verdicts (own group first, then the callee groups, singletons before multi-member groups). verdictTagForIn calls it with callees resolved once against the whole registry and restricted to the bodied records."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaVerdictTagOver : (subjectId: String) -> (functions: a) -> (adjacency: b) -> String
+anaVerdictTagOver subjectId functions adjacency =
+  let fuel = add (length functions) 1
+  let reached = anaAddUnique subjectId (anaReachStep adjacency (appendItem subjectId []) [] fuel)
+  let records = filter (\f -> elem f.id reached) functions
+  if not (eq (length records) (length reached)) then "Unknown"
+  else if gt (length (filter (\f -> not f.analyzable) records)) 0 then "Unknown"
+  else
+    let reaches = map (\f -> { id = f.id, reach = anaReachStep adjacency (appendItem f.id []) [] fuel }) records
+    let groups = anaReachedGroups records reaches
+    let own = anaVerdictTagOf subjectId (anaAnalyzeGroups (filter (\g -> elem subjectId (anaMapIds g)) groups))
+    if not (eq own "Total") then own
+    else
+      fold
+        (\tag g ->
+          if not (eq tag "Total") then tag
+          else if elem subjectId (anaMapIds g) then tag
+          else if eq (anaVerdictTagOf (fromMaybe "" (head (anaMapIds g))) (anaAnalyzeGroups (appendItem g []))) "Total" then "Total"
+          else "Unknown")
+        "Total"
+        (concat (filter (\g -> eq (length g) 1) groups) (filter (\g -> gt (length g) 1) groups))
+
+@label "analyze: applied callee of an apply form"
+@description "The applied reference of one `$ callee args…` form for anaAppliedRefsIn: when the callee is a variable whose root (totSpellingRoot) no binder in `bound` binds, append {spelling, argc} with argc the number of arguments applied to it. A bound callee (a parameter, a pattern variable, a local closure), a lambda literal and a computed callee are left to the group audit (totUncheckedApply)."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaAppliedCallee : (bound: a) -> (acc: b) -> (args: c) -> b
+anaAppliedCallee bound acc args =
+  case head args of
+    Nothing -> acc
+    Just callee ->
+      case callee of
+        EVar { name = n } -> if elem (totSpellingRoot n) bound then acc else appendItem { spelling = n, argc = sub (length args) 1 } acc
+        _ -> acc
+
+@label "analyze: applied reference of a call node"
+@description "The applied reference a call node `f args` contributes for anaAppliedRefsIn: none for the `if` guard form or a list literal's synthetic appendItem (totIsListLiteral, a construction); the callee of the `$` apply form (anaAppliedCallee); a `$dyn:` var-head call when no binder in `bound` binds its root; every other string head. Each is the record {spelling, argc}."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaAppliedHead : (bound: a) -> (acc: b) -> (e: (Expr Any)) -> (f: String) -> (args: c) -> b
+anaAppliedHead bound acc e f args =
+  if and (eq f "if") (not (eq (lookup e "structural") (Just false))) then acc
+  else if totIsListLiteral e then acc
+  else if eq f "$" then anaAppliedCallee bound acc args
+  else if startsWith f "$dyn:" then (if elem (totSpellingRoot f) bound then acc else appendItem { spelling = f, argc = length args } acc)
+  else appendItem { spelling = f, argc = length args } acc
+
+@label "analyze: applied references in a body"
+@description "Collect, as {spelling, argc} records, every reference the core Expr applies to arguments without a binder in `bound` providing it (anaAppliedHead): each string call head (except the `if` form and a list literal's synthetic appendItem), the variable callee of a `$` apply, and each `$dyn:` var-head call, with the number of arguments applied. The kernel-gate entry starts `bound` at the function's params; lambda params and arm pattern vars extend it, so a bound callee is left to the group audit (totUncheckedReference: a callback is refused, a checked local closure accepted). Arm guards are walked like bodies."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaAppliedRefsIn : (bound: a) -> (acc: b) -> (e: (Expr Any)) -> b
+anaAppliedRefsIn bound acc e =
+  case e of
+    ELit { value = _ } -> acc
+    EVar { name = _ } -> acc
+    ECall { fnId = f, args = args } -> fold (\current a -> anaAppliedRefsIn bound current a) (anaAppliedHead bound acc e f args) args
+    ELambda { params = ps, body = bd } -> anaAppliedRefsIn (totAppendAll ps bound) acc bd
+    EMatch { scrutinee = s, arms = arms } -> fold (\current arm -> anaAppliedRefsInArm (totCollectAllVars arm.pattern bound) current arm) (anaAppliedRefsIn bound acc s) arms
+    EConstruct { args = args } -> fold (\current a -> anaAppliedRefsIn bound current a) acc args
+    ERecord { fields = fields } -> fold (\current f -> anaAppliedRefsIn bound current f.value) acc fields
+
+@label "analyze: applied references in a match arm"
+@description "anaAppliedRefsIn over one match arm, `bound` already extended by the arm's pattern variables: its guard when present (it runs before the body), then its body."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaAppliedRefsInArm : (bound: a) -> (acc: b) -> (arm: c) -> b
+anaAppliedRefsInArm bound acc arm =
+  case lookup arm "guard" of
+    Nothing -> anaAppliedRefsIn bound acc arm.body
+    Just guard -> anaAppliedRefsIn bound (anaAppliedRefsIn bound acc guard) arm.body
+
+@label "analyze: applied reference over-applies a bodied function"
+@description "True when one of `targets` is a bodied function whose param count (`arities`, a record from id to param count built over the gathered bodied records) is below `argc`. The evaluator binds a bodied callee's params, evaluates its body and applies any leftover arguments to the result when it is callable (json-logic.ts, the eta-reduction spill): an invocation of a value the analysis never checked. A native receives every argument and never spills, so natives are absent from `arities`."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaOverApplies : (targets: a) -> (argc: Number) -> (arities: b) -> Bool
+anaOverApplies targets argc arities =
+  fold (\found t -> if found then True else anaOverAppliesOne t argc arities) False targets
+
+@label "analyze: applied reference over-applies one function"
+@description "True when `t` has a param count in `arities` (it is a gathered bodied function) below `argc` (anaOverApplies)."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaOverAppliesOne : (t: String) -> (argc: Number) -> (arities: a) -> Bool
+anaOverAppliesOne t argc arities =
+  case mapGet arities t of
+    Nothing -> False
+    Just n -> gt argc n
+
+@label "analyze: body applies an unchecked reference"
+@description "True when an applied reference of the record's body (anaAppliedRefsIn, `bound` starting at its params) denotes no registry id (anaSpellingTargets against `registryIds`; `joined` is anaJoinedIds registryIds) — a class-method name resolved by dispatch, a host leaf the registry does not hold, a bundle or instance member path (`m.k.run`), or a free local recursive binding, any of which may run code the analysis never gathered — or over-applies a bodied function (anaOverApplies: the extra arguments invoke its result)."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaAppliesUnchecked : (f: a) -> (registryIds: b) -> (joined: String) -> (arities: c) -> Bool
+anaAppliesUnchecked f registryIds joined arities =
+  fold (\found r -> if found then True else anaRefUnchecked r registryIds joined arities) False (anaAppliedRefsIn f.params [] f.body)
+
+@label "analyze: applied reference is unchecked"
+@description "True when the applied reference `r` ({spelling, argc}) denotes no registry id, or over-applies a gathered bodied function (anaOverApplies)."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaRefUnchecked : (r: a) -> (registryIds: b) -> (joined: String) -> (arities: c) -> Bool
+anaRefUnchecked r registryIds joined arities =
+  let targets = anaSpellingTargets r.spelling registryIds joined
+  if eq (length targets) 0 then True else anaOverApplies targets r.argc arities
+
+-- -------------------------------------------------------------------------
+-- NATIVE LEAVES (2026-10-03). A registered function with no body (a native
+-- or host leaf) is a termination SINK only when it is a CERTIFIED terminating
+-- leaf. The kernel seam gathers each reached bodyless function as a record
+-- marked `native = True` (it never decides anything about it); the list below is
+-- the certification, as Fenel data. A native that evaluates caller-supplied code
+-- or calls back into the evaluator is NOT certified (evaluator re-entry: running
+-- a closure, a function id, an expression value, or the predicates a type or a
+-- set carries), nor is one that may wait forever; nor is any native this list
+-- does not name (fail-closed: a new native is Unknown until certified here).
+-- Audit (2026-10-03, every bodyless system-registry function): uncertified are
+-- std:evalExpr / std:validateValue / std:parseInput (evaluate an expression or a
+-- type's refinements), all of control:* (run a function id; while_true / repeat
+-- loop), io:read (waits for input) and io:call_function, the sampling and
+-- rendering natives that invoke the closure a Sound / Animation / Movie /
+-- Behavior / Game / Track carries (sound:sampleSound/renderSound,
+-- animation:sampleAnim/renderAnim, movie:sampleMovie/renderMovie,
+-- events:_accumFold/sampleBehavior, games:gameStateAt/_gameViewAt,
+-- track:sampleTrackAt), every set:* native except the All/None/Enum/Interval/
+-- Pattern membership leaves (the rest reach `$where` predicate evaluation or a
+-- named type's refinements), all of prover:* and evaluator-strategies:*,
+-- kernel:verify, and migration:roundtripCheck/forwardTotalCheck (apply a
+-- migration's functions). Certified natives that delegate to engine Fenel bodies
+-- on DATA (compile-*:* run the compiler passes over a program without running
+-- it; storage containment filters call storage:jsonContains) trust those bodies
+-- to terminate.
+-- Second audit (2026-10-03, loop bounds and host re-entry). A native whose loop
+-- bound is a caller-supplied number with no enforced safe-integer bound can run
+-- forever on finite input: a JS number counter stalls at 2^53 (y + 1 === y). The
+-- image routines of image-ops.ts loop `y < height` / `x < width` over the
+-- caller's image record, and `new Array(width * height)` bounds nothing when
+-- width is 0 (or tiny) and height huge, so 35 of them are uncertified:
+-- Grayscale, Invert, Brightness, Contrast, Saturate, HueRotate, Sepia, Threshold,
+-- Posterize, Gamma, Opacity, Red/Green/BlueChannel, SwapRedBlue, SwapRedGreen,
+-- Vignette (mapPixels); BoxBlur, GaussianBlur, Sharpen, Emboss (convolve);
+-- EdgeDetect, Median, Dither, Crop (fractional width), FlipHorizontal,
+-- FlipVertical, Rotate90, Rotate270, Transpose, Pixelate, Overlay, Multiply,
+-- Screen, Difference. Kept: imageResize, imageSolid, imageGradient,
+-- imageCheckerboard (integer dimensions >= 1 whose product new Array accepts,
+-- so each loop is below 2^32), imageRotate180 and imageNoise (loop i < w*h
+-- after that allocation), imageSample (no loop). Every other certified native
+-- loops only over its argument data (a list, a string, a record's keys) or
+-- calls a host builtin whose work is bounded by its result (String repeat and
+-- padStart throw RangeError past the maximum string length; "".repeat(n) and
+-- slice return at once). Also uncertified: io:emit (its handler runs
+-- events:emitEvent, whose trigger dispatch runs the event's subscribers) and
+-- telegram:startCollectorEntry (its handler runs telegram:startTelegramForm with
+-- the caller's hook functions) — both re-enter the evaluator — and
+-- templates:render_template (declared to evaluate the template function its
+-- caller names by slug; it has no implementation today, so a call throws). Trusted, not
+-- re-checked: an IO leaf's single host act returns (a timeout, a wake time or a
+-- RangeError bounds it); io:sleep suspends the run until a wake time the Date
+-- range bounds.
+-- recipe-functions S1 (2026-10-18): std:includes, std:unique and
+-- std:distinctCount became Fenel-bodied (membership on structural `eq`), so
+-- they left this list and the analysis walks their bodies; std:elem stays a
+-- certified bodyless native (its array arm now compares with structuralEq,
+-- which recurses only over its argument data).
+-- -------------------------------------------------------------------------
+
+@label "analyze: certified terminating native leaves"
+@description "The ids of the bodyless registry functions certified as terminating leaves (the native-leaves block above): a native that only computes on its argument data or performs one host IO act, never evaluating caller-supplied code. A reached bodyless function whose id is not listed makes the kernel-gate verdict Unknown (verdictTagForIn). Takes a unit argument so a body reads the list, not a reference to it."
+@tags "engine" "analyze" "unified-static-analysis"
+anaCertifiedNativeLeaves : (unit: a) -> List String
+anaCertifiedNativeLeaves unit =
+  [
+    "std:assocRecord", "std:at", "std:avg", "std:concat", "std:drop", "std:flatten",
+    "std:head", "std:init", "std:last", "std:lookup", "std:mergeRecords", "std:reverse",
+    "std:sortLex", "std:sum", "std:tail", "std:take", "std:zip", "std:addDays", "std:addHours",
+    "std:diffDays", "std:formatDate", "std:now", "std:parseDate", "std:namedSet", "std:regexSet",
+    "std:imageCheckerboard", "std:imageGradient", "std:imageNoise", "std:imageResize", "std:imageRotate180",
+    "std:imageSample", "std:imageSolid", "std:bitAnd", "std:bitNot", "std:bitOr", "std:bitXor", "std:elem",
+    "std:eq", "std:float32ToBytesLE", "std:float64ToBytesLE", "std:gt", "std:gte", "std:lt", "std:lte",
+    "std:merge", "std:neq", "std:shiftLeft", "std:shiftRight", "std:shiftRightU", "std:substr", "std:truthy",
+    "std:attr", "std:element", "std:text", "std:add", "std:ceil", "std:cos", "std:div", "std:exp",
+    "std:floor", "std:log", "std:mod", "std:mul", "std:pow", "std:round", "std:sin", "std:sqrt", "std:sub",
+    "std:tan", "std:camelCase", "std:canonical", "std:capitalize", "std:chars", "std:contains",
+    "std:decodeUriComponent", "std:endsWith", "std:entries", "std:fromEntries", "std:mapGet", "std:format",
+    "std:join", "std:kebabCase", "std:length", "std:lines", "std:lower", "std:mapDelete", "std:mapSet",
+    "std:padEnd", "std:padStart", "std:parseJsonRows", "std:repeat", "std:replace", "std:replaceAll",
+    "std:slice", "std:slugify", "std:snakeCase", "std:split", "std:startsWith",
+    "std:titleCase", "std:trim", "std:tryParseInt", "std:upper", "std:urlEncode", "std:words",
+    "std:charFromCode", "std:charCode", "std:isArray", "std:isBytes", "std:isBoolean", "std:isNull",
+    "std:isNumber", "std:isString", "std:jsLit", "std:numberIsFinite", "std:numberToHex", "std:toBoolean",
+    "std:toNumber", "std:toString", "std:utf8Bytes", "std:typeOf", "std:vecOfLength",
+    "std:lengthBoundedStringOf", "io:sleep", "io:end_function", "io:http_request", "io:random_hex",
+    "io:env_get", "time:now", "time:hostDateParse", "time:formatIsoTimestamp", "time:nowIso",
+    "email:parseAddress", "email:providerSend", "twitter:twitter_get_metrics", "twitter:twitter_get_recent",
+    "twitter:twitter_post_reply", "social:crosspost",
+    "templates:markup_to_html", "templates:markup_to_plaintext", "templates:markup_to_telegram_md",
+    "ai:callLLM", "telegram:findBotById", "telegram:sendMessageText", "telegram:sendFieldPrompt",
+    "telegram:sendConfirmationSummary", "telegram:validateBotToken", "telegram:setWebhookByToken",
+    "telegram:sendCollectorPicker", "telegram:ackCallbackQuery", "telegram:deleteWebhookByToken",
+    "telegram:getUpdatesPoll", "telegram:sendNotification", "notion:retrievePage", "notion:createPage",
+    "notion:updatePage", "notion:retrieveDatabase", "notion:queryDatabase", "notion:retrieveBlock",
+    "notion:retrieveBlockChildren", "notion:appendBlockChildren", "notion:updateBlock", "notion:deleteBlock",
+    "notion:retrieveUser", "notion:listUsers", "notion:retrieveMe", "notion:createComment",
+    "notion:retrieveComments", "notion:search", "picture:point", "picture:color", "picture:alphaBlend",
+    "sound:time", "sound:amplitude", "sound:mono", "sound:ampL", "sound:ampR", "sound:audioBuffer",
+    "movie:scene", "events:_stepLookup", "events:step", "events:accum", "events:behaviorToAnim",
+    "events:behaviorToSound", "games:mkGame", "games:gameToAnim", "games:gameToMovie", "games:runGame",
+    "track:mixDown", "codec:base64Encode", "codec:base64Decode", "codec:jsonEncode", "codec:jsonDecode",
+    "codec:canonicalJsonEncode", "codec:canonicalJsonDecode", "codec:wrapJsonValue", "codec:unwrapJsonValue",
+    "codec:recordFirstNameView", "codec:recordFirstNamePut", "storage:dbStore", "storage:dbLoad",
+    "storage:dbUpdate", "storage:dbDelete", "storage:dbList", "storage:dbAppendEvent", "storage:dbLoadType",
+    "storage:dbLoadTypeByName", "storage:memoryStore", "storage:memoryLoad", "storage:memoryUpdate",
+    "storage:memoryDelete", "storage:memoryList", "storage:memoryAppendEvent", "storage:memoryLoadType",
+    "storage:memoryLoadTypeByName", "storage:bundleStore", "storage:bundleLoad", "storage:bundleUpdate",
+    "storage:bundleDelete", "storage:bundleList", "storage:bundleAppendEvent", "storage:bundleLoadType",
+    "storage:bundleLoadTypeByName", "set:setAllContains", "set:setNoneContains", "set:setEnumContains",
+    "set:setIntervalContains", "set:setPatternContains", "compile-js:normaliseToCore",
+    "compile-js:makeEffectsExplicit", "compile-js:makeClosuresExplicit", "compile-js:emitJs",
+    "compile-js:serializeJsModule", "compile-js:deserializeJsModule", "compile-js:compileFenelToJs",
+    "compile-wasm:normaliseToCore", "compile-wasm:makeEffectsExplicit", "compile-wasm:makeClosuresExplicit",
+    "compile-wasm:lowerToWasmAst", "compile-wasm:serializeWasmModule", "compile-wasm:deserializeWasmModule",
+    "compile-wasm:compileFenelToWasm", "compile-llvm:normaliseToCore", "compile-llvm:makeEffectsExplicit",
+    "compile-llvm:makeClosuresExplicit", "compile-llvm:lowerToLlvmAst", "compile-llvm:serializeLlvmModule",
+    "compile-llvm:deserializeLlvmModule", "compile-llvm:compileFenelToLlvm", "aggregable:lengthImageOf",
+    "aggregable:countImageOf", "aggregable:sumImageOf", "aggregable:avgImageOf", "aggregable:minimumImageOf",
+    "aggregable:maximumImageOf", "aggregable:distinctCountImageOf", "aggregable:preimagePredicateEnvelope",
+    "aggregable:preimageBooleanEnvelope", "aggregable:preimageRoundtripCheck", "migration:profileDemoV1ToV2",
+    "migration:profileDemoV2ToV1", "migration:profileDemoV2ToV1Narrow"
+  ]
+
+-- -------------------------------------------------------------------------
+-- DETERMINISTIC native leaves (S1, 2026-10-23) — the positive list behind the
+-- engine-body memo (design/tcb-ledger.md, "content-keyed replay of engine-body
+-- applications"). anaCertifiedNativeLeaves above certifies TERMINATION only:
+-- it lists std:now, std:formatDate and IO leaves, which are not functions of
+-- their arguments. A memo recording run stores its result only when every
+-- native it reached is listed HERE. Each entry was read in std-ffi.ts: it
+-- computes on its argument data only (no clock, randomness, environment,
+-- locale, time zone, registry or process-global table). The higher-order
+-- entries (map, filter, fold, find, all, some, none, findIndex, partition,
+-- takeWhile, flatMap, zipWith, sort, groupBy) re-enter the evaluator only
+-- through invokeCallable on their callback, whose own natives the recording
+-- sees separately. std:lower depends on the host's Unicode case tables
+-- (toLowerCase, not the locale form) for text outside ASCII: it is also in
+-- anaHostVariantNativeLeaves below, and an entry whose run lowercased such text
+-- is bound to the recording host's case-mapping fingerprint. std:sort is the
+-- engine's own stable merge over keys computed once, so its order no longer
+-- depends on the host sort (2026-10-30). std:sortLex (default sort: stable,
+-- code-unit order) is ES-specified. Excluded on
+-- purpose: std:now, std:formatDate, std:parseDate, std:addDays,
+-- std:addHours, std:diffDays (Date and locale), transcendental math
+-- (std:sin/cos/tan/exp/log/pow/sqrt), std:namedSet/std:regexSet, and every
+-- IO leaf. Adding an entry is a TCB change: read its implementation first.
+-- -------------------------------------------------------------------------
+
+@label "analyze: deterministic native leaves"
+@description "The ids of the bodyless functions whose result is a function of their argument data alone (the deterministic-leaves block above). The engine-body memo stores a recorded result only when every native the run reached is listed here; anything else (a clock, the environment, a locale, a process-global table) leaves the result unstored."
+@tags "engine" "analyze" "engine-body-memo"
+anaDeterministicNativeLeaves : List String
+anaDeterministicNativeLeaves =
+  [
+    "std:add", "std:sub", "std:mul", "std:div", "std:mod", "std:min", "std:max",
+    "std:round", "std:floor", "std:ceil", "std:and", "std:or", "std:eq", "std:neq",
+    "std:gt", "std:gte", "std:lt", "std:lte", "std:at", "std:chars", "std:concat",
+    "std:contains", "std:elem", "std:entries", "std:fromEntries", "std:head", "std:tail", "std:take",
+    "std:isArray", "std:isBoolean", "std:isNull", "std:isNumber", "std:isString",
+    -- Descriptor-only observation over S1's exact admitted snapshot; numeric
+    -- finiteness keeps toNum's existing nonnumber-coercion taint refusal.
+    "std:representationValueSnapshot", "std:numberIsFinite",
+    "std:join", "std:jsLit", "std:length", "std:lookup", "std:lower", "std:mapGet",
+    "std:mapSet", "std:replaceAll", "std:slice", "std:sortLex", "std:split", "std:sum",
+    "std:startsWith", "std:toString", "std:tryParseInt", "std:urlEncode",
+    "std:includes", "std:unique", "std:distinctCount",
+    "std:map", "std:filter", "std:fold", "std:find", "std:findIndex", "std:all",
+    "std:some", "std:none", "std:partition", "std:takeWhile", "std:flatMap",
+    "std:zipWith", "std:sort", "std:groupBy"
+  ]
+
+@label "analyze: host-variant deterministic native leaves"
+@description "The subset of the deterministic native leaves whose result also depends on the host: std:lower reads the host's Unicode case tables for text outside ASCII. A memo entry whose run read them is replayed only where the live host fingerprint for that native equals the recorded one."
+@tags "engine" "analyze" "engine-body-memo"
+anaHostVariantNativeLeaves : List String
+anaHostVariantNativeLeaves =
+  [ "std:lower" ]
+
+-- -------------------------------------------------------------------------
+-- UNMEMOIZED engine bodies (2026-10-30) — bodies that dispatchEngineBody calls
+-- WITHOUT the engine-body memo (the ordinary no-memo path, sound for every
+-- body: the memo only proposes values). Criterion: the memo's key work for a
+-- call (argument snapshot, portable-key digest, table compare) costs more
+-- than the body's own computation, and its recordings are not stored anyway.
+-- Measured for engine:collectFieldIdentitiesDelta in a Chrome worker reload
+-- (2026-10-30, .tmp-diag/usable-20261030/probe-reprofile-reload-a): per call
+-- a snapshot of base.kernel 1.8 s, the SHA-256 1.76 s and a 0.44 s compare,
+-- against 0.18 s of computation; both recordings were refused ("uncertified
+-- native"), and the replay recorder runs Delta outside the public scope, so
+-- the artifact never holds a Delta entry. The facets delta (F1, 2026-11-01)
+-- joins for the same reason: engine:fieldFacetsBase and
+-- engine:projectFieldFacetsDelta take the retained repository facet
+-- projection (thousands of facets) to add a few Local Codeables, and run only
+-- in Local/account builds, whose entries no other partition reads. Removing an
+-- entry only switches the memo back on for that body; adding one is a
+-- performance choice, not a TCB change.
+-- -------------------------------------------------------------------------
+
+@label "analyze: unmemoized engine bodies"
+@description "The engine bodies called without the engine-body memo because the memo's key work (argument snapshot and digest) costs more than their computation (the unmemoized-bodies block above). Calling a body without the memo is always sound; it only gives up reuse."
+@tags "engine" "analyze" "engine-body-memo"
+anaUnmemoizedBodies : List String
+anaUnmemoizedBodies =
+  [ "engine:collectFieldIdentitiesDelta", "engine:fieldFacetsBase", "engine:projectFieldFacetsDelta" ]
+
+@label "analyze: native record"
+@description "True when a gathered function record is a bodyless (native or host-leaf) function: the kernel seam marks such a record `native = True`. A record without the field (hand-built groups, the census) is not native."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaIsNative : (f: a) -> Bool
+anaIsNative f =
+  case lookup f "native" of
+    Nothing -> False
+    Just flag -> eq flag True
+
+@label "analyze: canonical trusted head"
+@description "The head the size-change oracle should see for a string call head: its canonical registry id when the spelling denotes exactly one registry id (anaSpellingTargets) and that id is a trusted std primitive (totIsTrustedPrimitive: std:sub, std:gt, std:gte, std:lt, std:lte, std:and, std:or); otherwise the spelling unchanged. A bare `gt` in a registry that also holds a user `gt` is ambiguous and stays a spelling, so it yields no fact. `$dyn:` heads and the `if` form are never rewritten. A string call head is resolved globally (a lambda or pattern binder never shadows one; a local is called through a var head)."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaCanonicalHead : (spelling: String) -> (registryIds: a) -> (joined: String) -> String
+anaCanonicalHead spelling registryIds joined =
+  if startsWith spelling "$dyn:" then spelling
+  else if eq spelling "if" then spelling
+  else
+    let targets = anaSpellingTargets spelling registryIds joined
+    let target = fromMaybe "" (head targets)
+    if and (eq (length targets) 1) (totIsTrustedPrimitive target) then target else spelling
+
+@label "analyze: canonicalize trusted heads (walk)"
+@description "Rewrite every string call head of the core Expr through anaCanonicalHead, keeping each node's other fields (mapSet over the node, so marks such as a list literal's `lit` survive). Lambda bodies, match scrutinees, arm guards and bodies, constructor arguments and record field values are walked."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaCanonGo : (e: (Expr Any)) -> (registryIds: a) -> (joined: String) -> (Expr Any)
+anaCanonGo e registryIds joined =
+  case e of
+    ELit { value = _ } -> e
+    EVar { name = _ } -> e
+    ECall { fnId = f, args = args } ->
+      let headed = mapSet e "fnId" (anaCanonicalHead f registryIds joined)
+      mapSet headed "args" (map (\a -> anaCanonGo a registryIds joined) args)
+    ELambda { body = bd } -> mapSet e "body" (anaCanonGo bd registryIds joined)
+    EMatch { scrutinee = sc, arms = arms } ->
+      let withScrutinee = mapSet e "scrutinee" (anaCanonGo sc registryIds joined)
+      mapSet withScrutinee "arms" (map (\arm -> anaCanonArm arm registryIds joined) arms)
+    EConstruct { args = args } -> mapSet e "args" (map (\a -> anaCanonGo a registryIds joined) args)
+    ERecord { fields = fields } -> mapSet e "fields" (map (\field -> mapSet field "value" (anaCanonGo field.value registryIds joined)) fields)
+
+@label "analyze: canonicalize trusted heads (arm)"
+@description "anaCanonGo over one match arm: its body, and its guard when present."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaCanonArm : (arm: a) -> (registryIds: b) -> (joined: String) -> a
+anaCanonArm arm registryIds joined =
+  let withBody = mapSet arm "body" (anaCanonGo arm.body registryIds joined)
+  case lookup arm "guard" of
+    Nothing -> withBody
+    Just guard -> mapSet withBody "guard" (anaCanonGo guard registryIds joined)
+
+@label "Canonicalize trusted primitive heads"
+@description "The kernel projection's identity resolution for the size-change oracle (2026-10-03): rewrite each string call head of a lowered body that denotes exactly one registry id, that id being a trusted std primitive, to the canonical id (anaCanonicalHead). The oracle reads positivity, bound and descent facts only off canonical ids (totIsTrustedPrimitive), so a user function sharing a primitive's name, or an ambiguous spelling, yields none. verdictTagForIn applies it to every gathered body before the analysis."
+@tags "engine" "analyze" "unified-static-analysis"
+anaCanonicalizeTrusted : (body: (Expr Any)) -> (registryIds: a) -> (Expr Any)
+anaCanonicalizeTrusted body registryIds = anaCanonGo body registryIds (anaJoinedIds registryIds)
+
+@label "Totality verdict tag for a subject function, against the registry ids"
+@description "THE KERNEL-GATE ENTRY (kernel.ts subjectTotalityVerdict dispatches it with the gathered records and the registry's id list, since 2026-10-03). Native records (anaIsNative: bodyless functions the seam gathered) are decided first: a native subject is Total exactly when it is a certified terminating leaf (anaCertifiedNativeLeaves), and any reached native that is not certified makes the verdict \"Unknown\" (a native that evaluates caller-supplied code can re-enter anything). The bodied records' trusted primitive heads are canonicalized (anaCanonicalizeTrusted: the size-change oracle reads facts only off canonical std ids) and their callees resolved once against the whole registry; a resolved callee with no gathered record ⇒ \"Unknown\" (anaAnyUngathered, 2026-10-03: a callee the seam lost is no evidence of termination, and a certified native is a sink only when present as a native record). The decision over the bodied records then runs on that adjacency restricted to them (anaVerdictTagOver, verdictTagFor's body; natives are absent there, so a gathered certified native stays a sink), followed by the refusal verdictTagFor cannot make without the registry's id set: a gathered body that APPLIES a reference denoting NO registry id ⇒ \"Unknown\" (anaAppliesUnchecked: a string call head other than the `if` form, the variable callee of a `$` apply, or a var-head call, whose root no binder binds; 2026-10-03 — before, only string call heads were checked, so `m.k.run $ x` over a bundle member holding the subject read Total), or that applies a gathered bodied function to more arguments than its params ⇒ \"Unknown\" (anaOverApplies: the evaluator spills the leftovers onto the result, invoking a value the analysis never checked — `idf p r` where p came from data). Such an unresolved reference is a class-method name resolved by dispatch (`fmap`), a host leaf the registry does not hold, a bundle or instance member path, or a free local recursive binding, and may re-enter the subject's group unseen. Applies to every gathered record (the kernel seam gathers exactly the subject's reach)."
+@tags "engine" "analyze" "unified-static-analysis"
+verdictTagForIn : (subjectId: String) -> (functions: a) -> (registryIds: b) -> String
+verdictTagForIn subjectId functions registryIds =
+  let certified = anaCertifiedNativeLeaves 0
+  let natives = filter (\f -> anaIsNative f) functions
+  let bodied = map (\f -> if f.analyzable then mapSet f "body" (anaCanonicalizeTrusted f.body registryIds) else f) (filter (\f -> not (anaIsNative f)) functions)
+  if elem subjectId (anaMapIds natives) then (if elem subjectId certified then "Total" else "Unknown")
+  else if gt (length (filter (\f -> not (elem f.id certified)) natives)) 0 then "Unknown"
+  else
+    let joined = anaJoinedIds registryIds
+    let resolved = map (\f -> { id = f.id, callees = if f.analyzable then anaCalleesJoined registryIds joined f.body else [] }) bodied
+    let gatheredIndex = fromEntries (map (\f -> { key = f.id, value = True }) functions)
+    if anaAnyUngathered resolved gatheredIndex then "Unknown"
+    else
+      let bodiedIndex = fromEntries (map (\f -> { key = f.id, value = True }) bodied)
+      let adjacency = map (\row -> { id = row.id, callees = filter (\c -> anaIndexHas bodiedIndex c) row.callees }) resolved
+      let tag = anaVerdictTagOver subjectId bodied adjacency
+      if not (eq tag "Total") then tag
+      else
+        let arities = fromEntries (map (\f -> { key = f.id, value = length f.params }) bodied)
+        let unresolved = filter (\f -> anaAppliesUnchecked f registryIds joined arities) (filter (\f -> f.analyzable) bodied)
+        if gt (length unresolved) 0 then "Unknown" else "Total"
+
+@label "analyze: index has key"
+@description "True when the record `index` (built by fromEntries) holds `key`."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaIndexHas : (index: a) -> (key: String) -> Bool
+anaIndexHas index key =
+  case mapGet index key of
+    Nothing -> False
+    Just _ -> True
+
+@label "analyze: a resolved callee was not gathered"
+@description "True when some row of `resolved` ({id, callees}: a bodied record's callees resolved against the whole registry) names a callee with no gathered record (`gatheredIndex`, over every record the seam passed, natives included). The seam gathers exactly the subject's reach; a missing callee means the gather lost it (a discovery failure, a truncated or hand-built record set), and treating it as a sink would assume, without evidence, that it terminates. A certified native counts as a sink only when it is present as a native record."
+@tags "engine" "internal" "analyze" "unified-static-analysis"
+@category "engine-internal"
+anaAnyUngathered : (resolved: a) -> (gatheredIndex: b) -> Bool
+anaAnyUngathered resolved gatheredIndex =
+  fold (\found row -> if found then True else gt (length (filter (\c -> not (anaIndexHas gatheredIndex c)) row.callees)) 0) False resolved
+
+
+-- =========================================================================
+-- D. CONSTRAINT (requires) INFERENCE — the transitive typeclass-constraint
+-- propagation over the call graph. unified-static-analysis Phase 4 (the
+-- "effects fold-in"). Brief:
+-- `workstreams/unified-static-analysis/briefs/phase-4-effects-fold-in-retire-effect-inference.md`.
+--
+-- NAMING — "effect inference" is LEGACY. Effects fold into typeclasses, which
+-- fold into types (the subsumption arc), so a function's `requires` is a list
+-- of typeclass CONSTRAINTS, and propagating them transitively up the call graph
+-- is CONSTRAINT inference — a piece of type inference, NOT a separate "effect"
+-- concern. The fold below is the SOURCE OF TRUTH for that inference. The legacy
+-- TS `effect-inference.ts` is retained as the BOOTSTRAP PERFORMANCE BRANCH (the
+-- opaque-repr-for-functions pattern), forced by two HEAD realities the Phase-4
+-- audit surfaced (see the file's header ledger):
+--   (1) RE-ENTRANCY. `attachInferredRequires` runs INSIDE every `createRegistry`,
+--       and the Fenel-dispatch harness itself builds a registry — so the
+--       load-time pass CANNOT route through `dispatchEngineBody` (it would recurse
+--       infinitely during harness construction). The load pass MUST stay TS.
+--   (2) The callee WALK is over RAW JSON-Logic (`call`/`pipe`/`apply`), whose keys
+--       ARE evaluator ops — a `$`-key shape a Fenel body cannot author/walk. AND
+--       `pipe`/`apply` do not lower to core `Expr` (normalise-to-core rejects
+--       them), so reusing `analyzeCallees` over a lowered body would silently DROP
+--       their callees (a parity break — Option A is NOT viable at HEAD). So the
+--       callee walk stays the TS marshal boundary; the SEAM pre-resolves each
+--       function's callee ids and hands the fold below `{ id, callees, requires }`
+--       records (the census-runner gather-host-data-then-dispatch precedent).
+-- What DOES become Fenel — and IS the genuine 2-birds the substrate was built
+-- for (brief line 142: "the genuine 2-birds is the CLOSURE, not just the walk") —
+-- is the transitive-reachability CLOSURE + the requires-union + the structural
+-- dedup, all riding `anaReachClose` / `anaEdgesFrom` / `anaReachable` shared with
+-- the SCC census. 0 entity decls (the Constraint ADT exists; requires-sets are
+-- plain `List`s — the propagate/totality/analyze plain-record discipline).
+--
+-- INPUT function record: { id: String, callees: List String, requires: List w }
+--   • id       : the registry fn-id (the call-graph node key).
+--   • callees  : the registry-fn callee ids out of this function, pre-extracted
+--                by the TS seam from the RAW JSON-Logic body (∩ the resolvable
+--                registry set). The directed call-graph edges out of the node.
+--   • requires : the function's OWN declared constraints, each MARSHALLED to a
+--                `{ key: String, orig: Constraint }` wrapper by the TS seam:
+--                  - key  : the dedup key STRING `${specId}::${stringified-args[0]}`
+--                           (the legacy `constraintKey`), computed host-side.
+--                  - orig : the Constraint value itself, riding OPAQUE — carried
+--                           through the fold by `appendItem`/`totConcat` and
+--                           returned EXACTLY as received (the `{$tag:"Id"}` class
+--                           ref + the `{$var}`-shaped arg are never AUTHORED in
+--                           Fenel; the seam unwraps `.orig` on the way out).
+--
+-- DEDUP is by the seam-computed STRING key (D-4-2, amended at HEAD). The brief
+-- proposed comparing the (class spec-id, args[0]) key BY VALUE in Fenel, but two
+-- HEAD realities forbid it: std `eq` is JS `==` (SHALLOW on records/variants — it
+-- never matches two distinct constraint objects), and the structural `deepEq` op
+-- is KEY-form-only (`{deepEq:[…]}`) — NOT reachable through function application
+-- (`deepEq a b` lowers to a `call` whose head has no impl ⇒ null). So this fold
+-- follows the KERNEL PRECEDENT (kernel.fenel: "std `eq` is shallow … structural
+-- equality is PRE-COMPUTED" in the prover-ffi seam and passed as facts): the
+-- structural dedup key is computed host-side as a String and compared here with
+-- `eq` (string equality — sound + equivalent to the legacy stringified key on the
+-- parity corpus). NOT a TS-ism leak — the seam IS the marshal boundary.
+-- =========================================================================
+
+@label "infer: edges from pre-extracted callees"
+@description "Build the directed call-graph edge set {from, to} over function records carrying a pre-extracted `callees` id-list (the TS-seam form; parallel to anaBuildEdges, which extracts callees from a core Expr body). Concatenated across functions (order-irrelevant — used as a relation). REUSES anaEdgesFrom + totConcat."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqEdges : (functions: a) -> b
+anaReqEdges functions =
+  fold (\edges f -> anaEdgesFrom f.id f.callees edges) [] functions
+
+@label "infer: constraint dedup-key equality"
+@description "Equality of two marshalled constraints by their seam-computed dedup-key STRING (`c.key` = the legacy `${specId}::${JSON.stringify(args[0])}`). Plain string `eq` — sound because the structural key was pre-computed host-side (the kernel-precedent: std `eq` is shallow on records/variants, so structural equality is computed in the marshal seam and compared here as a String, NOT by value over the `{$tag}`/`{$var}` shapes)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqKeyEq : (c1: a) -> (c2: a) -> Bool
+anaReqKeyEq c1 c2 = eq c1.key c2.key
+
+@label "infer: constraint member"
+@description "True when constraint `c` (by its dedup key) occurs in the constraint list `cs`. Fold anaReqKeyEq over cs — the dedup membership test."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqMember : (c: a) -> (cs: b) -> Bool
+anaReqMember c cs =
+  fold (\found c2 -> if found then True else anaReqKeyEq c c2) False cs
+
+@label "infer: add constraint unique"
+@description "Insert constraint `c` into `acc` only if its dedup key is not already present (the structural dedup). Keeps the requires list a set by key, first-occurrence-wins (matching the TS seenKeys order)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqAddUnique : (c: a) -> (acc: b) -> b
+anaReqAddUnique c acc = if anaReqMember c acc then acc else appendItem c acc
+
+@label "infer: union a requires list into the accumulator"
+@description "Fold anaReqAddUnique over a constraint list `cs`, threading the deduped accumulator. Unions one function's declared requires into the running transitive set."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqUnion : (cs: a) -> (acc: b) -> b
+anaReqUnion cs acc =
+  fold (\current c -> anaReqAddUnique c current) acc cs
+
+@label "infer: is g reached from target"
+@description "True when node `gid` is the target itself (eq targetId gid) OR reachable from it in the closed relation `r`. The membership predicate for the reached-function set (self ∪ transitive callees) — matching the TS BFS whose own-requires are seeded and whose visited set is reached from the direct callees."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqIsReached : (targetId: String) -> (gid: String) -> (r: a) -> Bool
+anaReqIsReached targetId gid r = if eq targetId gid then True else anaReachable targetId gid r
+
+@label "infer: reached functions (tail)"
+@description "Recurse on the tail of the function list for anaReqReached (keeps it free of case-in-let)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqReachedTail : (targetId: String) -> (functions: a) -> (r: b) -> a
+anaReqReachedTail targetId functions r =
+  case tail functions of
+    Nothing -> []
+    Just rest -> anaReqReached targetId rest r
+
+@label "infer: reached functions"
+@description "Every function record in the list that is reached from `targetId` (the target itself, or transitively reachable in the closed relation `r`). Keeps the full records (id/callees/requires) so the union step can read their requires."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqReached : (targetId: String) -> (functions: a) -> (r: b) -> a
+anaReqReached targetId functions r = filter (\g -> anaReqIsReached targetId g.id r) functions
+
+@label "infer: collect requires over reached functions"
+@description "Fold each reached function's `requires` list into the deduped accumulator (anaReqUnion). The transitive requires-union over the reached set."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqCollect : (functions: a) -> (acc: b) -> b
+anaReqCollect functions acc =
+  fold (\current f -> anaReqUnion f.requires current) acc functions
+
+-- =========================================================================
+-- unified-static-analysis Phase 4b — the `$dyn` / INDIRECT-DISPATCH arm (D-4b).
+--
+-- THE GAP (Phase-4 deferral D-4-4): the callee WALK (`collectCalledFunctions`,
+-- the TS marshal seam) used to SILENTLY DROP an INDIRECT dispatch — a `call` /
+-- `apply` head (or `pipe` stage) that is a non-string EXPRESSION (a function held
+-- in a param/local, e.g. `applyOne f x = f x`, or `(.) f g = \x -> f (g x)`).
+-- Its callee is a runtime VALUE, not a literal fn-id, so the walk dropped it and
+-- the higher-order function was inferred PURE — UNSOUND (a function that runs an
+-- effectful callback claiming `requires: []`).
+--
+-- THE FIX (the FLOOR — D-4b-1: conservative effect-opaque over-approximation).
+-- The seam now emits a `$`-prefixed sentinel CALLEE token (`"$dyn"`) into the
+-- `callees` list wherever an indirect dispatch occurs (it can never collide with
+-- a real fnId). The DECISION — what that token MEANS — is THIS Fenel arm: a
+-- reached function whose `callees` contains `"$dyn"` ⇒ the target carries an
+-- effect-OPAQUE sentinel constraint (`dynSentinel`), so it can NEVER be certified
+-- pure. SOUND by construction (never under-reports). The constraint VALUE itself
+-- (`{$tag:"Id"}` class ref — a `$`-key shape a `.fenel` body cannot AUTHOR) is
+-- marshalled IN by the seam as `dynSentinel`; the Fenel arm DECIDES its inclusion
+-- (the floor-vs-north-star model lives HERE, so the constraint-variable NORTH-STAR
+-- is a future Fenel-fold evolution, not a seam rewrite).
+--
+-- CONSUMER POLICY (D-4b-3 / D-4b-4, measured: only `.`/`$`/`bindResult` carry an
+-- indirect dispatch at HEAD — the universal effect-polymorphic combinators):
+--   • `findUndeclaredRequiresFor` EXEMPTS the sentinel (it is an inference-
+--     completeness marker, not a missing declaration the author can ADD).
+--   • the TS load-time `attachInferredRequires` STRIPS it from runtime
+--     `fn.requires` (it is not declarable/dispatchable — keeping dispatch /
+--     self-host / partial-eval untouched). The sentinel lives in the inference
+--     QUERY output (the soundness-complete analysis), not the runtime requires.
+-- =========================================================================
+
+@label "infer: callees list contains the $dyn indirect-dispatch token"
+@description "True when the callee-id list `callees` contains the `$dyn` sentinel — the marker the TS seam emits for an INDIRECT / dynamic dispatch (a non-string call/apply head or pipe stage). String membership fold."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4b"
+@category "engine-internal"
+anaCalleesHaveDyn : (callees: a) -> Bool
+anaCalleesHaveDyn callees = elem "$dyn" callees
+
+@label "infer: any reached function performs an indirect dispatch"
+@description "True when ANY function in the reached set carries the `$dyn` indirect-dispatch token in its callees — i.e. the target transitively reaches an effect-OPAQUE dispatch. Folds anaCalleesHaveDyn over the reached functions; the predicate that gates the effect-opaque sentinel arm in inferRequiresFor (the D-4b FLOOR)."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4b"
+@category "engine-internal"
+anaReqReachedHasDyn : (functions: a) -> Bool
+anaReqReachedHasDyn functions =
+  fold (\found f -> if found then True else anaCalleesHaveDyn f.callees) False functions
+
+@label "infer transitive requires for a function"
+@description "The transitive `requires` set for `target`: union the target's OWN declared requires (own-first, matching the TS seed order) with every reached function's declared requires, deduped by the structural (class spec-id, args[0]) key. Builds the call-graph edges from the pre-extracted callees (anaReqEdges), takes the exact node-count-bounded reachability closure (anaReachClose — SHARED with the SCC census, the genuine 2-birds), collects the reached set (anaReqReached, self-inclusive), and folds. THE `$dyn` ARM (Phase 4b, D-4b FLOOR): if any reached function performs an INDIRECT dispatch (anaReqReachedHasDyn — its callees carry the `$dyn` token), union the effect-OPAQUE `dynSentinel` (marshalled IN by the seam — the `$`-key Constraint a `.fenel` body cannot author) so the target can never be certified pure. SOUND over-approximation closing the Phase-4 D-4-4 deferral. `functions` MUST contain `target` and every function transitively reachable from it (the TS marshal seam pre-resolves this reachable set host-side). The SOURCE OF TRUTH for the legacy TS `inferTransitiveRequires` (kept as the bootstrap perf branch — see the module header)."
+@tags "engine" "analyze" "unified-static-analysis" "phase-4"
+inferRequiresFor : (target: a) -> (functions: b) -> (dynSentinel: c) -> d
+inferRequiresFor target functions dynSentinel =
+  let edges = anaReqEdges functions
+  let closure = anaReachClose (add (length functions) 1) edges
+  let reached = anaReqReached target.id functions closure
+  let acc0 = anaReqUnion target.requires []
+  let acc1 = anaReqCollect reached acc0
+  if anaReqReachedHasDyn reached then anaReqAddUnique dynSentinel acc1 else acc1
+
+@label "infer: subtract declared requires (tail-threaded)"
+@description "Keep each constraint of `cs` whose dedup key is NOT present in `declared`, preserving order. The set-difference inferred − declared underlying findUndeclaredRequiresFor."
+@tags "engine" "internal" "analyze" "unified-static-analysis" "phase-4"
+@category "engine-internal"
+anaReqSubtract : (cs: a) -> (declared: b) -> (acc: c) -> c
+anaReqSubtract cs declared acc =
+  fold
+    (\current c -> if anaReqMember c declared then current else appendItem c current)
+    acc
+    cs
+
+@label "find undeclared requires for a function"
+@description "The constraints `target` uses transitively but does NOT declare on its own signature: the set difference (inferRequiresFor target functions dynSentinel) − target.requires, by the structural dedup key. THE `$dyn` EXEMPTION (Phase 4b, D-4b-4): the effect-opaque `dynSentinel` is subtracted OUT of the result (a second anaReqSubtract against the singleton [dynSentinel]) — it is an inference-completeness marker, NOT a missing declaration the author can add, so it must never surface as a spurious 'undeclared requires' on a higher-order function. The SOURCE OF TRUTH for the legacy TS `findUndeclaredRequires` (the audit's undeclared-requires dimension; the TS stays the bootstrap perf branch — see the module header)."
+@tags "engine" "analyze" "unified-static-analysis" "phase-4"
+findUndeclaredRequiresFor : (target: a) -> (functions: b) -> (dynSentinel: c) -> d
+findUndeclaredRequiresFor target functions dynSentinel =
+  let inferred = inferRequiresFor target functions dynSentinel
+  let undeclared = anaReqSubtract inferred target.requires []
+  anaReqSubtract undeclared (appendItem dynSentinel []) []

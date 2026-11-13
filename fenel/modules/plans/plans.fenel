@@ -1,0 +1,255 @@
+-- =========================================================================
+-- Plans CRUD — create_plan + update_plan.
+--
+-- ts-elimination-completion Phase 2 (plans area). Ports the two
+-- entity_instances-backed `(E)` handlers in core/actions/plans.ts
+-- (createPlanHandler / updatePlanHandler) from live TS orchestration
+-- (`createEntityInstance` / `getEntityInstance` / `updateEntityInstance` /
+-- `appendEvent` + field-defaulting + `Object.assign` config-merge +
+-- patch-merge) to Fenel bodies over `state:*`, reducing each TS handler to
+-- a thin `validateActionParams` + `invokeIOAction` + `actionResultAdtToTs`
+-- delegator.
+--
+-- NEW module (plans had no `.fenel` source before this phase) — created
+-- directly in the `module … where` + `@facet` format. The thin
+-- `engine/src/modules/plans.ts` seam loads this file; `plansModule` is
+-- registered at the same boot sites as `itemsModule`. The header keeps the
+-- LEGACY lowercase `plans:` id-prefix + `plans` category + the `"plan"`
+-- entity-type string byte-identical (Decision 3 — no PascalCase rename).
+--
+-- DEFAULTING is in the Fenel body (Fenel-first HARD RULE): the pre-port's
+-- wrapper-side `currency ?? "USD"` / `onRefund ?? "manual"` / `providers ??
+-- []` / `grants ?? []` lift to maybeOr-over-Maybe in buildPlanData. The
+-- pre-port's `amount ?? null` / `duration ?? null` / `steps ?? null` /
+-- `terms ?? null` become OMIT-when-absent (Fenel has no null literal;
+-- absence = a missing key, which the codec boundary reads back as Nothing
+-- — equivalent to the erasable-null the pre-port stored). The non-null
+-- defaults (currency / onRefund / providers / grants) are always written.
+--
+-- state:tryCreateInstanceByName performs the SAME raw createEntityInstance
+-- write the pre-port did (strip-top-level-$tag + Verified-field check, NO
+-- schema-based field stripping), so the extra config / amount / grants /
+-- steps fields persist exactly as before.
+--
+-- Substrate consumed:
+--   - state:tryCreateInstanceByName "plan" data  ({ok, value, error})
+--   - state:getInstance "plan" id                (Maybe<Record> guard)
+--   - state:updateInstance id patch              (patch-merge / Nothing-clear)
+--   - state:appendEvent type payload …           (write-only event log)
+--   - std:mergeRecords / std:length             (merge + step count)
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line.
+-- =========================================================================
+
+module plans where
+
+-- OnRefundMode — the `$enum` `create_plan_params.onRefund` carried inline, now
+-- named so the function param projects a byte-identical `$refined` node
+-- (action-subsumption Phase 3, 2026-06-08): {$refined: {base: String, set:
+-- {$enum: ["revoke_and_kick","manual"]}}}.
+OnRefundMode = String | value ∈ {"revoke_and_kick", "manual"}
+
+-- maybeOr — Maybe<a> with a default. Just<x> → x; Nothing → defaultV.
+-- `@codeName` scopes the global codeName (profiles:maybeOr already owns
+-- the bare "maybeOr" codeName; sister of payments:maybeOrPayments). The
+-- intra-module body reference stays `maybeOr` (the source name).
+maybeOr : {} -> {} -> {}
+@codeName "maybeOrPlans"
+@label "Maybe or default (plans)"
+@description "ts-elimination-completion Phase 2 — Maybe with default: Just<x> → x; Nothing → defaultV. Sister of payments:maybeOrPayments; redeclared in plans scope. Applies the non-null create_plan defaults (currency 'USD', onRefund 'manual', providers [], grants [])."
+@tags "plan" "pure" "maybe" "ts-elimination"
+maybeOr m defaultV =
+  case m of
+    Nothing -> defaultV
+    Just v -> v
+
+-- addAmount / addDuration / addSteps / addTerms — OMIT-when-absent field
+-- merges (pre-port stored `?? null`; Fenel omits the key, which the codec
+-- boundary reads back as Nothing). Each is a Just-only mergeRecords.
+addAmount : {} -> Maybe Number -> {}
+@label "Add amount (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {amount} into the plan data record only when amountM is Just (pre-port `amount ?? null` → omit-when-absent)."
+@tags "plan" "pure" "ts-elimination"
+addAmount base amountM =
+  case amountM of
+    Nothing -> base
+    Just a -> mergeRecords base { amount = a }
+
+addDuration : {} -> Maybe String -> {}
+@label "Add duration (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {duration} into the plan data record only when durationM is Just (pre-port `duration ?? null` → omit-when-absent)."
+@tags "plan" "pure" "ts-elimination"
+addDuration base durationM =
+  case durationM of
+    Nothing -> base
+    Just d -> mergeRecords base { duration = d }
+
+addSteps : {} -> Maybe ({}) -> {}
+@label "Add steps (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {steps} into the plan data record only when stepsM is Just (pre-port `steps ?? null` → omit-when-absent)."
+@tags "plan" "pure" "ts-elimination"
+addSteps base stepsM =
+  case stepsM of
+    Nothing -> base
+    Just s -> mergeRecords base { steps = s }
+
+addTerms : {} -> Maybe ({}) -> {}
+@label "Add terms (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {terms} into the plan data record only when termsM is Just (pre-port `terms ?? null` → omit-when-absent)."
+@tags "plan" "pure" "ts-elimination"
+addTerms base termsM =
+  case termsM of
+    Nothing -> base
+    Just t -> mergeRecords base { terms = t }
+
+-- addConfig — right-biased config-record merge (pre-port `Object.assign(data,
+-- config ?? {})`). config keys override on collision.
+addConfig : {} -> Maybe ({}) -> {}
+@label "Add config (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Right-biased merge of an optional config record into the plan data (pre-port Object.assign(data, config ?? {}))."
+@tags "plan" "pure" "ts-elimination"
+addConfig base configM =
+  case configM of
+    Nothing -> base
+    Just config -> mergeRecords base config
+
+-- buildPlanData — composes the plan entity_instances data record. base
+-- carries the always-written fields with defaults; the optional
+-- amount/duration/steps/terms are merged when Just; config last (overrides).
+buildPlanData : String -> String -> Maybe Number -> Maybe String -> Maybe String -> Maybe ({}) -> Maybe ({}) -> Maybe ({}) -> Maybe ({}) -> Maybe String -> Maybe ({}) -> {}
+@label "Build plan data"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the plan data record: base {slug, name, currency='USD'-default, onRefund='manual'-default, providers=[]-default, grants=[]-default} + optional amount/duration/steps/terms (omit-when-absent) + right-biased config merge."
+@tags "plan" "pure" "ts-elimination"
+buildPlanData slug name amountM currencyM durationM providersM grantsM stepsM termsM onRefundM configM =
+  let base = { slug = slug, name = name, currency = maybeOr currencyM "USD", onRefund = maybeOr onRefundM "manual", providers = maybeOr providersM [], grants = maybeOr grantsM [] }
+  let withAmount = addAmount base amountM
+  let withDuration = addDuration withAmount durationM
+  let withSteps = addSteps withDuration stepsM
+  let withTerms = addTerms withSteps termsM
+  addConfig withTerms configM
+
+-- stepsIsMulti / stepsCount — plan_created event payload fields. Pre-port
+-- `isMultiStep: !!steps` / `stepCount: steps?.length ?? 1`.
+stepsIsMulti : Maybe ({}) -> Boolean
+@label "Steps is multi"
+@description "ts-elimination-completion Phase 2 — pure helper. True when stepsM is Just (pre-port `!!steps`), for the plan_created event payload."
+@tags "plan" "pure" "ts-elimination"
+stepsIsMulti stepsM =
+  case stepsM of
+    Nothing -> False
+    Just _ -> True
+
+stepsCount : Maybe ({}) -> Number
+@label "Steps count"
+@description "ts-elimination-completion Phase 2 — pure helper. length of the steps list when Just, else 1 (pre-port `steps?.length ?? 1`), for the plan_created event payload."
+@tags "plan" "pure" "ts-elimination"
+stepsCount stepsM =
+  case stepsM of
+    Nothing -> 1
+    Just s -> length s
+
+-- createPlan — main body. Builds data, persists, emits plan_created.
+-- action-subsumption Phase 3 (2026-06-08) — createPlan IS the public create_plan
+-- action now (D1 COLLAPSE): public field names (drop the `…M` marshalling) + the
+-- refinements create_plan_params mirrored ride the sig (slug/name : NonEmptyStr,
+-- providers : Maybe (List String), grants : Maybe (List PlanGrant), steps : Maybe
+-- (List PlanStep), onRefund : Maybe OnRefundMode). The G2 1-vs-N-step exclusion
+-- stays a body guard (Q3). The TS handler is deleted; `adapter` stays a param (D4).
+--
+-- `amount : Maybe NonNegInt`. RE-TIGHTENED 2026-06-10 from the temporary `Maybe
+-- Number` fallback: NonNegInt was the same NON-RESOLVING substrate gap as
+-- PositiveNat (the OLD `create_plan_params` `{$ref:"NonNegInt"}` rejected amount),
+-- now CLOSED by registering both presets into `systemEntities`. See the
+-- createInventory comment in inventory/manage.fenel for the gap analysis + fix.
+createPlan : NonEmptyStr -> NonEmptyStr -> Maybe NonNegInt -> Maybe String -> Maybe String -> Maybe (List String) -> Maybe (List PlanGrant) -> Maybe (List PlanStep) -> Maybe ({}) -> Maybe OnRefundMode -> Maybe ({}) -> String -> ActionResult
+@label "Create plan"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 3 — the public create_plan action (no separate TS handler). Params ARE the public contract (slug, name, amount?, currency?, duration?, providers?, grants?, steps?, terms?, onRefund?, config?, adapter). Builds the plan data record (buildPlanData), persists via state:tryCreateInstanceByName, emits plan_created (isMultiStep / stepCount), returns ActionOk { data = {planId, slug} }. Insert failure → ActionErr."
+@tags "plan" "create" "ts-elimination" "action"
+@ioAction "plans.create_plan"
+createPlan slug name amount currency duration providers grants steps terms onRefund config adapter =
+  let data = buildPlanData slug name amount currency duration providers grants steps terms onRefund config
+  let r = tryCreateInstanceByName "plan" data
+  if r.ok
+  then createPlanEmit r.value slug name steps adapter
+  else ActionErr { message = r.error }
+
+-- createPlanEmit — successful-create tail. Attaches the instance's Codeable
+-- (codeName ← slug) + Labelable (label ← name) representations, writes
+-- plan_created + returns Ok.
+--
+-- typed-function-references Phase 9a-3 — the two registerRepresentation calls
+-- replace the retired central `attachInstanceRepresentations` TS hook + its
+-- `representationSources: { codeName: "slug", label: "name" }` map declaration
+-- (system-entities.ts). registerRepresentation persists a typeclass_instances
+-- row AND merges the in-memory registry — byte-identical to the old hook's
+-- createSpecInstance + applyAccountSpecInstances pair. Carbon-copy of item.
+createPlanEmit : String -> String -> String -> Maybe ({}) -> String -> ActionResult
+@label "Create plan (emit)"
+@description "ts-elimination-completion Phase 2 + typed-function-references Phase 9a-3 — successful-create tail of createPlan. Attaches the instance Codeable (codeName ← slug) + Labelable (label ← name) via state:registerRepresentation (replacing the retired central representationSources attach hook), writes plan_created via state:appendEvent ({slug, name, isMultiStep, stepCount, adapter} payload; aggregateType=Just 'plan', aggregateId=Just planId, profileId=Nothing) and returns ActionOk { data = {planId, slug} }."
+@tags "plan" "create" "ts-elimination" "representation"
+createPlanEmit planId slug name stepsM adapter =
+  let _c = registerRepresentation planId "Codeable" { codeName = slug }
+  let _l = registerRepresentation planId "Labelable" { label = name }
+  let payload = { slug = slug, name = name, isMultiStep = stepsIsMulti stepsM, stepCount = stepsCount stepsM, adapter = adapter }
+  let _e = appendEvent "plan_created" payload (Just "plan") (Just planId) Nothing
+  ActionOk { data = { planId = planId, slug = slug }, aggregateType = Just "plan", aggregateId = Just planId, profileId = Nothing }
+
+-- buildPlanPatch — update patch (only changed fields; state:updateInstance
+-- is patch-merge). name when Just, config keys when Just (right-biased).
+buildPlanPatch : Maybe String -> Maybe ({}) -> {}
+@label "Build plan patch"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the update patch for state:updateInstance (patch-merge): name when Just, config keys when Just (right-biased). Carries only changed fields rather than re-sending the whole record."
+@tags "plan" "pure" "ts-elimination"
+buildPlanPatch nameM configM =
+  let base = case nameM of
+    Nothing -> {}
+    Just n -> { name = n }
+  case configM of
+    Nothing -> base
+    Just config -> mergeRecords base config
+
+-- buildPlanUpdatePayload — plan_updated event payload {name, config, adapter}
+-- with name/config included only when Just (pre-port undefined-keys dropped).
+buildPlanUpdatePayload : Maybe String -> Maybe ({}) -> String -> {}
+@label "Build plan-update payload"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the plan_updated event payload: {adapter} base + name when Just + config when Just (mirrors pre-port `{name, config, adapter}` with undefined keys dropped)."
+@tags "plan" "pure" "ts-elimination"
+buildPlanUpdatePayload nameM configM adapter =
+  let base = { adapter = adapter }
+  let withName = case nameM of
+    Nothing -> base
+    Just n -> mergeRecords base { name = n }
+  case configM of
+    Nothing -> withName
+    Just config -> mergeRecords withName { config = config }
+
+-- updatePlan — main body. Existence guard (pre-port throws "Plan not
+-- found"); known arm patches + emits plan_updated.
+-- action-subsumption Phase 3 (2026-06-08) — updatePlan IS the public update_plan
+-- action now (D1 COLLAPSE): public field names (`name`/`config`, not `…M`) + the
+-- refinements update_plan_params mirrored ride the sig (planId : Uuid, name :
+-- Maybe NonEmptyStr). The patch-merge residual stays body-side. The TS handler is
+-- deleted; `adapter` stays a param (D4).
+updatePlan : Uuid -> Maybe NonEmptyStr -> Maybe ({}) -> String -> ActionResult
+@label "Update plan"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 3 — the public update_plan action (no separate TS handler). Params ARE the public contract (planId, name?, config?, adapter). Guards on state:getInstance 'plan' id (Nothing → ActionErr 'Plan not found', matching pre-port throw); known arm patches via state:updateInstance + emits plan_updated."
+@tags "plan" "update" "ts-elimination" "action"
+@ioAction "plans.update_plan"
+updatePlan planId name config adapter =
+  case getInstance "plan" planId of
+    Nothing -> ActionErr { message = `Plan not found: ${planId}` }
+    Just _ -> updatePlanKnown planId name config adapter
+
+-- updatePlanKnown — after the existence guard. Patches, emits, returns Ok.
+updatePlanKnown : String -> Maybe String -> Maybe ({}) -> String -> ActionResult
+@label "Update plan (known)"
+@description "ts-elimination-completion Phase 2 — case-arm extraction from updatePlan (plan exists). Applies buildPlanPatch via state:updateInstance (patch-merge), emits plan_updated (buildPlanUpdatePayload), returns ActionOk { data = {} } with plan aggregate provenance."
+@tags "plan" "update" "ts-elimination"
+updatePlanKnown planId nameM configM adapter =
+  let patch = buildPlanPatch nameM configM
+  let _u = updateInstance planId patch
+  let payload = buildPlanUpdatePayload nameM configM adapter
+  let _e = appendEvent "plan_updated" payload (Just "plan") (Just planId) Nothing
+  ActionOk { data = {}, aggregateType = Just "plan", aggregateId = Just planId, profileId = Nothing }

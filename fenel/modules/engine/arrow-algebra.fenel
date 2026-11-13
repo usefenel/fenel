@@ -1,0 +1,227 @@
+module engine where
+
+-- arrow-algebra — the fold-arrow combinators (signature-substrate Phase A).
+--
+-- "Fold a list of types with `$arrow` and you've *built* a signature" — the
+-- seed's thread 2. Pure value-level constructors/recognizers over runtime type
+-- values: build an arrow from parts (mkArrow), fold a type list to the curried
+-- chain (foldTypes), peel one layer (peelArrow), normalize between the flat and
+-- curried presentations (uncurryType / curryType), and read the flattened spine
+-- (arity / paramTypes / finalReturn). Zero new judgments, zero TCB surface.
+--
+-- THE `$`-KEY BARRIER shapes everything here: a Fenel body cannot author
+-- `$`-prefixed keys, so these combinators do NOT build `{$arrow: …}` envelopes.
+-- They operate on the TraversalType (Tt*) face — the registered `$tag` ADT
+-- mirror (type-traversal.fenel) that IS Fenel-authorable — and the acceptance
+-- pipeline never needs the `$` envelope: typeToSetExpr (type-to-set.fenel)
+-- already consumes TraversalType, witnessOf consumes its SetExpr. Emitting an
+-- actual `$arrow` FenelType from a computed Tt value is deliberately deferred
+-- (the general writer is a P6/ux-parity consumer concern).
+--
+-- COMPUTED-PARAM IDENTITY (the Phase-A entry-check #1 decision): a computed
+-- (never-authored) TtArrowParam carries ordinal positional identity — the
+-- convention the field-identity Phase-3 validator itself enforces
+-- (fieldSemanticSlotsError: a PositionalField key must equal its container
+-- ordinal and project wireName "_<ordinal>"). Concretely at ordinal i:
+--   name = wireName = "_i" · key = PositionalFieldInput i ·
+--   semanticKey = PositionalField i · token = "arrow-algebra:p<i>" (synthetic;
+--   tokens are opaque host-reattachment channels, never validated/compared).
+-- No UUIDs are minted for ephemeral computed values — positional identity is
+-- exactly the identity-total spelling for unnamed slots.
+--
+-- THE `raw` SLOT (entry-check #2): Tt* ctors carry `raw` (the original host
+-- `$` envelope at that position — the peel-helper channel). No consumer on the
+-- typeToSetExpr path dereferences it structurally (the projection reads
+-- semanticKey/wireName/type only), and the host itself builds Tt nodes with
+-- loose raws (traversalSemanticBatch). Convention here: presentation
+-- transforms (curryType/uncurryType) THREAD THE OUTER raw — the ttArrowFlatten
+-- precedent — and freshly-computed nodes (mkArrow/foldTypes layers) carry the
+-- unmistakable sentinel string "arrow-algebra:synthetic" (there is no honest
+-- `$` envelope for a value Fenel computed; a lying half-envelope would be
+-- worse than a loud sentinel). A computed param's `raw` is its wrapped type's
+-- own raw (mirroring marshalTraversalArrowParam, whose param raw is the raw of
+-- the param's TYPE).
+--
+-- CURRYING IS LOAD-BEARING (design/signatures-and-contracts.md §1):
+-- ⟦(A,B)→C⟧ = ⟦(A)→((B)→C)⟧ under the currying calling convention.
+-- uncurryType DELEGATES the spine normalization to ttArrowFlatten
+-- (containment.fenel — the floor-kernel Phase-2 soundness-fixed normal form;
+-- deliberately NOT re-derived here), then repairs container-relative
+-- positional identity: the P3 validator's own law (index == ordinal,
+-- wireName == "_<ordinal>") makes positional keys container-relative, so a
+-- flattened container re-derives them; NamedField keys ride unchanged.
+-- curryType is layerize∘flatten, so the normal-form round-trips
+--   curryType (uncurryType t) ≡ curryType t
+--   uncurryType (curryType t) ≡ uncurryType t
+-- hold by construction. HONEST FENCE: layers carrying duplicate authored
+-- (NamedField) wire names have no name-faithful identity-total flat spelling —
+-- `(x: A) -> ((x: B) -> C)` flattens to a container with a duplicate wire
+-- name, which downstream validation rejects; that is the same
+-- presentation-partiality as the floor-isos backward witnesses, not a bug.
+--
+-- The arrow value type carries NO requires slot — TtArrow is params/returns/raw
+-- only. Capability obligations are contextual (`Γscope ⊨ requires(F)`, the
+-- contract judgment 2), never part of the value's arrow denotation; these
+-- combinators cannot emit a requires-carrying arrow because there is nowhere
+-- to put one (pinned by the Phase-A tests).
+
+-- ---------------------------------------------------------------------------
+-- Internal: ordinal positional wrapping + container-relative reindexing
+-- ---------------------------------------------------------------------------
+
+@label "arrow-algebra: wrap param"
+@description "signature-substrate Phase A — wrap a param TYPE as a computed TtArrowParam with ordinal positional identity (name/wireName \"_<ordinal>\", PositionalFieldInput/PositionalField <ordinal>, synthetic token; raw = the wrapped type's own raw). The identity-total spelling for unnamed computed slots per the field-identity Phase-3 container law. Internal helper."
+@tags "engine" "internal" "type" "arrow" "signature-substrate" "phase-a"
+@category "engine-internal"
+arrowAlgebraWrapParam : (type: a) -> (ordinal: Number) -> b
+arrowAlgebraWrapParam type ordinal =
+  let wire = concat "_" (fieldNaturalDecimal ordinal)
+  TtArrowParam
+    { name = wire
+    , key = PositionalFieldInput { index = ordinal }
+    , semanticKey = PositionalField { index = ordinal }
+    , wireName = wire
+    , token = concat "arrow-algebra:p" (fieldNaturalDecimal ordinal)
+    , type = type
+    , raw = type.raw
+    }
+
+@label "arrow-algebra: wrap params from"
+@description "signature-substrate Phase A — wrap a list of param TYPES as computed TtArrowParams, ordinals counting from the given start. Order-preserving. Internal helper."
+@tags "engine" "internal" "type" "arrow" "signature-substrate" "phase-a"
+@category "engine-internal"
+arrowAlgebraWrapParamsFrom : (types: List a) -> (ordinal: Number) -> List b
+arrowAlgebraWrapParamsFrom types ordinal =
+  case head types of
+    Nothing -> []
+    Just t -> concat [arrowAlgebraWrapParam t ordinal] (arrowAlgebraWrapParamsFrom (tailOr types) (add ordinal 1))
+
+@label "arrow-algebra: reindex param"
+@description "signature-substrate Phase A — re-derive one arrow param's container-relative positional identity at its new ordinal (index, wireName, name, authoring-input view all re-agree; the opaque token and the type/raw payloads ride unchanged). NamedField-keyed params are identity-stable across re-presentation and pass through untouched. Internal helper."
+@tags "engine" "internal" "type" "arrow" "signature-substrate" "phase-a"
+@category "engine-internal"
+arrowAlgebraReindexParam : (param: a) -> (ordinal: Number) -> a
+arrowAlgebraReindexParam param ordinal =
+  case param.semanticKey of
+    PositionalField ->
+      let wire = concat "_" (fieldNaturalDecimal ordinal)
+      TtArrowParam
+        { name = wire
+        , key = PositionalFieldInput { index = ordinal }
+        , semanticKey = PositionalField { index = ordinal }
+        , wireName = wire
+        , token = param.token
+        , type = param.type
+        , raw = param.raw
+        }
+    _ -> param
+
+@label "arrow-algebra: reindex params from"
+@description "signature-substrate Phase A — re-derive container-relative positional identity across a whole param list, ordinals counting from the given start. Internal helper."
+@tags "engine" "internal" "type" "arrow" "signature-substrate" "phase-a"
+@category "engine-internal"
+arrowAlgebraReindexFrom : (params: List a) -> (ordinal: Number) -> List a
+arrowAlgebraReindexFrom params ordinal =
+  case head params of
+    Nothing -> []
+    Just p -> concat [arrowAlgebraReindexParam p ordinal] (arrowAlgebraReindexFrom (tailOr params) (add ordinal 1))
+
+@label "arrow-algebra: reindex arrow"
+@description "signature-substrate Phase A — repair a TtArrow's param container to the P3 container law after a structural re-presentation (positional keys re-derived to their ordinals; named keys untouched). Non-arrow values pass through. Internal helper."
+@tags "engine" "internal" "type" "arrow" "signature-substrate" "phase-a"
+@category "engine-internal"
+arrowAlgebraReindex : (t: a) -> a
+arrowAlgebraReindex t = case t of
+  TtArrow { params = ps, returns = r, raw = rw } ->
+    TtArrow { params = arrowAlgebraReindexFrom ps 0, returns = r, raw = rw }
+  _ -> t
+
+@label "arrow-algebra: curry layers"
+@description "signature-substrate Phase A — right-nest a non-empty flat param list into 1-ary TtArrow layers over the given returns (each layer's single param re-derived at ordinal 0; the outer raw threaded onto every synthesized layer — the ttArrowFlatten raw-threading precedent, in reverse). Internal helper."
+@tags "engine" "internal" "type" "arrow" "signature-substrate" "phase-a"
+@category "engine-internal"
+arrowAlgebraCurryLayers : (params: List a) -> (returns: b) -> (raw: c) -> d
+arrowAlgebraCurryLayers params returns raw =
+  case head params of
+    Nothing -> returns
+    Just p ->
+      let layer = [arrowAlgebraReindexParam p 0]
+      case head (tailOr params) of
+        Nothing -> TtArrow { params = layer, returns = returns, raw = raw }
+        Just _ -> TtArrow { params = layer, returns = arrowAlgebraCurryLayers (tailOr params) returns raw, raw = raw }
+
+-- ---------------------------------------------------------------------------
+-- The public combinators
+-- ---------------------------------------------------------------------------
+
+@label "Make arrow type"
+@description "signature-substrate Phase A — build a TtArrow (the Fenel-authorable TraversalType face of `$arrow`) from a list of param TYPES and a return type. Params are wrapped as computed TtArrowParams with ordinal positional identity (the field-identity container law for unnamed slots); the node carries the synthetic raw sentinel (no host `$` envelope exists for a computed value). The arrow value has no requires slot — capability obligations are contextual, never part of the arrow denotation."
+@tags "engine" "type" "arrow" "algebra" "signature-substrate" "phase-a"
+mkArrow : (types: List a) -> (returns: a) -> a
+mkArrow types returns =
+  TtArrow
+    { params = arrowAlgebraWrapParamsFrom types 0
+    , returns = returns
+    , raw = "arrow-algebra:synthetic"
+    }
+
+@label "Fold types to arrow"
+@description "signature-substrate Phase A — right-fold a list of types to the curried arrow chain: `[t]` is `Just t`, `[t1, …, tn]` is the nested 1-ary chain `t1 -> (t2 -> … -> tn)` (each layer a fresh 1-ary TtArrow via mkArrow), `[]` is Nothing — no exceptions, the empty fold has no arrow. \"Fold a list of types with arrow and you've built a signature.\""
+@tags "engine" "type" "arrow" "algebra" "signature-substrate" "phase-a"
+foldTypes : (types: List a) -> Maybe a
+foldTypes types =
+  case head types of
+    Nothing -> Nothing
+    Just t ->
+      case head (tailOr types) of
+        Nothing -> Just t
+        Just _ ->
+          case foldTypes (tailOr types) of
+            Nothing -> Nothing
+            Just r -> Just (mkArrow [t] r)
+
+@label "Peel arrow layer"
+@description "signature-substrate Phase A — peel ONE arrow layer: `Just { params, returns }` with the param TYPES projected out of the TtArrowParams (identity metadata dropped — this is the type-spine read), or Nothing for a non-arrow value. One layer only; use uncurryType/paramTypes/finalReturn for the flattened spine."
+@tags "engine" "type" "arrow" "algebra" "signature-substrate" "phase-a"
+peelArrow : (t: a) -> Maybe b
+peelArrow t = case t of
+  TtArrow { params = ps, returns = r } ->
+    let peeled = { params = map (\p -> p.type) ps, returns = r }
+    Just peeled
+  _ -> Nothing
+
+@label "Uncurry arrow type"
+@description "signature-substrate Phase A — normalize an arrow to its flat n-ary spine: DELEGATES the structural transform to ttArrowFlatten (containment.fenel — the floor-kernel Phase-2 curry-normal form; ⟦(A)→((B)→C)⟧ = ⟦(A,B)→C⟧), then re-derives container-relative positional identity at the new flat ordinals (the P3 container law); NamedField params ride unchanged. Non-arrow values pass through. Honest fence: duplicate authored wire names across merged layers have no identity-total flat spelling — downstream validation rejects that container honestly."
+@tags "engine" "type" "arrow" "algebra" "signature-substrate" "phase-a"
+uncurryType : (t: a) -> a
+uncurryType t = arrowAlgebraReindex (ttArrowFlatten t)
+
+@label "Curry arrow type"
+@description "signature-substrate Phase A — normalize an arrow to the fully-curried right-nested 1-ary presentation: flatten the spine first (ttArrowFlatten — so nested flat segments in return position are absorbed), then right-nest one 1-ary layer per param, threading the outer raw onto every synthesized layer. layerize∘flatten makes the normal-form round-trips `curryType (uncurryType t) ≡ curryType t` and `uncurryType (curryType t) ≡ uncurryType t` hold by construction. A 0-ary arrow is its own curried form; non-arrow values pass through."
+@tags "engine" "type" "arrow" "algebra" "signature-substrate" "phase-a"
+curryType : (t: a) -> a
+curryType t =
+  case ttArrowFlatten t of
+    TtArrow { params = ps, returns = r, raw = rw } ->
+      case head ps of
+        Nothing -> TtArrow { params = [], returns = r, raw = rw }
+        Just _ -> arrowAlgebraCurryLayers ps r rw
+    _ -> t
+
+@label "Arrow arity"
+@description "signature-substrate Phase A — the arity of the FLATTENED spine (flatten first, then count): `(A) -> ((B) -> C)` and `(A,B) -> C` both have arity 2 — the currying calling convention makes them the same value set. Non-arrow values have arity 0."
+@tags "engine" "type" "arrow" "algebra" "signature-substrate" "phase-a"
+arity : (t: a) -> Number
+arity t = length (tsArrowParams (uncurryType t))
+
+@label "Arrow param types"
+@description "signature-substrate Phase A — the param TYPES of the FLATTENED spine, in positional order (flatten first, then project the types out of the TtArrowParams). Empty for non-arrow values."
+@tags "engine" "type" "arrow" "algebra" "signature-substrate" "phase-a"
+paramTypes : (t: a) -> List b
+paramTypes t = map (\p -> p.type) (tsArrowParams (uncurryType t))
+
+@label "Arrow final return"
+@description "signature-substrate Phase A — the final return of the FLATTENED spine (flatten first, then read the codomain): the ultimate result type past every curried layer. A non-arrow value is its own final return."
+@tags "engine" "type" "arrow" "algebra" "signature-substrate" "phase-a"
+finalReturn : (t: a) -> a
+finalReturn t = tsArrowReturns (uncurryType t)

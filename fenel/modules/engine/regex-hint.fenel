@@ -1,0 +1,869 @@
+module engine where
+
+-- =========================================================================
+-- The regex HINT engine in Fenel — the port of regex-derivative.ts's
+-- cursor-aware validation-hint surface: `regexHint` (the Brzozowski-
+-- derivative cursor driver), `nullable`/`deriv`/`firstSet`/`derivGroups`
+-- over `RxNode`, `describeRanges` (human range names), `isAnchored`, plus
+-- the segment tracking + URL/host/query enrichment (`buildSegments` +
+-- `enrichSegments`). regex-derivative-to-fenel Phase 3 (Slice C, C1 + C2).
+--
+-- WHAT THIS IS. `regexHint patToks consumedToks consumed` walks a regex
+-- against partially-consumed input and reports: whether the remaining input
+-- can still match / end, the valid next characters (as code-point ranges +
+-- a human label), the failing position (if any), and the named-group
+-- SEGMENTS of what's consumed (with URL/host/query sub-structure). The
+-- output is plain data — NO `$`-keys (the Slice-A "RNode deciders are
+-- `$`-key-free" precedent): the TS shim returns it directly, no marshal arm.
+--
+-- WHY TOKENS. Like the Slice-B front-end, the hint engine uses code POINTS:
+-- the `deriv`/`firstSet` over a
+-- char node compares/emits numeric code points. So the TS shim pre-tokenizes
+-- BOTH the pattern (`patToks = [{ ch, code }]`) and the consumed input
+-- (`consumedToks = [{ ch, code }]`); `consumed` is also passed as a raw
+-- string for `enrichSegments`' substring slicing (`.slice`/`.split` over the
+-- consumed text). `RxChar` carries its `code` (the Slice-C field added to
+-- `RxNode` in regex-parse.fenel) so `firstSet`/`deriv` stay code-point-clean.
+--
+-- REUSE, DON'T FORK. The parser + the `RxNode` ADT + the smart constructors
+-- + the range merge/complement come from regex-parse.fenel (Slice B, same
+-- `module engine`): `regexHint` uses `rxParseWhole` for complete admission
+-- (RAW — no `.*` normalization, mirroring regex-derivative.ts's hint surface
+-- which parses patterns directly), and `deriv`/`firstSet` reuse `rxMkSeq`/
+-- `rxMkAlt`/`rxMkGroup`/`rxMergeRanges`/`rxComplementRanges`/`rxMax`. The
+-- hint walk is the cursor-derivative COUNTERPART of Slice B's lowering — same
+-- AST, different fold.
+-- A group-close/tail failure returns an explicit failed hint before walking
+-- consumed input. This boundary repair retains the inherited regex fragment.
+-- Scalar parity (2026-10-08): first sets and consumed tokens use the Unicode
+-- scalar universe, including supplementary values and excluding surrogates.
+--
+-- FENCED (the 1a/Slice-B surprise): this file is TS-parsed (in
+-- `generate-parse-cache.ts`'s `FENCE_FALLBACK`) — the SAME class as
+-- regex-parse.fenel / regex-containment.fenel / pattern-algebra.fenel
+-- (substrate-grade nested `case`/`let` recursion). Closing the fence is
+-- parser-substrate's job.
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- Nullability over RxNode (regex-derivative.ts `nullable`).
+-- -------------------------------------------------------------------------
+
+@label "regex hint: nullable"
+@description "Does an RxNode match the empty string? eps yes; seq both-nullable; alt either-nullable; rep min=0 or child-nullable; group child-nullable; else no. Mirrors regex-derivative.ts `nullable`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhNullable : (n: RxNode) -> Bool
+rxhNullable n =
+  case n of
+    RxEps -> true
+    RxSeq a b -> and (rxhNullable a) (rxhNullable b)
+    RxAlt a b -> or (rxhNullable a) (rxhNullable b)
+    RxRep child mn mx -> or (eq mn 0) (rxhNullable child)
+    RxGroup name child -> rxhNullable child
+    other -> false
+
+
+-- -------------------------------------------------------------------------
+-- Brzozowski derivative over RxNode (regex-derivative.ts `deriv`). `tok` is
+-- a consumed `{ ch, code }`: char nodes compare `ch`, class/dot nodes compare
+-- `code`. Reuses the regex-parse smart constructors (`rxMkSeq`/`rxMkAlt`/
+-- `rxMkGroup`). The `max = -1` infinity sentinel replaces TS's `Infinity`.
+-- -------------------------------------------------------------------------
+
+@label "regex hint: class hit"
+@description "Does a code point fall in any `{ lo, hi }` range of a char class? Mirrors regex-derivative.ts `n.ranges.some(r => c >= r.lo && c <= r.hi)`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhClsHit : (ranges: a) -> (code: a) -> Bool
+rxhClsHit ranges code =
+  case head ranges of
+    Nothing -> false
+    Just r -> if and (gte code r.lo) (lte code r.hi) then true else rxhClsHit (rxRest ranges) code
+
+@label "regex hint: deriv"
+@description "Brzozowski derivative of an RxNode w.r.t. a consumed `{ ch, code }` token. Char ⇒ eps/empty on `ch` equality; class ⇒ membership (negated by `neg`); dot ⇒ eps unless newline (code 10); seq/alt/rep/group per the standard rules (the rep min/max decrement uses the `-1` infinity sentinel). Reuses regex-parse `rxMkSeq`/`rxMkAlt`/`rxMkGroup`. Mirrors regex-derivative.ts `deriv`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhDeriv : (n: RxNode) -> (tok: a) -> RxNode
+rxhDeriv n tok =
+  if lt tok.code 0 || gt tok.code 1114111 || (gte tok.code 55296 && lte tok.code 57343) then RxEmpty
+  else case n of
+    RxEmpty -> RxEmpty
+    RxEps -> RxEmpty
+    RxChar ch code -> if eq ch tok.ch then RxEps else RxEmpty
+    RxCls ranges neg ->
+      let hit = rxhClsHit ranges tok.code
+      let fires = if neg then not hit else hit
+      if fires then RxEps else RxEmpty
+    RxDot -> if eq tok.code 10 then RxEmpty else RxEps
+    RxSeq a b ->
+      let da = rxMkSeq (rxhDeriv a tok) b
+      if rxhNullable a then rxMkAlt da (rxhDeriv b tok) else da
+    RxAlt a b -> rxMkAlt (rxhDeriv a tok) (rxhDeriv b tok)
+    RxRep child mn mx ->
+      if eq mx 0 then RxEmpty
+      else
+        let nextMin = rxMax 0 (sub mn 1)
+        let nextMax = if eq mx (negate 1) then negate 1 else sub mx 1
+        rxMkSeq (rxhDeriv child tok) (RxRep child nextMin nextMax)
+    RxGroup name child -> rxMkGroup name (rxhDeriv child tok)
+
+
+-- -------------------------------------------------------------------------
+-- First set — the code-point ranges that can begin a match of an RxNode
+-- (regex-derivative.ts `firstSet`). `RxChar` uses its carried `code`; the
+-- `rep max > 0` test becomes `mx != 0` (the `-1` infinity sentinel is > 0).
+-- -------------------------------------------------------------------------
+
+@label "regex hint: first set"
+@description "Code-point ranges (`[{ lo, hi }]`) that can begin a match of an RxNode: char ⇒ its singleton; class ⇒ the ranges (complemented when negated); dot ⇒ everything but newline; seq ⇒ first(a) (∪ first(b) when a nullable); alt ⇒ both, merged; rep ⇒ first(child) unless max=0; group ⇒ first(child). Mirrors regex-derivative.ts `firstSet`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhFirstSet : (n: RxNode) -> a
+rxhFirstSet n =
+  case n of
+    RxEmpty -> []
+    RxEps -> []
+    RxChar ch code -> if lt code 0 || gt code 1114111 || (gte code 55296 && lte code 57343) then [] else [ { lo = code, hi = code } ]
+    RxCls ranges neg -> if neg then rxComplementRanges ranges else rxComplementRanges (rxComplementRanges ranges)
+    RxDot -> rxComplementRanges [{ lo = 10, hi = 10 }]
+    RxSeq a b -> if rxhNullable a then rxMergeRanges (concat (rxhFirstSet a) (rxhFirstSet b)) else rxhFirstSet a
+    RxAlt a b -> rxMergeRanges (concat (rxhFirstSet a) (rxhFirstSet b))
+    RxRep child mn mx -> if eq mx 0 then [] else rxhFirstSet child
+    RxGroup name child -> rxhFirstSet child
+
+
+-- -------------------------------------------------------------------------
+-- Derivative GROUPS — which named groups are active after consuming a token
+-- (regex-derivative.ts `derivGroups`). Used to build segments.
+-- -------------------------------------------------------------------------
+
+@label "regex hint: deriv groups"
+@description "The named groups still active after consuming `tok` from an RxNode: group ⇒ [name, …inner] when the inner derivative is non-empty; seq ⇒ derivGroups(a) if a's derivative is live, else derivGroups(b) when a nullable; alt ⇒ derivGroups(a) if live else derivGroups(b); rep ⇒ derivGroups(child) unless max=0; leaves ⇒ []. Mirrors regex-derivative.ts `derivGroups`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhDerivGroups : (n: RxNode) -> (tok: a) -> a
+rxhDerivGroups n tok =
+  case n of
+    RxGroup name child ->
+      if rxIsRxEmpty (rxhDeriv child tok) then [] else concat [ name ] (rxhDerivGroups child tok)
+    RxSeq a b ->
+      if not (rxIsRxEmpty (rxhDeriv a tok)) then rxhDerivGroups a tok
+      else if rxhNullable a then rxhDerivGroups b tok
+      else []
+    RxAlt a b ->
+      if not (rxIsRxEmpty (rxhDeriv a tok)) then rxhDerivGroups a tok else rxhDerivGroups b tok
+    RxRep child mn mx -> if eq mx 0 then [] else rxhDerivGroups child tok
+    other -> []
+
+
+-- -------------------------------------------------------------------------
+-- describeRanges — human-readable names for code-point ranges
+-- (regex-derivative.ts `describeRanges` + `charName` + `CHAR_NAMES`).
+-- -------------------------------------------------------------------------
+
+@label "regex hint: char-name lookup"
+@description "The human name for a code point from the CHAR_NAMES table (tab/newline/space/punctuation), or \"\" when absent. Mirrors regex-derivative.ts `CHAR_NAMES`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhCharNameLookup : (code: a) -> String
+rxhCharNameLookup code =
+  let names = [ { c = 9, n = "tab" }, { c = 10, n = "newline" }, { c = 32, n = "space" }, { c = 33, n = "!" }, { c = 35, n = "#" }, { c = 36, n = "$" }, { c = 37, n = "%" }, { c = 38, n = "&" }, { c = 40, n = "(" }, { c = 41, n = ")" }, { c = 42, n = "*" }, { c = 43, n = "+" }, { c = 44, n = "," }, { c = 45, n = "hyphen" }, { c = 46, n = "dot" }, { c = 47, n = "forward slash" }, { c = 58, n = "colon" }, { c = 59, n = "semicolon" }, { c = 61, n = "=" }, { c = 63, n = "?" }, { c = 64, n = "@" }, { c = 91, n = "[" }, { c = 93, n = "]" }, { c = 95, n = "underscore" }, { c = 123, n = "{" }, { c = 125, n = "}" } ]
+  rxhFindName names code
+
+@label "regex hint: find char name"
+@description "Scan a CHAR_NAMES assoc-list for a code-point entry, returning its name or \"\". Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhFindName : (names: a) -> (code: a) -> String
+rxhFindName names code =
+  case head names of
+    Nothing -> ""
+    Just e -> if eq e.c code then e.n else rxhFindName (rxRest names) code
+
+@label "regex hint: char name"
+@description "The display name for a single code point: alphanumerics render as the char itself; CHAR_NAMES entries by name; other printable ASCII (33..126) as the char; everything else as `U+XXXX` (4-digit lowercase hex). Mirrors regex-derivative.ts `charName`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhCharName : (code: a) -> String
+rxhCharName code =
+  if and (gte code 48) (lte code 57) then charFromCode code
+  else if and (gte code 65) (lte code 90) then charFromCode code
+  else if and (gte code 97) (lte code 122) then charFromCode code
+  else
+    let name = rxhCharNameLookup code
+    if neq name "" then name
+    else if and (gte code 33) (lte code 126) then charFromCode code
+    else concat "U+" (lower (numberToHex code 4))
+
+@label "regex hint: range total"
+@description "Total number of code points spanned by a range list (Σ (hi - lo + 1)). Used to short-circuit huge ranges to \"any character\". Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhRangeTotal : (ranges: a) -> a
+rxhRangeTotal ranges =
+  case head ranges of
+    Nothing -> 0
+    Just r -> add (add (sub r.hi r.lo) 1) (rxhRangeTotal (rxRest ranges))
+
+@label "regex hint: describe one range"
+@description "Render one code-point range: lo=hi ⇒ the char name; 0-9/A-Z/a-z get friendly class names; else `lo-hi`. Mirrors the per-range arm of regex-derivative.ts `describeRanges`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhDescribeOne : (r: a) -> String
+rxhDescribeOne r =
+  if eq r.lo r.hi then rxhCharName r.lo
+  else if and (eq r.lo 48) (eq r.hi 57) then "digit (0-9)"
+  else if and (eq r.lo 65) (eq r.hi 90) then "uppercase letter (A-Z)"
+  else if and (eq r.lo 97) (eq r.hi 122) then "lowercase letter (a-z)"
+  else concat (rxhCharName r.lo) (concat "-" (rxhCharName r.hi))
+
+@label "regex hint: describe ranges"
+@description "Human-readable description of a code-point range list: [] ⇒ \"end of input\"; spanning > 0xfff0 points ⇒ \"any character\"; a single point ⇒ the char (+ \"(name)\" when CHAR_NAMES gives a distinct name); else the per-range names joined by \", \". Mirrors regex-derivative.ts `describeRanges`. The Fenel port of the validation-hint range labeller. regex-derivative-to-fenel Phase 3 (Slice C)."
+@tags "engine" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+rxhDescribeRanges : (ranges: a) -> String
+rxhDescribeRanges ranges =
+  if eq (length ranges) 0 then "end of input"
+  else
+    let total = rxhRangeTotal ranges
+    if gt total 65520 then "any character"
+    else
+      let one = eq (length ranges) 1
+      let r0 = rxHeadRange ranges
+      if and one (eq r0.lo r0.hi)
+      then
+        let ch = charFromCode r0.lo
+        let name = rxhCharNameLookup r0.lo
+        if and (neq name "") (neq name ch) then concat ch (concat " (" (concat name ")")) else ch
+      else
+        let sorted = sort (\r -> r.lo) ranges
+        join (map rxhDescribeOne sorted) ", "
+
+
+-- -------------------------------------------------------------------------
+-- isAnchored — does a regex string carry a `^` or `$` boundary anchor
+-- (regex-derivative.ts `isAnchored`). Operates on the raw pattern STRING.
+-- -------------------------------------------------------------------------
+
+@label "regex hint: is anchored"
+@description "True when a regex pattern string starts with `^` or ends with `$`. Mirrors regex-derivative.ts `isAnchored`. The Fenel port of the anchor predicate. regex-derivative-to-fenel Phase 3 (Slice C)."
+@tags "engine" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+rxhIsAnchored : (pat: String) -> Bool
+rxhIsAnchored pat = or (startsWith pat "^") (endsWith pat "$")
+
+
+-- -------------------------------------------------------------------------
+-- Segment tracking — group lifetimes from the per-position group lists
+-- (regex-derivative.ts `buildSegments`). The mutable Map<name,start> becomes
+-- a THREADED ordered assoc-list of `{ name, start }`; the `Set` per position
+-- becomes an order-preserving `rxhDistinct`. ([[feedback_translate_to_fenel_idioms]])
+-- -------------------------------------------------------------------------
+
+@label "regex hint: distinct names"
+@description "Dedup a string list, preserving first-occurrence order (the `new Set(group)` per position in buildSegments). Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhDistinct : (xs: a) -> a
+rxhDistinct xs = rxhDistinctGo xs []
+
+@label "regex hint: distinct go"
+@description "The dedup fold for rxhDistinct (append on first sight). Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhDistinctGo : (xs: a) -> (acc: a) -> a
+rxhDistinctGo xs acc =
+  case head xs of
+    Nothing -> acc
+    Just x -> if elem x acc then rxhDistinctGo (rxRest xs) acc else rxhDistinctGo (rxRest xs) (appendItem x acc)
+
+@label "regex hint: active has"
+@description "Is a group name already open in the active assoc-list? Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhActiveHas : (active: a) -> (name: a) -> Bool
+rxhActiveHas active name =
+  case head active of
+    Nothing -> false
+    Just a -> if eq a.name name then true else rxhActiveHas (rxRest active) name
+
+@label "regex hint: close inactive"
+@description "Close every active group not present in the current position's name set: emit a `{ name, start, end = i }` segment (in active-iteration order) and drop it from the survivors; keep the rest. Returns `{ active = survivors, segs }`. Mirrors the close loop of buildSegments. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhCloseInactive : (active: a) -> (current: a) -> (i: a) -> (segs: a) -> (keep: a) -> a
+rxhCloseInactive active current i segs keep =
+  case head active of
+    Nothing -> { active = keep, segs = segs }
+    Just a ->
+      if elem a.name current
+      then rxhCloseInactive (rxRest active) current i segs (appendItem a keep)
+      else rxhCloseInactive (rxRest active) current i (appendItem { name = a.name, start = a.start, end = i } segs) keep
+
+@label "regex hint: open new"
+@description "Open every current-position group not already active, recording its start index `i` (in current-iteration order). Mirrors the open loop of buildSegments. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhOpenNew : (current: a) -> (active: a) -> (i: a) -> a
+rxhOpenNew current active i =
+  case head current of
+    Nothing -> active
+    Just name ->
+      let active2 = if rxhActiveHas active name then active else appendItem { name = name, start = i } active
+      rxhOpenNew (rxRest current) active2 i
+
+@label "regex hint: close all"
+@description "Close all remaining active groups at the final (post-last) index `i` (in active-iteration order). The `i == charGroups.length` terminal step of buildSegments. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhCloseAll : (active: a) -> (i: a) -> (segs: a) -> a
+rxhCloseAll active i segs =
+  case head active of
+    Nothing -> segs
+    Just a -> rxhCloseAll (rxRest active) i (appendItem { name = a.name, start = a.start, end = i } segs)
+
+@label "regex hint: build go"
+@description "The per-position segment fold: at each position close inactive groups, then open new ones, threading the active assoc-list + the index; the final empty step closes everything still open. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhBuildGo : (groups: a) -> (i: a) -> (active: a) -> (segs: a) -> a
+rxhBuildGo groups i active segs =
+  case head groups of
+    Nothing -> rxhCloseAll active i segs
+    Just g ->
+      let current = rxhDistinct g
+      let closed = rxhCloseInactive active current i segs []
+      let opened = rxhOpenNew current closed.active i
+      rxhBuildGo (rxRest groups) (add i 1) opened closed.segs
+
+@label "regex hint: build segments"
+@description "Turn a per-position list of active-group lists into `{ name, start, end }` segments tracking each group's consumed span. Mirrors regex-derivative.ts `buildSegments` (the mutable Map<name,start> as a threaded ordered assoc-list). Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhBuildSegments : (charGroups: a) -> a
+rxhBuildSegments charGroups = rxhBuildGo charGroups 0 [] []
+
+
+-- -------------------------------------------------------------------------
+-- Segment ENRICHMENT — post-process the raw segments for URL/host/query
+-- sub-structure (regex-derivative.ts `enrichSegments`). Plain string ops
+-- (`slice`/`split`/`endsWith`/`length`) over the consumed text. The mutable
+-- `result.push(...)` becomes a threaded `appendItem` accumulator.
+-- -------------------------------------------------------------------------
+
+@label "regex hint: make segment"
+@description "Construct an enriched segment record `{ name, start, end, depth }`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhSeg : (name: a) -> (start: a) -> (endIx: a) -> (depth: a) -> a
+rxhSeg name start endIx depth = { name = name, start = start, end = endIx, depth = depth }
+
+@label "regex hint: is TLS base"
+@description "Is a scheme stem one of the TLS-capable bases (http/ws/ftp), so a trailing `s` denotes the secure variant? Mirrors regex-derivative.ts `TLS_BASES`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhIsTlsBase : (s: String) -> Bool
+rxhIsTlsBase s = or (eq s "http") (or (eq s "ws") (eq s "ftp"))
+
+@label "regex hint: nth-or-empty"
+@description "The k-th string of a list, or \"\" out of range (host domain/tld access). Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhNth : (xs: a) -> (k: a) -> String
+rxhNth xs k =
+  case head (drop k xs) of
+    Nothing -> ""
+    Just x -> x
+
+@label "regex hint: head-or-empty"
+@description "The first string of a list, or \"\" when empty (query key/value split). Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhHead0 : (xs: a) -> String
+rxhHead0 xs =
+  case head xs of
+    Nothing -> ""
+    Just x -> x
+
+@label "regex hint: host subdomains"
+@description "Emit a depth-1 `sub` segment for each leading host label, threading the running offset (each label plus its `.` separator). Returns `{ offset, acc }`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhHostSubs : (subs: a) -> (offset: a) -> (acc: a) -> a
+rxhHostSubs subs offset acc =
+  case head subs of
+    Nothing -> { offset = offset, acc = acc }
+    Just p ->
+      let plen = length p
+      let acc2 = appendItem (rxhSeg "sub" offset (add offset plen) 1) acc
+      rxhHostSubs (rxRest subs) (add (add offset plen) 1) acc2
+
+@label "regex hint: host parts"
+@description "Decompose a dotted host into depth-1 `sub`/`domain`/`tld` segments (leading labels = subs, second-last = domain, last = tld), threading the offset. Mirrors the `host` arm of regex-derivative.ts `enrichSegments`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhHostParts : (parts: a) -> (start: a) -> (acc: a) -> a
+rxhHostParts parts start acc =
+  let n = length parts
+  let subs = take (sub n 2) parts
+  let domain = rxhNth parts (sub n 2)
+  let tld = rxhNth parts (sub n 1)
+  let afterSubs = rxhHostSubs subs start acc
+  let dStart = afterSubs.offset
+  let acc2 = appendItem (rxhSeg "domain" dStart (add dStart (length domain)) 1) afterSubs.acc
+  let tStart = add (add dStart (length domain)) 1
+  appendItem (rxhSeg "tld" tStart (add tStart (length tld)) 1) acc2
+
+@label "regex hint: query one"
+@description "Emit the depth-1 `key` (+ `value` when a `=` is present) segments for one query parameter at `offset`. The first-`=` split is reproduced via `split param \"=\"` (key = parts[0]; value = the rest). Mirrors the per-param body of the `query` arm of regex-derivative.ts `enrichSegments`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhQueryOne : (param: String) -> (offset: a) -> (acc: a) -> a
+rxhQueryOne param offset acc =
+  let plen = length param
+  let segs = split param "="
+  if gte (length segs) 2
+  then
+    let keyLen = length (rxhHead0 segs)
+    let withKey = appendItem (rxhSeg "key" offset (add offset keyLen) 1) acc
+    appendItem (rxhSeg "value" (add (add offset keyLen) 1) (add offset plen) 1) withKey
+  else appendItem (rxhSeg "key" offset (add offset plen) 1) acc
+
+@label "regex hint: query params"
+@description "Fold over `&`-split query parameters, threading the running offset (each param plus its `&` separator). Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhQueryParams : (params: a) -> (offset: a) -> (acc: a) -> a
+rxhQueryParams params offset acc =
+  case head params of
+    Nothing -> acc
+    Just param ->
+      let plen = length param
+      rxhQueryParams (rxRest params) (add (add offset plen) 1) (rxhQueryOne param offset acc)
+
+@label "regex hint: enrich one"
+@description "Enrich one raw segment: `scheme` ⇒ depth-0 + (protocol/secure split when it ends in `s` over a TLS base); `host` ⇒ depth-0 + sub/domain/tld; `tld` ⇒ dropped (subsumed by the host split); `query` ⇒ depth-0 + key/value params; anything else ⇒ depth-0 passthrough. Mirrors one iteration of regex-derivative.ts `enrichSegments`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhEnrichOne : (seg: a) -> (consumed: String) -> (acc: a) -> a
+rxhEnrichOne seg consumed acc =
+  if eq seg.name "scheme"
+  then
+    let base = appendItem (rxhSeg seg.name seg.start seg.end 0) acc
+    let str = slice consumed seg.start seg.end
+    let stem = slice str 0 (sub (length str) 1)
+    if and (endsWith str "s") (rxhIsTlsBase stem)
+    then
+      let withProto = appendItem (rxhSeg "protocol" seg.start (sub seg.end 1) 1) base
+      appendItem (rxhSeg "secure" (sub seg.end 1) seg.end 1) withProto
+    else base
+  else if eq seg.name "host"
+  then
+    let base = appendItem (rxhSeg seg.name seg.start seg.end 0) acc
+    let hostStr = slice consumed seg.start seg.end
+    let parts = split hostStr "."
+    if gte (length parts) 2 then rxhHostParts parts seg.start base else base
+  else if eq seg.name "tld" then acc
+  else if eq seg.name "query"
+  then
+    let base = appendItem (rxhSeg seg.name seg.start seg.end 0) acc
+    let qStr = slice consumed (add seg.start 1) seg.end
+    if neq qStr "" then rxhQueryParams (split qStr "&") (add seg.start 1) base else base
+  else appendItem (rxhSeg seg.name seg.start seg.end 0) acc
+
+@label "regex hint: enrich go"
+@description "Fold rxhEnrichOne over the raw segments, threading the result accumulator. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhEnrichGo : (segs: a) -> (consumed: String) -> (acc: a) -> a
+rxhEnrichGo segs consumed acc =
+  case head segs of
+    Nothing -> acc
+    Just seg -> rxhEnrichGo (rxRest segs) consumed (rxhEnrichOne seg consumed acc)
+
+@label "regex hint: enrich segments"
+@description "Post-process raw group segments into URL/host/query sub-structure (scheme→protocol/secure, host→sub/domain/tld, query→key/value), tagging each with a `depth`. Mirrors regex-derivative.ts `enrichSegments`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhEnrichSegments : (segments: a) -> (consumed: String) -> a
+rxhEnrichSegments segments consumed = rxhEnrichGo segments consumed []
+
+
+-- -------------------------------------------------------------------------
+-- The driver — `regexHint`. Walks the parsed pattern against the consumed
+-- tokens by repeated derivative, accumulating per-position group lists; on a
+-- dead derivative it reports the failure + valid-from-here ranges, else the
+-- valid-next ranges + can-match/can-end. Output is a plain record (the shim
+-- assembles the JS `RegexHint`: failedAt/activeGroup from the flag fields).
+-- -------------------------------------------------------------------------
+
+@label "regex hint: last group"
+@description "The last active group of the most-recent position's group list (the cursor's `activeGroup`), as `{ has, name }`. Mirrors regex-derivative.ts `charGroups[i]?.at(-1)`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhLastGroup : (cgs: a) -> a
+rxhLastGroup cgs =
+  case last cgs of
+    Nothing -> { has = false, name = "" }
+    Just cg ->
+      case last cg of
+        Nothing -> { has = false, name = "" }
+        Just nm -> { has = true, name = nm }
+
+@label "regex hint: walk loop"
+@description "The cursor walk: at each consumed token record the active groups, take the derivative, and either continue or (on a dead derivative) stop with the failing position + the valid-from-here ranges. Returns the terminal state `{ failed, node, matchedI, cgs, … }`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhWalk : (node: RxNode) -> (toks: a) -> (i: a) -> (cgs: a) -> a
+rxhWalk node toks i cgs =
+  case head toks of
+    Nothing -> { failed = false, node = node, matchedI = i, cgs = cgs, failPos = 0, failGot = "", failExpected = "" }
+    Just tok ->
+      let cg = rxhDerivGroups node tok
+      let prevValid = rxhFirstSet node
+      let node2 = rxhDeriv node tok
+      let cgs2 = appendItem cg cgs
+      if rxIsRxEmpty node2
+      then { failed = true, node = node2, matchedI = i, cgs = cgs2, failPos = i, failGot = tok.ch, failExpected = rxhDescribeRanges prevValid }
+      else rxhWalk node2 (rxRest toks) (add i 1) cgs2
+
+@label "regex hint: regex cursor hint"
+@description "Cursor-aware validation hint for a regex against partially-consumed input. Parses the (pre-tokenized) pattern RAW (anchors stripped, NO `.*` wrapping — the hint surface), walks the consumed tokens by Brzozowski derivative, and reports can-match / can-end / valid-next ranges (+ human label) / the failing position / the enriched named-group segments. Output is `$`-key-free plain data (the TS shim assembles the JS `RegexHint`: `failedAt` + `activeGroup` ride the `hasFailed`/`hasActiveGroup` flag fields). The Fenel port of regex-derivative.ts's `regexHint`. regex-derivative-to-fenel Phase 3 (Slice C)."
+@tags "engine" "regex" "hint" "regex-derivative-to-fenel" "phase-3"
+regexHint : (patToks: a) -> (consumedToks: a) -> (consumed: String) -> a
+regexHint patToks consumedToks consumed =
+  case rxParseWhole patToks of
+    Err reason ->
+      let message = concat "Invalid regex: " reason
+      { canMatch = false, canEnd = false, validNext = [], validNextLabel = message, hasFailed = true, failPosition = 0, failGot = "", failExpected = message, matchedCount = 0, segments = [], hasActiveGroup = false, activeGroup = "" }
+    Ok node ->
+      let r = rxhWalk node consumedToks 0 []
+      let segs = rxhEnrichSegments (rxhBuildSegments r.cgs) consumed
+      let activeG = rxhLastGroup r.cgs
+      if r.failed
+      then { canMatch = false, canEnd = false, validNext = [], validNextLabel = "pattern cannot match from here", hasFailed = true, failPosition = r.failPos, failGot = r.failGot, failExpected = r.failExpected, matchedCount = r.matchedI, segments = segs, hasActiveGroup = activeG.has, activeGroup = activeG.name }
+      else
+        let valid = rxhFirstSet r.node
+        let canEnd = rxhNullable r.node
+        { canMatch = or (gt (length valid) 0) canEnd, canEnd = canEnd, validNext = valid, validNextLabel = rxhDescribeRanges valid, hasFailed = false, failPosition = 0, failGot = "", failExpected = "", matchedCount = r.matchedI, segments = segs, hasActiveGroup = activeG.has, activeGroup = activeG.name }
+
+
+-- =========================================================================
+-- patternToRegex (Slice C / C3) — the Pattern → regex SERIALIZER. The TS
+-- shim READS the Pattern's SetExpr `$`-keys into a plain marker tree (the B3
+-- reading arm — INVERSE of Slice B's authoring arm): pattern nodes become
+-- `{ tag = "Pt…" }` markers, each `match.pred` SetExpr a `{ tag = "Pr…" }`
+-- pred marker (a non-char-class pred ⇒ `PrOther`, the `null` channel). This
+-- body folds the marker into a regex source string, returning `{ ok, value }`
+-- (`ok = false` ⇒ the TS shim returns `null` — the pred has no clean regex
+-- form). Mirrors regex-derivative.ts `patternToRegex` / `patternToRegexInner`
+-- / `predToRegex` / `predToCharClass` / `repToSuffix` + the escaping helpers.
+-- The `max = -1` infinity sentinel replaces `Infinity` (the shim maps it).
+-- =========================================================================
+
+@label "regex hint: is regex meta"
+@description "Is a char one of the regex metacharacters that need backslash-escaping outside a class (`\\ . ^ $ * + ? ( ) [ ] { } | /`)? Mirrors regex-derivative.ts `REGEX_META`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhIsMeta : (ch: String) -> Bool
+rxhIsMeta ch =
+  or (eq ch "\\") (or (eq ch ".") (or (eq ch "^") (or (eq ch "$") (or (eq ch "*") (or (eq ch "+") (or (eq ch "?") (or (eq ch "(") (or (eq ch ")") (or (eq ch "[") (or (eq ch "]") (or (eq ch "{") (or (eq ch "}") (or (eq ch "|") (eq ch "/"))))))))))))))
+
+@label "regex hint: escape literal"
+@description "Escape a single char as a regex literal (backslash-prefix metacharacters). Mirrors regex-derivative.ts `escapeRegexLiteral` (single-char path — the only path the enum-literal serializer exercises). Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhEscapeLiteral : (ch: String) -> String
+rxhEscapeLiteral ch = if rxhIsMeta ch then concat "\\" ch else ch
+
+@label "regex hint: escape char-class char"
+@description "Escape a single char inside a `[...]` class — only `] \\ ^ -` need it. Mirrors regex-derivative.ts `escapeCharClass`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhEscapeCC : (ch: String) -> String
+rxhEscapeCC ch = if or (eq ch "]") (or (eq ch "\\") (or (eq ch "^") (eq ch "-"))) then concat "\\" ch else ch
+
+@label "regex hint: all single-char"
+@description "Are all strings in a list exactly one char long (the char-class enum validity check)? Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhAllSingleChar : (chars: a) -> Bool
+rxhAllSingleChar chars =
+  case head chars of
+    Nothing -> true
+    Just c -> if eq (length c) 1 then rxhAllSingleChar (rxRest chars) else false
+
+@label "regex hint: enum is single literal"
+@description "Is an enum exactly one single-char string (the literal fast-path of predToRegex)? Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhEnumSingle : (chars: a) -> Bool
+rxhEnumSingle chars = and (eq (length chars) 1) (eq (length (rxhHead0 chars)) 1)
+
+@label "Pattern forced predicate"
+@description "Select the original sole first predicate only when input cannot already end. Return Nothing before inspecting a candidate's fields; the host can then perform its canonical representation observation."
+@tags "engine" "internal" "pattern" "input"
+@category "engine-internal"
+patternForcedPredicate : (canEnd: Bool) -> (predicates: List a) -> Maybe a
+patternForcedPredicate canEnd predicates =
+  if canEnd || not (isArray predicates) || length predicates != 1 then Nothing
+  else head predicates
+
+@label "Pattern forced next literal"
+@description "Given the existing Pattern nullability and first predicates, return its unique single-code-point String only when input cannot already end. Reuse the regex predicate reader and singleton check; nullable, open, non-String and multi-code-point choices return Nothing."
+@tags "engine" "internal" "pattern" "input"
+@category "engine-internal"
+patternForcedNextLiteral : (canEnd: Bool) -> (predicates: List SetExpr) -> Maybe String
+patternForcedNextLiteral canEnd predicates = case patternForcedPredicate canEnd predicates of
+  Nothing -> Nothing
+  Just first ->
+    let pred = rxhReadPred first
+    if pred.tag == "PrEnum" && rxhEnumSingle pred.chars then Just (rxhHead0 pred.chars)
+    else Nothing
+
+@label "regex hint: enum to char-class"
+@description "Render an enum pred as a char-class body `{ ok, body, negated }`: all single chars ⇒ their escaped concatenation; else not-ok (no clean class). Mirrors the `$enum` arm of regex-derivative.ts `predToCharClass`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhEnumToCC : (chars: a) -> a
+rxhEnumToCC chars =
+  if rxhAllSingleChar chars
+  then { ok = true, body = join (map rxhEscapeCC chars) "", negated = false }
+  else { ok = false, body = "", negated = false }
+
+@label "regex hint: pred to char-class"
+@description "Render a SetExpr-pred MARKER as a regex char-class `{ ok, body, negated }`, or not-ok when the pred has no clean class form. Enum ⇒ escaped chars; interval ⇒ `lo-hi` (single-char inclusive bounds only); union ⇒ concatenated non-negated children; complement ⇒ flips negation; diff-with-`$all` ⇒ negated inner; anything else ⇒ not-ok. Mirrors regex-derivative.ts `predToCharClass`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhPredToCC : (pred: a) -> a
+rxhPredToCC pred =
+  if eq pred.tag "PrEnum" then rxhEnumToCC pred.chars
+  else if eq pred.tag "PrInterval" then
+    if and (eq (length pred.lo) 1) (and (eq (length pred.hi) 1) (and pred.loInc pred.hiInc))
+    then { ok = true, body = concat (rxhEscapeCC pred.lo) (concat "-" (rxhEscapeCC pred.hi)), negated = false }
+    else { ok = false, body = "", negated = false }
+  else if eq pred.tag "PrUnion" then rxhUnionToCC pred.parts ""
+  else if eq pred.tag "PrComplement" then
+    let inner = rxhPredToCC pred.inner
+    if inner.ok then { ok = true, body = inner.body, negated = not inner.negated } else { ok = false, body = "", negated = false }
+  else if eq pred.tag "PrDiffAll" then
+    let inner = rxhPredToCC pred.inner
+    if and inner.ok (not inner.negated) then { ok = true, body = inner.body, negated = true } else { ok = false, body = "", negated = false }
+  else { ok = false, body = "", negated = false }
+
+@label "regex hint: union to char-class"
+@description "Fold a `$union` pred's children into a single char-class body, threading the accumulated body; any non-ok or negated child aborts to not-ok. Mirrors the `$union` arm of regex-derivative.ts `predToCharClass`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhUnionToCC : (parts: a) -> (acc: String) -> a
+rxhUnionToCC parts acc =
+  case head parts of
+    Nothing -> { ok = true, body = acc, negated = false }
+    Just p ->
+      let cc = rxhPredToCC p
+      if and cc.ok (not cc.negated) then rxhUnionToCC (rxRest parts) (concat acc cc.body) else { ok = false, body = "", negated = false }
+
+@label "regex hint: pred to regex atom"
+@description "Render a SetExpr-pred MARKER as a regex atom `{ ok, value }`: `$all` ⇒ `.`; a single-char enum ⇒ the escaped literal; else the char-class `[…]` (with `^` when negated); not-ok when no clean form. Mirrors regex-derivative.ts `predToRegex`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhPredToRegex : (pred: a) -> a
+rxhPredToRegex pred =
+  if eq pred.tag "PrAll" then { ok = true, value = "." }
+  else if and (eq pred.tag "PrEnum") (rxhEnumSingle pred.chars) then { ok = true, value = rxhEscapeLiteral (rxhHead0 pred.chars) }
+  else
+    let cc = rxhPredToCC pred
+    if cc.ok then { ok = true, value = concat "[" (concat (if cc.negated then "^" else "") (concat cc.body "]")) } else { ok = false, value = "" }
+
+@label "regex hint: is unbounded rep"
+@description "Is a rep max the `-1` infinity sentinel (TS `Infinity`)? Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhIsInf : (mx: a) -> Bool
+rxhIsInf mx = eq mx (negate 1)
+
+@label "regex hint: rep suffix"
+@description "Render a repetition bound as a regex quantifier suffix: `0..∞` ⇒ `*`; `1..∞` ⇒ `+`; `0..1` ⇒ `?`; `n..n` ⇒ `{n}`; `n..∞` ⇒ `{n,}`; else `{n,m}`. Mirrors regex-derivative.ts `repToSuffix` (∞ = the `-1` sentinel). Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhRepSuffix : (mn: a) -> (mx: a) -> String
+rxhRepSuffix mn mx =
+  if and (eq mn 0) (rxhIsInf mx) then "*"
+  else if and (eq mn 1) (rxhIsInf mx) then "+"
+  else if and (eq mn 0) (eq mx 1) then "?"
+  else if eq mn mx then concat "{" (concat (toString mn) "}")
+  else if rxhIsInf mx then concat "{" (concat (toString mn) ",}")
+  else concat "{" (concat (toString mn) (concat "," (concat (toString mx) "}")))
+
+@label "regex hint: pattern to regex inner"
+@description "Render a Pattern MARKER to a regex source fragment `{ ok, value }` in a context (`top`/`seq`/`atom`): empty ⇒ `(?!)`; eps ⇒ ``; match ⇒ the pred atom; seq ⇒ concatenation (parenthesised in atom context); alt ⇒ `a|b` (parenthesised unless top); rep ⇒ child + quantifier; group ⇒ `(?<name>…)`. Not-ok propagates from any child with no clean form. Mirrors regex-derivative.ts `patternToRegexInner`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+@category "engine-internal"
+rxhPatToRegexInner : (p: a) -> (ctx: String) -> a
+rxhPatToRegexInner p ctx =
+  if eq p.tag "PtEmpty" then { ok = true, value = "(?!)" }
+  else if eq p.tag "PtEps" then { ok = true, value = "" }
+  else if eq p.tag "PtMatch" then rxhPredToRegex p.pred
+  else if eq p.tag "PtSeq" then
+    let a = rxhPatToRegexInner p.a "seq"
+    let b = rxhPatToRegexInner p.b "seq"
+    if and a.ok b.ok
+    then
+      let inner = concat a.value b.value
+      if eq ctx "atom" then { ok = true, value = concat "(?:" (concat inner ")") } else { ok = true, value = inner }
+    else { ok = false, value = "" }
+  else if eq p.tag "PtAlt" then
+    let a = rxhPatToRegexInner p.a "top"
+    let b = rxhPatToRegexInner p.b "top"
+    if and a.ok b.ok
+    then
+      let inner = concat a.value (concat "|" b.value)
+      if eq ctx "top" then { ok = true, value = inner } else { ok = true, value = concat "(?:" (concat inner ")") }
+    else { ok = false, value = "" }
+  else if eq p.tag "PtRep" then
+    let child = rxhPatToRegexInner p.child "atom"
+    if child.ok then { ok = true, value = concat child.value (rxhRepSuffix p.min p.max) } else { ok = false, value = "" }
+  else if eq p.tag "PtGroup" then
+    let child = rxhPatToRegexInner p.child "top"
+    if child.ok then { ok = true, value = concat "(?<" (concat p.name (concat ">" (concat child.value ")"))) } else { ok = false, value = "" }
+  else { ok = false, value = "" }
+
+@label "regex hint: pattern to regex"
+@description "Best-effort inverse of the regex→Pattern conversion: render a Pattern MARKER to an anchored regex source `^…$` as `{ ok, value }`, or `ok = false` when the Pattern carries predicates with no clean regex form (typed `$where`, non-char `$named`, etc. — surfaced as `PrOther` markers). The TS shim reads the `$`-keys into the marker + maps `ok = false` to `null`. The Fenel port of regex-derivative.ts's `patternToRegex`. regex-derivative-to-fenel Phase 3 (Slice C)."
+@tags "engine" "regex" "serialize" "regex-derivative-to-fenel" "phase-3"
+rxhPatternToRegex : (pm: a) -> a
+rxhPatternToRegex pm =
+  let r = rxhPatToRegexInner pm "top"
+  if r.ok then { ok = true, value = concat "^" (concat r.value "$") } else { ok = false, value = "" }
+
+-- ---------------------------------------------------------------------------
+-- The legacy-Pattern → marker READING direction (the Fenel port of
+-- regex-derivative.ts's `readPat` / `readPred`). The `rxh*` functions above
+-- CONSUME the `Pt*` / `Pr*` plain-record markers; these two PRODUCE them from
+-- the runtime `SetExpr` / `Pattern` shapes, so a Fenel reader body
+-- (set-algebra-to-fenel Phase 3b-3c — `json-schema.fenel`'s SePattern arm, and
+-- later `stringWidgetFor` / `setExprToSQL`) can call `rxhPatternToRegex (rxhReadPat
+-- p)` end-to-end in Fenel, replacing the TS `patternToRegex` shim's `readPat` step.
+--
+-- INPUT SHAPE (Step-0 finding `notes/phase-3b-3c-step0-json-schema-scoping.md` §3):
+-- the inner `pattern` of a SePattern is the LEGACY `.t`-discriminated `Pattern`
+-- (`types.ts:196` — `{t:"empty"|"eps"|"match"|"seq"|"alt"|"rep"|"group"}`), NOT the
+-- `$tag` `SetPattern` ADT (registered in Phase 1 but no data uses it yet — the data
+-- migration is Phase 4). So `rxhReadPat` reads `p.t` via an `eq`-cascade (the
+-- `rxhPatToRegexInner` `.tag`-read idiom). The match-arm `pred` is a `SetExpr` whose
+-- producer (`regexStringToPattern.authorPred`) emits the `$`-KEY form, so `rxhReadPred`
+-- DUAL-READS — `case pred of Se… ->` ($tag) FIRST, then the `$`-key `lookup` fallback.
+-- Mirrors regex-derivative.ts `readPat` (l.331) + `readPred` (l.290) byte-for-byte.
+
+@label "regex hint: string-or-empty"
+@description "Lower a SeEnum value to a string: a String value passes through; anything non-string lowers to \"\" (length 0) so the downstream single-char check rejects it. Mirrors the `typeof x === \"string\" ? x : \"\"` map in regex-derivative.ts `readPred`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3b-3c"
+@category "engine-internal"
+rxhStrOrEmpty : (x: a) -> String
+rxhStrOrEmpty x = if isString x then x else ""
+
+@label "regex hint: pred is $all"
+@description "Is a SetExpr pred the universal set? Dual-reads the canonical $tag SeAll then the legacy $-key {$all}. The SeDiff `left === SeAll` guard for the PrDiffAll (negated-char-class) marker. Mirrors regex-derivative.ts `readPred`'s `peelSetExpr(v.left)?.kind === \"SeAll\"`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3b-3c"
+@category "engine-internal"
+rxhPredIsAll : (x: a) -> Bool
+rxhPredIsAll x =
+  case x of
+    SeAll -> true
+    _ ->
+      case lookup x "$all" of
+        Just _ -> true
+        Nothing -> false
+
+@label "regex hint: read interval pred"
+@description "Read a SeInterval pred into a `PrInterval` char-class marker — but ONLY when BOTH bounds are present (Just) AND both bound values are strings (single-char range endpoints); any other shape lowers to `PrOther` (no clean char-class form). Mirrors the SeInterval arm of regex-derivative.ts `readPred`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3b-3c"
+@category "engine-internal"
+rxhReadPredInterval : (iv: a) -> a
+rxhReadPredInterval iv =
+  case iv.lo of
+    Nothing -> { tag = "PrOther" }
+    Just lob ->
+      case iv.hi of
+        Nothing -> { tag = "PrOther" }
+        Just hib ->
+          if and (isString lob.value) (isString hib.value)
+          then { tag = "PrInterval", lo = lob.value, loInc = lob.inclusive, hi = hib.value, hiInc = hib.inclusive }
+          else { tag = "PrOther" }
+
+@label "regex hint: read diff pred"
+@description "Read a SeDiff pred into a `PrDiffAll` marker (negated char-class) when the left side is the universal set `$all`; anything else lowers to `PrOther`. The right side reads recursively via rxhReadPred. Mirrors the SeDiff arm of regex-derivative.ts `readPred`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3b-3c"
+@category "engine-internal"
+rxhReadPredDiff : (l: a) -> (r: a) -> a
+rxhReadPredDiff l r =
+  if rxhPredIsAll l then { tag = "PrDiffAll", inner = rxhReadPred r } else { tag = "PrOther" }
+
+@label "regex hint: read diff pred (array)"
+@description "Read the legacy `$diff: [left, right]` 2-element array form into a diff pred marker, extracting left/right via head/tail. Any short/empty array lowers to `PrOther`. The $-key dual-read sibling of the $tag SeDiff arm. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3b-3c"
+@category "engine-internal"
+rxhReadPredDiffArr : (d: a) -> a
+rxhReadPredDiffArr d =
+  case head d of
+    Nothing -> { tag = "PrOther" }
+    Just l ->
+      case tail d of
+        Nothing -> { tag = "PrOther" }
+        Just rest ->
+          case head rest of
+            Nothing -> { tag = "PrOther" }
+            Just r -> rxhReadPredDiff l r
+
+@label "regex hint: read pred ($-key fallback)"
+@description "The legacy $-key dual-read fallback of rxhReadPred: $all ⇒ PrAll / $enum ⇒ PrEnum / $interval ⇒ PrInterval / $union ⇒ PrUnion / $complement ⇒ PrComplement / $diff ⇒ PrDiffAll-or-PrOther / else ⇒ PrOther. Mirrors the $-key arms of `peelSetExpr` as consumed by regex-derivative.ts `readPred`. Internal helper (regex-hint)."
+@tags "engine" "internal" "regex" "serialize" "regex-derivative-to-fenel" "phase-3b-3c"
+@category "engine-internal"
+rxhReadPredLegacy : (pred: a) -> a
+rxhReadPredLegacy pred =
+  case lookup pred "$all" of
+    Just _ -> { tag = "PrAll" }
+    Nothing ->
+      case lookup pred "$enum" of
+        Just vs -> { tag = "PrEnum", chars = map rxhStrOrEmpty vs }
+        Nothing ->
+          case lookup pred "$interval" of
+            Just iv -> rxhReadPredInterval iv
+            Nothing ->
+              case lookup pred "$union" of
+                Just bs -> { tag = "PrUnion", parts = map rxhReadPred bs }
+                Nothing ->
+                  case lookup pred "$complement" of
+                    Just i -> { tag = "PrComplement", inner = rxhReadPred i }
+                    Nothing ->
+                      case lookup pred "$diff" of
+                        Just d -> rxhReadPredDiffArr d
+                        Nothing -> { tag = "PrOther" }
+
+@label "regex hint: read pred"
+@description "Read a SetExpr predicate into a `Pr*` char-class marker (PrAll / PrEnum / PrInterval / PrUnion / PrComplement / PrDiffAll / PrOther) — the input to rxhPredToRegex / rxhPredToCC. Dual-reads the canonical $tag Se* ADT FIRST, then the legacy $-key form (the SetExpr producer `regexStringToPattern.authorPred` emits $-key, so the fallback is the PRIMARY path for fresh patterns). The Fenel port of regex-derivative.ts's `readPred` (l.290). set-algebra-to-fenel Phase 3b-3c."
+@tags "engine" "regex" "serialize" "regex-derivative-to-fenel" "phase-3b-3c"
+rxhReadPred : (pred: a) -> a
+rxhReadPred pred =
+  case pred of
+    SeAll -> { tag = "PrAll" }
+    SeEnum { values = vs } -> { tag = "PrEnum", chars = map rxhStrOrEmpty vs }
+    SeInterval { interval = iv } -> rxhReadPredInterval iv
+    SeUnion { branches = bs } -> { tag = "PrUnion", parts = map rxhReadPred bs }
+    SeComplement { inner = i } -> { tag = "PrComplement", inner = rxhReadPred i }
+    SeDiff { left = l, right = r } -> rxhReadPredDiff l r
+    _ -> rxhReadPredLegacy pred
+
+@label "regex hint: read pattern"
+@description "Read a legacy `.t`-discriminated Pattern (types.ts:196 — empty/eps/match/seq/alt/rep/group) into a `Pt*` marker tree (the input to rxhPatternToRegex). The match-arm pred reads via rxhReadPred (dual-read); the rep max maps the Infinity sentinel to -1 (numberIsFinite guard). The Fenel port of regex-derivative.ts's `readPat` (l.331). set-algebra-to-fenel Phase 3b-3c."
+@tags "engine" "regex" "serialize" "regex-derivative-to-fenel" "phase-3b-3c"
+rxhReadPat : (p: a) -> a
+rxhReadPat p =
+  if eq p.t "empty" then { tag = "PtEmpty" }
+  else if eq p.t "eps" then { tag = "PtEps" }
+  else if eq p.t "match" then { tag = "PtMatch", pred = rxhReadPred p.pred }
+  else if eq p.t "seq" then { tag = "PtSeq", a = rxhReadPat p.a, b = rxhReadPat p.b }
+  else if eq p.t "alt" then { tag = "PtAlt", a = rxhReadPat p.a, b = rxhReadPat p.b }
+  else if eq p.t "rep" then { tag = "PtRep", child = rxhReadPat p.child, min = p.min, max = (if numberIsFinite p.max then p.max else negate 1) }
+  else { tag = "PtGroup", name = p.name, child = rxhReadPat p.child }

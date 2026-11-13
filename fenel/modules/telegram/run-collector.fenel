@@ -1,0 +1,77 @@
+-- runTelegramCollector — the bot-registration orchestration.
+--
+-- Registers a Telegram bot with a collector config, persists the bot
+-- as an entity_instances row, registers Labelable/Iconable/Emojiable/
+-- Describable so the dashboard reads identity through the typeclass
+-- system, and (when WEBHOOK_BASE_URL is configured) configures the
+-- webhook + persists the secret + writes a subscription row for the
+-- inbound HTTP route.
+--
+-- Returns Result<String, Id<Bot>> — Err "..." on any failure,
+-- Ok botId on success. Webhook setup failures are non-fatal: the
+-- bot row exists, so they still resolve to Ok botId (the user can
+-- retry / reconfigure later).
+--
+-- module-substrate Phase 3o (2026-05-31) — migrated to `module telegram where`.
+-- The hand-wrapped defineFunction spec + RUN_COLLECTOR_BODY extraction in
+-- engine/src/modules/telegram.ts are RETIRED; identity now rides @facet
+-- directives here. The def head renames runTelegramCollector → runCollector
+-- with @codeName preserving the divergent public codeName (callers resolve by
+-- codeName). `requires` is INFERRED transitively from the IO leaves this body
+-- calls (validateBotToken / setWebhookByToken … declare HasTelegramBot) — NOT
+-- hand-declared. Body UNCHANGED.
+
+module telegram where
+
+@label "Run Telegram Collector"
+@description "Register a type-driven Telegram bot collector. Each entry references a registered type (by UUID) and turns it into an automatic conversation that collects field values from the user, then persists the result as an instance of that type. Inline types are not allowed — types must be registered first. Optionally pass welcome, completion, and per-field hook functions. With one entry the bot auto-starts on /start; with multiple entries it shows a picker. Returns a registration handle; the bot's actual conversation handling happens via handleTelegramUpdate when Telegram POSTs to the webhook."
+@tags "telegram" "collector" "io" "form"
+@icon "bot"
+@emoji "🤖"
+@ioAction "telegram_collector.run"
+@stopAction "telegram_collector.stop"
+@listInstancesAction "telegram_collector.list"
+@codeName "runTelegramCollector"
+runCollector : (botToken: BotToken) -> (entries: List CollectorEntry) -> Result String BotId
+runCollector botToken entries =
+  let validation = validateBotToken botToken
+  case validation of
+    Err err -> Err err
+    Ok user ->
+      let label = `@${user.username}`
+      let create = tryCreateInstance (Bot {
+        platform = "telegram",
+        token = botToken,
+        username = user.username,
+        label = label,
+        telegramBotId = user.id,
+        collectorConfig = entries,
+        enabled = true
+      })
+      if create.ok then
+        let botId = create.value
+        registerRepresentation botId "Labelable" { label = label }
+        registerRepresentation botId "Iconable" { icon = "bot" }
+        registerRepresentation botId "Emojiable" { emoji = "🤖" }
+        registerRepresentation botId "Describable" { description = "Telegram bot deployment — collector handles inbound updates and persists answers as typed entity instances." }
+        -- Pre-bind every IO scrutinee. The runtime evaluator's
+        -- match handler resolves the scrutinee through the pure
+        -- engine evaluator, which can't yield IO — so an inline
+        -- `case envGet … of` would silently see null and miss
+        -- every arm. Binding the result with `let` first uses
+        -- the proper IO-yield path before the case runs.
+        let baseUrlMaybe = envGet "WEBHOOK_BASE_URL"
+        case baseUrlMaybe of
+          Nothing -> Ok botId
+          Just baseUrl ->
+            let secret = randomHex 32
+            let webhookUrl = `${baseUrl}/webhooks/telegram/${botId}`
+            let webhookResult = setWebhookByToken botToken webhookUrl (Just secret)
+            case webhookResult of
+              Err _ -> Ok botId
+              Ok _ ->
+                updateInstance botId { webhookUrl = webhookUrl, webhookSecret = secret }
+                let metadata = { kind = "telegram_collector", botId = botId, webhookUrl = webhookUrl }
+                upsertSubscription `tg-bot-${botId}` "http_webhook" secret metadata
+                Ok botId
+      else Err create.error

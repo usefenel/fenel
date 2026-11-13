@@ -1,0 +1,86 @@
+module engine where
+
+-- A presentation adapter for explicitly declared type binders. The complete
+-- scheme reconciler remains the authority for application Kind and capture.
+-- Ordinary value applications and global names are never rewritten here.
+
+GenericTypeCallable = GenericTypeCallable id: String inputs: List Kind result: Kind seeds: List String ready: Boolean
+GenericTypeScopePlan = GenericTypeScopePlan ok: Boolean message: String variables: List SchemeVar calls: List GenericTypeCallable
+GenericTypeArgumentProjection = GenericTypeArgumentProjection index: Number name: String id: String
+GenericTypeApplicationPlan = GenericTypeApplicationPlan ok: Boolean message: String local: Boolean name: String id: String arguments: List GenericTypeArgumentProjection
+
+agtInputKinds : (kind: Kind) -> List Kind
+agtInputKinds kind = case kind of
+  KArrow { input = input, output = output } -> concat [input] (agtInputKinds output)
+  _ -> []
+
+agtResultKind : (kind: Kind) -> Kind
+agtResultKind kind = case kind of
+  KArrow { input = input, output = output } -> agtResultKind output
+  other -> other
+
+agtSeedName : (kind: Kind) -> (variables: List SchemeVar) -> String
+agtSeedName kind variables = case kind of
+  KType -> ""
+  _ -> case find (\variable -> eq variable.kind kind) variables of
+    Just variable -> variable.sourceName
+    Nothing -> ""
+
+agtSeedReady : (kind: Kind) -> (variables: List SchemeVar) -> Boolean
+agtSeedReady kind variables = case kind of
+  KType -> true
+  _ -> not (eq (agtSeedName kind variables) "")
+
+agtCallable : (variable: SchemeVar) -> (variables: List SchemeVar) -> GenericTypeCallable
+agtCallable variable variables =
+  let inputs = agtInputKinds variable.kind
+  { id = variable.id, inputs = inputs, result = agtResultKind variable.kind, seeds = map (\kind -> agtSeedName kind variables) inputs,
+    ready = fold (\ready kind -> and ready (agtSeedReady kind variables)) true inputs }
+
+authoringGenericTypeScopePlan : (variables: List SchemeVar) -> (shadowed: List String) -> GenericTypeScopePlan
+authoringGenericTypeScopePlan variables shadowed =
+  if not (agBindersValid variables [] []) then { ok = false, message = "The type parameter scope is malformed.", variables = [], calls = [] }
+  else
+    let visible = filter (\variable -> not (elem variable.sourceName shadowed)) variables
+    { ok = true, message = "", variables = visible, calls = map (\variable -> agtCallable variable visible) visible }
+
+agtArgumentProjections : (args: List (JsonLogic Any)) -> (kinds: List Kind) -> (variables: List SchemeVar) -> (direction: String) -> (index: Number) -> Result String (List GenericTypeArgumentProjection)
+agtArgumentProjections args kinds variables direction index = case head args of
+  Nothing -> Ok []
+  Just argument -> case head kinds of
+    Nothing -> Err "The type application has too many arguments."
+    Just kind ->
+      let name = if eq (length (abeFields argument)) 1 then abeText (abeGet argument (if eq direction "editor" then "$var" else "var")) else ""
+      let project = if eq direction "type" then true else case kind of
+        KType -> false
+        _ -> true
+      let selected = inferenceQuantifiedByName name variables
+      let here = if not project then Ok [] else case selected of
+            Nothing -> Ok []
+            Just variable -> if eq variable.kind kind then Ok [{ index = index, name = variable.sourceName, id = variable.id }] else Err "The selected type parameter has a different argument kind."
+      case here of
+        Err message -> Err message
+        Ok rows -> case agtArgumentProjections (tailOr args) (tailOr kinds) variables direction (add index 1) of
+          Err message -> Err message
+          Ok rest -> Ok (concat rows rest)
+
+authoringGenericTypeApplicationPlan : (variables: List SchemeVar) -> (shadowed: List String) -> (expression: (JsonLogic Any)) -> (direction: String) -> GenericTypeApplicationPlan
+authoringGenericTypeApplicationPlan variables shadowed expression direction =
+  let scope = authoringGenericTypeScopePlan variables shadowed
+  if not (or (eq direction "editor") (eq direction "type")) then { ok = false, message = "Unknown type application projection direction.", local = false, name = "", id = "", arguments = [] }
+  else if not scope.ok then { ok = false, message = scope.message, local = false, name = "", id = "", arguments = [] }
+  else if and (abeHas expression "call") (eq (length (abeItems (abeGet expression "call"))) 0) then { ok = false, message = "The type application has no callable head.", local = false, name = "", id = "", arguments = [] }
+  else
+    let call = abeGet expression "call"
+    let target = abeAt call 0
+    let name = if eq direction "editor" then abeText target else if eq (length (abeFields target)) 1 then abeText (abeGet target "var") else ""
+    let selected = inferenceQuantifiedByName name scope.variables
+    case selected of
+      Nothing -> { ok = true, message = "", local = false, name = "", id = "", arguments = [] }
+      Just variable -> case variable.kind of
+        KArrow { input = input, output = output } ->
+          if not (eq (length (abeFields expression)) 1) then { ok = false, message = "The type application has an unsupported expression shape.", local = false, name = "", id = "", arguments = [] }
+          else case agtArgumentProjections (tailOr (abeItems call)) (agtInputKinds variable.kind) scope.variables direction 1 of
+            Err message -> { ok = false, message = message, local = false, name = "", id = "", arguments = [] }
+            Ok arguments -> { ok = true, message = "", local = true, name = variable.sourceName, id = variable.id, arguments = arguments }
+        _ -> { ok = false, message = "This type parameter is not callable.", local = false, name = "", id = "", arguments = [] }

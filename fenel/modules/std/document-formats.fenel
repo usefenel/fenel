@@ -1,0 +1,364 @@
+module std where
+
+-- GP-63: ordinary exports of the existing authored RichDocument tree.
+-- No new document model, rendering system or IO. The bounded XHTML importer
+-- lives in document-html-import.fenel. document-markdown-import.fenel reads a
+-- declared bounded Markdown fragment with outline/text normalization; only
+-- representable outline-shaped trees have normalized-value round trips.
+-- Both formats retain sections (levels 1..6), paragraphs, composed
+-- emphasis/strong, inline/block code, safe links and notes. Embeds and unknown
+-- node kinds or invalid required payloads refuse the WHOLE export. Declared
+-- Doc* fields are the contract; extra properties on host objects are outside it.
+-- Nesting is bounded at 64 traversal steps. Strings must contain XML scalars;
+-- this fragment additionally excludes C0/C1 controls other than TAB/LF/CR and
+-- Unicode noncharacters (some of which XML itself permits). TAB/LF/CR become
+-- numeric references in XHTML to avoid normalization.
+--
+-- Markdown is CommonMark with XHTML for inline styling/links and note blocks.
+-- Literal whitespace is encoded, and punctuation escaped, so authoring text
+-- cannot become Markdown syntax. Inline code uses collision-free backticks;
+-- literal CR/LF is refused because CommonMark would turn it into spaces. Block
+-- code uses collision-free fences only for LF-terminated source without CR;
+-- otherwise XHTML preserves the exact source without appending a newline.
+-- Markdown language identifiers admit only ASCII letters/digits/_/./+/-. Empty
+-- paragraphs retain an explicit <p></p>. Multiline headings and heading depth
+-- beyond six refuse instead of silently changing structure.
+--
+-- URL admission is shared by BOTH formats: http(s) with a nonempty ASCII DNS
+-- host (no userinfo/IPv6, an optional decimal port 1..65535), a bare ASCII
+-- mailto address, /path (never //), ./path, ../path or #fragment. Whitespace,
+-- controls and backslashes refuse. This is a bounded safe-link fragment, not
+-- a general URL validator; broad format:url membership admits other schemes.
+-- Existing std.escapeHtml owns HTML escaping. Export selection/composition,
+-- URL/scalar policy and traversal stay entirely in these Fenel bodies.
+
+@category "document-internal"
+documentExportXmlCharacter : (character: String) -> Boolean
+documentExportXmlCharacter character =
+  let code = charCode character
+  let ordinary = and (gte code 32) (lte code 1114111)
+  let surrogate = and (gte code 55296) (lte code 57343)
+  let control = and (gte code 127) (lte code 159)
+  let noncharacter = or (and (gte code 64976) (lte code 65007)) (gte (mod code 65536) 65534)
+  or (elem code [9, 10, 13]) (and ordinary (not (or surrogate (or control noncharacter))))
+
+@category "document-internal"
+documentExportText : (value: String) -> Result String String
+documentExportText value =
+  if not (isString value) then Err "Document export expects literal text"
+  else if all (chars value) documentExportXmlCharacter then Ok value
+  else Err "Document export refuses characters outside its XML-safe fragment"
+
+@category "document-internal"
+documentExportHtmlLiteral : (value: String) -> String
+documentExportHtmlLiteral value =
+  let escaped = escapeHtml value
+  let tabs = replaceAll escaped "\t" "&#9;"
+  let lines = replaceAll tabs "\n" "&#10;"
+  replaceAll lines "\r" "&#13;"
+
+@category "document-internal"
+documentExportTag : (opening: String) -> (closing: String) -> (content: Result String String) -> Result String String
+documentExportTag opening closing content = case content of
+  Err reason -> Err reason
+  Ok value -> Ok (join [opening, value, closing] "")
+
+@category "document-internal"
+documentExportGather : (gathered: Result String (List String)) -> (next: Result String String) -> Result String (List String)
+documentExportGather gathered next = case gathered of
+  Err reason -> Err reason
+  Ok values -> case next of
+    Err reason -> Err reason
+    Ok value -> Ok (appendItem value values)
+
+@category "document-internal"
+documentExportJoin : (parts: List (Result String String)) -> (separator: String) -> Result String String
+documentExportJoin parts separator = case fold documentExportGather (Ok []) parts of
+  Err reason -> Err reason
+  Ok values -> Ok (join values separator)
+
+@category "document-internal"
+documentExportAsciiAlnum : (character: String) -> Boolean
+documentExportAsciiAlnum character =
+  let code = charCode character
+  or (and (gte code 48) (lte code 57)) (or (and (gte code 65) (lte code 90)) (and (gte code 97) (lte code 122)))
+
+@category "document-internal"
+documentExportHostLabel : (label: String) -> Boolean
+documentExportHostLabel label =
+  and (not (eq label "")) (and (not (startsWith label "-")) (and (not (endsWith label "-")) (all (chars label) (\character -> or (documentExportAsciiAlnum character) (eq character "-")))))
+
+@category "document-internal"
+documentExportHost : (host: String) -> Boolean
+documentExportHost host = and (not (eq host "")) (all (split host ".") documentExportHostLabel)
+
+@category "document-internal"
+documentExportHttpAddress : (address: String) -> Boolean
+documentExportHttpAddress address =
+  let authority = join (takeWhile (\character -> not (elem character "/?#")) (chars address)) ""
+  let parts = split authority ":"
+  let host = fromMaybe "" (head parts)
+  if not (documentExportHost host) then false
+  else if eq (length parts) 1 then true
+  else if not (eq (length parts) 2) then false
+  else
+    let port = fromMaybe "" (head (drop 1 parts))
+    if or (eq port "") (not (all (chars port) (\character -> elem character "0123456789"))) then false
+    else case tryParseInt port of
+      Nothing -> false
+      Just value -> and (gte value 1) (lte value 65535)
+
+@category "document-internal"
+documentExportMailAddress : (address: String) -> Boolean
+documentExportMailAddress address =
+  let parts = split address "@"
+  let local = fromMaybe "" (head parts)
+  let domain = fromMaybe "" (head (drop 1 parts))
+  and (eq (length parts) 2) (and (not (eq local "")) (and (all (chars local) (\character -> or (documentExportAsciiAlnum character) (elem character "._+-"))) (documentExportHost domain)))
+
+@category "document-internal"
+documentExportUrlCharacter : (character: String) -> Boolean
+documentExportUrlCharacter character =
+  let code = charCode character
+  let unicodeSpace = or (elem code [160, 5760, 8232, 8233, 8239, 8287, 12288, 65279]) (and (gte code 8192) (lte code 8202))
+  and (gt code 32) (and (documentExportXmlCharacter character) (and (not unicodeSpace) (not (eq character "\\"))))
+
+@category "document-internal"
+documentExportLinkUrl : (url: String) -> Result String String
+documentExportLinkUrl url =
+  if not (isString url) then Err "Document export expects a literal link URL"
+  else if or (eq url "") (not (all (chars url) documentExportUrlCharacter)) then Err "Document export refuses whitespace, controls or backslashes in links"
+  else
+    let lowered = lower url
+    let admitted =
+      if startsWith lowered "https://" then documentExportHttpAddress (slice url 8 (length url))
+      else if startsWith lowered "http://" then documentExportHttpAddress (slice url 7 (length url))
+      else if startsWith lowered "mailto:" then documentExportMailAddress (slice url 7 (length url))
+      else if startsWith url "/" then not (startsWith url "//")
+      else or (startsWith url "./") (or (startsWith url "../") (startsWith url "#"))
+    if admitted then Ok (documentExportHtmlLiteral url)
+    else Err "Document export refuses an unsafe or unsupported link URL"
+
+@category "document-internal"
+documentExportHeading : (content: Result String String) -> Result String String
+documentExportHeading content = case content of
+  Err reason -> Err reason
+  Ok value ->
+    if or (contains value "&#10;") (contains value "&#13;") then Err "Document export refuses multiline headings"
+    else Ok value
+
+@category "document-internal"
+documentHtmlInlines : (nesting: Nat) -> (inLink: Boolean) -> (content: List DocInline) -> Result String String
+documentHtmlInlines nesting inLink content =
+  if gt nesting 64 then Err "Document export nesting exceeds 64 steps"
+  else if not (isArray content) then Err "Document export expects an inline list"
+  else documentExportJoin (map (documentHtmlInline (add nesting 1) inLink) content) ""
+
+@category "document-internal"
+documentHtmlInline : (nesting: Nat) -> (inLink: Boolean) -> (inline: DocInline) -> Result String String
+documentHtmlInline nesting inLink inline =
+  if gt nesting 64 then Err "Document export nesting exceeds 64 steps"
+  else case inline of
+    DocText { text = value } -> case documentExportText value of
+      Err reason -> Err reason
+      Ok literal -> Ok (documentExportHtmlLiteral literal)
+    DocEmphasis { content = content } -> documentExportTag "<em>" "</em>" (documentHtmlInlines nesting inLink content)
+    DocStrong { content = content } -> documentExportTag "<strong>" "</strong>" (documentHtmlInlines nesting inLink content)
+    DocInlineCode { code = code } -> case documentExportText code of
+      Err reason -> Err reason
+      Ok literal -> Ok (join ["<code>", documentExportHtmlLiteral literal, "</code>"] "")
+    DocLink { url = url, content = content } ->
+      if inLink then Err "Document export refuses nested links"
+      else case documentExportLinkUrl url of
+        Err reason -> Err reason
+        Ok href -> documentExportTag (join ["<a href=\"", href, "\">"] "") "</a>" (documentHtmlInlines nesting true content)
+    _ -> Err "Document export refuses an unknown inline node"
+
+@category "document-internal"
+documentHtmlCodeLanguage : (language: Maybe String) -> Result String String
+documentHtmlCodeLanguage language = case language of
+  Nothing -> Ok ""
+  Just name -> case documentExportText name of
+    Err reason -> Err reason
+    Ok literal -> Ok (join [" data-language=\"", documentExportHtmlLiteral literal, "\""] "")
+  _ -> Err "Document export refuses an unknown code-language value"
+
+@category "document-internal"
+documentHtmlCode : (language: Maybe String) -> (source: String) -> Result String String
+documentHtmlCode language source = case documentExportText source of
+  Err reason -> Err reason
+  Ok literal -> case documentHtmlCodeLanguage language of
+    Err reason -> Err reason
+    Ok attributes -> Ok (join ["<pre><code", attributes, ">", documentExportHtmlLiteral literal, "</code></pre>"] "")
+
+@category "document-internal"
+documentHtmlBlocks : (depth: Nat) -> (nesting: Nat) -> (blocks: List DocBlock) -> Result String String
+documentHtmlBlocks depth nesting blocks =
+  if gt nesting 64 then Err "Document export nesting exceeds 64 steps"
+  else if not (isArray blocks) then Err "Document export expects a block list"
+  else documentExportJoin (map (documentHtmlBlock depth (add nesting 1)) blocks) ""
+
+@category "document-internal"
+documentHtmlBlock : (depth: Nat) -> (nesting: Nat) -> (block: DocBlock) -> Result String String
+documentHtmlBlock depth nesting block =
+  if gt nesting 64 then Err "Document export nesting exceeds 64 steps"
+  else case block of
+    DocSection { title = title, blocks = blocks } ->
+      if gt depth 6 then Err "Document export refuses heading levels beyond six"
+      else
+        let tag = join ["h", toString depth] ""
+        let heading = documentExportTag (join ["<", tag, ">"] "") (join ["</", tag, ">"] "") (documentExportHeading (documentHtmlInlines nesting false title))
+        documentExportTag "<section>" "</section>" (documentExportJoin [heading, documentHtmlBlocks (add depth 1) nesting blocks] "")
+    DocParagraph { content = content } -> documentExportTag "<p>" "</p>" (documentHtmlInlines nesting false content)
+    DocCode { language = language, source = source } -> documentHtmlCode language source
+    DocNote { blocks = blocks } -> documentExportTag "<aside class=\"document-note\">" "</aside>" (documentHtmlBlocks depth nesting blocks)
+    DocEmbed -> Err "Document export does not yet support embedded typed data"
+    _ -> Err "Document export refuses an unknown block node"
+
+@category "document-internal"
+documentMarkdownCharacter : (character: String) -> String
+documentMarkdownCharacter character =
+  let code = charCode character
+  if eq character " " then "&#32;"
+  else if elem code [9, 10, 13] then documentExportHtmlLiteral character
+  else if elem character "&<>\"'" then escapeHtml character
+  else if or (and (gte code 33) (lte code 47)) (or (and (gte code 58) (lte code 64)) (or (and (gte code 91) (lte code 96)) (and (gte code 123) (lte code 126))))
+    then join ["\\", character] ""
+  else character
+
+@category "document-internal"
+documentBacktickRun : (state: { current: Nat, longest: Nat }) -> (character: String) -> { current: Nat, longest: Nat }
+documentBacktickRun state character =
+  let current = if eq character "`" then add state.current 1 else 0
+  { current = current, longest = max state.longest current }
+
+@category "document-internal"
+documentBacktickFence : (minimum: Nat) -> (source: String) -> String
+documentBacktickFence minimum source =
+  let runs = fold documentBacktickRun { current = 0, longest = 0 } (chars source)
+  repeat "`" (max minimum (add runs.longest 1))
+
+@category "document-internal"
+documentMarkdownInlineCode : (code: String) -> Result String String
+documentMarkdownInlineCode code = case documentExportText code of
+  Err reason -> Err reason
+  Ok literal ->
+    if or (contains literal "\n") (contains literal "\r") then Err "Markdown inline code cannot preserve literal line endings"
+    else if eq literal "" then Ok "<code></code>"
+    else
+      let fence = documentBacktickFence 1 literal
+      let edgeBacktick = or (startsWith literal "`") (endsWith literal "`")
+      let trimmedSpaces = and (and (startsWith literal " ") (endsWith literal " ")) (not (all (chars literal) (\character -> eq character " ")))
+      let padding = if or edgeBacktick trimmedSpaces then " " else ""
+      Ok (join [fence, padding, literal, padding, fence] "")
+
+@category "document-internal"
+documentMarkdownInlines : (nesting: Nat) -> (inLink: Boolean) -> (content: List DocInline) -> Result String String
+documentMarkdownInlines nesting inLink content =
+  if gt nesting 64 then Err "Document export nesting exceeds 64 steps"
+  else if not (isArray content) then Err "Document export expects an inline list"
+  else fold documentMarkdownAppend (Ok "") (map (documentMarkdownInline (add nesting 1) inLink) content)
+
+-- Read line endings through the escaped HTML projection of authored heading
+-- data. A Markdown code span can contain literal "&#10;" without a newline;
+-- testing the final Markdown string would wrongly refuse that valid content.
+@category "document-internal"
+documentMarkdownHeading : (nesting: Nat) -> (title: List DocInline) -> Result String String
+documentMarkdownHeading nesting title = case documentExportHeading (documentHtmlInlines nesting false title) of
+  Err reason -> Err reason
+  Ok _ -> documentMarkdownInlines nesting false title
+
+-- A zero-width HTML comment keeps touching code-span fences separate. Without
+-- it, adjacent authored code nodes merge their delimiter runs in CommonMark.
+@category "document-internal"
+documentMarkdownAppend : (accumulated: Result String String) -> (next: Result String String) -> Result String String
+documentMarkdownAppend accumulated next = case accumulated of
+  Err reason -> Err reason
+  Ok before -> case next of
+    Err reason -> Err reason
+    Ok after ->
+      let boundary = if and (endsWith before "`") (startsWith after "`") then "<!---->" else ""
+      Ok (join [before, boundary, after] "")
+
+@category "document-internal"
+documentMarkdownInline : (nesting: Nat) -> (inLink: Boolean) -> (inline: DocInline) -> Result String String
+documentMarkdownInline nesting inLink inline =
+  if gt nesting 64 then Err "Document export nesting exceeds 64 steps"
+  else case inline of
+    DocText { text = value } -> case documentExportText value of
+      Err reason -> Err reason
+      Ok literal -> Ok (join (map documentMarkdownCharacter (chars literal)) "")
+    DocEmphasis { content = content } -> documentExportTag "<em>" "</em>" (documentMarkdownInlines nesting inLink content)
+    DocStrong { content = content } -> documentExportTag "<strong>" "</strong>" (documentMarkdownInlines nesting inLink content)
+    DocInlineCode { code = code } -> documentMarkdownInlineCode code
+    DocLink { url = url, content = content } ->
+      if inLink then Err "Document export refuses nested links"
+      else case documentExportLinkUrl url of
+        Err reason -> Err reason
+        Ok href -> documentExportTag (join ["<a href=\"", href, "\">"] "") "</a>" (documentMarkdownInlines nesting true content)
+    _ -> Err "Document export refuses an unknown inline node"
+
+@category "document-internal"
+documentMarkdownLanguage : (language: Maybe String) -> Result String String
+documentMarkdownLanguage language = case language of
+  Nothing -> Ok ""
+  Just name ->
+    if not (isString name) then Err "Markdown code expects a literal language identifier"
+    else if or (eq name "") (not (all (chars name) (\character -> or (documentExportAsciiAlnum character) (elem character "_.+-")))) then Err "Markdown code language is outside the ASCII identifier fragment"
+    else Ok name
+  _ -> Err "Document export refuses an unknown code-language value"
+
+@category "document-internal"
+documentMarkdownCode : (language: Maybe String) -> (source: String) -> Result String String
+documentMarkdownCode language source = case documentExportText source of
+  Err reason -> Err reason
+  Ok literal -> case documentMarkdownLanguage language of
+    Err reason -> Err reason
+    Ok identifier ->
+      if or (not (endsWith literal "\n")) (contains literal "\r") then documentHtmlCode language literal
+      else
+        let fence = documentBacktickFence 3 literal
+        Ok (join [fence, identifier, "\n", literal, fence] "")
+
+@category "document-internal"
+documentMarkdownBlocks : (depth: Nat) -> (nesting: Nat) -> (blocks: List DocBlock) -> Result String String
+documentMarkdownBlocks depth nesting blocks =
+  if gt nesting 64 then Err "Document export nesting exceeds 64 steps"
+  else if not (isArray blocks) then Err "Document export expects a block list"
+  else documentExportJoin (map (documentMarkdownBlock depth (add nesting 1)) blocks) "\n\n"
+
+@category "document-internal"
+documentMarkdownBlock : (depth: Nat) -> (nesting: Nat) -> (block: DocBlock) -> Result String String
+documentMarkdownBlock depth nesting block =
+  if gt nesting 64 then Err "Document export nesting exceeds 64 steps"
+  else case block of
+    DocSection { title = title, blocks = blocks } ->
+      if gt depth 6 then Err "Document export refuses heading levels beyond six"
+      else case documentMarkdownHeading nesting title of
+        Err reason -> Err reason
+        Ok heading -> case documentMarkdownBlocks (add depth 1) nesting blocks of
+          Err reason -> Err reason
+          Ok children -> Ok (join [repeat "#" depth, " ", heading, if eq children "" then "" else join ["\n\n", children] ""] "")
+    DocParagraph { content = content } -> case documentMarkdownInlines nesting false content of
+      Err reason -> Err reason
+      Ok value -> Ok (if eq value "" then "<p></p>" else value)
+    DocCode { language = language, source = source } -> documentMarkdownCode language source
+    DocNote { blocks = blocks } -> documentExportTag "<aside class=\"document-note\">" "</aside>" (documentHtmlBlocks depth nesting blocks)
+    DocEmbed -> Err "Document export does not yet support embedded typed data"
+    _ -> Err "Document export refuses an unknown block node"
+
+@label "Document as Markdown"
+@description "Export sections/paragraphs, composed emphasis/strong, code, safe links and notes as CommonMark with XHTML for inline styling/links, notes and exact block-code fallbacks. Text punctuation/whitespace stays literal; code delimiters avoid source collisions. Embeds, invalid characters, unsafe links, multiline headings/inline code and excessive nesting return Err. documentFromMarkdown reads a declared bounded fragment with outline/text normalization: normalized-value round trips apply to representable outline-shaped trees within its source bound, not arbitrary authored section endings."
+@tags "document" "markdown" "conversion"
+documentToMarkdown : (document: RichDocument) -> Result String String
+documentToMarkdown document = case document of
+  RichDocument { blocks = blocks } -> documentMarkdownBlocks 1 0 blocks
+  _ -> Err "Document export expects RichDocument"
+
+@label "Document as HTML"
+@description "Export sections/paragraphs, composed emphasis/strong, code, safe links and notes as a deterministic XHTML-compatible HTML fragment. Escape text/attributes with the shared HTML primitive and encode TAB/LF/CR as numeric references. The character fragment excludes invalid XML scalars, other C0/C1 controls and Unicode noncharacters. Embeds, unsafe links, multiline headings and excessive nesting return Err. documentFromHtml reads this fragment within its source-size bound, normalizing only text-node boundaries."
+@tags "document" "html" "conversion"
+documentToHtml : (document: RichDocument) -> Result String String
+documentToHtml document = case document of
+  RichDocument { blocks = blocks } -> documentHtmlBlocks 1 0 blocks
+  _ -> Err "Document export expects RichDocument"

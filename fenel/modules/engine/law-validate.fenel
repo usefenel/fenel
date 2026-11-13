@@ -1,0 +1,146 @@
+module engine where
+
+-- =========================================================================
+-- gradeEvidence / specObligations — the law-validation surface, Fenel-bodied.
+-- expr-substrate Phase 6b0 (brief:
+-- `workstreams/expr-substrate/briefs/phase-6b0-prover-fenel-port.md`).
+--
+-- `engine/src/law-validation.ts`'s construction-time canonical surface
+-- (`validateVerified` + `validateSpecRecord`, Phase 10a) was pure-logic TS.
+-- The LOGIC lives here now:
+--   - `gradeEvidence` — the Evidence-variant dispatch (Axiom ⇒ pass/Assumed,
+--     SolverChecked ⇒ pass/SolverChecked, SampleTested ⇒ pass + count,
+--     KernelProven ⇒ uncheckable/reserved, unknown ⇒ uncheckable) including
+--     every reason string. EpistemicStatus construction stays TS-side
+--     output grading (the 6b Q1 lock — the `es` field names the status).
+--   - `specObligations` — the per-field walk over the marshalled field-fact
+--     list: skip non-Verified fields, classify invalid values (the missing /
+--     prove-candidate split), classify malformed evidence, grade well-formed
+--     evidence. Emits an ORDERED outcome list ({ outcome = "err" | "prove" });
+--     the TS delegate replays it (pushing errors / firing the proveMissing
+--     hook) so error ORDER is byte-identical to the original single walk.
+--
+-- MARSHALLED FIELD FACTS (TS builds one per spec-record field — typeof /
+-- `$`-key reads are the boundary; the BRANCHING on them is here):
+--   name               — the field name
+--   verified           — isVerifiedFieldType(field.type): stays the ONE TS
+--                        recognizer (shared verbatim with effect-dispatch's
+--                        isLawField — porting it here would fork the
+--                        recognizer or cycle the registry bootstrap)
+--   valueFalsy / valueTypeofObject / valueIsArray / valueIsUndefined
+--                      — the `!fv || typeof fv !== "object" || isArray` facts
+--   typeofStr          — for the verbatim "(got <typeof>)" message
+--   evidencePresent / evidenceTypeofObject / evidenceTagIsString
+--                      — the malformed-evidence facts
+--   evidenceTag / evidenceCount — the Evidence `$tag` + SampleTested count
+--
+-- The "fail" status arm is carried faithfully from the TS original even
+-- though no Evidence variant produces it today (validateVerified has no
+-- failing variant) — the `result.status === "fail"` branch was dead there
+-- and stays an honest mirror here.
+--
+-- NO ENTITY DECLS: markers are plain records — entity oracle + law count
+-- move +0 (the function-only rule).
+-- =========================================================================
+
+@label "Grade evidence"
+@description "The validateVerified Evidence dispatch, Fenel-bodied (expr-substrate Phase 6b0; External arm added 6b Q1 arm A): Axiom ⇒ pass (Assumed); SolverChecked ⇒ pass (SolverChecked); SampleTested ⇒ pass with samplesChecked = count (SampleTested); KernelProven ⇒ uncheckable with the reserved-kernel reason (Unknown); External ⇒ pass (Assumed — the un-re-checkable external attestation; A-minimal, the provenance lives in the evidence value); any other tag ⇒ uncheckable 'Unknown Evidence variant' (Unknown). Returns a plain-record marker { law, status, es, reason?, samplesChecked?, hasSamples }; the TS delegate maps `es` to the EpistemicStatus value (TS-side output grading, the 6b Q1 lock) and reconstructs the exact LawValidationResult key set."
+@tags "engine" "law" "validation" "prover" "expr-substrate" "phase-6b0"
+gradeEvidence : (evidenceTag: String) -> (count: a) -> (lawName: String) -> a
+gradeEvidence evidenceTag count lawName =
+  if eq evidenceTag "Axiom"
+  then { law = lawName, status = "pass", es = "Assumed", hasSamples = false }
+  else if eq evidenceTag "SolverChecked"
+  then { law = lawName, status = "pass", es = "SolverChecked", hasSamples = false }
+  else if eq evidenceTag "SampleTested"
+  then { law = lawName, status = "pass", es = "SampleTested", samplesChecked = count, hasSamples = true }
+  else if eq evidenceTag "KernelProven"
+  then { law = lawName, status = "uncheckable", reason = "KernelProven evidence reserved — today's kernel doesn't reduction-check proof expressions (see design/laws-and-proofs.md Stage 10+).", es = "Unknown", hasSamples = false }
+  else if eq evidenceTag "External"
+  then { law = lawName, status = "pass", es = "Assumed", hasSamples = false }
+  else { law = lawName, status = "uncheckable", reason = "Unknown Evidence variant", es = "Unknown", hasSamples = false }
+
+@label "Spec obligations"
+@description "The validateSpecRecord walk, Fenel-bodied (expr-substrate Phase 6b0): for each marshalled field-fact record, skip non-Verified fields; an invalid value (falsy / non-object / array) becomes a prove-candidate when the hook is present AND the value is strictly undefined (the prove-on-missing branch), else the verbatim 'missing Verified value (got <typeof>)' error; malformed evidence becomes its verbatim error; well-formed evidence is graded via gradeEvidence (only a 'fail' status emits — 'uncheckable' is accepted under the permissive policy). Emits the ORDERED outcome list ({ outcome = err, field, reason } / { outcome = prove, field, missingReason }); the TS delegate replays it in order, so the error list is byte-identical to the original single walk."
+@tags "engine" "law" "validation" "prover" "expr-substrate" "phase-6b0"
+specObligations : (fields: a) -> (hookPresent: Bool) -> a
+specObligations fields hookPresent = soWalk fields hookPresent []
+
+-- soWalk — accumulator-threaded walk over the field-fact list.
+@label "law-validate: soWalk"
+@description "Phase 6b0 — accumulator-threaded recursion over the marshalled field-fact list, appending each field's outcome entries in field order. Internal helper."
+@tags "engine" "internal" "law" "validation" "expr-substrate" "phase-6b0"
+@category "engine-internal"
+soWalk : (fields: a) -> (hookPresent: Bool) -> (acc: a) -> a
+soWalk fields hookPresent acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let acc2 = soField f hookPresent acc
+      case tail fields of
+        Nothing -> acc2
+        Just rest -> soWalk rest hookPresent acc2
+
+-- soField — classify one field's obligation.
+@label "law-validate: soField"
+@description "Phase 6b0 — one field's classification: skip non-Verified; invalid value ⇒ prove-candidate (hook present + strictly undefined) or the missing-value error; malformed evidence ⇒ its error; else grade the evidence. Internal helper."
+@tags "engine" "internal" "law" "validation" "expr-substrate" "phase-6b0"
+@category "engine-internal"
+soField : (f: a) -> (hookPresent: Bool) -> (acc: a) -> a
+soField f hookPresent acc =
+  if not f.verified
+  then acc
+  else if soValueInvalid f
+  then
+    if hookPresent
+    then
+      if f.valueIsUndefined
+      then appendItem { outcome = "prove", field = f.name, missingReason = soMissingMsg f.typeofStr } acc
+      else appendItem { outcome = "err", field = f.name, reason = soMissingMsg f.typeofStr } acc
+    else appendItem { outcome = "err", field = f.name, reason = soMissingMsg f.typeofStr } acc
+  else if soEvidenceMalformed f
+  then appendItem { outcome = "err", field = f.name, reason = "Verified value missing or malformed evidence field (expected {$tag: ...})" } acc
+  else soEvidence f acc
+
+-- soValueInvalid — `!fv || typeof fv !== "object" || Array.isArray(fv)`.
+@label "law-validate: soValueInvalid"
+@description "Phase 6b0 — the invalid-value predicate over the marshalled typeof facts: falsy OR array OR not typeof-object. Internal helper."
+@tags "engine" "internal" "law" "validation" "expr-substrate" "phase-6b0"
+@category "engine-internal"
+soValueInvalid : (f: a) -> Bool
+soValueInvalid f =
+  if f.valueFalsy then true
+  else if f.valueIsArray then true
+  else not f.valueTypeofObject
+
+-- soEvidenceMalformed — `!ev || typeof ev !== "object" || typeof ev.$tag !== "string"`.
+@label "law-validate: soEvidenceMalformed"
+@description "Phase 6b0 — the malformed-evidence predicate over the marshalled facts: absent OR not typeof-object OR `$tag` not a string. Internal helper."
+@tags "engine" "internal" "law" "validation" "expr-substrate" "phase-6b0"
+@category "engine-internal"
+soEvidenceMalformed : (f: a) -> Bool
+soEvidenceMalformed f =
+  if not f.evidencePresent then true
+  else if not f.evidenceTypeofObject then true
+  else not f.evidenceTagIsString
+
+-- soEvidence — grade well-formed evidence; only "fail" emits an error.
+@label "law-validate: soEvidence"
+@description "Phase 6b0 — grade a well-formed Verified value's evidence via gradeEvidence; a 'fail' status emits the error (with the graded reason), 'pass' and 'uncheckable' emit nothing (the permissive policy — KernelProven's reserved uncheckable is accepted at construction time). Internal helper."
+@tags "engine" "internal" "law" "validation" "expr-substrate" "phase-6b0"
+@category "engine-internal"
+soEvidence : (f: a) -> (acc: a) -> a
+soEvidence f acc =
+  let g = gradeEvidence f.evidenceTag f.evidenceCount f.name
+  if eq g.status "fail"
+  then appendItem { outcome = "err", field = f.name, reason = g.reason } acc
+  else acc
+
+-- soMissingMsg — the verbatim "missing Verified value (got <typeof>)".
+@label "law-validate: soMissingMsg"
+@description "Phase 6b0 — build the verbatim missing-Verified-value message embedding the marshalled typeof string. Internal helper."
+@tags "engine" "internal" "law" "validation" "expr-substrate" "phase-6b0"
+@category "engine-internal"
+soMissingMsg : (typeofStr: String) -> String
+soMissingMsg typeofStr =
+  concat "missing Verified value (got " (concat typeofStr ")")

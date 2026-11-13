@@ -1,0 +1,1180 @@
+module engine where
+
+-- normaliseToCore — lift raw JSON Logic (the source-level op-zoo) into the
+-- irreducible core `Expr` tree, packaged as a CoreProgram. The FIRST step in
+-- every per-target compile pipeline.
+--
+-- expr-substrate Phase 4c — the recognition cascade that used to live here
+-- (`lowerExpr` + the ~33 target-producing `lower*` helpers) is GONE.
+-- `normaliseToCore` now DELEGATES to the JSON-Logic source-format adapter
+-- `jsonLogicToExpr` (= `desugar ∘ jsonLogicToSyntax`, `json-logic-to-syntax.fenel`,
+-- Phase 4a) and just packages the resulting `Expr` body into a `CoreProgram`.
+-- What REMAINS in this file is the ~21 target-AGNOSTIC structural helpers
+-- (`normalizeToArgList` / `ifNthArg` / `resolveCallee` / `lookupCtorDef` / … —
+-- list/JsonLogic walkers that yield strings or raw nodes) that the adapter
+-- REUSES cross-file through the `module engine where` union.
+--
+-- The `JsonLogic` / `JlField` / `CtorDefEntry` ADTs (the typed view of the raw
+-- marshalled input) MOVED to `json-logic-to-syntax.fenel` (decision 4 — the
+-- adapter owns its input type); the helpers below still reference them, resolved
+-- through the union. The raw→ADT marshalling lives in the dispatch wrapper
+-- (`marshalJsonLogic` in engine-bodies-dispatch.ts), preserving JS object key
+-- insertion order by encoding fields as `List<JlField>`.
+--
+-- The body takes three arguments: the marshalled input, an empty list, and a JS
+-- null sentinel. `emptyList` is now UNUSED (the adapter seeds its own
+-- accumulators with bare `[]` literals) but stays in the signature — the
+-- dispatch wrapper passes it and the seam shape is unchanged (decision 1).
+-- `nullValue` threads to the adapter for `null`-literal materialisation.
+
+-- CoreProgram / CompileError — canonical declarations live in
+-- `fenel/modules/engine/ir-types.fenel` (Phase 3v.2 Axis-B dedup). The
+-- CompileError registration (Unsupported / EffectfulCallNotHandled /
+-- UnboundVariable / InternalError) seeds the engine's `_constructors` map so the
+-- per-target compile lowerings emit named-key error shapes byte-equal to the
+-- engine evaluator's output. `normaliseToCore` constructs CoreProgram; the
+-- adapter constructs Unsupported via the registered shape.
+
+-- normaliseToCore — entry point. Lowers `input.body` to an Expr, resolves
+-- defining-module lexical calls to canonical fnIds, and packages the result into a
+-- CoreProgram. Errors from the body lowering short-circuit out as Err.
+--
+-- Identity-bearing input.params and constructor slots pass through unchanged.
+-- Target lexical names are projected from wireName only by the final lowering
+-- adapters; ambiguous unscoped constructor spellings fail closed in the adapter.
+@label "Normalise to Core IR"
+@description "Lower raw JSON Logic to an Expr tree packaged as a CoreProgram, the first step in every per-target compile pipeline. The shared JSON-Logic adapter preserves identity-bearing constructor slots, rejects ambiguous unscoped constructor metadata, and surfaces unrecognised shapes as structured CompileError.Unsupported. The final Fenel walk resolves bare defining-module call heads through the host-projected binding index to exact canonical fnIds; unlisted, already-qualified, dynamic, and effect heads remain unchanged. A global function passed as a value lowers to the runtime reference a call head of the same spelling lowers to (`$fn:<key>`). A dynamic head or a variable reference whose root is no binder in scope and which names no global function, or an unresolved dotted head, is refused as Unsupported."
+@tags "engine" "ir" "lowering" "self-host" "phase-21"
+normaliseToCore : (input: { name: String, params: List CompileFieldSlot, body: (JsonLogic Any), requires: List String, ctorDefs: List ({ name: String, wireName: String, fields: List CompileFieldSlot, ambiguous: Boolean }), callBindings: a }) -> (emptyList: List a) -> (nullValue: a) -> Result a CoreProgram
+-- expr-substrate Phase 4b — `normaliseToCore` DELEGATES to the JSON-Logic
+-- source-format adapter (`jsonLogicToExpr = desugar ∘ jsonLogicToSyntax`,
+-- Phase 4a). The old recognition cascade (`lowerExpr` + the ~30 target-
+-- producing helpers below) stays REGISTERED but is now unreachable from the
+-- live compile path — its deletion rides 4c (the `JsonLogic`-ADT move + file
+-- reorganisation). The `body` field of the returned `CoreProgram` is now an
+-- `Expr` tree (7 cases) rather than a `CoreExpr` (10) — the downstream passes
+-- (`makeEffectsExplicit` / `makeClosuresExplicit`) gained `Expr` arms +
+-- `CeIf`/`CeLet`/`CeDo` reconstitution to consume it; the backends stay
+-- byte-identical. The `emptyList` arg is now unused (the adapter seeds its own
+-- accumulators with bare `[]` 5b14 literals) but stays in the signature — the
+-- dispatch wrapper passes it and the seam shape is unchanged (decision 1). Same
+-- Err shapes (the adapter inherits `normaliseToCore`'s recognition error arms,
+-- proven 0-divergent on the 810-body engine corpus at 4a).
+normaliseToCore input emptyList nullValue =
+  let bodyResult = jsonLogicToExpr input.body input.ctorDefs nullValue
+  case bodyResult of
+    Err e -> Err e
+    Ok exprBody ->
+      let callResolvedBody = compileResolveCalls exprBody input.callBindings
+      let topScope = compileScopeWith [] (compileSlotWireNames input.params [])
+      let unresolvedHeads = compileUnresolvedHeads callResolvedBody topScope input.callBindings
+      case head unresolvedHeads of
+        Just unresolvedHead -> Err (Unsupported {
+          reason = concat "reference cannot be compiled: " (concat unresolvedHead " is neither a local binder in scope nor a function the compiler resolves"),
+          node = input.body
+        })
+        Nothing ->
+          if compileHasUnresolvedConstructorWire callResolvedBody input.ctorDefs
+          then Err (Unsupported {
+            reason = "constructor wire projection must leave the reserved @ctor namespace",
+            node = input.body
+          })
+          else
+            let valueResolvedBody = compileResolveValueRefs callResolvedBody topScope input.callBindings
+            let resolvedBody = compileResolveConstructorWires valueResolvedBody input.ctorDefs
+            Ok (CoreProgram {
+              name = input.name,
+              params = input.params,
+              body = resolvedBody,
+              requires = input.requires
+            })
+
+-- Fail closed before backend lowering if any constructor projects into the
+-- compiler-only exact-target namespace. This catches an omitted projection,
+-- exact-to-exact remapping, and a bare spelling redirected to an exact target.
+-- The recursive judgment is Fenel-owned and covers values and patterns.
+@label "Compiler exact constructor wire fence"
+@description "Detect any constructor in an Expr or match pattern whose projected runtime wire name remains in or enters the reserved @ctor namespace."
+@tags "engine" "compiler" "constructor" "signature-substrate" "self-host"
+@category "engine-internal"
+compileHasUnresolvedConstructorWire : (expr: (Expr Any)) -> a -> Boolean
+compileHasUnresolvedConstructorWire expr ctorDefs =
+  case expr of
+    ELit {} -> false
+    EVar {} -> false
+    ECall { args = args } -> compileHasUnresolvedConstructorWireExprList args ctorDefs
+    ELambda { body = body } -> compileHasUnresolvedConstructorWire body ctorDefs
+    EMatch { scrutinee = scrutinee, arms = arms } ->
+      if compileHasUnresolvedConstructorWire scrutinee ctorDefs
+      then true
+      else compileHasUnresolvedConstructorWireArms arms ctorDefs
+    EConstruct { ctor = ctor, args = args } ->
+      if exactCtorWireUnresolved ctor ctorDefs
+      then true
+      else compileHasUnresolvedConstructorWireExprList args ctorDefs
+    ERecord { fields = fields } -> compileHasUnresolvedConstructorWireFields fields ctorDefs
+    _ -> true
+
+@category "engine-internal"
+compileHasUnresolvedConstructorWireExprList : (exprs: List (Expr Any)) -> a -> Boolean
+compileHasUnresolvedConstructorWireExprList exprs ctorDefs =
+  case head exprs of
+    Nothing -> false
+    Just expr ->
+      if compileHasUnresolvedConstructorWire expr ctorDefs
+      then true
+      else compileHasUnresolvedConstructorWireExprList (tailOr exprs) ctorDefs
+
+@category "engine-internal"
+compileHasUnresolvedConstructorWireFields : (fields: a) -> a -> Boolean
+compileHasUnresolvedConstructorWireFields fields ctorDefs =
+  case head fields of
+    Nothing -> false
+    Just field ->
+      if compileHasUnresolvedConstructorWire field.value ctorDefs
+      then true
+      else compileHasUnresolvedConstructorWireFields (tailOr fields) ctorDefs
+
+@category "engine-internal"
+compileHasUnresolvedConstructorWireArms : (arms: a) -> a -> Boolean
+compileHasUnresolvedConstructorWireArms arms ctorDefs =
+  case head arms of
+    Nothing -> false
+    Just arm ->
+      if compileHasUnresolvedConstructorWirePattern arm.pattern ctorDefs
+      then true
+      else if compileHasUnresolvedConstructorWireArmBody arm ctorDefs
+      then true
+      else compileHasUnresolvedConstructorWireArms (tailOr arms) ctorDefs
+
+@category "engine-internal"
+compileHasUnresolvedConstructorWireArmBody : (arm: a) -> a -> Boolean
+compileHasUnresolvedConstructorWireArmBody arm ctorDefs =
+  case lookup arm "guard" of
+    Nothing -> compileHasUnresolvedConstructorWire arm.body ctorDefs
+    Just guard ->
+      if compileHasUnresolvedConstructorWire guard ctorDefs
+      then true
+      else compileHasUnresolvedConstructorWire arm.body ctorDefs
+
+@category "engine-internal"
+compileHasUnresolvedConstructorWirePattern : (pattern: (Pattern Any)) -> a -> Boolean
+compileHasUnresolvedConstructorWirePattern pattern ctorDefs =
+  case pattern of
+    PatLit {} -> false
+    PatVar {} -> false
+    PatWildcard -> false
+    PatConstruct { ctor = ctor, args = args } ->
+      if exactCtorWireUnresolved ctor ctorDefs
+      then true
+      else compileHasUnresolvedConstructorWirePatternList args ctorDefs
+    _ -> true
+
+@category "engine-internal"
+compileHasUnresolvedConstructorWirePatternList : (patterns: List (Pattern Any)) -> a -> Boolean
+compileHasUnresolvedConstructorWirePatternList patterns ctorDefs =
+  case head patterns of
+    Nothing -> false
+    Just pattern ->
+      if compileHasUnresolvedConstructorWirePattern pattern ctorDefs
+      then true
+      else compileHasUnresolvedConstructorWirePatternList (tailOr patterns) ctorDefs
+
+-- Compile-only constructor projection. JSON-Logic/Syntax/Expr inference keeps
+-- the exact semantic target; after the adapter has selected its exact field
+-- metadata, this final shared walk projects constructors and patterns to the
+-- short runtime ADT wire tag once for JS, Wasm, and LLVM.
+@label "Resolve compile constructor wires"
+@description "After exact constructor metadata selection, recursively project EConstruct and PatConstruct semantic targets to their runtime ADT wire tags for every compiler backend."
+@tags "engine" "compiler" "constructor" "signature-substrate" "self-host"
+@category "engine-internal"
+compileResolveConstructorWires : (expr: (Expr Any)) -> a -> (Expr Any)
+compileResolveConstructorWires expr ctorDefs =
+  case expr of
+    ELit {} -> expr
+    EVar {} -> expr
+    ECall { fnId = f, args = args } ->
+      mapSet expr "args" (compileResolveConstructorExprList args ctorDefs [])
+    ELambda { params = ps, body = bd } ->
+      ELambda { params = ps, body = compileResolveConstructorWires bd ctorDefs }
+    EMatch { scrutinee = scrut, arms = arms } ->
+      EMatch {
+        scrutinee = compileResolveConstructorWires scrut ctorDefs,
+        arms = compileResolveConstructorArms arms ctorDefs []
+      }
+    EConstruct { ctor = c, args = args, fields = fs } ->
+      EConstruct {
+        ctor = lookupCtorWireName c ctorDefs,
+        args = compileResolveConstructorExprList args ctorDefs [],
+        fields = fs
+      }
+    EConstruct { ctor = c, args = args } ->
+      EConstruct {
+        ctor = lookupCtorWireName c ctorDefs,
+        args = compileResolveConstructorExprList args ctorDefs []
+      }
+    ERecord { fields = fs } ->
+      ERecord { fields = compileResolveConstructorFields fs ctorDefs [] }
+
+@category "engine-internal"
+compileResolveConstructorExprList : (exprs: List (Expr Any)) -> a -> (acc: List (Expr Any)) -> List (Expr Any)
+compileResolveConstructorExprList exprs ctorDefs acc =
+  case head exprs of
+    Nothing -> acc
+    Just expr ->
+      compileResolveConstructorExprList
+        (tailOr exprs)
+        ctorDefs
+        (appendItem (compileResolveConstructorWires expr ctorDefs) acc)
+
+@category "engine-internal"
+compileResolveConstructorFields : (fields: a) -> a -> (acc: a) -> a
+compileResolveConstructorFields fields ctorDefs acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let resolved = {
+        name = field.name,
+        value = compileResolveConstructorWires field.value ctorDefs
+      }
+      compileResolveConstructorFields (tailOr fields) ctorDefs (appendItem resolved acc)
+
+@category "engine-internal"
+compileResolveConstructorArms : (arms: a) -> a -> (acc: a) -> a
+compileResolveConstructorArms arms ctorDefs acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let resolvedPattern = compileResolveConstructorPattern arm.pattern ctorDefs
+      let resolvedBody = compileResolveConstructorWires arm.body ctorDefs
+      let resolvedArm = case lookup arm "guard" of
+        Nothing -> { pattern = resolvedPattern, body = resolvedBody }
+        Just guard -> {
+          pattern = resolvedPattern,
+          guard = compileResolveConstructorWires guard ctorDefs,
+          body = resolvedBody
+        }
+      compileResolveConstructorArms (tailOr arms) ctorDefs (appendItem resolvedArm acc)
+
+@category "engine-internal"
+compileResolveConstructorPattern : (pattern: (Pattern Any)) -> a -> (Pattern Any)
+compileResolveConstructorPattern pattern ctorDefs =
+  case pattern of
+    PatLit {} -> pattern
+    PatVar {} -> pattern
+    PatWildcard -> pattern
+    PatConstruct { ctor = c, args = args, fields = fs } ->
+      PatConstruct {
+        ctor = lookupCtorWireName c ctorDefs,
+        args = compileResolveConstructorPatternList args ctorDefs [],
+        fields = fs
+      }
+    PatConstruct { ctor = c, args = args } ->
+      PatConstruct {
+        ctor = lookupCtorWireName c ctorDefs,
+        args = compileResolveConstructorPatternList args ctorDefs []
+      }
+
+@category "engine-internal"
+compileResolveConstructorPatternList : (patterns: List (Pattern Any)) -> a -> (acc: List (Pattern Any)) -> List (Pattern Any)
+compileResolveConstructorPatternList patterns ctorDefs acc =
+  case head patterns of
+    Nothing -> acc
+    Just pattern ->
+      compileResolveConstructorPatternList
+        (tailOr patterns)
+        ctorDefs
+        (appendItem (compileResolveConstructorPattern pattern ctorDefs) acc)
+
+-- Compile-time calls retain the parser's bare spelling until the defining
+-- module is known. The host supplies only that module's explicit name→fnId
+-- index; this Fenel walk owns selection and rewrites exact local hits to their
+-- canonical full ids. Unlisted, already-qualified, dynamic, and effect heads
+-- are unchanged; normaliseToCore then refuses the unresolvable ones
+-- (compileUnresolvedHeads) and lowers global function values to runtime
+-- references (compileResolveValueRefs). The rewritten Expr is shared by JS/Wasm/LLVM lowering; LLVM's
+-- host projection intentionally omits `std:mod` and `std:appendItem` so those
+-- native ABI calls retain their short C runtime symbols.
+@label "Resolve compile calls"
+@description "Resolve bare ECall heads through the explicit defining-module binding index. Fenel owns lookup and the recursive Expr rewrite; the host only marshals the current module's declaration bindings."
+@tags "engine" "compiler" "resolution" "self-host" "field-identity" "phase-3"
+compileResolveCalls : (expr: (Expr Any)) -> (bindings: a) -> (Expr Any)
+compileResolveCalls expr bindings =
+  case expr of
+    ELit {} -> expr
+    EVar {} -> expr
+    ECall { fnId = f, args = args } ->
+      let structuralBoolean = and (elem f ["if", "?:", "and", "or"]) (eq (lookup expr "structural") (Just true))
+      let resolved = if structuralBoolean then f else compileResolveCallHead f bindings
+      mapSet (mapSet expr "fnId" resolved) "args" (compileResolveCallList args bindings [])
+    ELambda { params = ps, body = bd } ->
+      ELambda { params = ps, body = compileResolveCalls bd bindings }
+    EMatch { scrutinee = scrut, arms = arms } ->
+      EMatch {
+        scrutinee = compileResolveCalls scrut bindings,
+        arms = compileResolveCallArms arms bindings []
+      }
+    EConstruct { ctor = c, args = args, fields = fs } ->
+      EConstruct {
+        ctor = c,
+        args = compileResolveCallList args bindings [],
+        fields = fs
+      }
+    EConstruct { ctor = c, args = args } ->
+      EConstruct { ctor = c, args = compileResolveCallList args bindings [] }
+    ERecord { fields = fs } ->
+      ERecord { fields = compileResolveCallFields fs bindings [] }
+
+-- Compilers refuse what they cannot compile correctly. After resolution, a
+-- reference the target lowerings would turn into broken code is collected:
+--   * a dynamic `$dyn:<path>` head (a `{var}` callee) whose root segment is no
+--     local binder in scope (a parameter, a lambda parameter, a pattern
+--     binder). JS would emit a call of a free JS variable (`std.add(1, 2)`);
+--     Wasm and LLVM already refuse an out-of-scope closure local;
+--   * a variable reference whose root is no local binder in scope and which
+--     names no global function (compileVarUnresolved): a dotted or qualified
+--     name (`std.add $ 1`, `let g = std.add`), `_`, or an uppercase name;
+--   * a dotted string head (`std.some`) the module binding index left
+--     unresolved: the compiler knows no canonical id for it, and the emitted
+--     runtime key `$fenel["std.some"]` names no runtime entry.
+-- normaliseToCore turns the first one into an honest Unsupported refusal.
+-- Effect (`$effect:`) and qualified (`owner:name`) heads are not dotted paths.
+-- A `_` string head (the text `_ 1`) names nothing and is refused too.
+-- `_` names nothing, so it never enters the scope (compileScopeWith): the
+-- synthetic do-block statement lambda `\_ -> rest` binds no visible name once
+-- sequencing is reconstituted (ceReconDoRun), and `_` in a pattern is a
+-- wildcard.
+-- These walks pass no lambda to a separately compiled function (map, filter,
+-- flatMap, all): the Wasm self-host harness cannot call a closure created by
+-- one compiled function from inside another, and normaliseToCore self-hosts.
+@label "Collect unresolvable references"
+@description "Walk a resolved Expr with the lexical binders in scope (parameters, lambda parameters, pattern binders; never `_`) and collect every reference no target can compile correctly: a `$dyn:<path>` head whose root is no binder in scope, a variable whose root is no binder in scope and which names no global function (dotted, qualified, `_` or uppercase), or a dotted string head the binding index left unresolved."
+@tags "engine" "compiler" "resolution" "self-host"
+@category "engine-internal"
+compileUnresolvedHeads : (expr: (Expr Any)) -> (scope: List String) -> (bindings: a) -> List String
+compileUnresolvedHeads expr scope bindings =
+  case expr of
+    ELit {} -> []
+    EVar { name = n } -> if compileVarUnresolved n scope bindings then [n] else []
+    ECall { fnId = f, args = args } ->
+      let selfHeads = if compileHeadUnresolved f scope then [f] else []
+      compileUnresolvedHeadList args scope bindings selfHeads
+    ELambda { params = ps, body = bd } -> compileUnresolvedHeads bd (compileScopeWith scope ps) bindings
+    EMatch { scrutinee = scrut, arms = arms } ->
+      compileUnresolvedArmList arms scope bindings (compileUnresolvedHeads scrut scope bindings)
+    EConstruct { args = args } -> compileUnresolvedHeadList args scope bindings []
+    ERecord { fields = fs } -> compileUnresolvedFieldList fs scope bindings []
+
+@category "engine-internal"
+compileUnresolvedHeadList : (exprs: List (Expr Any)) -> (scope: List String) -> (bindings: a) -> (acc: List String) -> List String
+compileUnresolvedHeadList exprs scope bindings acc =
+  case head exprs of
+    Nothing -> acc
+    Just expr ->
+      compileUnresolvedHeadList
+        (tailOr exprs)
+        scope
+        bindings
+        (concat acc (compileUnresolvedHeads expr scope bindings))
+
+@category "engine-internal"
+compileUnresolvedFieldList : (fields: a) -> (scope: List String) -> (bindings: a) -> (acc: List String) -> List String
+compileUnresolvedFieldList fields scope bindings acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      compileUnresolvedFieldList
+        (tailOr fields)
+        scope
+        bindings
+        (concat acc (compileUnresolvedHeads field.value scope bindings))
+
+@category "engine-internal"
+compileUnresolvedArmList : (arms: a) -> (scope: List String) -> (bindings: a) -> (acc: List String) -> List String
+compileUnresolvedArmList arms scope bindings acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      compileUnresolvedArmList
+        (tailOr arms)
+        scope
+        bindings
+        (concat acc (compileUnresolvedArmHeads arm scope bindings))
+
+@category "engine-internal"
+compileUnresolvedArmHeads : (arm: a) -> (scope: List String) -> (bindings: a) -> List String
+compileUnresolvedArmHeads arm scope bindings =
+  let armScope = compileScopeWith scope (compilePatternBinders arm.pattern)
+  let guardHeads = case lookup arm "guard" of
+    Nothing -> []
+    Just guard -> compileUnresolvedHeads guard armScope bindings
+  concat guardHeads (compileUnresolvedHeads arm.body armScope bindings)
+
+-- compileScopeWith scope names: extend the lexical scope with binder names,
+-- dropping `_`. It names nothing (the do-block statement lambda, a wildcard).
+@category "engine-internal"
+compileScopeWith : (scope: List String) -> (names: List String) -> List String
+compileScopeWith scope names =
+  case head names of
+    Nothing -> scope
+    Just n ->
+      if eq n "_"
+      then compileScopeWith scope (tailOr names)
+      else compileScopeWith (appendItem n scope) (tailOr names)
+
+-- compileVarUnresolved name scope bindings: a variable reference no target
+-- lowers to a bound name or a global function. A name whose root is a binder
+-- in scope is local; `null` lowers to the target's null literal. Outside
+-- scope, a bare lowercase name is a global function passed as a value: the
+-- module binding index resolves it to its canonical id, and otherwise it is
+-- a function the target runtime namespace provides by its bare name (a
+-- native: `map isString xs`), exactly like a bare call head the index leaves
+-- unresolved. compileResolveValueRefs lowers it to that runtime reference.
+-- A dotted or qualified name outside scope, `_`, and an uppercase name (no
+-- function) are refused.
+@category "engine-internal"
+compileVarUnresolved : (name: String) -> (scope: List String) -> (bindings: a) -> Bool
+compileVarUnresolved name scope bindings =
+  if elem (fromMaybe name (head (split name "."))) scope then false
+  else if eq name "null" then false
+  else not (compileVarIsGlobalFunction name scope)
+
+-- compileVarIsGlobalFunction name scope: the variable names a global function
+-- (a bare lowercase name, neither dotted nor qualified, bound by no binder in
+-- scope). Function names start with a lowercase letter; `_`, `$`-prefixed
+-- compiler names and constructors do not. `null` is the null literal (every
+-- target lowers the variable `null` to it), never a function.
+@category "engine-internal"
+compileVarIsGlobalFunction : (name: String) -> (scope: List String) -> Bool
+compileVarIsGlobalFunction name scope =
+  if eq name "null" then false
+  else if contains name "." then false
+  else if contains name ":" then false
+  else if elem name scope then false
+  else if eq (length name) 0 then false
+  else elem (slice name 0 1) "abcdefghijklmnopqrstuvwxyz"
+
+-- compileResolveValueRefs expr scope bindings: lower every global function
+-- passed as a VALUE to the runtime reference a call head lowers to. The
+-- variable becomes `$fn:<runtime key>`, where the key is what
+-- compileResolveCallHead gives a call head of the same spelling: the
+-- canonical id for a name the module binding index resolves (`demo:helper`),
+-- the bare name otherwise (`isString`). JS emits `$fenel["demo:helper"]` /
+-- `$fenel.isString`, the same member a call emits, so the reference resolves
+-- in every JS namespace that serves the call (the shared self-host runtime,
+-- and the compiled parser and resolver `with` namespace, where `$fenel` is
+-- the namespace itself). Wasm and LLVM have no global function value and
+-- refuse the variable as out of scope. A binder in scope shadows a global
+-- (parameters, lambda parameters, let bindings, pattern binders), and `$fn:`
+-- is no lexical name: a `$` cannot start a Fenel identifier, and a written
+-- `{var: "$fn:x"}` is qualified, so the scan refuses it first.
+@label "Resolve function value references"
+@description "Rewrite every variable that names a global function (a bare lowercase name bound by no binder in scope) to `$fn:<runtime key>`, the key a call head of the same spelling resolves to through the module binding index: the canonical id when the index lists it, the bare name otherwise. Backends lower it to the runtime reference a call uses (JS `$fenel[key]`); binders in scope shadow globals."
+@tags "engine" "compiler" "resolution" "self-host"
+@category "engine-internal"
+compileResolveValueRefs : (expr: (Expr Any)) -> (scope: List String) -> (bindings: a) -> (Expr Any)
+compileResolveValueRefs expr scope bindings =
+  case expr of
+    ELit {} -> expr
+    EVar { name = n } ->
+      if compileVarIsGlobalFunction n scope
+      then EVar { name = concat "$fn:" (compileResolveCallHead n bindings) }
+      else expr
+    ECall { fnId = f, args = args } ->
+      mapSet expr "args" (compileResolveValueRefList args scope bindings [])
+    ELambda { params = ps, body = bd } ->
+      ELambda { params = ps, body = compileResolveValueRefs bd (compileScopeWith scope ps) bindings }
+    EMatch { scrutinee = scrut, arms = arms } ->
+      EMatch {
+        scrutinee = compileResolveValueRefs scrut scope bindings,
+        arms = compileResolveValueRefArms arms scope bindings []
+      }
+    EConstruct { ctor = c, args = args, fields = fs } ->
+      EConstruct {
+        ctor = c,
+        args = compileResolveValueRefList args scope bindings [],
+        fields = fs
+      }
+    EConstruct { ctor = c, args = args } ->
+      EConstruct { ctor = c, args = compileResolveValueRefList args scope bindings [] }
+    ERecord { fields = fs } ->
+      ERecord { fields = compileResolveValueRefFields fs scope bindings [] }
+
+@category "engine-internal"
+compileResolveValueRefList : (exprs: List (Expr Any)) -> (scope: List String) -> (bindings: a) -> (acc: List (Expr Any)) -> List (Expr Any)
+compileResolveValueRefList exprs scope bindings acc =
+  case head exprs of
+    Nothing -> acc
+    Just expr ->
+      compileResolveValueRefList
+        (tailOr exprs)
+        scope
+        bindings
+        (appendItem (compileResolveValueRefs expr scope bindings) acc)
+
+@category "engine-internal"
+compileResolveValueRefFields : (fields: a) -> (scope: List String) -> (bindings: a) -> (acc: a) -> a
+compileResolveValueRefFields fields scope bindings acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let resolved = {
+        name = field.name,
+        value = compileResolveValueRefs field.value scope bindings
+      }
+      compileResolveValueRefFields (tailOr fields) scope bindings (appendItem resolved acc)
+
+@category "engine-internal"
+compileResolveValueRefArms : (arms: a) -> (scope: List String) -> (bindings: a) -> (acc: a) -> a
+compileResolveValueRefArms arms scope bindings acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let armScope = compileScopeWith scope (compilePatternBinders arm.pattern)
+      let resolvedBody = compileResolveValueRefs arm.body armScope bindings
+      let resolvedArm = case lookup arm "guard" of
+        Nothing -> { pattern = arm.pattern, body = resolvedBody }
+        Just guard -> {
+          pattern = arm.pattern,
+          guard = compileResolveValueRefs guard armScope bindings,
+          body = resolvedBody
+        }
+      compileResolveValueRefArms (tailOr arms) scope bindings (appendItem resolvedArm acc)
+
+@category "engine-internal"
+compilePatternBinders : (pattern: (Pattern Any)) -> List String
+compilePatternBinders pattern =
+  case pattern of
+    PatVar { name = n } -> [n]
+    PatConstruct { args = args } -> compilePatternBinderList args []
+    PatLit {} -> []
+    PatWildcard -> []
+
+@category "engine-internal"
+compilePatternBinderList : (patterns: List (Pattern Any)) -> (acc: List String) -> List String
+compilePatternBinderList patterns acc =
+  case head patterns of
+    Nothing -> acc
+    Just pattern -> compilePatternBinderList (tailOr patterns) (concat acc (compilePatternBinders pattern))
+
+@category "engine-internal"
+compileHeadUnresolved : (fnId: String) -> (scope: List String) -> Bool
+compileHeadUnresolved fnId scope =
+  if eq fnId "_" then true
+  else if startsWith fnId "$dyn:"
+  then
+    let path = slice fnId 5 (length fnId)
+    not (elem (fromMaybe path (head (split path "."))) scope)
+  else if contains fnId ":" then false
+  else if contains fnId "."
+  then compileIdentifierSegments (split fnId ".")
+  else false
+
+-- compileIdentifierSegments segments: every dotted segment is non-empty and
+-- starts like an identifier (a letter or `_`).
+@category "engine-internal"
+compileIdentifierSegments : (segments: List String) -> Bool
+compileIdentifierSegments segments =
+  case head segments of
+    Nothing -> true
+    Just segment ->
+      if (gt (length segment) 0) && (elem (slice segment 0 1) "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
+      then compileIdentifierSegments (tailOr segments)
+      else false
+
+@category "engine-internal"
+compileResolveCallHead : (fnId: String) -> (bindings: a) -> String
+compileResolveCallHead fnId bindings =
+  -- Qualified/effect/dynamic heads are already semantic names. Even a
+  -- hostile host record containing such a key cannot reinterpret them.
+  if contains fnId ":"
+  then fnId
+  else case mapGet bindings fnId of
+    Nothing -> fnId
+    Just fullFnId -> fullFnId
+
+@category "engine-internal"
+compileResolveCallList : (exprs: List (Expr Any)) -> (bindings: a) -> (acc: List (Expr Any)) -> List (Expr Any)
+compileResolveCallList exprs bindings acc =
+  case head exprs of
+    Nothing -> acc
+    Just expr ->
+      compileResolveCallList
+        (tailOr exprs)
+        bindings
+        (appendItem (compileResolveCalls expr bindings) acc)
+
+@category "engine-internal"
+compileResolveCallFields : (fields: a) -> (bindings: a) -> (acc: a) -> a
+compileResolveCallFields fields bindings acc =
+  case head fields of
+    Nothing -> acc
+    Just field ->
+      let resolved = {
+        name = field.name,
+        value = compileResolveCalls field.value bindings
+      }
+      compileResolveCallFields (tailOr fields) bindings (appendItem resolved acc)
+
+@category "engine-internal"
+compileResolveCallArms : (arms: a) -> (bindings: a) -> (acc: a) -> a
+compileResolveCallArms arms bindings acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let resolvedBody = compileResolveCalls arm.body bindings
+      let resolvedArm = case lookup arm "guard" of
+        Nothing -> { pattern = arm.pattern, body = resolvedBody }
+        Just guard -> {
+          pattern = arm.pattern,
+          guard = compileResolveCalls guard bindings,
+          body = resolvedBody
+        }
+      compileResolveCallArms (tailOr arms) bindings (appendItem resolvedArm acc)
+
+-- Compiler slots retain source-level parameter spellings even when their
+-- semantic key is positional, so the universal semantic-slot validator's
+-- stricter `_n` wire projection is not directly the compiler wire policy.
+-- Validate the compiler's actual wire names in Fenel, then canonicalise only
+-- positional wire projections before delegating every key/UUID/ordinal and
+-- duplicate-semantic-key decision to fieldSemanticSlotsError.
+@label "Compiler field slots error"
+@description "Validate one compiler/reflection slot list. Current compiler wire names must be non-empty and unique; UUID/key/ordinal validity and duplicate semantic keys delegate to fieldSemanticSlotsError after a positional-wire-only canonical projection. Nothing means valid."
+@tags "engine" "compiler" "field-identity" "semantic-slot" "phase-3"
+compileFieldSlotsError : (slots: List a) -> Maybe String
+compileFieldSlotsError slots =
+  case compileFieldSlotWireError slots [] of
+    Just message -> Just message
+    Nothing -> fieldSemanticSlotsError (compileCanonicalFieldSlots slots 0 [])
+
+@label "Compiler field slots error with SourceHandles"
+@description "Source-registry compiler validation: preserve compiler wire, duplicate, ordinal, and UUID laws while admitting only rigorously validated lock-less SourceHandles."
+@tags "engine" "compiler" "field-identity" "semantic-slot" "source-handle" "phase-3"
+compileFieldSlotsErrorWithSourceHandles : (slots: List a) -> Maybe String
+compileFieldSlotsErrorWithSourceHandles slots =
+  case compileFieldSlotWireError slots [] of
+    Just message -> Just message
+    Nothing -> fieldSemanticSlotsErrorWithSourceHandles (compileCanonicalFieldSlots slots 0 [])
+
+@category "engine-internal"
+compileFieldSlotWireError : (slots: List a) -> (seen: List String) -> Maybe String
+compileFieldSlotWireError slots seen =
+  case head slots of
+    Nothing -> Nothing
+    Just slot ->
+      if not (isString slot.wireName)
+      then Just "compiler field slot: wireName must be a string"
+      else if eq slot.wireName ""
+      then Just "compiler field slot: wireName must not be empty"
+      else if elem slot.wireName seen
+      then Just (concat "compiler field slot: duplicate wireName " slot.wireName)
+      else compileFieldSlotWireError (tailOr slots) (appendItem slot.wireName seen)
+
+@category "engine-internal"
+compileCanonicalFieldSlots : (slots: List a) -> (ordinal: Number) -> (acc: List a) -> List a
+compileCanonicalFieldSlots slots ordinal acc =
+  case head slots of
+    Nothing -> acc
+    Just slot ->
+      let canonical = case slot.key of
+        PositionalField -> {
+          key = slot.key,
+          wireName = concat "_" (fieldNaturalDecimal ordinal)
+        }
+        NamedField -> { key = slot.key, wireName = slot.wireName }
+      compileCanonicalFieldSlots (tailOr slots) (add ordinal 1) (appendItem canonical acc)
+
+-- objectHasDollarPrefixedKey — check whether any field name in the
+-- list starts with `$`. Mirrors the TS oracle's multi-key
+-- `for (k of keys) if (k.startsWith("$")) ...` guard.
+@label "Object has $-prefixed key"
+@description "Check whether any field name in the list starts with `$`. Multi-key marker-rejection helper for lowerObjectExpr."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+objectHasDollarPrefixedKey : (fields: a) -> Boolean
+objectHasDollarPrefixedKey fields =
+  case head fields of
+    Nothing -> false
+    Just f ->
+      if startsWith f.name "$"
+      then true
+      else case tail fields of
+        Nothing -> false
+        Just rest -> objectHasDollarPrefixedKey rest
+
+-- normalizeToArgList — canonicalise the value of a single-key
+-- JlObject's only field into a list of JsonLogic nodes. Mirrors the
+-- TS oracle's `argList = Array.isArray(rawArgs) ? rawArgs : [rawArgs]`.
+@label "Normalise to arg list"
+@description "Canonicalise a single-key JlObject's only field value into a list. Mirrors `argList = Array.isArray(rawArgs) ? rawArgs : [rawArgs]`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+normalizeToArgList : (rawArgs: (JsonLogic Any)) -> (emptyList: List a) -> a
+normalizeToArgList rawArgs emptyList =
+  case rawArgs of
+    JlArray { items = xs } -> xs
+    JlNull -> appendItem rawArgs emptyList
+    JlBool -> appendItem rawArgs emptyList
+    JlNumber -> appendItem rawArgs emptyList
+    JlString -> appendItem rawArgs emptyList
+    JlTagged -> appendItem rawArgs emptyList
+    JlObject -> appendItem rawArgs emptyList
+
+-- lastBindingName — read the last binding's name from a non-empty
+-- bindings list. Used by lowerLetOp / lowerDoSequence to synthesise
+-- the implicit body when only bindings remain. The length-1 check
+-- inside the head's Just branch correctly identifies the last element;
+-- a naive `case tail of Nothing -> b.name | Just rest -> recurse rest`
+-- mishandles the singleton case because std:tail returns Just [] for
+-- 1-element lists (not Nothing).
+@label "Last binding name"
+@description "Read the last binding's name from a non-empty bindings list. Used to synthesise let's implicit body."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+lastBindingName : (bindings: a) -> String
+lastBindingName bindings =
+  case head bindings of
+    Nothing -> ""
+    Just b ->
+      if eq (length bindings) 1
+      then b.name
+      else case tail bindings of
+        Nothing -> b.name
+        Just rest -> lastBindingName rest
+
+-- isSingleLetObject — recognise a JsonLogic node that is `{let:
+-- <something>}` with EXACTLY one field. Mirrors the TS oracle's
+-- `arg !== null && typeof arg === "object" && !Array.isArray(arg) &&
+-- "let" in arg && Object.keys(arg).length === 1`.
+@label "Is single-let object"
+@description "Recognise a JsonLogic node that is `{let: <something>}` with exactly one field."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+isSingleLetObject : (node: (JsonLogic Any)) -> Boolean
+isSingleLetObject node =
+  case node of
+    JlObject { fields = fs } ->
+      if eq (length fs) 1
+      then isFirstFieldNamed fs "let"
+      else false
+    JlNull -> false
+    JlBool -> false
+    JlNumber -> false
+    JlString -> false
+    JlArray -> false
+    JlTagged -> false
+
+-- isFirstFieldNamed — head's name equals the given string. Helper
+-- for isSingleLetObject.
+@label "Is first field named"
+@description "Head's name equals the given string. Helper for isSingleLetObject."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+isFirstFieldNamed : (fields: a) -> (name: String) -> Boolean
+isFirstFieldNamed fields name =
+  case head fields of
+    Nothing -> false
+    Just f -> eq f.name name
+
+-- extractLetFields — pull the inner JlObject's field list out of a
+-- known `{let: <inner>}` node. Caller (`collectLeadingLets`) only
+-- invokes this after `isSingleLetObject` returns true, so the outer
+-- node is guaranteed to be `JlObject` with `head.value` = `JlObject`.
+-- The degenerate fall-throughs return the caller's already-built
+-- bindings accumulator unchanged via an empty list, which the caller
+-- threads as `lowerLetBindings`' input — no bindings added in that
+-- unreachable path.
+@label "Extract let fields"
+@description "Pull the inner JlObject's field list out of a known `{let: <inner>}` node."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+extractLetFields : (node: (JsonLogic Any)) -> (emptyList: List a) -> a
+extractLetFields node emptyList =
+  case node of
+    JlObject { fields = fs } ->
+      case head fs of
+        Nothing -> emptyList
+        Just first ->
+          case first.value of
+            JlObject { fields = inner } -> inner
+            JlNull -> emptyList
+            JlBool -> emptyList
+            JlNumber -> emptyList
+            JlString -> emptyList
+            JlArray -> emptyList
+            JlTagged -> emptyList
+    JlNull -> emptyList
+    JlBool -> emptyList
+    JlNumber -> emptyList
+    JlString -> emptyList
+    JlArray -> emptyList
+    JlTagged -> emptyList
+
+-- ifNthArg — get the nth arg from a list (positional indexing helper
+-- for if-chain). Returns JlNull on out-of-range (the lengths are
+-- already checked in lowerIfChain).
+@label "If nth arg"
+@description "Get the nth arg from a list. Returns JlNull on out-of-range (callers pre-check length)."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+ifNthArg : (args: a) -> (idx: Number) -> (JsonLogic Any)
+ifNthArg args idx =
+  case head args of
+    Nothing -> JlNull
+    Just h ->
+      if eq idx 0
+      then h
+      else case tail args of
+        Nothing -> JlNull
+        Just rest -> ifNthArg rest (sub idx 1)
+
+-- ifTailFrom — get the tail starting at index `idx` (drops the first
+-- idx elements). Used by lowerIfChain to recurse on the remaining
+-- cond/then/...else after consuming one cond/then pair.
+@label "If tail from"
+@description "Get the tail starting at index `idx`. Functional equivalent of Array.slice without truncation."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+ifTailFrom : (args: a) -> (idx: Number) -> (acc: a) -> a
+ifTailFrom args idx acc =
+  if eq idx 0
+  then collectAllItems args acc
+  else case tail args of
+    Nothing -> acc
+    Just rest -> ifTailFrom rest (sub idx 1) acc
+
+-- collectAllItems — append every item of a list to an accumulator.
+-- Functional equivalent of Array.slice with no truncation.
+@label "Collect all items"
+@description "Append every item of a list to an accumulator."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectAllItems : (xs: List a) -> (acc: List a) -> List a
+collectAllItems xs acc =
+  case head xs of
+    Nothing -> acc
+    Just h ->
+      let accNext = appendItem h acc
+      case tail xs of
+        Nothing -> accNext
+        Just rest -> collectAllItems rest accNext
+
+-- collectParamNames — walk a list of JsonLogic nodes, expecting each
+-- to be a JlString; accumulate the string values. Errors on non-
+-- string params (mirrors the TS oracle's per-element typeof check).
+@label "Collect param names"
+@description "Walk a list of JsonLogic nodes, expecting JlString; accumulate string values. Errors on non-string."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectParamNames : (items: a) -> (originalNode: (JsonLogic Any)) -> (acc: List String) -> a
+collectParamNames items originalNode acc =
+  case head items of
+    Nothing -> Ok acc
+    Just h ->
+      case h of
+        JlString { value = s } ->
+          let accNext = appendItem s acc
+          case tail items of
+            Nothing -> Ok accNext
+            Just rest ->
+              collectParamNames rest originalNode accNext
+        JlNull -> Err (Unsupported { reason = "fn param must be a string", node = originalNode })
+        JlBool -> Err (Unsupported { reason = "fn param must be a string", node = originalNode })
+        JlNumber -> Err (Unsupported { reason = "fn param must be a string", node = originalNode })
+        JlArray -> Err (Unsupported { reason = "fn param must be a string", node = originalNode })
+        JlTagged -> Err (Unsupported { reason = "fn param must be a string", node = originalNode })
+        JlObject -> Err (Unsupported { reason = "fn param must be a string", node = originalNode })
+
+-- ifTailExcept — walk args, dropping the element at `excludeIdx` and
+-- collecting everything before it (used by the flat-`fn` form to
+-- separate params from the trailing body).
+@label "If tail except"
+@description "Walk args, dropping the element at `excludeIdx` and collecting everything before it."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+ifTailExcept : (args: a) -> (excludeIdx: Number) -> (idx: Number) -> (acc: a) -> a
+ifTailExcept args excludeIdx idx acc =
+  case head args of
+    Nothing -> acc
+    Just h ->
+      if eq idx excludeIdx
+      then acc
+      else
+        let accNext = appendItem h acc
+        case tail args of
+          Nothing -> accNext
+          Just rest -> ifTailExcept rest excludeIdx (add idx 1) accNext
+
+-- resolveCallee — turn a call's first arg into a fnId string. Direct
+-- string → use as-is. Indirect `{var: "name"}` → `$dyn:name`. Other
+-- shapes → error.
+@label "Resolve callee"
+@description "Turn a call's first arg into a fnId string. Direct → use as-is. Indirect `{var}` → `$dyn:name`. Errors otherwise."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+resolveCallee : (callee: (JsonLogic Any)) -> (originalNode: (JsonLogic Any)) -> a
+resolveCallee callee originalNode =
+  case callee of
+    JlString { value = s } -> Ok s
+    JlObject { fields = fs } ->
+      if eq (length fs) 1
+      then
+        let first = unwrapFirstField fs
+        if eq first.name "var"
+        then case first.value of
+          JlString { value = ref } -> Ok (concat "$dyn:" ref)
+          JlNull -> Err (Unsupported { reason = "indirect call's var must reference a string name", node = originalNode })
+          JlBool -> Err (Unsupported { reason = "indirect call's var must reference a string name", node = originalNode })
+          JlNumber -> Err (Unsupported { reason = "indirect call's var must reference a string name", node = originalNode })
+          JlArray -> Err (Unsupported { reason = "indirect call's var must reference a string name", node = originalNode })
+          JlTagged -> Err (Unsupported { reason = "indirect call's var must reference a string name", node = originalNode })
+          JlObject -> Err (Unsupported { reason = "indirect call's var must reference a string name", node = originalNode })
+        else Err (Unsupported { reason = "call callee must be a fnId string or {var: name}", node = originalNode })
+      else Err (Unsupported { reason = "call callee must be a fnId string or {var: name}", node = originalNode })
+    JlNull -> Err (Unsupported { reason = "call callee must be a fnId string or {var: name}", node = originalNode })
+    JlBool -> Err (Unsupported { reason = "call callee must be a fnId string or {var: name}", node = originalNode })
+    JlNumber -> Err (Unsupported { reason = "call callee must be a fnId string or {var: name}", node = originalNode })
+    JlArray -> Err (Unsupported { reason = "call callee must be a fnId string or {var: name}", node = originalNode })
+    JlTagged -> Err (Unsupported { reason = "call callee must be a fnId string or {var: name}", node = originalNode })
+
+-- unwrapFirstField — take the head field out of a JlField list.
+-- Caller guarantees non-empty.
+@label "Unwrap first field"
+@description "Take the head field out of a JlField list."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+unwrapFirstField : (fields: List (JlField (JsonLogic Any))) -> JlField (JsonLogic Any)
+unwrapFirstField fields =
+  case head fields of
+    Nothing -> JlField { name = "", value = JlNull }
+    Just f -> f
+
+-- lookupCtorDef — find a ctor name in the marshalled ctorDefs list.
+-- Returns `Just <fields>` when found, `Nothing` otherwise. The TS
+-- oracle indexes the JS map directly; the marshalled list is the
+-- Fenel equivalent (the order doesn't affect lookup semantics).
+@label "Lookup ctor def"
+@description "Find a ctor name in the marshalled ctorDefs list. Returns `Just fields` or `Nothing`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+lookupCtorDef : (ctor: String) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> Maybe (List CompileFieldSlot)
+lookupCtorDef ctor ctorDefs =
+  case find (\entry -> eq entry.name ctor) ctorDefs of
+    Nothing -> Nothing
+    Just entry -> Just entry.fields
+
+-- Exact semantic constructor targets remain in saved/source JSON Logic long
+-- enough to select owner-specific field metadata. Once selected, every backend
+-- must emit the declaration's established short ADT tag. Unknown/caller-owned
+-- metadata is identity-preserving.
+@label "Lookup ctor wire name"
+@description "Project an exact semantic constructor target to its runtime ADT wire tag after constructor metadata selection; unknown spellings remain unchanged."
+@tags "engine" "internal" "compiler" "constructor" "signature-substrate"
+@category "engine-internal"
+lookupCtorWireName : (ctor: String) -> a -> String
+lookupCtorWireName ctor ctorDefs =
+  case find (\entry -> eq entry.name ctor) ctorDefs of
+    Nothing -> ctor
+    Just entry -> entry.wireName
+
+@label "Exact ctor wire unresolved"
+@description "Fail-closed guard for any constructor projection that remains in or enters the reserved @ctor namespace."
+@tags "engine" "internal" "compiler" "constructor" "signature-substrate"
+@category "engine-internal"
+exactCtorWireUnresolved : (ctor: String) -> a -> Boolean
+exactCtorWireUnresolved ctor ctorDefs =
+  startsWith (lookupCtorWireName ctor ctorDefs) "@ctor/"
+
+@label "Lookup ctor def ambiguity"
+@description "Report whether the requested source constructor spelling was omitted because multiple semantic owners define it."
+@tags "engine" "internal" "field-identity"
+@category "engine-internal"
+lookupCtorDefAmbiguous : (ctor: String) -> a -> Boolean
+lookupCtorDefAmbiguous ctor ctorDefs =
+  -- Keep first-match semantics while the existing iterative find native avoids
+  -- one interpreter frame chain per unrelated constructor in a large registry.
+  case find (\entry -> eq entry.name ctor) ctorDefs of
+    Nothing -> false
+    Just entry -> entry.ambiguous
+
+-- allKeysInCtorDef — every field name in `recFields` appears in
+-- `ctorDef`. Mirrors the TS oracle's `argKeys.every((k) =>
+-- ctorDef.includes(k))`.
+@label "All keys in ctor def"
+@description "Every field name in `recFields` appears in `ctorDef`. Mirrors `argKeys.every((k) => ctorDef.includes(k))`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+allKeysInCtorDef : (recFields: a) -> (ctorDef: List CompileFieldSlot) -> Boolean
+allKeysInCtorDef recFields ctorDef =
+  case head recFields of
+    Nothing -> true
+    Just f ->
+      if ctorDefHasWireName f.name ctorDef
+      then case tail recFields of
+        Nothing -> true
+        Just rest -> allKeysInCtorDef rest ctorDef
+      else false
+
+-- Explicit resolver-boundary projection: raw source object keys are compared
+-- with the current wireName, while the returned/retained metadata is the whole
+-- key-bearing CompileFieldSlot.
+ctorDefHasWireName : (wireName: String) -> (ctorDef: List CompileFieldSlot) -> Boolean
+ctorDefHasWireName wireName ctorDef =
+  case head ctorDef of
+    Nothing -> false
+    Just slot ->
+      if eq slot.wireName wireName
+      then true
+      else case tail ctorDef of
+        Nothing -> false
+        Just rest -> ctorDefHasWireName wireName rest
+
+lookupCtorFieldSlot : (wireName: String) -> (ctorDef: List CompileFieldSlot) -> Maybe CompileFieldSlot
+lookupCtorFieldSlot wireName ctorDef =
+  case head ctorDef of
+    Nothing -> Nothing
+    Just slot ->
+      if eq slot.wireName wireName
+      then Just slot
+      else case tail ctorDef of
+        Nothing -> Nothing
+        Just rest -> lookupCtorFieldSlot wireName rest
+
+resolveCtorFieldSlots : (wireNames: List String) -> (ctorDef: List CompileFieldSlot) -> (acc: List CompileFieldSlot) -> List CompileFieldSlot
+resolveCtorFieldSlots wireNames ctorDef acc =
+  case head wireNames of
+    Nothing -> acc
+    Just wireName ->
+      case lookupCtorFieldSlot wireName ctorDef of
+        Nothing -> acc
+        Just slot ->
+          let next = appendItem slot acc
+          case tail wireNames of
+            Nothing -> next
+            Just rest -> resolveCtorFieldSlots rest ctorDef next
+
+-- lookupFieldInList — find a JlField by name in a List<JlField>.
+-- Returns Just <value> when found, Nothing otherwise.
+@label "Lookup field in list"
+@description "Find a JlField by name in a List<JlField>. Returns `Just value` or `Nothing`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+lookupFieldInList : (name: String) -> (fields: a) -> Maybe (JsonLogic Any)
+lookupFieldInList name fields =
+  case head fields of
+    Nothing -> Nothing
+    Just f ->
+      if eq f.name name
+      then Just f.value
+      else case tail fields of
+        Nothing -> Nothing
+        Just rest -> lookupFieldInList name rest
+
+-- positionalFieldsForCtor — Phase 10a-6: positional construction binds
+-- by ORDER. Returning Nothing forces per-target lowerings to emit
+-- `_<idx>` keys uniformly via their fall-through path, matching the
+-- runtime construct op which also emits `_N` unconditionally. The
+-- legacy "if ctorDef.length === args.length use declared names" rule
+-- is retired.
+@label "Positional fields for ctor"
+@description "When ctorDef is registered AND arg count matches the declared field count, return the field list. Otherwise Nothing."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+positionalFieldsForCtor : (ctorDefM: a) -> (argLen: Number) -> Maybe (List CompileFieldSlot)
+positionalFieldsForCtor ctorDefM argLen =
+  Nothing
+
+-- isUnsupportedOp — the Phase 5 explicitly-rejected ops. The TS
+-- oracle's `case "ann": case "where": ...` block becomes a Bool-
+-- returning predicate so the dispatcher can route to a structured
+-- Unsupported error.
+@label "Is unsupported op"
+@description "Phase 5 explicitly-rejected ops (ann/where/withInstance/pipe/|>/apply/type_def/missing/missing_some/in/merge/map/filter/reduce/all/some/none/substr/length/min/max/deepEq)."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+isUnsupportedOp : (op: String) -> Boolean
+isUnsupportedOp op =
+  if eq op "ann" then true
+  else if eq op "where" then true
+  else if eq op "withInstance" then true
+  else if eq op "pipe" then true
+  else if eq op "|>" then true
+  else if eq op "apply" then true
+  else if eq op "type_def" then true
+  else if eq op "missing" then true
+  else if eq op "missing_some" then true
+  else if eq op "in" then true
+  else if eq op "merge" then true
+  else if eq op "map" then true
+  else if eq op "filter" then true
+  else if eq op "reduce" then true
+  else if eq op "all" then true
+  else if eq op "some" then true
+  else if eq op "none" then true
+  else if eq op "substr" then true
+  else if eq op "length" then true
+  else if eq op "min" then true
+  else if eq op "max" then true
+  else if eq op "deepEq" then true
+  else false
+
+-- opNotationToCodeName — operator-notation key (`+`, `==`, `cat`, ...)
+-- → canonical codeName (`add`, `eq`, `concat`). Mirrors the
+-- OPERATOR_NOTATION_TO_CODENAME table in ir/core.ts.
+@label "Op notation to codename"
+@description "Operator-notation key (`+`, `==`, `cat`, ...) → canonical codeName (`add`, `eq`, `concat`). Mirrors OPERATOR_NOTATION_TO_CODENAME table."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+opNotationToCodeName : (op: String) -> Maybe String
+opNotationToCodeName op =
+  if eq op "+" then Just "add"
+  else if eq op "-" then Just "sub"
+  else if eq op "*" then Just "mul"
+  else if eq op "/" then Just "div"
+  else if eq op "%" then Just "mod"
+  else if eq op "==" then Just "eq"
+  else if eq op "===" then Just "eq"
+  else if eq op "!=" then Just "neq"
+  else if eq op "!==" then Just "neq"
+  else if eq op "<" then Just "lt"
+  else if eq op "<=" then Just "lte"
+  else if eq op ">" then Just "gt"
+  else if eq op ">=" then Just "gte"
+  else if eq op "cat" then Just "concat"
+  else if eq op "!" then Just "not"
+  else if eq op "!!" then Just "truthy"
+  else Nothing
+
+-- shouldUseNamedFields — for a pattern's field-name list, decide
+-- whether to attach it to PatConstruct. true when ctorDef is
+-- registered, the list is non-empty, AND every name is in ctorDef.
+-- Mirrors ir/core.ts:lowerPattern's `useNamedFields` heuristic.
+@label "Should use named fields"
+@description "Decide whether a pattern's field-name list should attach to PatConstruct. True when ctorDef is registered, list is non-empty, AND every name is in ctorDef."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+shouldUseNamedFields : (fieldNames: List String) -> (ctorDefM: Maybe (List CompileFieldSlot)) -> Boolean
+shouldUseNamedFields fieldNames ctorDefM =
+  case ctorDefM of
+    Nothing -> false
+    Just ctorDef ->
+      if eq (length fieldNames) 0
+      then false
+      else allWireNamesInCtorDef fieldNames ctorDef
+
+-- allStringsInList — every string in `xs` appears in `ys`. Used by
+-- shouldUseNamedFields. (Generic over a but called with strings.)
+@label "All strings in list"
+@description "Every string in `xs` appears in `ys`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+allWireNamesInCtorDef : (xs: List String) -> (ys: List CompileFieldSlot) -> Boolean
+allWireNamesInCtorDef xs ys =
+  case head xs of
+    Nothing -> true
+    Just x ->
+      if ctorDefHasWireName x ys
+      then case tail xs of
+        Nothing -> true
+        Just rest -> allWireNamesInCtorDef rest ys
+      else false

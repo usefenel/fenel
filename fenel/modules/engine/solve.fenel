@@ -1,0 +1,1929 @@
+module engine where
+
+-- =========================================================================
+-- solve / solveFn / inhabit + the quantifier builders — the reify payoff.
+-- expr-substrate Phase 5 (brief:
+-- `workstreams/expr-substrate/briefs/phase-5-quantifiers-solve.md`).
+--
+-- THE LOCKED COMPOSITION: `solveFn f = solve (reify f)` — the user writes a
+-- lambda predicate (⇒ a Fn value), `reify` (P3a) lifts its body to `Expr`,
+-- `solve` finds a witness. This is what 3a's `reify` was FOR.
+--
+-- HOME = the engine module (decision 1): `solveFn` needs `engine:reify` +
+-- `engine:jsonLogicToExpr`; `inhabit` reuses the interval reasoning
+-- shape the engine-module set-algebra deciders established; a prover-module
+-- home would dangle on BOTH in production (engine ∉ SYSTEM_MODULES) AND in
+-- the dispatch harness (getHarness loads engine, NOT prover). One home, full
+-- reuse, zero dangling refs. The std/user EXPOSURE is inherited-and-parked
+-- from 3a (these are engine-prefixed, harness-callable fns; std exposure
+-- rides P6/P10-era or an engine→SYSTEM_MODULES decision, NOT this phase).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- SetExpr representation — the canonical `Se*` (decide-substrate Phase 1
+-- Stage B). `solve = inhabit ∘ comprehend` LITERALLY: `comprehend`
+-- (comprehend.fenel) lowers the predicate `Expr` to the canonical registered
+-- `Se*` SetExpr (constructors write the `$tag`; the `$`-key barrier only
+-- fences literal `$`-keys, so the canonical form IS Fenel-authorable), and
+-- `inhabit` (inhabit.fenel) extracts the witness from it. The historical
+-- plain-record WitSet marker vocabulary (`{ tag = "Ws…" }` — P5's
+-- `predicateToSet` → `witnessOfSet` pipeline) is RETIRED: predicateToSet and
+-- the whole Ws-reading witness side are DELETED; the bound math
+-- (witInterval / tighterLo / tighterHi) moved to inhabit.fenel,
+-- representation-neutral over the shared `Maybe { value, inclusive }` bound
+-- shape. The every/some Proposition builders now carry `Se*` payloads too —
+-- `$tag` Se* IS the canonical SetExpr the prover natives read (peelSetExpr's
+-- dual-read), so no marker→SetExpr unmarshal is needed downstream.
+--
+-- DECIDABLE FRAGMENT + WITNESS RULES: see comprehend.fenel (the ONE
+-- recognizer — eq/comparisons/and/or/not + the P12 affine inversion) and
+-- inhabit.fenel (the witness fences — enum-first / inclusive-bound /
+-- interval-fold / union-first-child; everything else Nothing).
+--
+-- FREE-VAR FENCE (decision 3): `solve`'s witness variable is the predicate
+-- body's SINGLE free var (via the existing `collectFreeVars`). 0 or ≥2 free
+-- vars ⇒ Nothing (a documented v1 fence, NOT a gap — no params record
+-- threaded).
+--
+-- NO ENTITY DECLS: functions only (the P2/4a/3a rule — law count +0).
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- solve — find a witness for a single-free-var predicate body.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Solve"
+@description "Find a witness value satisfying a predicate `Expr` over a SINGLE free variable — LITERALLY `inhabit ∘ comprehend` (the decide-substrate one-judgment composition): `comprehend` lowers the body to the canonical `Se*` SetExpr, `inhabit` extracts a witness from it. Discovers the free var via `collectFreeVars`; 0 or ≥2 free vars ⇒ Nothing (the documented v1 fence). The decidable fragment (eq / comparisons / and / or / not / the P12 affine inversion) yields enum/interval witnesses; out-of-fragment shapes ⇒ Nothing (the SeWhere fence). expr-substrate Phase 5; representation collapsed decide-substrate Phase 1 Stage B; `solveFn f = solve (reify f)` is the ergonomic surface."
+@tags "engine" "solve" "prover" "expr-substrate" "phase-5" "decide-substrate" "phase-1"
+solve : (expr: Expr) -> Maybe a
+solve expr =
+  let free = collectFreeVars expr [] []
+  if eq (length free) 1
+  then
+    case head free of
+      Nothing -> Nothing
+      Just varName -> inhabit (comprehend varName expr)
+  else Nothing
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- solveFn — reify ∘ substituteCaptures ∘ solve. THE locked composition.
+-- Takes the SAME marshalled Fn-value input shape as `reify` (the dispatch
+-- wrapper introspects the runtime Fn value). reify's Err ⇒ Nothing (solveFn
+-- is Maybe-typed end-to-end — the Result lives on reify; decision 4). On Ok,
+-- substitute the captured values into the body (so `y = 5; \x -> x == y`
+-- becomes `\x -> x == 5` ⇒ Just 5 — the reify payoff), then solve.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Solve fn"
+@description "The locked composition `solveFn f = solve (reify f)`: reify the marshalled Fn value to its `Expr` body + captures, substitute the captured values into the body (substituteCaptures), then solve for a witness. reify's Err (bodyless / native / non-reifiable) ⇒ Nothing (solveFn is Maybe-typed; the Result lives on reify). The captures path is the reify payoff: `y = 5; \\x -> x == y` ⇒ Just 5. expr-substrate Phase 5."
+@tags "engine" "solve" "reify" "prover" "expr-substrate" "phase-5"
+solveFn : (input: a) -> (ctorDefs: a) -> (nullValue: a) -> Maybe a
+solveFn input ctorDefs nullValue =
+  case reify input ctorDefs nullValue of
+    Err e -> Nothing
+    Ok r -> solve (substituteCaptures r.body r.captures)
+
+-- (The v1 type-marker `inhabit` (Inh*) + the `predicateToSet` face are GONE —
+-- decide-substrate Phase 1 Stage B. `engine:inhabit : SetExpr → Maybe a` lives
+-- in inhabit.fenel (the constructive dual of comprehend); type-level
+-- inhabitation is `inhabit ∘ typeToSetExpr` (the refined arm's TS marshal
+-- feeds Se* directly until typeToSetExpr's Stage-E output refit). The
+-- representation-neutral extractors below (p2sExtract*, the affineOf family,
+-- flipRel, exprAsVar/exprAsLit) stay, REUSED by comprehend cross-file.)
+
+-- p2sExtract — pull `(orientation, literal)` from a two-arg compare/eq.
+-- Returns `{ ok = false }` when neither operand is `EVar varName` paired
+-- with an `ELit`; `{ ok = true, left = <var-on-left?>, lit = v }` otherwise.
+@label "solve: p2sExtract"
+@description "Phase 5 — extract `(orientation, literal)` from a two-arg comparison/eq over `varName`: `{ ok = true, left, lit }` when one operand is `EVar varName` and the other an `ELit`, else `{ ok = false }`. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-5"
+@category "engine-internal"
+p2sExtract : (varName: String) -> (args: a) -> a
+p2sExtract varName args =
+  case head args of
+    Nothing -> { ok = false }
+    Just a0 ->
+      case tail args of
+        Nothing -> { ok = false }
+        Just rest ->
+          case head rest of
+            Nothing -> { ok = false }
+            Just a1 -> p2sExtractBoth varName a0 a1
+
+-- p2sExtractBoth — try var-on-left, else fall to var-on-right.
+@label "solve: p2sExtractBoth"
+@description "Phase 5 — try `EVar varName` in the LEFT operand (with the right an ELit); fall through to p2sExtractRight otherwise. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-5"
+@category "engine-internal"
+p2sExtractBoth : (varName: String) -> (a0: a) -> (a1: a) -> a
+p2sExtractBoth varName a0 a1 =
+  case exprAsVar a0 of
+    Just x ->
+      if eq x varName
+      then
+        case exprAsLit a1 of
+          Just v -> { ok = true, left = true, lit = v }
+          Nothing -> { ok = false }
+      else p2sExtractRight varName a0 a1
+    Nothing -> p2sExtractRight varName a0 a1
+
+-- p2sExtractRight — `EVar varName` in the RIGHT operand (left an ELit).
+@label "solve: p2sExtractRight"
+@description "Phase 5 — `EVar varName` in the RIGHT operand (left an ELit) ⇒ `{ ok = true, left = false, lit }`; else `{ ok = false }`. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-5"
+@category "engine-internal"
+p2sExtractRight : (varName: String) -> (a0: a) -> (a1: a) -> a
+p2sExtractRight varName a0 a1 =
+  case exprAsVar a1 of
+    Just x ->
+      if eq x varName
+      then
+        case exprAsLit a0 of
+          Just v -> { ok = true, left = false, lit = v }
+          Nothing -> { ok = false }
+      else { ok = false }
+    Nothing -> { ok = false }
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- AFFINE WIDENING (expr-substrate Phase 12) — the ONE-fragment payoff.
+--
+-- The comparison arms above (p2sEq / p2sCompare) recognise only a BARE
+-- `var-vs-literal` shape. P12 widens the SAME fragment so a COMPOUND affine
+-- term `coeff·x + k` on either (or both) side(s) inverts to the witness:
+-- `2*x + 5 == 6` ⇒ WsEnum [0.5]; `-2*x < 4` ⇒ the FLIPPED interval x > -2.
+-- The widening lands as the FALL-THROUGH of p2sEq / p2sCompare (decision 1):
+-- the existing var-vs-lit arms fire FIRST (byte-stable for every pinned test),
+-- and only their `{ ok = false }` branch tries `p2sAffine`; affine failure
+-- still ⇒ WsWhere. BOTH consumers (solve + refine) inherit with zero changes.
+--
+-- The grammar is SINGLE-VAR and LINEAR (multi-var = P13; quadratic/poly stays
+-- out — `x*x == 4` ⇒ WsWhere). Heads (post adapter-normalisation, recon at
+-- Step 0): `add` / `sub` (binary) / `mul` / `div`; prefix `-` lowers to UNARY
+-- `sub [e]` (NOT `negate` — Step-0 probe surprise; `negate` handled too for
+-- safety). Constant literals MUST pass `isNumber` (the std arithmetic natives
+-- coerce — `add "a" 1` ⇒ "a1" — so a non-number literal ⇒ not-ok).
+-- ─────────────────────────────────────────────────────────────────────────
+
+-- affineOf — extract `coeff·x + k` from an Expr over the single var `varName`.
+-- `{ ok = true, coeff, k }` on success; `{ ok = false }` otherwise (a different
+-- var, a non-number literal, a non-affine head, quadratic, reciprocal, …).
+@label "solve: affineOf"
+@description "Phase 12 — extract an affine term `coeff·x + k` (over the single variable `varName`) from an `Expr`: a number `ELit` ⇒ {0, v}; `EVar varName` ⇒ {1, 0}; `add`/`sub`/`mul`/`div`/`negate` (+ unary `sub`) recurse and combine; a DIFFERENT var, a non-number literal, a non-affine head, x*x (quadratic), or k/x (reciprocal) ⇒ { ok = false }. The single-var linear fence (multi-var is P13). Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-12"
+@category "engine-internal"
+affineOf : (varName: String) -> (e: Expr) -> a
+affineOf varName e =
+  case e of
+    ELit { value = v } ->
+      if isNumber v then { ok = true, coeff = 0, k = v } else { ok = false }
+    EVar { name = n } ->
+      if eq n varName then { ok = true, coeff = 1, k = 0 } else { ok = false }
+    ECall { fnId = f, args = args } -> affineCall varName f args
+    _ -> { ok = false }
+
+-- affineCall — route an ECall head to its affine combiner (negate / sub-arity).
+@label "solve: affineCall"
+@description "Phase 12 — route an `ECall` head to its affine combiner: `add`/`mul`/`div` ⇒ binary combine; `negate` ⇒ negation; `sub` ⇒ negation (unary, the prefix-minus spelling) or subtraction (binary) by arity; any other head ⇒ { ok = false }. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-12"
+@category "engine-internal"
+affineCall : (varName: String) -> (f: String) -> (args: a) -> a
+affineCall varName f args =
+  if eq f "add" then affineBin varName "add" args
+  else if eq f "mul" then affineBin varName "mul" args
+  else if eq f "div" then affineBin varName "div" args
+  else if eq f "negate" then affineNeg varName args
+  else if eq f "sub" then affineSub varName args
+  else { ok = false }
+
+-- affineSub — `sub` dispatches on arity: unary ⇒ negation, binary ⇒ subtraction.
+@label "solve: affineSub"
+@description "Phase 12 — `sub` dispatch by arity: ONE operand ⇒ negation (prefix-minus's `sub [e]` spelling); TWO operands ⇒ binary subtraction. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-12"
+@category "engine-internal"
+affineSub : (varName: String) -> (args: a) -> a
+affineSub varName args =
+  if eq (length args) 1 then affineNeg varName args else affineBin varName "sub" args
+
+-- affineBin — extract both operands, then combine by head.
+@label "solve: affineBin"
+@description "Phase 12 — extract both operands of a binary affine op (add/sub/mul/div) via affineOf; combine via affineCombine when both extract; any non-affine operand ⇒ { ok = false }. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-12"
+@category "engine-internal"
+affineBin : (varName: String) -> (f: String) -> (args: a) -> a
+affineBin varName f args =
+  case head args of
+    Nothing -> { ok = false }
+    Just a0 ->
+      case tail args of
+        Nothing -> { ok = false }
+        Just rest ->
+          case head rest of
+            Nothing -> { ok = false }
+            Just a1 ->
+              let la = affineOf varName a0
+              if la.ok
+              then
+                let ra = affineOf varName a1
+                if ra.ok then affineCombine f la ra else { ok = false }
+              else { ok = false }
+
+-- affineCombine — combine two affine terms by op (add/sub linear; mul/div guarded).
+@label "solve: affineCombine"
+@description "Phase 12 — combine two extracted affine terms by op: add ⇒ pairwise sum; sub ⇒ pairwise difference; mul ⇒ affineMul (one side must be constant); div ⇒ affineDiv (divisor must be a nonzero constant). Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-12"
+@category "engine-internal"
+affineCombine : (f: String) -> (la: a) -> (ra: a) -> a
+affineCombine f la ra =
+  if eq f "add" then { ok = true, coeff = add la.coeff ra.coeff, k = add la.k ra.k }
+  else if eq f "sub" then { ok = true, coeff = sub la.coeff ra.coeff, k = sub la.k ra.k }
+  else if eq f "mul" then affineMul la ra
+  else affineDiv la ra
+
+-- affineMul — `l * r` is affine only when one side is constant (coeff 0).
+@label "solve: affineMul"
+@description "Phase 12 — multiply two affine terms: linear only when ONE side is a constant (coeff 0) — scale the other by it; BOTH non-constant (x*x quadratic) ⇒ { ok = false } (the quadratic fence). Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-12"
+@category "engine-internal"
+affineMul : (la: a) -> (ra: a) -> a
+affineMul la ra =
+  if eq la.coeff 0 then { ok = true, coeff = mul la.k ra.coeff, k = mul la.k ra.k }
+  else if eq ra.coeff 0 then { ok = true, coeff = mul ra.k la.coeff, k = mul ra.k la.k }
+  else { ok = false }
+
+-- affineDiv — `l / r` is affine only when r is a NONZERO constant; scale l by 1/r.
+@label "solve: affineDiv"
+@description "Phase 12 — divide two affine terms: linear only when the divisor `r` is a NONZERO constant (coeff 0, k ≠ 0) — scale the numerator by 1/r; a non-constant divisor (k/x reciprocal) or a zero divisor ⇒ { ok = false }. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-12"
+@category "engine-internal"
+affineDiv : (la: a) -> (ra: a) -> a
+affineDiv la ra =
+  if eq ra.coeff 0
+  then (if eq ra.k 0 then { ok = false } else { ok = true, coeff = div la.coeff ra.k, k = div la.k ra.k })
+  else { ok = false }
+
+-- affineNeg — negate a single affine operand (`-e` ⇒ scale by −1).
+@label "solve: affineNeg"
+@description "Phase 12 — negate a single affine operand (prefix `-e` / `negate e`): extract via affineOf, flip the signs of coeff and k; a non-affine operand ⇒ { ok = false }. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-12"
+@category "engine-internal"
+affineNeg : (varName: String) -> (args: a) -> a
+affineNeg varName args =
+  case head args of
+    Nothing -> { ok = false }
+    Just a0 ->
+      let la = affineOf varName a0
+      if la.ok then { ok = true, coeff = sub 0 la.coeff, k = sub 0 la.k } else { ok = false }
+
+-- (The Ws-emitting affine tail — p2sAffine / p2sAffineBuild / p2sAffineConst
+-- / p2sAffineOriented — moved to comprehend.fenel as the Se*-emitting cph*
+-- arms, decide-substrate Phase 1 Stage A. The affineOf math family above is
+-- their shared, representation-neutral substrate and stays here.)
+
+-- flipRel — flip a comparison op for the negative-coefficient case (eq fixed).
+@label "solve: flipRel"
+@description "Phase 12 — flip a comparison op when the leading coefficient is negative: lt↔gt, lte↔gte; eq is unchanged (it is symmetric). Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-12"
+@category "engine-internal"
+flipRel : (f: String) -> String
+flipRel f =
+  if eq f "lt" then "gt"
+  else if eq f "gt" then "lt"
+  else if eq f "lte" then "gte"
+  else if eq f "gte" then "lte"
+  else f
+
+-- exprAsVar — `EVar { name }` ⇒ Just name, else Nothing.
+@label "solve: exprAsVar"
+@description "Phase 5 — `EVar { name }` ⇒ Just name; any other Expr ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-5"
+@category "engine-internal"
+exprAsVar : (e: Expr) -> Maybe String
+exprAsVar e =
+  case e of
+    EVar { name = n } -> Just n
+    _ -> Nothing
+
+-- exprAsLit — `ELit { value }` ⇒ Just value, else Nothing.
+@label "solve: exprAsLit"
+@description "Phase 5 — `ELit { value }` ⇒ Just value; any other Expr ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-5"
+@category "engine-internal"
+exprAsLit : (e: Expr) -> Maybe a
+exprAsLit e =
+  case e of
+    ELit { value = v } -> Just v
+    _ -> Nothing
+
+-- (The Ws-reading witness side — witnessOfSet / witEnum / witIntersect /
+-- witIntersectFold / witIntersectStep / witUnion — is DELETED, decide-substrate
+-- Phase 1 Stage B; `inhabit` (inhabit.fenel) is the sole successor, reading
+-- the canonical `Se*` directly. The representation-neutral bound math —
+-- witInterval / witIntervalLo / tighterLo / tighterHi — MOVED there with it,
+-- alongside the shared Se-interval fold `seIntervalFold`.)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- substituteCaptures — inline a closure's captured values into its body.
+-- Every `EVar n` where `n` is a captured name becomes `ELit <captured value>`
+-- (decision 4). Capture VALUES are NOT recursed (the 3a rule). This is what
+-- turns `y = 5; \x -> x == y`'s body (`ECall eq [EVar x, EVar y]` + capture
+-- `{y: 5}`) into `ECall eq [EVar x, ELit 5]` so `solve` finds the witness.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Substitute captures"
+@description "Inline a closure's captured values into its `Expr` body: every free `EVar n` whose name is in the captures env becomes `ELit <captured value>`; all other nodes recurse structurally, keeping every other field of a node (a list literal's `lit` mark, an arm's guard), and a lambda parameter or pattern variable shadows a capture of the same name. Capture values are NOT recursed (the 3a rule). Turns `y = 5; \\x -> x == y` into the closed `\\x -> x == 5` so solve can witness it — the reify payoff. expr-substrate Phase 5."
+@tags "engine" "solve" "reify" "expr-substrate" "phase-5"
+substituteCaptures : (expr: Expr) -> (captures: a) -> Expr
+substituteCaptures expr captures =
+  case expr of
+    EVar { name = n } ->
+      case capLookup captures n of
+        Just v -> ELit { value = v }
+        Nothing -> expr
+    ELit {} -> expr
+    ECall { args = args } -> mapSet expr "args" (subCapList args captures [])
+    ELambda { params = ps, body = bd } ->
+      mapSet expr "body" (substituteCaptures bd (subCapWithout captures ps))
+    EMatch { scrutinee = scrut, arms = arms } ->
+      mapSet (mapSet expr "scrutinee" (substituteCaptures scrut captures)) "arms" (subCapArms arms captures [])
+    EConstruct { args = args } -> mapSet expr "args" (subCapList args captures [])
+    ERecord { fields = fs } -> mapSet expr "fields" (subCapFields fs captures [])
+
+-- subCapWithout — the captures a binder leaves visible: every entry whose
+-- name the binder rebinds is removed (lambda parameters, pattern variables),
+-- so a substitution never reaches through a shadowing binder (recipe-functions
+-- S2 item 7).
+@category "engine-internal"
+subCapWithout : (captures: a) -> (names: List String) -> a
+subCapWithout captures names = filter (\c -> not (elem c.name names)) captures
+
+-- subCapList — substituteCaptures over an Expr list (ECall/EConstruct args).
+@label "solve: subCapList"
+@description "Phase 5 — apply substituteCaptures over an Expr list (ECall.args / EConstruct.args), threading the accumulator. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-5"
+@category "engine-internal"
+subCapList : (exprs: a) -> (captures: a) -> (acc: a) -> a
+subCapList exprs captures acc =
+  case head exprs of
+    Nothing -> acc
+    Just h ->
+      let dH = substituteCaptures h captures
+      let acc2 = appendItem dH acc
+      case tail exprs of
+        Nothing -> acc2
+        Just rest -> subCapList rest captures acc2
+
+-- subCapArms — substituteCaptures over match-arm bodies and guards (pattern
+-- untouched; every other arm field kept). The pattern's variables shadow the
+-- captures in the arm.
+@label "solve: subCapArms"
+@description "Phase 5 — apply substituteCaptures over EMatch arm bodies and guards, passing each arm's pattern (and any other arm field) through untouched; a capture whose name the arm's pattern binds is not substituted inside that arm. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-5"
+@category "engine-internal"
+subCapArms : (arms: a) -> (captures: a) -> (acc: a) -> a
+subCapArms arms captures acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let visible = subCapWithout captures (collectPatternBindings arm.pattern [])
+      let withBody = mapSet arm "body" (substituteCaptures arm.body visible)
+      let dArm = case lookup arm "guard" of
+        Nothing -> withBody
+        Just guard -> mapSet withBody "guard" (substituteCaptures guard visible)
+      let acc2 = appendItem dArm acc
+      case tail arms of
+        Nothing -> acc2
+        Just rest -> subCapArms rest captures acc2
+
+-- subCapFields — substituteCaptures over record-field values (name kept).
+@label "solve: subCapFields"
+@description "Phase 5 — apply substituteCaptures over ERecord field values, preserving each field name. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-5"
+@category "engine-internal"
+subCapFields : (fields: a) -> (captures: a) -> (acc: a) -> a
+subCapFields fields captures acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let acc2 = appendItem (mapSet f "value" (substituteCaptures f.value captures)) acc
+      case tail fields of
+        Nothing -> acc2
+        Just rest -> subCapFields rest captures acc2
+
+-- capLookup — find a name in the captures env (a list of {name, value}).
+@label "solve: capLookup"
+@description "Phase 5 — find a name in the captures env (a list of {name, value} records); Just value on hit, Nothing otherwise. Internal helper."
+@tags "engine" "internal" "solve" "expr-substrate" "phase-5"
+@category "engine-internal"
+capLookup : (captures: a) -> (n: String) -> Maybe a
+capLookup captures n =
+  case head captures of
+    Nothing -> Nothing
+    Just c ->
+      if eq c.name n then Just c.value
+      else
+        case tail captures of
+          Nothing -> Nothing
+          Just rest -> capLookup rest n
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Quantifier builders — JUDGMENT-NATIVE claims (decide-substrate Phase 2, K2).
+-- These now emit the ONE lattice judgment (`JEmpty`/`JInhabited`, judgment.fenel)
+-- rather than the closed `{ tag = "Prop…" }` markers: `every` ⇒ the subset
+-- judgment (`JEmpty (baseSet ∩ ¬pred-set)`, via `jopSubset` — the kernel iso's
+-- builder), `exists`/`some` ⇒ the inhabited judgment (`JInhabited (pred-set ∩
+-- typeSet)`). The SetExpr payloads are the canonical `Se*` (Stage B). No live
+-- consumer feeds these to the prover directly (solve.test reconstructs the
+-- Proposition from the judgment's composed set); the assignability/law paths use
+-- their own producers, so the quantifier flip is byte-neutral for production.
+-- expr-substrate Phase 6b absorbed the `some` truth-INVERSION wart: `some` emits
+-- the inhabited judgment (s ≠ ∅) the kernel proves directly (JInhabited accepts
+-- a non-empty re-decide). baseSet/typeSet are `Se*` SetExprs (the predicate's
+-- set and the base set share the canonical representation to intersect).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Every"
+@description "Quantifier builder: `every varName pred baseSet` ⇒ the subset JUDGMENT `JEmpty (SeIntersect [baseSet, ¬(comprehend varName pred)])` via jopSubset — \"baseSet ⊆ the predicate's set\" ≡ `baseSet ∩ ¬pred-set` empty = all of baseSet satisfies pred. Judgment-native since decide-substrate Phase 2 (K2): emits the one lattice judgment (JEmpty), not the closed PropSubset marker; its SetExpr payloads are canonical `Se*` (Stage B). expr-substrate Phase 5."
+@tags "engine" "solve" "quantifier" "prover" "judgment" "expr-substrate" "phase-5" "decide-substrate" "phase-2"
+every : (varName: String) -> (pred: Expr) -> (baseSet: a) -> a
+every varName pred baseSet =
+  jopSubset { s = baseSet, t = comprehend varName pred }
+
+@label "Some"
+@description "Quantifier builder: `some varName pred baseSet` ⇒ the inhabited JUDGMENT `JInhabited (baseSet ∩ the predicate's set)` (\"the intersection is non-empty\" = some element satisfies pred). Judgment-native since decide-substrate Phase 2 (K2). DELEGATES to `exists` (the body carrier): `some` collides with `std:some` (the list predicate, which owns the bare name — live bare callers, JS-conventional), so a bare `some` call is a resolution-substrate Phase-1b hard ambiguousModule error; the intra-module delegation therefore runs exists-ward (bare `exists` is unambiguous). Callers by fnId (`engine:some`) are unaffected. expr-substrate Phase 5 / 6b; delegation flipped decide-substrate Phase 1 Stage A."
+@tags "engine" "solve" "quantifier" "prover" "expr-substrate" "phase-5" "phase-6b"
+some : (varName: String) -> (pred: Expr) -> (baseSet: a) -> a
+some varName pred baseSet =
+  exists varName pred baseSet
+
+@label "Forall"
+@description "Quantifier builder over a type argument: `forall varName pred typeSet` ≡ the ∀ / Π form ≡ subset (every) — `typeSet` is the type's base set supplied pre-extracted (full `$type`→set extraction is deferred to P7, since a Fenel body can't read `$`-keyed type internals). Builder-only; P6 inherits the type-extraction. expr-substrate Phase 5."
+@tags "engine" "solve" "quantifier" "prover" "expr-substrate" "phase-5"
+forall : (varName: String) -> (pred: Expr) -> (typeSet: a) -> a
+forall varName pred typeSet =
+  every varName pred typeSet
+
+@label "Exists"
+@description "Quantifier builder over a type argument: `exists varName pred typeSet` ≡ the ∃ / Σ form ≡ non-empty intersection — the inhabited JUDGMENT `JInhabited (SeIntersect [comprehend varName pred, typeSet])` (judgment-native since decide-substrate Phase 2 K2; expr-substrate Phase 6b absorbed the some-inversion wart: the inhabited polarity, no `inverted` flag; the kernel proves it directly — JInhabited accepts a non-empty re-decide, decideEmpty Just false). THE BODY CARRIER of the some/exists dual (the delegation runs some→exists because bare `some` is ambiguous vs `std:some` — see `some`). `typeSet` is the type's base set supplied pre-extracted; the intersection is the canonical `SeIntersect` since decide-substrate Phase 1 Stage B. expr-substrate Phase 5 / 6b; body moved here decide-substrate Phase 1 Stage A."
+@tags "engine" "solve" "quantifier" "prover" "judgment" "expr-substrate" "phase-5" "phase-6b" "decide-substrate" "phase-2"
+exists : (varName: String) -> (pred: Expr) -> (typeSet: a) -> a
+exists varName pred typeSet =
+  let inhSet = SeIntersect { branches = appendItem (comprehend varName pred) (appendItem typeSet []) }
+  JInhabited inhSet
+
+-- =========================================================================
+-- Public solver doors (GP-12 clearance, 2026-11-06, amended after the
+-- refute-first review of 2026-11-07; design and argument:
+-- `workstreams/locus-workspace/notes/2026-11-06-public-solver-clearance.md`).
+--
+-- The public SolverDemo forwards enter the engine harness ONLY through these
+-- bodies. Each admits the authority-invariant fragment F (scalar or nullary
+-- constructor literals, variables, the closed arithmetic/comparison/logic
+-- heads, and relation or rule names supplied with the same call; the same
+-- values as fact cells and SetExpr leaves) and abstains (Nothing) on anything
+-- else. Inside F no closure, constructor with fields, numeric-tower record,
+-- SeCtor or SeArrow can arise, so the four context-dependent reads
+-- (checkCtorDeclaredWires, fieldKeyCurrentWire, fnTypeMarker,
+-- exactValueOwnerType) cannot fire: tcb-ledger `syn.witness.ctx-authority`,
+-- the public-door trigger exclusion.
+--
+-- The predicate doors lower the predicate with `comprehend` themselves and
+-- refuse when the lowered set leaves the fragment (an SeWhere residual is the
+-- usual case), so no door reaches the whereMember / namedMember seams. Every
+-- non-relational door re-checks each answer it returns against the set it
+-- came from with the membership judgment (`setAlgebraContains`, the leaf of
+-- the kernel witness rule) and, for a typed door, against the base type;
+-- a refuted or undecided re-check answers Nothing. The core entries stay
+-- unchanged for every internal caller.
+-- =========================================================================
+
+@label "Solver fragment scalar"
+@description "A scalar the public solver doors admit: a String, a Bool or a finite Number. Every other value (records, lists, constructors, closures, non-finite numbers) is outside the authority-invariant fragment. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentScalar : (v: a) -> Bool
+solverFragmentScalar v =
+  if isString v then true
+  else if isBoolean v then true
+  else if isNumber v then numberIsFinite v
+  else false
+
+@label "Solver fragment value"
+@description "A value the public solver doors admit as a literal or a fact cell: a fragment scalar, or a nullary constructor value (a record whose only own field is a String `$tag`, such as a City = Paris | Lyon choice). The numeric-tower tags Nat, Int, Rational, Zero and Succ are refused (they are the only records whose equality consults the representation owner, exactValueOwnerType), and so are True, False and Nil (constructors of types with a native carrier, which structural equality does not identify with true, false or the empty list). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentValue : (v: a) -> Bool
+solverFragmentValue v =
+  if solverFragmentScalar v then true else solverFragmentNullary v
+
+@label "Solver fragment nullary constructor"
+@description "True when a value is an admitted nullary constructor value: a record with exactly one own entry, `$tag`, holding a String outside the refused tags. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentNullary : (v: a) -> Bool
+solverFragmentNullary v =
+  if isNull v then false
+  else if isArray v then false
+  else if isString v then false
+  else if isNumber v then false
+  else if isBoolean v then false
+  else if isBytes v then false
+  else
+    let es = entries v
+    if eq (length es) 1 then solverFragmentNullaryEntry (at es 0) else false
+
+@label "Solver fragment nullary entry"
+@description "True when the single entry of a record is a String `$tag` outside the numeric tower (Nat, Int, Rational, Zero, Succ) and the native-carrier constructors (True, False, Nil). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentNullaryEntry : (e: a) -> Bool
+solverFragmentNullaryEntry e =
+  if e.key == "$tag"
+  then (if isString e.value then not (elem e.value ["Nat", "Int", "Rational", "Zero", "Succ", "True", "False", "Nil"]) else false)
+  else false
+
+@label "Solver fragment head"
+@description "The closed list of call heads the public solver doors admit besides supplied relation and rule names: equality, inequality, the four orderings, the arithmetic heads and the Boolean connectives, bare or qualified by std (a reflected body may name std:add). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentHead : (f: String) -> Bool
+solverFragmentHead f =
+  elem (solverBareHead f) ["eq", "neq", "lt", "lte", "gt", "gte", "add", "sub", "mul", "div", "negate", "and", "or", "not"]
+
+@label "Solver bare head"
+@description "A call head without its std qualification (`std:add`, `std.add` and `add` all read `add`); any other qualification is kept, so a user function is never read as a closed head. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverBareHead : (f: String) -> String
+solverBareHead f =
+  if startsWith f "std:" then slice f 4 (length f)
+  else if startsWith f "std." then slice f 4 (length f)
+  else f
+
+@label "Solver fragment field"
+@description "Read one own field of a record supplied to a public solver door; a non-record input or a missing field reads Nothing. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentField : (r: a) -> (k: String) -> Maybe b
+solverFragmentField r k =
+  if isNull r then Nothing
+  else if isArray r then Nothing
+  else if isString r then Nothing
+  else if isNumber r then Nothing
+  else if isBoolean r then Nothing
+  else mapGet r k
+
+@label "Solver fragment expression"
+@description "True when a predicate Expr lies in the public doors' fragment: an ELit of a fragment value (scalar or nullary constructor), an EVar, or an ECall whose head is a fragment head or one of the supplied relation/rule names and whose arguments are all in the fragment. Lambdas, matches, constructors, records and every other head are refused. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentExpr : (names: List String) -> (e: Expr) -> Bool
+solverFragmentExpr names e =
+  case e of
+    ELit { value = v } -> solverFragmentValue v
+    EVar { name = n } -> isString n
+    ECall { fnId = f, args = args } ->
+      if isString f
+      then (if solverFragmentHead f then solverFragmentArgs names args else (if elem f names then solverFragmentArgs names args else false))
+      else false
+    _ -> false
+
+@label "Solver fragment arguments"
+@description "True when an ECall argument list is a list whose every element is a fragment expression. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentArgs : (names: List String) -> (args: a) -> Bool
+solverFragmentArgs names args =
+  if isArray args then all args (\a -> solverFragmentExpr names a) else false
+
+@label "Solver fragment name"
+@description "The String name of a supplied relation or rule entry, or the empty string (which names no head and is refused by solverFragmentNamesOk) when absent or not a String. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentName : (item: a) -> String
+solverFragmentName item =
+  case solverFragmentField item "name" of
+    Just n -> if isString n then n else ""
+    Nothing -> ""
+
+@label "Solver fragment names"
+@description "True when the relation and rule names a public query declares are usable heads: none is empty, none repeats (the solver reads the first entry of a name, so a repeated name would silently ignore the rest) and none is a closed fragment head such as not, lt or eq (which the solver would read as the relation instead of the operator, or the reverse). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentNamesOk : (names: List String) -> Bool
+solverFragmentNamesOk names =
+  if relDistinctNames names
+  then all names (\n -> (if eq n "" then false else not (solverFragmentHead n)))
+  else false
+
+@label "Solver fragment row"
+@description "True when a fact row is a list of exactly `arity` fragment values (scalars or nullary constructors). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentRow : (arity: Number) -> (row: a) -> Bool
+solverFragmentRow arity row =
+  if isArray row
+  then (if eq (length row) arity then all row solverFragmentValue else false)
+  else false
+
+@label "Solver fragment whole"
+@description "True when a value is a safe whole Number (an Int the Number carrier represents exactly). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentWhole : (v: a) -> Bool
+solverFragmentWhole v =
+  if isNumber v
+  then (if numberIsFinite v then (if eq (floor v) v then lte (abs v) 9007199254740991 else false) else false)
+  else false
+
+@label "Solver fragment relation"
+@description "True when a supplied relation is { name: String, arity, rows } with a nonnegative whole arity and every row a list of exactly arity fragment values. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentRelation : (r: a) -> Bool
+solverFragmentRelation r =
+  case solverFragmentField r "arity" of
+    Nothing -> false
+    Just arity ->
+      case solverFragmentField r "rows" of
+        Nothing -> false
+        Just rows ->
+          if solverFragmentWhole arity
+          then (if gte arity 0 then (if isArray rows then all rows (\row -> solverFragmentRow arity row) else false) else false)
+          else false
+
+@label "Solver fragment rule"
+@description "True when a supplied rule is { name, params: List String, body } with distinct parameters and a fragment body over the supplied relation and rule names. Repeated parameters are refused: inline unfolding keeps only the first occurrence and would drop the equality they state. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentRule : (names: List String) -> (r: a) -> Bool
+solverFragmentRule names r =
+  case solverFragmentField r "params" of
+    Nothing -> false
+    Just params ->
+      case solverFragmentField r "body" of
+        Nothing -> false
+        Just body ->
+          if isArray params
+          then (if all params isString then (if relDistinctNames params then solverFragmentExpr names body else false) else false)
+          else false
+
+@label "Solver fragment list"
+@description "Read a list-valued own field of a supplied record; anything else reads as Nothing. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentList : (r: a) -> (k: String) -> Maybe (List b)
+solverFragmentList r k =
+  case solverFragmentField r k of
+    Nothing -> Nothing
+    Just xs -> if isArray xs then Just xs else Nothing
+
+@label "Solver fragment fact names"
+@description "The relation and rule names a supplied fact base declares: the heads a fragment query over it may call. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentFactNames : (facts: a) -> List String
+solverFragmentFactNames facts =
+  let rels = fromMaybe [] (solverFragmentList facts "relations")
+  let rules = fromMaybe [] (solverFragmentList facts "rules")
+  concat (map solverFragmentName rels) (map solverFragmentName rules)
+
+@label "Solver fragment facts"
+@description "True when a fact base is { relations, rules } with usable distinct names, relations whose rows are fragment values of the declared arity, and rules with distinct parameters and fragment bodies over the declared names. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentFacts : (facts: a) -> Bool
+solverFragmentFacts facts =
+  case solverFragmentList facts "relations" of
+    Nothing -> false
+    Just rels ->
+      case solverFragmentList facts "rules" of
+        Nothing -> false
+        Just rules ->
+          let names = solverFragmentFactNames facts
+          if solverFragmentNamesOk names
+          then (if all rels solverFragmentRelation then all rules (solverFragmentRule names) else false)
+          else false
+
+@label "Solver fragment cell"
+@description "True when one projected cell of a typed relation instance is present and a fragment value. An instance missing a projected field is refused: the core would drop it from the relation, and the answer would silently leave it out. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentCell : (instance: a) -> (field: String) -> Bool
+solverFragmentCell instance field =
+  case solverFragmentField instance field of
+    Nothing -> false
+    Just v -> solverFragmentValue v
+
+@label "Solver fragment instance"
+@description "True when every fieldOrder cell of a typed relation instance is present and a fragment value. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentInstance : (fieldOrder: List String) -> (instance: a) -> Bool
+solverFragmentInstance fieldOrder instance =
+  all fieldOrder (\f -> solverFragmentCell instance f)
+
+@label "Solver fragment relation definition"
+@description "True when a typed relation definition is { name: String, fieldOrder: List String, instances } whose projected cells are all present fragment values. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentRelDef : (d: a) -> Bool
+solverFragmentRelDef d =
+  case solverFragmentList d "fieldOrder" of
+    Nothing -> false
+    Just fieldOrder ->
+      case solverFragmentList d "instances" of
+        Nothing -> false
+        Just instances ->
+          if all fieldOrder isString
+          then all instances (solverFragmentInstance fieldOrder)
+          else false
+
+@label "Solver fragment query"
+@description "True when a typed relational query (definitions, rules, predicate) lies in the public doors' fragment, with usable distinct names. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentQuery : (expr: Expr) -> (relDefs: a) -> (rules: b) -> Bool
+solverFragmentQuery expr relDefs rules =
+  if isArray relDefs
+  then
+    if isArray rules
+    then
+      let names = concat (map solverFragmentName relDefs) (map solverFragmentName rules)
+      if solverFragmentNamesOk names
+      then
+        if all relDefs solverFragmentRelDef
+        then (if all rules (solverFragmentRule names) then solverFragmentExpr names expr else false)
+        else false
+      else false
+    else false
+  else false
+
+@label "Solver fragment bound value"
+@description "An interval endpoint the public doors admit: a String or a finite Number. Bool endpoints are refused (the interval readers order only numbers and strings). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentBoundValue : (v: a) -> Bool
+solverFragmentBoundValue v =
+  if isString v then true
+  else if isNumber v then numberIsFinite v
+  else false
+
+@label "Solver fragment bound"
+@description "True when an interval bound is Nothing or Just { value, inclusive } with an admitted endpoint and a Bool flag. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentBound : (b: a) -> Bool
+solverFragmentBound b =
+  case b of
+    Nothing -> true
+    Just x ->
+      case solverFragmentField x "value" of
+        Nothing -> false
+        Just v ->
+          case solverFragmentField x "inclusive" of
+            Nothing -> false
+            Just i -> if isBoolean i then solverFragmentBoundValue v else false
+    _ -> false
+
+@label "Solver fragment bound kind"
+@description "The kind of an admitted interval bound: \"none\" when absent, \"number\" or \"string\" by its endpoint. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentBoundKind : (b: a) -> String
+solverFragmentBoundKind b =
+  case b of
+    Just x -> if isString x.value then "string" else "number"
+    _ -> "none"
+
+@label "Solver fragment interval"
+@description "True when an SeInterval payload has admitted bounds of the same kind: two Number endpoints, two String endpoints, or one endpoint and one open side. An interval mixing a Number and a String endpoint is refused. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentInterval : (iv: a) -> Bool
+solverFragmentInterval iv =
+  case solverFragmentField iv "lo" of
+    Nothing -> false
+    Just lo ->
+      case solverFragmentField iv "hi" of
+        Nothing -> false
+        Just hi ->
+          if solverFragmentBound lo
+          then
+            if solverFragmentBound hi
+            then
+              let loKind = solverFragmentBoundKind lo
+              let hiKind = solverFragmentBoundKind hi
+              if eq loKind "none" then true
+              else if eq hiKind "none" then true
+              else eq loKind hiKind
+            else false
+          else false
+
+@label "Solver fragment set"
+@description "True when a SetExpr lies in the public doors' fragment: SeAll, SeNone, an SeEnum of fragment values, an SeInterval with admitted bounds of one kind, or SeIntersect / SeUnion / SeComplement / SeDiff of fragment sets. Constructor, arrow, named, recursive, pattern, rigid and predicate sets are refused. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverFragmentSet : (s: SetExpr) -> Bool
+solverFragmentSet s =
+  case s of
+    SeAll -> true
+    SeNone -> true
+    SeEnum { values = vs } -> if isArray vs then all vs solverFragmentValue else false
+    SeInterval { interval = iv } -> solverFragmentInterval iv
+    SeIntersect { branches = bs } -> if isArray bs then all bs solverFragmentSet else false
+    SeUnion { branches = bs } -> if isArray bs then all bs solverFragmentSet else false
+    SeComplement { inner = i } -> solverFragmentSet i
+    SeDiff { left = l, right = r } -> if solverFragmentSet l then solverFragmentSet r else false
+    _ -> false
+
+@label "Solver single unknown"
+@description "The single free variable of a predicate, or Nothing when it has none or several (the solve fence). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverSingleUnknown : (expr: Expr) -> Maybe String
+solverSingleUnknown expr =
+  let free = collectFreeVars expr [] []
+  if eq (length free) 1 then head free else Nothing
+
+@label "Solver predicate set"
+@description "The set a fragment predicate over one unknown denotes, as `comprehend` lowers it, when that set lies in the fragment; else Nothing. A predicate comprehend cannot lower exactly (an SeWhere residual, such as x * x == 4 or an ill-typed comparison) is refused here, before any witness search could consult the predicate seam. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverPredicateSet : (expr: Expr) -> Maybe SetExpr
+solverPredicateSet expr =
+  if solverFragmentExpr [] expr
+  then
+    case solverSingleUnknown expr of
+      Just v ->
+        let s = comprehend v expr
+        if solverFragmentSet s then Just s else Nothing
+      _ -> Nothing
+  else Nothing
+
+@label "Solver member"
+@description "True only when the membership judgment proves w ∈ s (setAlgebraContains answers Just true, the leaf of the kernel witness rule); a refuted or undecided membership is false. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverMember : (s: SetExpr) -> (w: a) -> Bool
+solverMember s w =
+  case setAlgebraContains s w of
+    Just true -> true
+    _ -> false
+
+@label "Solver answer admitted"
+@description "True when a door answer is a fragment value and a proven member of the set it was drawn from. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverAnswerOk : (s: SetExpr) -> (w: a) -> Bool
+solverAnswerOk s w =
+  if solverFragmentValue w then solverMember s w else false
+
+@label "Solver checked answer"
+@description "Pass a single answer through when it is a proven member of its set (solverAnswerOk), else Nothing. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverCheckedOne : (s: SetExpr) -> (answer: Maybe a) -> Maybe a
+solverCheckedOne s answer =
+  case answer of
+    Just w -> if solverAnswerOk s w then Just w else Nothing
+    _ -> Nothing
+
+@label "Solver checked answer list"
+@description "Pass a complete answer list through when every element is a proven member of its set, else Nothing (a list with one unproven element is not shown at all, never filtered, since a filtered list would still claim to be complete). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverCheckedAll : (s: SetExpr) -> (answer: Maybe (List a)) -> Maybe (List a)
+solverCheckedAll s answer =
+  case answer of
+    Just ws -> if isArray ws then (if all ws (\w -> solverAnswerOk s w) then Just ws else Nothing) else Nothing
+    _ -> Nothing
+
+@label "Solver base admitted"
+@description "The base types the typed public doors admit: Int, Nat, Char, String, Number and Bool. Each has a membership check (solverBaseMember); any other base is refused, since the core would return set members without checking them against the base. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverBaseAdmitted : (base: a) -> Bool
+solverBaseAdmitted base =
+  if isString base then elem base ["Int", "Nat", "Char", "String", "Number", "Bool"] else false
+
+@label "Solver Char value"
+@description "True when a value is a one-code-point String naming a Unicode scalar value (a surrogate code point is not a Char). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverIsChar : (w: a) -> Bool
+solverIsChar w =
+  if isString w
+  then
+    let code = charCode w
+    if eq (charFromCode code) w
+    then (if lt code 55296 then true else gt code 57343)
+    else false
+  else false
+
+@label "Solver base member"
+@description "True when a door answer belongs to the admitted base type: Int a safe whole Number, Nat a nonnegative one, Char a one-code-point String, String a String, Number a finite Number, Bool a Bool. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverBaseMember : (base: String) -> (w: a) -> Bool
+solverBaseMember base w =
+  if eq base "Char" then solverIsChar w
+  else if eq base "Int" then solverFragmentWhole w
+  else if eq base "Nat" then (if solverFragmentWhole w then gte w 0 else false)
+  else if eq base "String" then isString w
+  else if eq base "Number" then (if isNumber w then numberIsFinite w else false)
+  else if eq base "Bool" then isBoolean w
+  else false
+
+@label "Solver base bound"
+@description "True when an interval bound suits the base type: absent, or an endpoint of the base's kind (a Char for Char, a Number for Int, Nat and Number, a String for String; Bool admits no interval endpoint). The Char enumeration reads only the first code point of an endpoint, so a longer String endpoint would enumerate the wrong range. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverBaseBound : (base: String) -> (b: a) -> Bool
+solverBaseBound base b =
+  case b of
+    Nothing -> true
+    Just x ->
+      if eq base "Char" then solverIsChar x.value
+      else if eq base "String" then isString x.value
+      else if eq base "Bool" then false
+      else isNumber x.value
+    _ -> false
+
+@label "Solver base set"
+@description "True when every interval inside a fragment set has bounds that suit the base type (solverBaseBound). Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverBaseSet : (base: String) -> (s: SetExpr) -> Bool
+solverBaseSet base s =
+  case s of
+    SeInterval { interval = iv } -> if solverBaseBound base iv.lo then solverBaseBound base iv.hi else false
+    SeIntersect { branches = bs } -> all bs (\b -> solverBaseSet base b)
+    SeUnion { branches = bs } -> all bs (\b -> solverBaseSet base b)
+    SeComplement { inner = i } -> solverBaseSet base i
+    SeDiff { left = l, right = r } -> if solverBaseSet base l then solverBaseSet base r else false
+    _ -> true
+
+@label "Solver typed set admitted"
+@description "True when a typed door may run: an admitted base and a fragment set whose interval bounds suit it. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverTypedSetOk : (base: a) -> (s: SetExpr) -> Bool
+solverTypedSetOk base s =
+  if solverBaseAdmitted base
+  then (if solverFragmentSet s then solverBaseSet base s else false)
+  else false
+
+@label "Solver checked typed answer"
+@description "Pass a typed door's single answer through when it is a proven member of its set and of the base type, else Nothing. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverCheckedTypedOne : (base: String) -> (s: SetExpr) -> (answer: Maybe a) -> Maybe a
+solverCheckedTypedOne base s answer =
+  case answer of
+    Just w -> if solverBaseMember base w then (if solverAnswerOk s w then Just w else Nothing) else Nothing
+    _ -> Nothing
+
+@label "Solver checked typed answer list"
+@description "Pass a typed door's complete answer list through when every element is a proven member of its set and of the base type, else Nothing. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverCheckedTypedAll : (base: String) -> (s: SetExpr) -> (answer: Maybe (List a)) -> Maybe (List a)
+solverCheckedTypedAll base s answer =
+  case answer of
+    Just ws ->
+      if isArray ws
+      then (if all ws (\w -> (if solverBaseMember base w then solverAnswerOk s w else false)) then Just ws else Nothing)
+      else Nothing
+    _ -> Nothing
+
+@label "Public solve"
+@description "Public door to solve: a single-unknown fragment predicate whose comprehended set lies in the fragment; the witness is re-checked as a member of that set, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "public" "gp-12"
+@category "engine-internal"
+solverPublicSolve : (expr: Expr) -> Maybe a
+solverPublicSolve expr =
+  case solverPredicateSet expr of
+    Just s -> solverCheckedOne s (inhabit s)
+    _ -> Nothing
+
+@label "Public solve all"
+@description "Public door to solveAll: the complete finite answer list of a fragment predicate whose comprehended set lies in the fragment, each answer re-checked as a member, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "public" "gp-12"
+@category "engine-internal"
+solverPublicSolveAll : (expr: Expr) -> Maybe a
+solverPublicSolveAll expr =
+  case solverPredicateSet expr of
+    Just s -> solverCheckedAll s (enumerateSet s)
+    _ -> Nothing
+
+@label "Public relational solve"
+@description "Public door to solveRel: one proven binding over a fragment fact base, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "relational" "public" "gp-12"
+@category "engine-internal"
+solverPublicSolveRel : (expr: Expr) -> (facts: a) -> Maybe b
+solverPublicSolveRel expr facts =
+  if solverFragmentFacts facts
+  then (if solverFragmentExpr (solverFragmentFactNames facts) expr then solveRel expr facts else Nothing)
+  else Nothing
+
+@label "Public relational solve all"
+@description "Public door to solveRelAll: every binding over a fragment fact base when the answer is complete, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "relational" "public" "gp-12"
+@category "engine-internal"
+solverPublicSolveRelAll : (expr: Expr) -> (facts: a) -> Maybe b
+solverPublicSolveRelAll expr facts =
+  if solverFragmentFacts facts
+  then (if solverFragmentExpr (solverFragmentFactNames facts) expr then solveRelAll expr facts else Nothing)
+  else Nothing
+
+@label "Public typed relational query"
+@description "Public door to queryRel over typed relation definitions with present fragment cells, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "relational" "query" "public" "gp-12"
+@category "engine-internal"
+solverPublicQueryRel : (expr: Expr) -> (relDefs: a) -> (rules: b) -> Maybe c
+solverPublicQueryRel expr relDefs rules =
+  if solverFragmentQuery expr relDefs rules then queryRel expr relDefs rules else Nothing
+
+@label "Public typed relational query one"
+@description "Public door to queryRelOne over typed relation definitions with present fragment cells, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "relational" "query" "public" "gp-12"
+@category "engine-internal"
+solverPublicQueryRelOne : (expr: Expr) -> (relDefs: a) -> (rules: b) -> Maybe c
+solverPublicQueryRelOne expr relDefs rules =
+  if solverFragmentQuery expr relDefs rules then queryRelOne expr relDefs rules else Nothing
+
+@label "Public sample set"
+@description "Public door to sampleSet over a fragment SetExpr with a finite Number seed; the sample is re-checked as a member, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "public" "gp-12"
+@category "engine-internal"
+solverPublicSampleSet : (seed: a) -> (set: SetExpr) -> Maybe b
+solverPublicSampleSet seed set =
+  if solverFragmentWhole seed
+  then (if solverFragmentSet set then solverCheckedOne set (sampleSet seed set) else Nothing)
+  else Nothing
+
+@label "Public minimum of set"
+@description "Public door to minOfSet over a fragment SetExpr; the minimum is re-checked as a member (an empty interval such as [7, 3] has none), else Nothing. GP-12 clearance."
+@tags "engine" "solve" "public" "gp-12"
+@category "engine-internal"
+solverPublicMinOfSet : (set: SetExpr) -> Maybe a
+solverPublicMinOfSet set =
+  if solverFragmentSet set then solverCheckedOne set (minOfSet set) else Nothing
+
+@label "Public maximum of set"
+@description "Public door to maxOfSet over a fragment SetExpr; the maximum is re-checked as a member, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "public" "gp-12"
+@category "engine-internal"
+solverPublicMaxOfSet : (set: SetExpr) -> Maybe a
+solverPublicMaxOfSet set =
+  if solverFragmentSet set then solverCheckedOne set (maxOfSet set) else Nothing
+
+@label "Public enumerable set"
+@description "Public door to enumerableSet over an admitted base and a fragment SetExpr whose bounds suit the base; every element is re-checked against the set and the base, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "enumerate" "public" "gp-12"
+@category "engine-internal"
+solverPublicEnumerableSet : (base: a) -> (set: SetExpr) -> Maybe b
+solverPublicEnumerableSet base set =
+  if solverTypedSetOk base set then solverCheckedTypedAll base set (enumerableSet base set) else Nothing
+
+@label "Public enumerable solve all"
+@description "Public door to enumerableSolveAll over an admitted base and a fragment predicate whose comprehended set lies in the fragment and suits the base; every element is re-checked, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "enumerate" "public" "gp-12"
+@category "engine-internal"
+solverPublicEnumerableSolveAll : (base: a) -> (expr: Expr) -> Maybe b
+solverPublicEnumerableSolveAll base expr =
+  case solverPredicateSet expr of
+    Just s -> if solverTypedSetOk base s then solverCheckedTypedAll base s (enumerableSet base s) else Nothing
+    _ -> Nothing
+
+@label "Public enumerable inhabit"
+@description "Public door to enumerableInhabit over an { tag = \"InhRefined\", base, set } marker with an admitted base and a fragment set; every element is re-checked against the set and the base, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "enumerate" "public" "gp-12"
+@category "engine-internal"
+solverPublicEnumerableInhabit : (marker: a) -> Maybe b
+solverPublicEnumerableInhabit marker =
+  case solverFragmentField marker "tag" of
+    Just tag ->
+      if eq tag "InhRefined"
+      then
+        case solverFragmentField marker "base" of
+          Just base ->
+            case solverFragmentField marker "set" of
+              Just set -> if solverTypedSetOk base set then solverCheckedTypedAll base set (enumerableInhabit marker) else Nothing
+              _ -> Nothing
+          _ -> Nothing
+      else Nothing
+    _ -> Nothing
+
+@label "Solver ordered base admitted"
+@description "The typed min / max / sample doors admit the typed bases other than Int and Nat. At the base commit the Int/Nat interval readers either abstain (enumeration) or throw on a native integer carrier (min/max of an exclusive bound: \"Reprable JsRuntime Nat: native carrier inspection is undecidable\"); the public door answers Nothing for them instead of an exception. Internal helper."
+@tags "engine" "internal" "solve" "public" "gp-12"
+@category "engine-internal"
+solverOrderedBaseAdmitted : (base: a) -> Bool
+solverOrderedBaseAdmitted base =
+  if solverBaseAdmitted base then not (elem base ["Int", "Nat"]) else false
+
+@label "Public enumerable minimum"
+@description "Public door to enumerableMinOfSet over an admitted ordered base (not Int or Nat) and a fragment SetExpr whose bounds suit it; the minimum is re-checked against the set and the base, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "enumerate" "public" "gp-12"
+@category "engine-internal"
+solverPublicEnumerableMinOfSet : (base: a) -> (set: SetExpr) -> Maybe b
+solverPublicEnumerableMinOfSet base set =
+  if solverOrderedBaseAdmitted base
+  then (if solverTypedSetOk base set then solverCheckedTypedOne base set (enumerableMinOfSet base set) else Nothing)
+  else Nothing
+
+@label "Public enumerable maximum"
+@description "Public door to enumerableMaxOfSet over an admitted ordered base (not Int or Nat) and a fragment SetExpr whose bounds suit it; the maximum is re-checked against the set and the base, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "enumerate" "public" "gp-12"
+@category "engine-internal"
+solverPublicEnumerableMaxOfSet : (base: a) -> (set: SetExpr) -> Maybe b
+solverPublicEnumerableMaxOfSet base set =
+  if solverOrderedBaseAdmitted base
+  then (if solverTypedSetOk base set then solverCheckedTypedOne base set (enumerableMaxOfSet base set) else Nothing)
+  else Nothing
+
+@label "Public enumerable sample"
+@description "Public door to enumerableSampleSet over an admitted ordered base (not Int or Nat), a whole Number seed and a fragment SetExpr whose bounds suit the base; the sample is re-checked against the set and the base, else Nothing. GP-12 clearance."
+@tags "engine" "solve" "enumerate" "public" "gp-12"
+@category "engine-internal"
+solverPublicEnumerableSampleSet : (base: a) -> (seed: b) -> (set: SetExpr) -> Maybe c
+solverPublicEnumerableSampleSet base seed set =
+  if solverOrderedBaseAdmitted base
+  then (if solverFragmentWhole seed then (if solverTypedSetOk base set then solverCheckedTypedOne base set (enumerableSampleSet base seed set) else Nothing) else Nothing)
+  else Nothing
+
+@label "Public symbolic solve"
+@description "Public door to symbolic solving: the predicate after symbolizeEffects (effect reads become unknowns; no IO is performed) goes through the public solve door (fragment, comprehended fragment set, membership re-check), else Nothing. GP-12 clearance."
+@tags "engine" "solve" "symbolize" "public" "gp-12"
+@category "engine-internal"
+solverPublicSolveSymbolic : (effectFnIds: a) -> (expr: Expr) -> Maybe b
+solverPublicSolveSymbolic effectFnIds expr =
+  if isArray effectFnIds
+  then
+    if all effectFnIds isString
+    then solverPublicSolve (symbolizeEffects effectFnIds expr)
+    else Nothing
+  else Nothing
+
+-- =========================================================================
+-- Exact linear systems (S1, 2026-11-06) — Gauss–Jordan elimination over
+-- exact fractions.
+--
+-- A predicate that is a conjunction of linear equations over its inputs
+-- (`3*x + y == 2 && x - y == 1`) is read into exact rows: every Number
+-- literal is read as the decimal it is written as (0.1 is exactly 1/10),
+-- `add`/`sub`/`negate` combine forms, `mul` needs one constant side and `div`
+-- a nonzero constant divisor. Anything else (a product of two unknowns, an
+-- inequality, another call) is outside this fragment and the answer is
+-- `unsupported`, never a guess.
+--
+-- ARITHMETIC. A fraction is { num, den }: two safe integers (|n| <= 2^53 - 1),
+-- den > 0, in lowest terms. Every product and sum is checked against the
+-- safe-integer bound before it is used; a step that would leave it makes the
+-- fraction the invalid { num = 0, den = 0 }, which propagates, and the whole
+-- result is `unsupported` instead of a rounded answer. std Rational is the
+-- general exact carrier, but its arithmetic needs the Nat/Int/Rational
+-- representation projections, which the engine harness does not install
+-- (its pure bodies then throw "native carrier inspection is undecidable");
+-- safe-integer fractions are exact, total and portable, and every demo
+-- system stays far inside the bound.
+--
+-- Elimination keeps, for every row, the multipliers that produce it from the
+-- input equations, so every outcome is checkable by exact arithmetic alone:
+--   unique   — each derived row is x_j = c_j; with substitution into every
+--              input equation this shows the answer and that there is no other;
+--   family   — the derived rows express every pivot unknown through the free
+--              ones; the particular answer and each direction re-check by
+--              substitution;
+--   none     — one derived row reads 0 = c with c ≠ 0 (the Fredholm
+--              alternative: a combination of the equations is contradictory).
+-- This is the shape the planned linear-combination kernel rule (and
+-- Fourier–Motzkin / Farkas for inequalities) will re-check. These are solver
+-- results with their exact data, not kernel certificates.
+-- =========================================================================
+
+@label "Linear safe integer"
+@description "True when a Number is an integer within the exact safe range (absolute value at most 2^53 - 1). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linSafe : (n: a) -> Bool
+linSafe n =
+  if isNumber n
+  then (if numberIsFinite n then (if floor n == n then abs n <= 9007199254740991 else false) else false)
+  else false
+
+@label "Linear gcd"
+@description "Greatest common divisor of two non-negative safe integers (Euclid). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linGcd : (a: Number) -> (b: Number) -> Number
+linGcd a b = if b == 0 then a else linGcd b (mod a b)
+
+@label "Linear invalid fraction"
+@description "The invalid fraction 0/0 that marks an arithmetic step outside the safe-integer range; it propagates through every operation. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linBad : (unit: a) -> b
+linBad unit = { num = 0, den = 0 }
+
+@label "Linear fraction invalid?"
+@description "True for the invalid fraction (denominator 0). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linIsBad : (f: a) -> Bool
+linIsBad f = f.den == 0
+
+@label "Linear fraction"
+@description "The fraction n/d in lowest terms with a positive denominator, or the invalid fraction when n or d is not a safe integer or d is 0. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linFrac : (n: Number) -> (d: Number) -> a
+linFrac n d =
+  if linSafe n && linSafe d && d != 0
+  then
+    let g = linGcd (abs n) (abs d)
+    let s = if d < 0 then 0 - 1 else 1
+    { num = s * n / g, den = s * d / g }
+  else linBad 0
+
+@label "Linear zero"
+@description "The fraction 0. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linZero : (unit: a) -> b
+linZero unit = { num = 0, den = 1 }
+
+@label "Linear one"
+@description "The fraction 1. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linOne : (unit: a) -> b
+linOne unit = { num = 1, den = 1 }
+
+@label "Linear is zero"
+@description "True when a valid fraction equals 0. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linIsZero : (f: a) -> Bool
+linIsZero f = if f.den == 0 then false else f.num == 0
+
+@label "Linear add"
+@description "The exact sum of two fractions; invalid when an operand is invalid or a step leaves the safe-integer range. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linAdd : (a: a) -> (b: a) -> a
+linAdd a b =
+  if linIsBad a || linIsBad b then linBad 0
+  else
+    let p = a.num * b.den
+    let q = b.num * a.den
+    let d = a.den * b.den
+    if linSafe p && linSafe q && linSafe d then linFrac (p + q) d else linBad 0
+
+@label "Linear negate"
+@description "The negation of a fraction. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linNeg : (a: a) -> a
+linNeg a = if linIsBad a then linBad 0 else { num = 0 - a.num, den = a.den }
+
+@label "Linear subtract"
+@description "The exact difference of two fractions. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linSub : (a: a) -> (b: a) -> a
+linSub a b = linAdd a (linNeg b)
+
+@label "Linear multiply"
+@description "The exact product of two fractions; invalid when a step leaves the safe-integer range. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linMul : (a: a) -> (b: a) -> a
+linMul a b =
+  if linIsBad a || linIsBad b then linBad 0
+  else
+    let p = a.num * b.num
+    let d = a.den * b.den
+    if linSafe p && linSafe d then linFrac p d else linBad 0
+
+@label "Linear divide"
+@description "The exact quotient of two fractions; invalid for a zero divisor or a step outside the safe-integer range. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linDiv : (a: a) -> (b: a) -> a
+linDiv a b =
+  if linIsBad a || linIsBad b || b.num == 0 then linBad 0
+  else
+    let p = a.num * b.den
+    let d = a.den * b.num
+    if linSafe p && linSafe d then linFrac p d else linBad 0
+
+@label "Linear digits"
+@description "The integer value of a string of decimal digits, or Nothing beyond 15 digits (where a Number would stop being exact). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linDigits : (text: String) -> Maybe Number
+linDigits text =
+  if length text == 0 || length text > 15 then Nothing
+  else
+    let cs = chars text
+    if all cs (\c -> elem c ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])
+    then Just (fold (\acc c -> acc * 10 + (charCode c - charCode "0")) 0 cs)
+    else Nothing
+
+@label "Linear power of ten"
+@description "10^k for a small non-negative k. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linTen : (k: Number) -> Number
+linTen k = if k <= 0 then 1 else 10 * linTen (k - 1)
+
+@label "Linear decimal"
+@description "Read the decimal text of a non-negative number (`12`, `0.1`, `3.25`) as an exact fraction, or Nothing for any other spelling (an exponent, too many digits). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linDecimal : (text: String) -> Maybe a
+linDecimal text =
+  let parts = split text "."
+  if length parts == 1 then linDecimalWhole (at parts 0)
+  else if length parts == 2 then linDecimalFraction (at parts 0) (at parts 1)
+  else Nothing
+
+@label "Linear decimal whole"
+@description "A digit string as an exact whole fraction. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linDecimalWhole : (digits: String) -> Maybe a
+linDecimalWhole digits = case linDigits digits of
+  Just n -> Just (linFrac n 1)
+  Nothing -> Nothing
+
+@label "Linear decimal fraction"
+@description "Integer and fraction digit strings as the exact fraction they spell. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linDecimalFraction : (whole: String) -> (fraction: String) -> Maybe a
+linDecimalFraction whole fraction = case linDigits (join [whole, fraction] "") of
+  Just n -> Just (linFrac n (linTen (length fraction)))
+  Nothing -> Nothing
+
+@label "Linear number"
+@description "Read a finite Number literal as the exact fraction its decimal text denotes (0.1 is 1/10), or Nothing (non-finite, exponent spelling, too many digits). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linReadNumber : (v: a) -> Maybe b
+linReadNumber v =
+  if isNumber v
+  then
+    if numberIsFinite v
+    then (if v < 0 then linNegMaybe (linDecimal (toString (0 - v))) else linDecimal (toString v))
+    else Nothing
+  else Nothing
+
+@label "Linear negate maybe"
+@description "Negate a fraction inside Maybe. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linNegMaybe : (m: Maybe a) -> Maybe a
+linNegMaybe m = case m of
+  Just f -> Just (linNeg f)
+  Nothing -> Nothing
+
+@label "Linear indices"
+@description "The indices 0 through n - 1. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linIndices : (n: Number) -> List Number
+linIndices n = linIndicesFrom 0 n
+
+@label "Linear indices from"
+@description "The indices i through n - 1. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linIndicesFrom : (i: Number) -> (n: Number) -> List Number
+linIndicesFrom i n = if i >= n then [] else concat [i] (linIndicesFrom (i + 1) n)
+
+@label "Linear zip"
+@description "Combine two equally long lists element by element. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linZip : (f: (a -> b -> c)) -> (xs: List a) -> (ys: List b) -> List c
+linZip f xs ys = map (\i -> f (at xs i) (at ys i)) (linIndices (length xs))
+
+@label "Linear some"
+@description "True when some element of a list satisfies the predicate. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linSome : (xs: List a) -> (p: (a -> Bool)) -> Bool
+linSome xs p = case find p xs of
+  Nothing -> false
+  Just x -> true
+
+@label "Linear constant form"
+@description "The linear form c (every coefficient 0). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linConstForm : (n: Number) -> (c: a) -> b
+linConstForm n c = { coeffs = map (\i -> linZero 0) (linIndices n), constant = c }
+
+@label "Linear variable form"
+@description "The linear form 1·x for one unknown. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linVarForm : (vars: List String) -> (name: String) -> a
+linVarForm vars name = { coeffs = map (\v -> if v == name then linOne 0 else linZero 0) vars, constant = linZero 0 }
+
+@label "Linear add forms"
+@description "The sum of two linear forms. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linAddForm : (a: a) -> (b: a) -> a
+linAddForm a b = { coeffs = linZip linAdd a.coeffs b.coeffs, constant = linAdd a.constant b.constant }
+
+@label "Linear subtract forms"
+@description "The difference of two linear forms. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linSubForm : (a: a) -> (b: a) -> a
+linSubForm a b = { coeffs = linZip linSub a.coeffs b.coeffs, constant = linSub a.constant b.constant }
+
+@label "Linear scale form"
+@description "A linear form multiplied by an exact constant. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linScaleForm : (k: a) -> (f: b) -> b
+linScaleForm k f = { coeffs = map (\c -> linMul k c) f.coeffs, constant = linMul k f.constant }
+
+@label "Linear constant form?"
+@description "True when every coefficient of a linear form is 0. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linIsConstant : (f: a) -> Bool
+linIsConstant f = all f.coeffs linIsZero
+
+@label "Linear form of"
+@description "Read an Expr as an exact linear form over the given unknowns, or Nothing when it is not linear (a product of two unknowns, a division by an unknown or zero, another call, a non-number literal). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linFormOf : (vars: List String) -> (e: Expr) -> Maybe a
+linFormOf vars e =
+  case e of
+    ELit { value = v } -> linConstMaybe (length vars) (linReadNumber v)
+    EVar { name = n } -> if elem n vars then Just (linVarForm vars n) else Nothing
+    ECall { fnId = f, args = args } -> linCallForm vars (solverBareHead f) args
+    _ -> Nothing
+
+@label "Linear constant maybe"
+@description "A constant form from a read literal, or Nothing. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linConstMaybe : (n: Number) -> (m: Maybe a) -> Maybe b
+linConstMaybe n m = case m of
+  Just r -> Just (linConstForm n r)
+  Nothing -> Nothing
+
+@label "Linear call form"
+@description "Read a unary or binary arithmetic call as a linear form. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linCallForm : (vars: List String) -> (h: String) -> (args: a) -> Maybe b
+linCallForm vars h args =
+  if isArray args
+  then
+    if eq (length args) 1 then linUnaryForm vars h (at args 0)
+    else if eq (length args) 2 then linBinaryForm vars h (at args 0) (at args 1)
+    else Nothing
+  else Nothing
+
+@label "Linear unary form"
+@description "Negation (`negate x`) of a linear form. A one-argument `sub x` is refused: evaluation reads it as a partial application (a function), not as -x. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linUnaryForm : (vars: List String) -> (h: String) -> (a: Expr) -> Maybe b
+linUnaryForm vars h a =
+  if h == "negate"
+  then
+    case linFormOf vars a of
+      Nothing -> Nothing
+      Just f -> Just (linScaleForm (linNeg (linOne 0)) f)
+  else Nothing
+
+@label "Linear binary form"
+@description "Read both operands of a binary call, then combine them. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linBinaryForm : (vars: List String) -> (h: String) -> (a: Expr) -> (b: Expr) -> Maybe c
+linBinaryForm vars h a b =
+  case linFormOf vars a of
+    Nothing -> Nothing
+    Just fa ->
+      case linFormOf vars b of
+        Nothing -> Nothing
+        Just fb -> linCombine h fa fb
+
+@label "Linear combine"
+@description "add / sub of two forms; mul when one side is constant; div by a nonzero constant. Every other case is not linear. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linCombine : (h: String) -> (fa: a) -> (fb: a) -> Maybe a
+linCombine h fa fb =
+  if h == "add" then Just (linAddForm fa fb)
+  else if h == "sub" then Just (linSubForm fa fb)
+  else if h == "mul" then linMulForm fa fb
+  else if h == "div" then linDivForm fa fb
+  else Nothing
+
+@label "Linear multiply forms"
+@description "A product is linear only when one factor is constant. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linMulForm : (fa: a) -> (fb: a) -> Maybe a
+linMulForm fa fb =
+  if linIsConstant fa then Just (linScaleForm fa.constant fb)
+  else if linIsConstant fb then Just (linScaleForm fb.constant fa)
+  else Nothing
+
+@label "Linear divide forms"
+@description "A quotient is linear only when the divisor is a nonzero constant. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linDivForm : (fa: a) -> (fb: a) -> Maybe a
+linDivForm fa fb =
+  if linIsConstant fb
+  then (if linIsZero fb.constant then Nothing else Just (linScaleForm (linDiv (linOne 0) fb.constant) fa))
+  else Nothing
+
+@label "Linear equations of"
+@description "Read a predicate as a conjunction of linear equations: each `l == r` becomes the form l - r (meaning l - r = 0); `and` concatenates. Anything else is outside the fragment (Nothing). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linEquationsOf : (vars: List String) -> (e: Expr) -> Maybe (List a)
+linEquationsOf vars e =
+  case e of
+    ECall { fnId = f, args = args } -> linEquationsCall vars (solverBareHead f) args
+    _ -> Nothing
+
+@label "Linear equations call"
+@description "The `and` / `eq` cases of linEquationsOf. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linEquationsCall : (vars: List String) -> (h: String) -> (args: a) -> Maybe (List b)
+linEquationsCall vars h args =
+  if isArray args
+  then
+    if h == "and" then linEquationsAll vars args []
+    else if h == "eq" then linEquationOf vars args
+    else Nothing
+  else Nothing
+
+@label "Linear equation of"
+@description "One `l == r` as the single form l - r. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linEquationOf : (vars: List String) -> (args: a) -> Maybe (List b)
+linEquationOf vars args =
+  if eq (length args) 2
+  then
+    case linFormOf vars (at args 0) of
+      Nothing -> Nothing
+      Just l ->
+        case linFormOf vars (at args 1) of
+          Nothing -> Nothing
+          Just r -> Just [linSubForm l r]
+  else Nothing
+
+@label "Linear equations all"
+@description "Concatenate the equations of every conjunct; any conjunct outside the fragment makes the whole predicate unsupported. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linEquationsAll : (vars: List String) -> (args: a) -> (acc: List b) -> Maybe (List b)
+linEquationsAll vars args acc =
+  case head args of
+    Nothing -> Just acc
+    Just a ->
+      case linEquationsOf vars a of
+        Nothing -> Nothing
+        Just es -> linEquationsAll vars (fromMaybe [] (tail args)) (concat acc es)
+
+@label "Linear unit vector"
+@description "The list of n fractions with 1 at index i and 0 elsewhere. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linUnit : (n: Number) -> (i: Number) -> List a
+linUnit n i = map (\j -> if j == i then linOne 0 else linZero 0) (linIndices n)
+
+@label "Linear rows"
+@description "The augmented rows { coeffs, rhs, mult } of the equations F·x + c = 0: rhs = -c, and mult is the unit combination naming the input equation. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linRows : (forms: List a) -> List b
+linRows forms =
+  let m = length forms
+  map (\i -> linRowOf (at forms i) (linUnit m i)) (linIndices m)
+
+@label "Linear row of"
+@description "One augmented row from a form and its multipliers. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linRowOf : (form: a) -> (multipliers: List b) -> c
+linRowOf form multipliers = { coeffs = form.coeffs, rhs = linNeg form.constant, mult = multipliers }
+
+@label "Linear row scale"
+@description "Multiply a row (coefficients, right-hand side and multipliers) by an exact constant. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linRowScale : (k: a) -> (r: b) -> b
+linRowScale k r = { coeffs = map (\c -> linMul k c) r.coeffs, rhs = linMul k r.rhs, mult = map (\c -> linMul k c) r.mult }
+
+@label "Linear row subtract"
+@description "r - k·s for two rows. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linRowSub : (r: a) -> (s: a) -> (k: b) -> a
+linRowSub r s k = { coeffs = linZip (\x y -> linSub x (linMul k y)) r.coeffs s.coeffs, rhs = linSub r.rhs (linMul k s.rhs), mult = linZip (\x y -> linSub x (linMul k y)) r.mult s.mult }
+
+@label "Linear row right-hand side"
+@description "A row's right-hand side. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linRowRhs : (r: a) -> b
+linRowRhs r = r.rhs
+
+@label "Linear row coefficients"
+@description "A row's coefficient list. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linRowCoeffs : (r: a) -> List b
+linRowCoeffs r = r.coeffs
+
+@label "Linear coefficient"
+@description "Row i's coefficient at column c. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linCoeff : (rows: List a) -> (i: Number) -> (c: Number) -> b
+linCoeff rows i c = at (linRowCoeffs (at rows i)) c
+
+@label "Linear eliminate"
+@description "Reduced row-echelon form by Gauss–Jordan elimination over exact fractions, column by column, keeping each row's multipliers. Returns { rows, rank, pivots }. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linEliminate : (current: List a) -> (col: Number) -> (n: Number) -> (found: Number) -> (pivotCols: List Number) -> b
+linEliminate current col n found pivotCols =
+  if col >= n then { rows = current, rank = found, pivots = pivotCols }
+  else
+    let indices = linIndices (length current)
+    let candidates = filter (\i -> i >= found && not (linIsZero (linCoeff current i col))) indices
+    case head candidates of
+      Nothing -> linEliminate current (col + 1) n found pivotCols
+      Just p ->
+        let pivotRow = linRowScale (linDiv (linOne 0) (linCoeff current p col)) (at current p)
+        let swapped = map (\i -> if i == found then pivotRow else (if i == p then at current found else at current i)) indices
+        let reduced = map (\i -> if i == found then pivotRow else linRowSub (at swapped i) pivotRow (linCoeff swapped i col)) indices
+        linEliminate reduced (col + 1) n (found + 1) (appendItem col pivotCols)
+
+@label "Linear row valid?"
+@description "True when every fraction of a row is valid (no step left the safe-integer range). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linRowValid : (r: a) -> Bool
+linRowValid r = if linIsBad r.rhs then false else (if linSome r.coeffs linIsBad then false else not (linSome r.mult linIsBad))
+
+@label "Linear row inconsistent?"
+@description "True when a reduced row reads 0 = c with c ≠ 0. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linRowInconsistent : (r: a) -> Bool
+linRowInconsistent r = if all r.coeffs linIsZero then not (linIsZero r.rhs) else false
+
+@label "Linear derived equation"
+@description "A derived row as data: its multipliers over the input equations and the equation they produce (coefficients and right-hand side). Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linDerived : (r: a) -> b
+linDerived r = { multipliers = r.mult, coefficients = r.coeffs, constant = r.rhs }
+
+@label "Linear input equation"
+@description "An input row as the equation Σ a_i·x_i = b. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linInputEquation : (r: a) -> b
+linInputEquation r = { coefficients = r.coeffs, constant = r.rhs }
+
+@label "Linear result"
+@description "Build the uniform linear result record. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linResult : (outcome: String) -> (why: String) -> (vars: List String) -> (inputs: List a) -> (rowsUsed: List b) -> (answer: List c) -> (dirs: List (List c)) -> (freeNames: List String) -> d
+linResult outcome why vars inputs rowsUsed answer dirs freeNames = { status = outcome, reason = why, variables = vars, equations = map linInputEquation inputs, derived = map linDerived rowsUsed, values = answer, directions = dirs, free = freeNames }
+
+@label "Linear unsupported"
+@description "The uniform result for a predicate outside the linear fragment. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linUnsupported : (vars: List String) -> (reason: String) -> a
+linUnsupported vars reason = linResult "unsupported" reason vars [] [] [] [] []
+
+@label "Linear pivot row of"
+@description "The reduced row whose pivot is column c, or Nothing for a free column. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linPivotRowOf : (pivots: List Number) -> (c: Number) -> Maybe Number
+linPivotRowOf pivots c = find (\k -> at pivots k == c) (linIndices (length pivots))
+
+@label "Linear particular value"
+@description "Column c's value in the particular answer: its pivot row's right-hand side, or 0 for a free column. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linParticularValue : (rows: List a) -> (pivots: List Number) -> (c: Number) -> b
+linParticularValue rows pivots c =
+  case linPivotRowOf pivots c of
+    Nothing -> linZero 0
+    Just k -> linRowRhs (at rows k)
+
+@label "Linear direction value"
+@description "Column c's entry in the direction of free column f: 1 at f, minus the pivot row's coefficient at f for a pivot column, 0 elsewhere. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linDirectionValue : (rows: List a) -> (pivots: List Number) -> (f: Number) -> (c: Number) -> b
+linDirectionValue rows pivots f c =
+  if c == f then linOne 0
+  else
+    case linPivotRowOf pivots c of
+      Nothing -> linZero 0
+      Just k -> linNeg (linCoeff rows k f)
+
+@label "Linear classify"
+@description "Classify the reduced system: a row 0 = c (c ≠ 0) means no answer; full rank means exactly one answer; otherwise a family with one direction per free unknown. A step outside the safe-integer range makes the result unsupported. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linClassify : (vars: List String) -> (inputs: List a) -> (state: b) -> c
+linClassify vars inputs state =
+  if all state.rows linRowValid && all inputs linRowValid
+  then linClassifyValid vars inputs state
+  else linUnsupported vars "The numbers grew too large for exact arithmetic within safe integers, so no answer is claimed."
+
+@label "Linear classify valid"
+@description "The classification of a reduced system whose fractions are all valid. Internal helper."
+@tags "engine" "internal" "solve" "linear"
+@category "engine-internal"
+linClassifyValid : (vars: List String) -> (inputs: List a) -> (state: b) -> c
+linClassifyValid vars inputs state =
+  let columns = linIndices (length vars)
+  case find linRowInconsistent state.rows of
+    Just bad -> linResult "none" "A combination of the equations gives 0 = c with c not 0, so no values satisfy all of them." vars inputs [bad] [] [] []
+    Nothing ->
+      let pivotRows = map (\k -> at state.rows k) (linIndices state.rank)
+      let particular = map (\c -> linParticularValue state.rows state.pivots c) columns
+      if state.rank == length vars
+      then linResult "unique" "Each unknown is fixed by a combination of the equations." vars inputs pivotRows particular [] []
+      else
+        let freeColumns = filter (\c -> not (elem c state.pivots)) columns
+        let directions = map (\f -> map (\c -> linDirectionValue state.rows state.pivots f c) columns) freeColumns
+        linResult "family" "Some unknowns stay free; every answer is the particular one plus any multiples of the directions." vars inputs pivotRows particular directions (map (\f -> at vars f) freeColumns)
+
+@label "Solve linear"
+@description "Solve a conjunction of linear equations over the given unknowns exactly, by Gauss–Jordan elimination over exact fractions { num, den } (safe integers; a step beyond them answers unsupported). Returns { status = unique | family | none | unsupported, reason, variables, equations (inputs as Σ a_i·x_i = b), derived (each derived equation with its multipliers over the inputs), values (unique: the answer; family: the particular answer), directions (family), free (family: the free unknowns) }. Every outcome is re-checkable by exact arithmetic. A solver result, not a kernel certificate."
+@tags "engine" "solve" "linear"
+linearSolve : (vars: List String) -> (body: Expr) -> a
+linearSolve vars body =
+  case linEquationsOf vars body of
+    Nothing -> linUnsupported vars "This predicate is not a conjunction of linear equations over its inputs (for example a product of two unknowns, an inequality or another call)."
+    Just forms ->
+      if eq (length forms) 0 then linUnsupported vars "There are no equations to solve."
+      else
+        let rows = linRows forms
+        let state = linEliminate rows 0 (length vars) 0 []
+        linClassify vars rows state
+
+@label "Public linear solve"
+@description "Public door to linearSolve: one to six String unknowns and a predicate in the authority-invariant fragment; otherwise the result is unsupported. GP-12 clearance."
+@tags "engine" "solve" "linear" "public" "gp-12"
+@category "engine-internal"
+solverPublicLinear : (vars: a) -> (body: Expr) -> b
+solverPublicLinear vars body =
+  if isArray vars
+  then
+    if all vars isString && length vars <= 6 && length vars > 0
+    then (if solverFragmentExpr [] body then linearSolve vars body else linUnsupported vars "This predicate uses a form the public solver does not admit.")
+    else linUnsupported [] "Use one to six named unknowns."
+  else linUnsupported [] "Use one to six named unknowns."
+
+@label "Public linear solve of a function"
+@description "Public door to linearSolve over a reflected function value: the reified body with its captured values substituted, over the function's parameters. Any other reflection outcome is unsupported. GP-12 clearance."
+@tags "engine" "solve" "linear" "public" "gp-12"
+@category "engine-internal"
+solverPublicLinearFn : (outcome: ReifyOutcome) -> a
+solverPublicLinearFn outcome =
+  case outcome of
+    Reified { package = pkg } -> solverPublicLinear pkg.params (substituteCaptures pkg.body pkg.captures)
+    _ -> linUnsupported [] "This predicate's definition could not be read as data in this reader."
+
+-- =========================================================================
+-- Finite answer sets (S2, 2026-11-06). A predicate over a STATED finite
+-- domain (whole numbers in a range, or explicit candidate values) is solved
+-- by the relational core: each unknown is grounded by a one-column domain
+-- relation and the predicate becomes the residual condition. The answer is
+-- complete over that domain or the result is unsupported: an undecided
+-- candidate makes the find-all face answer Nothing (rel.complete-answer). It
+-- says nothing about values outside the stated domain, and an unbounded
+-- domain is never enumerated.
+-- =========================================================================
+
+@label "Solver bare expression"
+@description "Rewrite every call head of an Expr to its bare std name (`std:eq` reads `eq`), so a reflected body reaches the relational residual decider with the heads it knows. Other heads keep their qualification. Internal helper."
+@tags "engine" "internal" "solve" "finite" "public" "gp-12"
+@category "engine-internal"
+solverBareExpr : (e: Expr) -> Expr
+solverBareExpr e =
+  case e of
+    ECall { fnId = f, args = args } ->
+      if isString f
+      then (if isArray args then ECall { fnId = solverBareHead f, args = map solverBareExpr args } else e)
+      else e
+    _ -> e
+
+@label "Finite domain name"
+@description "The name of the one-column domain relation that grounds unknown i. Internal helper."
+@tags "engine" "internal" "solve" "finite"
+@category "engine-internal"
+finiteDomainName : (i: Number) -> String
+finiteDomainName i = concat "solverDomain" (toString i)
+
+@label "Finite domain relation"
+@description "Unknown i's candidate values as a one-column relation. Internal helper."
+@tags "engine" "internal" "solve" "finite"
+@category "engine-internal"
+finiteDomainRelation : (domains: List (List a)) -> (i: Number) -> b
+finiteDomainRelation domains i = { name = finiteDomainName i, arity = 1, rows = map (\v -> [v]) (at domains i) }
+
+@label "Finite domain atom"
+@description "The atom that grounds unknown i in its domain relation. Internal helper."
+@tags "engine" "internal" "solve" "finite"
+@category "engine-internal"
+finiteDomainAtom : (vars: List String) -> (i: Number) -> Expr
+finiteDomainAtom vars i = ECall { fnId = finiteDomainName i, args = [EVar { name = at vars i }] }
+
+@label "Finite candidates"
+@description "The number of candidate combinations: the product of the domain sizes. Internal helper."
+@tags "engine" "internal" "solve" "finite"
+@category "engine-internal"
+finiteCandidates : (domains: List (List a)) -> Number
+finiteCandidates domains = fold (\acc d -> mul acc (length d)) 1 domains
+
+@label "Finite result"
+@description "The uniform finite-domain result record. Internal helper."
+@tags "engine" "internal" "solve" "finite"
+@category "engine-internal"
+finiteResult : (outcome: String) -> (why: String) -> (names: List String) -> (found: List a) -> (count: Number) -> b
+finiteResult outcome why names found count = { status = outcome, reason = why, variables = names, answers = found, candidates = count }
+
+@label "Finite domains for unknowns"
+@description "One domain per unknown: a single supplied domain is shared by every unknown. Internal helper."
+@tags "engine" "internal" "solve" "finite"
+@category "engine-internal"
+finiteDomainsFor : (vars: List String) -> (domains: List (List a)) -> List (List a)
+finiteDomainsFor vars domains =
+  if eq (length domains) 1 then map (\v -> at domains 0) vars else domains
+
+@label "Public finite solve"
+@description "Every answer of a fragment predicate over a stated finite domain (one candidate list per unknown, or one list shared by all), complete over that domain: { status = complete | unsupported, reason, variables, answers (binding rows), candidates }. At most 4 unknowns and 5000 candidate combinations; an undecided candidate makes the result unsupported instead of a shortened list. GP-12 clearance (the relational door's fragment check applies)."
+@tags "engine" "solve" "finite" "public" "gp-12"
+@category "engine-internal"
+solverPublicFinite : (vars: a) -> (body: Expr) -> (domains: b) -> c
+solverPublicFinite vars body domains =
+  if isArray vars && isArray domains
+  then
+    if length vars > 0 && length vars <= 4 && all vars isString && all domains isArray
+    then
+      let perUnknown = finiteDomainsFor vars domains
+      if eq (length perUnknown) (length vars)
+      then solverPublicFiniteSearch vars body perUnknown
+      else finiteResult "unsupported" "Give one list of candidate values per unknown, or one list for all of them." vars [] 0
+    else finiteResult "unsupported" "Use one to four named unknowns and lists of candidate values." [] [] 0
+  else finiteResult "unsupported" "Use one to four named unknowns and lists of candidate values." [] [] 0
+
+@label "Public finite search"
+@description "The bounded search behind solverPublicFinite. Internal helper."
+@tags "engine" "internal" "solve" "finite" "public" "gp-12"
+@category "engine-internal"
+solverPublicFiniteSearch : (vars: List String) -> (body: Expr) -> (domains: List (List a)) -> b
+solverPublicFiniteSearch vars body domains =
+  let count = finiteCandidates domains
+  if count > 5000 then finiteResult "unsupported" "More than 5000 candidate combinations; narrow the domain." vars [] count
+  else
+    let indices = linIndices (length vars)
+    let facts = { relations = map (\i -> finiteDomainRelation domains i) indices, rules = [] }
+    let query = ECall { fnId = "and", args = concat (map (\i -> finiteDomainAtom vars i) indices) [body] }
+    case solverPublicSolveRelAll query facts of
+      Nothing -> finiteResult "unsupported" "Some candidate could not be decided exactly (or the predicate uses a form the public solver does not admit), so no complete answer is claimed." vars [] count
+      Just found -> finiteResult "complete" "Every candidate combination in the stated domain was checked." vars found count
+
+@label "Public finite solve of a function"
+@description "solverPublicFinite over a reflected function value: its parameters are the unknowns and its body (captures substituted, std heads bare) is the condition. Any other reflection outcome is unsupported. GP-12 clearance."
+@tags "engine" "solve" "finite" "public" "gp-12"
+@category "engine-internal"
+solverPublicFiniteFn : (outcome: ReifyOutcome) -> (domains: a) -> b
+solverPublicFiniteFn outcome domains =
+  case outcome of
+    Reified { package = pkg } -> solverPublicFinite pkg.params (solverBareExpr (substituteCaptures pkg.body pkg.captures)) domains
+    _ -> finiteResult "unsupported" "This predicate's definition could not be read as data in this reader." [] [] 0

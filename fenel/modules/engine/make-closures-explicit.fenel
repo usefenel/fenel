@@ -1,0 +1,439 @@
+module engine where
+
+-- makeClosuresExplicit — walk an EffectsExplicitProgram body, rewrite
+-- every CoreLambda into a CeClosure carrying an explicit `captures:
+-- List<String>` free-variable list, return a ClosuresExplicitProgram
+-- with the converted body.
+--
+-- Mirrors the TS oracle at ir/closures-explicit.ts:148-336.
+--
+-- Phase 21.3 — second real recursive engine pass authored in Fenel,
+-- following Phase 21.2's `makeEffectsExplicit`. Builds on the same
+-- substrate: a 10-arm CoreMatch over the registered CoreExpr ADT,
+-- threaded accumulator state, and `appendItem` / `elem` / `sortLex`
+-- for list-as-set operations (Fenel doesn't have native Sets, so
+-- `List<String>` plays the part).
+--
+-- Two walks happen inside each CoreLambda case:
+--
+--   1. `collectFreeVars` — names referenced in the body that aren't
+--      bound by the lambda's own params (or inner let / pattern /
+--      nested-lambda bindings). Returns the free set as a deduped
+--      list.
+--   2. `convert` — recursively rewrites the body with the visible-
+--      bindings set extended by the lambda's params.
+--
+-- The captures list is the intersection of the free set with the
+-- OUTER visible-bindings (globals don't go through captures — the
+-- per-target emitter resolves them by name). Sorted via `sortLex`
+-- so byte-equality with the TS oracle's `[...free].sort()` holds.
+--
+-- $dyn:<varName> sentinel — indirect-call CoreCall whose fnId
+-- encodes the captured variable's name rather than naming a global.
+-- `collectFreeVars`'s CoreCall case checks the prefix and adds the
+-- referenced name to the free set. Load-bearing for higher-order
+-- bodies (`std:.`, `std:$`, …) that pass through closure conversion.
+
+-- CeExpr — canonical declaration lives in
+-- `fenel/modules/engine/ir-ast.fenel` (loaded first in engine.ts). Field-
+-- for-field mirror of CoreExpr except `CoreLambda` becomes `CeClosure`
+-- carrying an explicit `captures: List<String>` free-variable list — the
+-- load-bearing structural difference. The body below references CeExpr
+-- by name; the engine evaluator + harness's `sameValue` walk by `$tag` +
+-- named fields against the registered shape.
+
+-- ClosuresExplicitProgram — canonical declaration lives in
+-- `fenel/modules/engine/ir-types.fenel` (Phase 3v.2 Axis-B dedup). Pre-3v.2
+-- this file redeclared it as an inert duplicate; with the `module engine
+-- where` cross-file UNION a duplicate entity id within the group is a
+-- LOAD-TIME ERROR, so the redeclaration is dropped and ir-types.fenel owns
+-- it. Byte-neutral — ir-types loaded FIRST and already won the dedup (its
+-- `body: CeExpr` shape was canonical). The body below constructs it via the
+-- registered shape.
+
+-- makeClosuresExplicit — entry point. The top-level bindings are the
+-- function's formal parameter names; the recursive `convert` carries
+-- the visible-bindings set as a list and threads `emptyList` so every
+-- sub-list-converter has an empty accumulator seed available (Core IR
+-- rejects bare-array literals at expression position).
+@label "Make closures explicit"
+@description "Walk an EffectsExplicitProgram body, convert every CoreLambda to a CeClosure with explicit captures, return a ClosuresExplicitProgram. The captures list at each closure is the intersection of the body's free vars with the OUTER visible-bindings set, sorted lexicographically. Globals don't go through captures (the emitter resolves them by name); the `$dyn:<varName>` sentinel handles indirect calls through captured function values. Mirrors the TS oracle at implementations/typescript/engine/src/ir/closures-explicit.ts. Phase 21.3 — third Fenel-authored engine pass, builds on the Phase 21.2 substrate (`elem` / `appendItem` / `sortLex` for list-as-set ops, two-pass walk inside each CoreLambda case for free-var analysis + body conversion)."
+@tags "engine" "ir" "closure" "self-host" "phase-21"
+makeClosuresExplicit : (input: { name: String, params: a, body: (Expr Any), effects: List String, handlerSites: List ({ callPath: String, typeName: String, methodName: String }) }) -> (emptyList: List a) -> Result a ({ name: String, params: a, body: (CeExpr Any) })
+makeClosuresExplicit input emptyList =
+  let topBindings = compileSlotWireNames input.params emptyList
+  let convertedBody = convert input.body topBindings emptyList
+  Ok (ClosuresExplicitProgram {
+    name = input.name,
+    params = input.params,
+    body = convertedBody
+  })
+
+-- Explicit lexical-boundary projection. The program envelope retains the
+-- complete key-bearing slots; only the lexical scope needs current names.
+@label "Compile slot wire names"
+@description "Project current wireName values from key-bearing CompileFieldSlot metadata to seed closure conversion's lexical visible-bindings set."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+compileSlotWireNames : (items: List CompileFieldSlot) -> (acc: List String) -> List String
+compileSlotWireNames items acc =
+  case head items of
+    Nothing -> acc
+    Just p ->
+      case tail items of
+        Nothing -> appendItem p.wireName acc
+        Just rest -> compileSlotWireNames rest (appendItem p.wireName acc)
+
+-- convert — structural CoreExpr → CeExpr transform. Every CoreLambda
+-- is rewritten to a CeClosure carrying an explicit captures list.
+-- All other 9 cases mirror their input shape with sub-expressions
+-- converted recursively. No Result wrap — the structural transform
+-- has no error path; the top-level entry adds the Ok wrap.
+@label "Convert CoreExpr to CeExpr"
+@description "Structural CoreExpr → CeExpr transform with one twist: every CoreLambda is rewritten to a CeClosure carrying explicit captures. All other 9 cases mirror their input shape with sub-expressions converted recursively. Helper to makeClosuresExplicit — the 10-arm walker."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+convert : (expr: (Expr Any)) -> (bindings: List String) -> (emptyList: List a) -> (CeExpr Any)
+convert expr bindings emptyList =
+  case expr of
+    -- expr-substrate Phase 4c — the live pipeline feeds `Expr` (7 cases); the
+    -- old `Core*` arms (the dead recognition cascade) were retired here. `if` /
+    -- `let` / `do` are no longer IR cases — they're the canonical `ECall "if"`
+    -- / applied-`ELambda`-via-`"$"` encodings desugar produces. This pass is
+    -- the ONE sanctioned recognition site that RECONSTITUTES `CeIf` / `CeLet` /
+    -- `CeDo` from those encodings (backends KEEP those CeExpr cases — P0-locked;
+    -- the reconstitution recognisers live in make-closures-reconstitution.fenel,
+    -- dispatched from the ECall arm via `ceConvertCall`).
+    ELit { value = v } -> CeLit { value = v }
+    EVar { name = n } -> CeVar { name = n }
+    ECall { fnId = f, args = args } ->
+      if and (elem f ["and", "or"]) (eq (lookup expr "structural") (Just true))
+      then ceStructuralBoolean f args bindings (concat bindings (collectFreeVarsList args [] [])) emptyList
+      else if and (elem f ["if", "?:"]) (eq (lookup expr "structural") (Just false))
+      then copyCallMetadata expr (CeCall { fnId = f, args = convertList args bindings emptyList emptyList })
+      else
+        let converted = ceConvertCall f args bindings emptyList
+        case converted of
+          CeCall {} -> copyCallMetadata expr converted
+          other -> other
+    ELambda { params = ps, body = bd } ->
+      let free = collectFreeVars bd ps emptyList
+      let captures = sortLex (filterToCaptures free bindings emptyList)
+      let inner = concat bindings ps
+      CeClosure {
+        params = ps,
+        captures = captures,
+        body = convert bd inner emptyList
+      }
+    EConstruct { ctor = c, args = args, fields = fs } ->
+      CeConstruct {
+        ctor = c,
+        args = convertList args bindings emptyList emptyList,
+        fields = fs
+      }
+    EConstruct { ctor = c, args = args } ->
+      CeConstruct { ctor = c, args = convertList args bindings emptyList emptyList }
+    ERecord { fields = fs } ->
+      CeRecord { fields = convertRecordFields fs bindings emptyList emptyList }
+    EMatch { scrutinee = scrut, arms = arms } ->
+      CeMatch {
+        scrutinee = convert scrut bindings emptyList,
+        arms = convertMatchArms arms bindings emptyList emptyList
+      }
+
+-- The CeIf / CeLet / CeDo reconstitution recognisers that `convert`'s ECall arm
+-- (`ceConvertCall`) dispatches to live in the sibling
+-- `make-closures-reconstitution.fenel` (same `module engine where` union —
+-- split out so the per-pass roster oracle over THIS file stays untouched).
+
+-- convertList — iterate over a list of CoreExpr children, converting
+-- each via `convert` and appending to the accumulator. Used by the
+-- CoreCall.args, CoreDo.exprs, and CoreConstruct.args cases.
+@label "Convert CoreExpr list"
+@description "Iterate over a list of CoreExpr children, converting each via `convert` and appending to the accumulator. Threading helper used by the CoreCall.args, CoreDo.exprs, CoreConstruct.args cases."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+convertList : (exprs: List (Expr Any)) -> (bindings: List String) -> (emptyList: List a) -> (acc: a) -> a
+convertList exprs bindings emptyList acc =
+  case head exprs of
+    Nothing -> acc
+    Just h ->
+      let ceH = convert h bindings emptyList
+      let accNext = appendItem ceH acc
+      case tail exprs of
+        Nothing -> accNext
+        Just rest -> convertList rest bindings emptyList accNext
+
+-- convertLetBindings — walk a CoreLet.bindings list, converting each
+-- binding's value with the CURRENT visible-bindings set, then
+-- extending the set with the bound name BEFORE processing the next
+-- binding (matches JSON-Logic let semantics where binding N can
+-- reference bindings 0..N-1). Returns a record carrying both the
+-- converted-bindings list AND the final visible-bindings set so the
+-- caller can convert the body with the extended scope.
+@label "Convert CoreLet bindings"
+@description "Walk a CoreLet.bindings list, converting each binding's value with the CURRENT visible-bindings then extending the set with the bound name (matches JSON-Logic let semantics). Returns `{bindings, innerVisible}` so the caller can convert the body with the extended scope."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+convertLetBindings : (bs: a) -> (visible: List String) -> (emptyList: List a) -> (ceAcc: a) -> { bindings: a, innerVisible: List String }
+convertLetBindings bs visible emptyList ceAcc =
+  case head bs of
+    Nothing -> { bindings = ceAcc, innerVisible = visible }
+    Just b ->
+      let ceVal = convert b.value visible emptyList
+      let ceAccNext = appendItem { name = b.name, value = ceVal } ceAcc
+      let visibleNext = appendItem b.name visible
+      case tail bs of
+        Nothing -> { bindings = ceAccNext, innerVisible = visibleNext }
+        Just rest ->
+          convertLetBindings rest visibleNext emptyList ceAccNext
+
+-- convertRecordFields — walk a CoreRecord.fields list, converting
+-- each field's value while preserving the field name.
+@label "Convert CoreRecord fields"
+@description "Walk a CoreRecord.fields list, converting each field's value while preserving the field name. Threading helper for the CoreRecord case."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+convertRecordFields : (fs: a) -> (bindings: List String) -> (emptyList: List a) -> (acc: a) -> a
+convertRecordFields fs bindings emptyList acc =
+  case head fs of
+    Nothing -> acc
+    Just f ->
+      let ceV = convert f.value bindings emptyList
+      let accNext = appendItem { name = f.name, value = ceV } acc
+      case tail fs of
+        Nothing -> accNext
+        Just rest -> convertRecordFields rest bindings emptyList accNext
+
+-- convertMatchArms — walk a CoreMatch.arms list, converting each
+-- arm body with the pattern-extended visible-bindings set. The
+-- pattern itself flows through unchanged (CorePattern values are
+-- preserved verbatim in CeMatch arms).
+@label "Convert CoreMatch arms"
+@description "Walk a CoreMatch.arms list, converting each arm body with the pattern-extended visible-bindings set. The pattern itself flows through unchanged."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+convertMatchArms : (arms: a) -> (bindings: List String) -> (emptyList: List a) -> (acc: a) -> a
+convertMatchArms arms bindings emptyList acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let armBindings = collectPatternBindings arm.pattern bindings
+      let ceBody = convert arm.body armBindings emptyList
+      let accNext = appendItem { pattern = arm.pattern, body = ceBody } acc
+      case tail arms of
+        Nothing -> accNext
+        Just rest -> convertMatchArms rest bindings emptyList accNext
+
+-- collectFreeVars — walk a CoreExpr collecting names referenced but
+-- not bound locally. Mirrors ir/closures-explicit.ts:267-321.
+-- `local` is the set of names bound within the lambda being analysed
+-- (its params + any nested let / pattern / inner-lambda bindings);
+-- `free` is the dedup'd accumulator threaded through every recursive
+-- call (functional equivalent of the TS oracle's mutated Set).
+@label "Collect free variables"
+@description "Walk a CoreExpr collecting names referenced but not bound locally. The 10-arm walker that mirrors `convert`'s recursion shape but accumulates a deduped free-var list instead of producing a converted tree. Used by the CoreLambda case in `convert` to compute the captures list."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectFreeVars : (expr: (Expr Any)) -> (local: List String) -> (free: List String) -> List String
+collectFreeVars expr local free =
+  case expr of
+    -- expr-substrate Phase 4c — `Expr` arms only (generic, no special
+    -- if/let/do handling); the old `Core*` arms were retired here. The let/do
+    -- encodings are `ECall "$" [ELambda [p] body, v]`: the ELambda arm binds
+    -- `p` (or "_") into `local` for its body and the applied value scans under
+    -- the outer `local`, so the free-var set falls out EXACTLY right from the
+    -- generic ECall + ELambda arms — no reconstitution needed here (only
+    -- `convert` reconstitutes). `if` is a plain ECall whose three args scan
+    -- under the same `local`.
+    ELit -> free
+    EVar { name = n } -> maybeAddFreeVar n local free
+    ECall { fnId = fnId, args = args } ->
+      let freeAfterFnId = collectDynFreeVar fnId local free
+      collectFreeVarsList args local freeAfterFnId
+    ELambda { params = ps, body = bd } ->
+      let innerLocal = concat local ps
+      collectFreeVars bd innerLocal free
+    EConstruct { args = args } ->
+      collectFreeVarsList args local free
+    ERecord { fields = fs } ->
+      collectFreeVarsRecordFields fs local free
+    EMatch { scrutinee = scrut, arms = arms } ->
+      let f1 = collectFreeVars scrut local free
+      collectFreeVarsMatchArms arms local f1
+
+-- dottedHead — strip everything from the first '.' onward, returning
+-- the substring before the '.'. If no '.' is present, return the
+-- input. Used by `maybeAddFreeVar` to map a dotted CeVar leaf name
+-- like `"c.x"` to the bound head `"c"` so the elem-checks compare
+-- against the outer/local binding sets correctly. Mirrors WASM-emit's
+-- split-and-chain lowering — `lookupLocal head` → `chainGetFieldNamed
+-- tail-fields` — at the conceptual level (head determines whether the
+-- name is captured; the suffix is structural-field access against the
+-- bound head's runtime value).
+@label "Dotted head"
+@description "Strip everything from the first '.' onward, returning the substring before the '.'. If no '.' is present, return the input. Used by `maybeAddFreeVar` to map dotted CeVar leaf names like `c.x` to the bound head `c` so the elem-checks compare against the outer/local binding sets correctly. Phase 5b28 — substrate fix for the closure-conversion dotted-capture bug class."
+@tags "engine" "internal" "phase-21" "phase-5b28"
+@category "engine-internal"
+dottedHead : (name: String) -> String
+dottedHead name =
+  if contains name "."
+  then case head (split name ".") of
+    Nothing -> name
+    Just h -> h
+  else name
+
+-- maybeAddFreeVar — dedup'd append: add `name` to `free` only if
+-- it's not already in `local` (bound) AND not already in `free`
+-- (already collected). Returns the (possibly extended) free list.
+-- Strips dotted CeVar leaf names (`"c.x"` → `"c"`) BEFORE the elem-
+-- checks so dotted captures contribute the bound head to the free
+-- set, matching the captures-filter's elem-check against outer.
+@label "Maybe add free var"
+@description "Dedup'd append: add `name` to `free` only if it's not already in `local` (bound) AND not already in `free` (already collected). Phase 5b28 — strips dotted CeVar leaf names (`c.x` → `c`) via `dottedHead` BEFORE the elem-checks so dotted captures contribute the bound head to the free set. Used by collectFreeVars's CoreVar / CoreCall cases."
+@tags "engine" "internal" "phase-21" "phase-5b28"
+@category "engine-internal"
+maybeAddFreeVar : (name: String) -> (local: List String) -> (free: List String) -> List String
+maybeAddFreeVar name local free =
+  let stripped = dottedHead name
+  if elem stripped local
+  then free
+  else (if elem stripped free then free else appendItem stripped free)
+
+-- collectDynFreeVar — recognise the `$dyn:<varName>` sentinel that
+-- CoreCall uses to encode indirect calls through a captured function
+-- value. The TS oracle's `.startsWith("$dyn:") + .slice(5)` becomes
+-- `startsWith` + `slice fnId 5 (length fnId)` on the Fenel side.
+@label "Collect $dyn free var"
+@description "Recognise the `$dyn:<varName>` sentinel that CoreCall uses to encode indirect calls through a captured function value. Adds the referenced name to the free set when the prefix matches and the name isn't already bound."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectDynFreeVar : (fnId: String) -> (local: List String) -> (free: List String) -> List String
+collectDynFreeVar fnId local free =
+  if startsWith fnId "$dyn:"
+  then maybeAddFreeVar (slice fnId 5 (length fnId)) local free
+  else free
+
+-- collectFreeVarsList — iterate over a list of CoreExpr children,
+-- threading the free-vars accumulator forward through every step.
+@label "Collect free vars (list)"
+@description "Iterate over a list of CoreExpr children, threading the free-vars accumulator through every step. Used by CoreCall.args / CoreDo.exprs / CoreConstruct.args cases."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectFreeVarsList : (exprs: List (Expr Any)) -> (local: List String) -> (free: List String) -> List String
+collectFreeVarsList exprs local free =
+  case head exprs of
+    Nothing -> free
+    Just h ->
+      let freeNext = collectFreeVars h local free
+      case tail exprs of
+        Nothing -> freeNext
+        Just rest -> collectFreeVarsList rest local freeNext
+
+-- collectFreeVarsLetBindings — walk a CoreLet.bindings list scanning
+-- each value's free vars with the CURRENT local set, then extending
+-- local with the bound name before processing the next binding.
+-- Returns `{innerLocal, free}` so the caller can scan the let-body
+-- with the extended scope.
+@label "Collect free vars (let bindings)"
+@description "Walk a CoreLet.bindings list scanning each value's free vars with the CURRENT local set, then extending local with the bound name. Returns `{innerLocal, free}` for the caller to scan the let-body with the extended scope."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectFreeVarsLetBindings : (bs: a) -> (local: List String) -> (free: List String) -> { innerLocal: List String, free: List String }
+collectFreeVarsLetBindings bs local free =
+  case head bs of
+    Nothing -> { innerLocal = local, free = free }
+    Just b ->
+      let freeNext = collectFreeVars b.value local free
+      let localNext = appendItem b.name local
+      case tail bs of
+        Nothing -> { innerLocal = localNext, free = freeNext }
+        Just rest -> collectFreeVarsLetBindings rest localNext freeNext
+
+-- collectFreeVarsRecordFields — walk a CoreRecord.fields list,
+-- scanning each field value's free vars.
+@label "Collect free vars (record fields)"
+@description "Walk a CoreRecord.fields list, scanning each field value's free vars and threading the accumulator forward."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectFreeVarsRecordFields : (fs: a) -> (local: List String) -> (free: List String) -> List String
+collectFreeVarsRecordFields fs local free =
+  case head fs of
+    Nothing -> free
+    Just f ->
+      let freeNext = collectFreeVars f.value local free
+      case tail fs of
+        Nothing -> freeNext
+        Just rest -> collectFreeVarsRecordFields rest local freeNext
+
+-- collectFreeVarsMatchArms — walk a CoreMatch.arms list, scanning
+-- each arm body with the pattern-extended local-bindings set.
+@label "Collect free vars (match arms)"
+@description "Walk a CoreMatch.arms list, scanning each arm body and guard with the pattern-extended local-bindings set."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectFreeVarsMatchArms : (arms: a) -> (local: List String) -> (free: List String) -> List String
+collectFreeVarsMatchArms arms local free =
+  case head arms of
+    Nothing -> free
+    Just arm ->
+      let armLocal = collectPatternBindings arm.pattern local
+      let freeBody = collectFreeVars arm.body armLocal free
+      -- recipe-functions S2 item 7: a guard's free names are free too (a
+      -- capture used only in a guard was missed before).
+      let freeNext = case lookup arm "guard" of
+        Nothing -> freeBody
+        Just guard -> collectFreeVars guard armLocal freeBody
+      case tail arms of
+        Nothing -> freeNext
+        Just rest -> collectFreeVarsMatchArms rest local freeNext
+
+-- collectPatternBindings — walk a CorePattern, accumulating bound
+-- names. PatVar binds its `name`; PatConstruct recurses into sub-
+-- patterns; PatLit and PatWildcard bind nothing.
+@label "Collect pattern bindings"
+@description "Walk a CorePattern, accumulating bound names. PatVar binds its `name`; PatConstruct recurses into sub-patterns; PatLit / PatWildcard bind nothing."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectPatternBindings : (pattern: CorePattern p) -> (acc: List String) -> List String
+collectPatternBindings pattern acc =
+  case pattern of
+    PatLit -> acc
+    PatWildcard -> acc
+    PatVar { name = n } -> appendItem n acc
+    PatConstruct { args = subs } -> collectPatternBindingsList subs acc
+
+-- collectPatternBindingsList — iterate over a list of sub-patterns,
+-- threading the accumulator through `collectPatternBindings`.
+@label "Collect pattern bindings (list)"
+@description "Iterate over a list of sub-patterns, threading the accumulator through collectPatternBindings."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectPatternBindingsList : (patterns: a) -> (acc: List String) -> List String
+collectPatternBindingsList patterns acc =
+  case head patterns of
+    Nothing -> acc
+    Just p ->
+      let accNext = collectPatternBindings p acc
+      case tail patterns of
+        Nothing -> accNext
+        Just rest -> collectPatternBindingsList rest accNext
+
+-- filterToCaptures — filter a list of free-var names to those that
+-- ARE in the outer-bindings set. Mirrors the TS oracle's
+-- `if (bindings.has(name)) captures.push(name)` filter. The caller
+-- wraps the result in `sortLex` to match the TS oracle's
+-- `[...free].sort()` ordering.
+@label "Filter free vars to captures"
+@description "Filter a list of free-var names to those that ARE in the outer-bindings set. Mirrors the TS oracle's `if (bindings.has(name)) captures.push(name)` filter. The caller wraps the result in sortLex to match the TS oracle's `[...free].sort()` ordering."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+filterToCaptures : (free: List String) -> (outer: List String) -> (acc: List String) -> List String
+filterToCaptures free outer acc =
+  case head free of
+    Nothing -> acc
+    Just name ->
+      let accNext = if elem name outer then appendItem name acc else acc
+      case tail free of
+        Nothing -> accNext
+        Just rest -> filterToCaptures rest outer accNext

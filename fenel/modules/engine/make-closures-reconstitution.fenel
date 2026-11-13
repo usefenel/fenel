@@ -1,0 +1,287 @@
+module engine where
+
+-- =========================================================================
+-- make-closures-reconstitution — the CeIf / CeLet / CeDo reconstitution
+-- recognisers for the expr-substrate Phase 4b CoreExpr→Expr replace.
+--
+-- Post-flip (`normaliseToCore` DELEGATES to `jsonLogicToExpr`) the live
+-- compile pipeline feeds `Expr` (7 cases) into `makeClosuresExplicit`. `if` /
+-- `let` / `do` are NO LONGER IR cases — they're the canonical encodings
+-- `desugar` produces:
+--
+--   SIf  ⇒ ECall "if" [c, t, e]
+--   SLet ⇒ right-nested `ECall "$" [ELambda [name] <rest>, value]`  (named)
+--   SDo  ⇒ the same template with `ELambda ["_"]`                   ("_")
+--
+-- `makeClosuresExplicit`'s `convert` is the ONE sanctioned recognition site
+-- that reconstitutes `CeIf` / `CeLet` / `CeDo` from those encodings (the
+-- backends KEEP those CeExpr cases — P0-locked). The recogniser helpers live
+-- in THIS file (a sibling of make-closures-explicit.fenel in the same
+-- `module engine where` union — `convert`'s `ECall` arm calls `ceConvertCall`
+-- here, and the reconstituters call back into `convert` cross-file). Split out
+-- so the per-pass roster oracle (the front-of-pipeline 80 / FULL 813 fixtures
+-- over make-closures-explicit) stays untouched; these 10 fns ride the engine
+-- module total like the P2 desugar / P4a adapter files do.
+--
+-- THE RUN-SPLIT (decision 4): flatten the right-nested applied-`"$"` chain into
+-- (param, value) pairs + the innermost body, then nest:
+--   consecutive NAMED params ⇒ one CeLet { bindings }
+--   consecutive "_"   params ⇒ one CeDo  { exprs = values ++ [continuation] }
+--   a named-then-"_" mix      ⇒ CeLet { body = CeDo … }
+-- byte-equal to the OLD CoreLet→CeLet / CoreDo→CeDo mappings (validated against
+-- the dead cascade on the curated corpus — closures-reconstitution.test.ts).
+-- The visible-bindings set threads so each binding value / body converts under
+-- the correct scope (named binding N sees 0..N-1; "_" adds no visible name) —
+-- mirroring make-closures-explicit's convertLetBindings / convertList.
+--
+-- CANONICALISATION (decision 4 bullet 2): a genuine inline applied single-param
+-- lambda (`(\x -> x) $ y`) is INDISTINGUISHABLE from a let once both are
+-- `ECall "$" [ELambda [p] body, v]`, so it reconstitutes as CeLet — semantically
+-- identical under strict eval. Real `f $ x` (fn-position a var / fnId, NOT a
+-- lambda) does NOT peel a pair, so it stays `CeCall "$"` (frequency of the
+-- canonicalising shape ≈0 in real bodies — probe 5).
+-- =========================================================================
+
+-- ceConvertCall — convert an `ECall`, recognising the two reconstitution
+-- encodings before the generic CeCall fall-through (decision 4):
+--   `if`  (arity EXACTLY 3)            ⇒ CeIf      (ceReconIf)
+--   `$`   (applied single-param λ)     ⇒ CeLet/CeDo (ceReconDollar)
+-- Any other fnId — or `if`/`$` whose shape doesn't match — stays a CeCall
+-- (the std `if` / `($)` are callable; non-matching shapes are genuine calls).
+@label "Convert ECall (reconstituting)"
+@description "Convert an ECall: recognises `ECall \"if\" [c,t,e]` (arity 3) ⇒ CeIf and `ECall \"$\" [ELambda [p] body, v]` chains ⇒ CeLet/CeDo (run-split), else generic CeCall. The single sanctioned CeIf/CeLet/CeDo reconstitution site for the expr-substrate Phase 4b CoreExpr→Expr replace."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+ceConvertCall : (f: String) -> (args: a) -> (bindings: List String) -> (emptyList: List a) -> (CeExpr Any)
+ceConvertCall f args bindings emptyList =
+  if eq f "if"
+  then ceReconIf args bindings emptyList
+  else if eq f "$"
+  then ceReconDollar args bindings emptyList
+  else CeCall { fnId = f, args = convertList args bindings emptyList emptyList }
+
+-- ceReconIf — `ECall "if" [c, t, e]` (arity EXACTLY 3) ⇒ CeIf, recursing all
+-- three. Other arities of "if" are unreachable via the adapter (jlsIfChain
+-- always emits 3-arg nests; 2-arg gets the implicit-else SLit at the adapter)
+-- — they fall back to a generic CeCall for totality.
+@label "Reconstitute CeIf"
+@description "ECall \"if\" [c,t,e] (arity exactly 3) ⇒ CeIf with all three sub-exprs converted; any other arity falls back to a generic CeCall (unreachable via the adapter)."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+ceReconIf : (args: a) -> (bindings: List String) -> (emptyList: List a) -> (CeExpr Any)
+ceReconIf args bindings emptyList =
+  if eq (length args) 3
+  then ceReconIfThree args bindings emptyList
+  else CeCall { fnId = "if", args = convertList args bindings emptyList emptyList }
+
+-- ceReconIfThree — positional destructure of a known-3-element arg list into
+-- CeIf. The Nothing fall-throughs are unreachable (length checked) but present
+-- for pattern totality.
+@label "Reconstitute CeIf (3-arg)"
+@description "Positional destructure of a 3-element ECall \"if\" arg list into CeIf { cond, then, else }. Helper to ceReconIf; Nothing branches are unreachable totality fall-throughs."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+ceReconIfThree : (args: a) -> (bindings: List String) -> (emptyList: List a) -> (CeExpr Any)
+ceReconIfThree args bindings emptyList =
+  case head args of
+    Nothing -> CeCall { fnId = "if", args = convertList args bindings emptyList emptyList }
+    Just c ->
+      case tail args of
+        Nothing -> CeCall { fnId = "if", args = convertList args bindings emptyList emptyList }
+        Just rest1 ->
+          case head rest1 of
+            Nothing -> CeCall { fnId = "if", args = convertList args bindings emptyList emptyList }
+            Just t ->
+              case tail rest1 of
+                Nothing -> CeCall { fnId = "if", args = convertList args bindings emptyList emptyList }
+                Just rest2 ->
+                  case head rest2 of
+                    Nothing -> CeCall { fnId = "if", args = convertList args bindings emptyList emptyList }
+                    Just e ->
+                      CeIf {
+                        cond = convert c bindings emptyList,
+                        then = convert t bindings emptyList,
+                        else = convert e bindings emptyList
+                      }
+
+-- ceReconDollar — `ECall "$" [ELambda [p] body, v]` chains ⇒ CeLet/CeDo. Flatten
+-- the right-nested chain into (param, value) pairs (collectApplyChain), then
+-- run-split: consecutive NAMED params ⇒ CeLet bindings; consecutive "_" params
+-- ⇒ CeDo exprs; a named-then-"_" mix ⇒ CeLet { body = CeDo … } (ceReconApply).
+-- The desugar encoding is `ECall "$" [ELambda [name] <rest>, value]` for SLet
+-- (named) and `[ELambda ["_"] <rest>, value]` for SDo ("_") — this inverts it,
+-- byte-equal to the old CoreLet→CeLet / CoreDo→CeDo mappings. A `$` call whose
+-- shape doesn't peel a pair (fn-position not a single-param lambda, wrong
+-- arity) stays a CeCall (the std `($)` is callable). NOTE: a genuine inline
+-- applied single-param lambda (`(\x -> x) $ y`) CANONICALISES to CeLet —
+-- semantically identical under strict eval (decision 4 bullet 2); real `f $ x`
+-- (fn-position a var / fnId, not a lambda) does NOT peel, so it stays CeCall.
+@label "Reconstitute CeLet/CeDo"
+@description "Flatten an `ECall \"$\" [ELambda [p] body, v]` chain into (param,value) pairs and run-split into CeLet (named runs) / CeDo (\"_\" runs), inverting desugar's applied-ELambda encoding byte-equal to the old CoreLet/CoreDo→CeLet/CeDo mappings. Non-matching `$` shapes stay CeCall. Genuine inline applied single-param lambdas canonicalise to CeLet (strict-eval-identical)."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+ceReconDollar : (args: a) -> (bindings: List String) -> (emptyList: List a) -> (CeExpr Any)
+ceReconDollar args bindings emptyList =
+  let node = ECall { fnId = "$", args = args }
+  let chain = collectApplyChain node emptyList
+  if eq (length chain.pairs) 0
+  then CeCall { fnId = "$", args = convertList args bindings emptyList emptyList }
+  else ceReconApply chain.pairs chain.body bindings emptyList
+
+-- collectApplyChain — walk a right-nested applied-`"$"` chain, peeling one
+-- (param, value) pair per level while the shape holds, returning the collected
+-- pairs (in source order via snoc) + the innermost non-matching body.
+@label "Collect apply chain"
+@description "Walk a right-nested `ECall \"$\" [ELambda [p] body, v]` chain, peeling (param, value) pairs (snoc, source order) until the body is no longer that shape; returns { pairs, body }."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+collectApplyChain : (expr: (Expr Any)) -> (pairsAcc: a) -> { pairs: a, body: (Expr Any) }
+collectApplyChain expr pairsAcc =
+  case expr of
+    ECall { fnId = f, args = args } ->
+      if eq f "$"
+      then case applyDollarPair args of
+        Nothing -> { pairs = pairsAcc, body = expr }
+        Just pr ->
+          collectApplyChain pr.body (appendItem { name = pr.param, value = pr.value } pairsAcc)
+      else { pairs = pairsAcc, body = expr }
+    ELit -> { pairs = pairsAcc, body = expr }
+    EVar -> { pairs = pairsAcc, body = expr }
+    ELambda -> { pairs = pairsAcc, body = expr }
+    EMatch -> { pairs = pairsAcc, body = expr }
+    EConstruct -> { pairs = pairsAcc, body = expr }
+    ERecord -> { pairs = pairsAcc, body = expr }
+
+-- applyDollarPair — peel one pair from an `ECall "$"` arg list: requires EXACTLY
+-- two args, the first an `ELambda` with EXACTLY one param. Returns the param
+-- name, the applied value, and the lambda body (the next chain level).
+@label "Apply-$ pair"
+@description "Peel one (param, value, body) from an `ECall \"$\"` arg list: requires exactly 2 args with arg0 an ELambda of exactly 1 param. Returns Nothing when the shape doesn't match (genuine `($)` call)."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+applyDollarPair : (args: a) -> a
+applyDollarPair args =
+  if eq (length args) 2
+  then case head args of
+    Nothing -> Nothing
+    Just lam ->
+      case tail args of
+        Nothing -> Nothing
+        Just rest1 ->
+          case head rest1 of
+            Nothing -> Nothing
+            Just val -> singleParamLambda lam val
+  else Nothing
+
+-- singleParamLambda — if `lam` is an `ELambda` with exactly one param, return
+-- the pair record; otherwise Nothing.
+@label "Single-param lambda peel"
+@description "If `lam` is an ELambda of exactly one param, returns Just { param, value, body }; otherwise Nothing. Helper to applyDollarPair."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+singleParamLambda : (lam: (Expr Any)) -> (val: (Expr Any)) -> a
+singleParamLambda lam val =
+  case lam of
+    ELambda { params = ps, body = lbody } ->
+      if eq (length ps) 1
+      then case head ps of
+        Nothing -> Nothing
+        Just p -> Just { param = p, value = val, body = lbody }
+      else Nothing
+    ELit -> Nothing
+    EVar -> Nothing
+    ECall -> Nothing
+    EMatch -> Nothing
+    EConstruct -> Nothing
+    ERecord -> Nothing
+
+-- ceReconApply — run-split the flattened (param, value) pairs + innermost body
+-- into a nested CeLet / CeDo tree, threading the visible-bindings set so each
+-- binding value / body converts under the correct scope (named binding N sees
+-- 0..N-1; "_" statements add no visible name). Empty pairs ⇒ the body alone.
+@label "Reconstitute apply chain"
+@description "Run-split flattened (param,value) pairs + innermost body into nested CeLet (named runs) / CeDo (\"_\" runs), threading the visible-bindings set for correct sequential scope. Empty pairs ⇒ convert body alone."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+ceReconApply : (pairs: a) -> (body: (Expr Any)) -> (bindings: List String) -> (emptyList: List a) -> (CeExpr Any)
+ceReconApply pairs body bindings emptyList =
+  case head pairs of
+    Nothing -> convert body bindings emptyList
+    Just p0 ->
+      if eq p0.name "_"
+      then ceReconDoRun pairs body bindings emptyList emptyList
+      else ceReconLetRun pairs body bindings emptyList emptyList
+
+-- ceReconLetRun — peel the maximal leading NAMED run into one CeLet. Each
+-- binding value converts with the CURRENT visible set (sequential scope), then
+-- the set extends with the bound name before the next. When the run ends (a
+-- "_" pair or the pairs exhaust), the CeLet body = ceReconApply on the rest
+-- (or convert body when exhausted) under the fully-extended scope.
+@label "Reconstitute CeLet run"
+@description "Peel the maximal leading NAMED run of (param,value) pairs into one CeLet, converting each value under progressively-extended visible scope (sequential let). The body recurses via ceReconApply on the remaining pairs (or convert body when exhausted)."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+ceReconLetRun : (pairs: a) -> (body: (Expr Any)) -> (visible: List String) -> (emptyList: List a) -> (bindAcc: a) -> (CeExpr Any)
+ceReconLetRun pairs body visible emptyList bindAcc =
+  case head pairs of
+    Nothing -> CeLet { bindings = bindAcc, body = convert body visible emptyList }
+    Just p0 ->
+      if eq p0.name "_"
+      then CeLet { bindings = bindAcc, body = ceReconApply pairs body visible emptyList }
+      else
+        let ceVal = convert p0.value visible emptyList
+        let bindAccNext = appendItem { name = p0.name, value = ceVal } bindAcc
+        let visibleNext = appendItem p0.name visible
+        case tail pairs of
+          Nothing -> CeLet { bindings = bindAccNext, body = convert body visibleNext emptyList }
+          Just rest -> ceReconLetRun rest body visibleNext emptyList bindAccNext
+
+-- ceReconDoRun — peel the maximal leading "_" run into one CeDo. Each statement
+-- value converts under the SAME visible set ("_" binds no visible name); the
+-- CeDo's last expr is the run's continuation (ceReconApply on the rest, or the
+-- converted body when exhausted). exprs accumulate in source order via snoc.
+@label "Reconstitute CeDo run"
+@description "Peel the maximal leading \"_\" run of (param,value) pairs into one CeDo (statements convert under the unchanged visible set); the CeDo's final expr is ceReconApply on the remaining pairs (or convert body when exhausted)."
+@tags "engine" "internal" "expr-substrate" "phase-4b"
+@category "engine-internal"
+ceReconDoRun : (pairs: a) -> (body: (Expr Any)) -> (visible: List String) -> (emptyList: List a) -> (exprAcc: a) -> (CeExpr Any)
+ceReconDoRun pairs body visible emptyList exprAcc =
+  case head pairs of
+    Nothing -> CeDo { exprs = appendItem (convert body visible emptyList) exprAcc }
+    Just p0 ->
+      if eq p0.name "_"
+      then
+        let ceVal = convert p0.value visible emptyList
+        let exprAccNext = appendItem ceVal exprAcc
+        case tail pairs of
+          Nothing -> CeDo { exprs = appendItem (convert body visible emptyList) exprAccNext }
+          Just rest -> ceReconDoRun rest body visible emptyList exprAccNext
+      else CeDo { exprs = appendItem (ceReconApply pairs body visible emptyList) exprAcc }
+
+-- Raw controls return an operand, not the ordinary Boolean native result.
+-- The existing evaluator predicate is a target-runtime ABI observation; no
+-- truthiness policy is reproduced in this pass or inferred from an owner name.
+@category "engine-internal"
+ceStructuralBoolean : (f: String) -> (args: a) -> (bindings: List String) -> (reserved: List String) -> (emptyList: List a) -> (CeExpr Any)
+ceStructuralBoolean f args bindings reserved emptyList =
+  case head args of
+    Nothing -> CeLit { value = eq f "and" }
+    Just first ->
+      let remaining = tailOr args
+      if eq (length remaining) 0 then convert first bindings emptyList
+      else
+        let name = ceStructuralFresh "$structuralOperand" reserved
+        let kept = CeVar { name = name }
+        let rest = ceStructuralBoolean f remaining bindings (appendItem name reserved) emptyList
+        let test = CeCall { fnId = "$structuralTruthy", args = [kept] }
+        CeLet {
+          bindings = [{ name = name, value = convert first bindings emptyList }],
+          body = if eq f "and"
+                 then CeIf { cond = test, then = rest, else = kept }
+                 else CeIf { cond = test, then = kept, else = rest }
+        }
+
+@category "engine-internal"
+ceStructuralFresh : (candidate: String) -> (reserved: List String) -> String
+ceStructuralFresh candidate reserved =
+  if elem candidate reserved then ceStructuralFresh (concat candidate "_") reserved else candidate

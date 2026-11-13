@@ -1,0 +1,1250 @@
+module engine where
+
+-- emitJs — lower a ClosuresExplicitProgram body to a JsModule, the JS-
+-- target's typed AST. The fifth Fenel-authored engine pass and the
+-- final step on the JS pipeline before the (TS-only) serializeJsModule
+-- encode-to-string step.
+--
+-- Mirrors the TS oracle at
+-- implementations/typescript/engine/src/modules/compile-js.ts:emitJsNative.
+--
+-- Phase 21.6 — closes the JS pipeline. After this body lands, every
+-- step from raw source to JsAst has a Fenel body when
+-- FENEL_DISPATCH_FENEL_PASSES=1. Wasm/LLVM lowerings (`lowerToWasmAst`,
+-- `lowerToLlvmAst`) remain TS-only — they're substantially larger and
+-- depend on a substrate fix surfaced by Phase 21.5 (string-field
+-- preservation through deep ADT walks).
+--
+-- The body's input is `ClosuresExplicitProgram` — already a typed
+-- Fenel ADT declared in `make-closures-explicit.fenel`. No marshalling
+-- layer is needed (unlike Phase 21.5's `normaliseToCore`, which marshals
+-- raw JSON-Logic into a `JsonLogic` ADT at the boundary). The body
+-- walks `input.body: CeExpr` via a 10-arm match identical in shape to
+-- Phase 21.3's `convert`.
+--
+-- The body produces a new IR (`JsAst`) — declared below as a 12-variant
+-- ADT mirroring `ir/js-ast.ts`. The construct op uses these declarations
+-- to emit field-named records that byte-equal the TS oracle's output.
+--
+-- Cross-call dispatch: the body invokes `parseEffectFnId` (Phase 21.0's
+-- registered body at `engine:parseEffectFnId`) to classify each
+-- `$effect:<Class>:<method>` sentinel at CeCall sites. Same substrate
+-- as Phase 21.2's `makeEffectsExplicit`.
+
+-- JsAst / JsStmt / JsLoopFn / JsModule / CallMapping — declared canonically in
+-- `fenel/modules/compile-js/types.fenel` (Phase 4j consolidation). The
+-- compile-js module loads that file via `?raw` import and registers the
+-- entities with the system registry; this body file references them by
+-- name via lazy `$named` lookup at runtime.
+
+-- callMappingOf — encoded mapping from canonical codeName to lowering
+-- shape. By the time emitJs sees a CeCall, normaliseToCore has already
+-- mapped operator notation (`+`, `==`, `cat`, ...) to canonical
+-- codeNames, so this only needs to handle codeName keys. Mirrors the
+-- CALL_MAPPING table in compile-js.ts.
+@label "Call mapping of"
+@description "Fenel translation of compile-js.ts's CALL_MAPPING table. Maps a canonical codeName to its lowering shape (BinOp / Unary / Concat) or `NoMapping` (default `$fenel.<fnId>` fallback)."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+callMappingOf : (fnId: String) -> CallMapping
+callMappingOf fnId =
+  if eq fnId "add" then CMBinOp { op = "+" }
+  else if eq fnId "sub" then CMBinOp { op = "-" }
+  else if eq fnId "mul" then CMBinOp { op = "*" }
+  else if eq fnId "div" then CMBinOp { op = "/" }
+  else if eq fnId "mod" then CMBinOp { op = "%" }
+  else if eq fnId "eq" then CMBinOp { op = "===" }
+  else if eq fnId "neq" then CMBinOp { op = "!==" }
+  else if eq fnId "lt" then CMBinOp { op = "<" }
+  else if eq fnId "lte" then CMBinOp { op = "<=" }
+  else if eq fnId "gt" then CMBinOp { op = ">" }
+  else if eq fnId "gte" then CMBinOp { op = ">=" }
+  else if eq fnId "and" then CMBinOp { op = "&&" }
+  else if eq fnId "or" then CMBinOp { op = "||" }
+  else if eq fnId "not" then CMUnary { op = "!" }
+  else if eq fnId "truthy" then CMUnary { op = "!!" }
+  else if eq fnId "negate" then CMUnary { op = "-" }
+  else if eq fnId "concat" then CMConcat
+  else CMNoMapping
+
+-- emitJs — entry point. Lower `input.body` via `emitExpr`, wrap the
+-- result in a JsArrow carrying the function's formal params (and an
+-- empty captures list — the top-level function captures nothing by
+-- construction), package as a JsModule. Returns Result CompileError
+-- JsModule so the first failing nested expr short-circuits out as Err.
+--
+-- The `emptyList` arg is the harness-supplied empty-list seed that
+-- propagates through every accumulator (Core IR rejects bare-array
+-- literals at expression position).
+@label "Emit JsAst"
+@description "Lower a ClosuresExplicitProgram to a JsModule. Maps the Fenel std-op set to direct JS operators (`add` → `+`, `eq` → `===`, …) where the semantics align; routes other calls through `$fenel.<fnId>(…)` runtime helpers. Effect-dispatch sentinels (`$effect:<Class>:<method>`) lower to `$fenel.$effect.<Class>.<method>(...)` via cross-call dispatch to `engine:parseEffectFnId`. Pattern matching emits chained ternaries over `$tag` and field access, with `$fenel.matchFail($scrut)` at the innermost else position. Mirrors the TS oracle at implementations/typescript/engine/src/modules/compile-js.ts:emitJsNative. Phase 21.6 — the fifth Fenel-authored engine pass; closes the JS pipeline end-to-end (modulo serializeJsModule's TS-only encode step)."
+@tags "engine" "ir" "lowering" "js" "self-host" "phase-21"
+emitJs : (input: { name: String, params: a, body: (CeExpr Any) }) -> (emptyList: List a) -> Result a JsModule
+emitJs input emptyList =
+  if emitJsMembershipFenced input.name
+  then emitJsMembershipRefusal input.name
+  else if and (eq input.name "jitResidual") (not (jitLowerable input.body))
+  then Err (Unsupported {
+         reason = "JIT: an operator or condition whose JS lowering is not exact for these operands",
+         node = input.name
+       })
+  else emitJsChecked input emptyList
+
+-- ===================================================================
+-- recipe-functions S1 fence (review S1-3, round 2 R2-5). std membership
+-- (`includes` / `unique` / `distinctCount`) is structural `eq`, and compiled
+-- `eq` lowers to JS `===` (reference equality on objects), so none of the
+-- three may be compiled: not as the root, not as a call head, not as a
+-- function value (`$fn:<key>`). Unresolved UUID routes are refused
+-- conservatively. The emitter is pure and has no registry to tell which
+-- function a UUID names: every UUID-shaped key is an identity route it cannot resolve
+-- and is refused (conservative: an unrelated UUID-headed call is refused
+-- too; the compiled parser and resolver namespaces are keyed by codename,
+-- not UUID). The canonical spellings (bare, `std:` and `std.`) are refused
+-- directly; an admitted alias binding resolves to `std:<name>` in
+-- normaliseToCore before it reaches here. CompileSource admission rejects a
+-- UUID target in callBindings. A dynamic head with no binder or an
+-- unresolved dotted head is refused upstream by normaliseToCore.
+-- ===================================================================
+
+@label "Membership fence"
+@description "True when a compile root name, call head or function-value key may denote std membership (`includes` / `unique` / `distinctCount`): one of their canonical spellings, or any UUID-shaped identity the emitter cannot resolve. recipe-functions S1 fence."
+@tags "engine" "internal" "recipe-functions"
+@category "engine-internal"
+emitJsMembershipFenced : (key: String) -> Boolean
+emitJsMembershipFenced key =
+  if elem key ["includes", "std:includes", "std.includes", "unique", "std:unique", "std.unique", "distinctCount", "std:distinctCount", "std.distinctCount"]
+  then true
+  else emitJsUuidShaped key
+
+-- emitJsUuidShaped key: the 36-character hyphenated shape of a UUID
+-- identity (hyphens at 8, 13, 18 and 23), in either case and any version.
+-- Shape only, deliberately wider than std:isUuid (no version or variant
+-- check): a conservative refusal must not miss an identity spelling. No
+-- Fenel function name or qualified codename has this shape (an identifier
+-- never contains a hyphen at those offsets with that length).
+@label "UUID-shaped key"
+@description "True for a 36-character text with hyphens at offsets 8, 13, 18 and 23 (the UUID identity shape, any case or version). Used by the membership fence to refuse identity routes the emitter cannot resolve."
+@tags "engine" "internal" "recipe-functions"
+@category "engine-internal"
+emitJsUuidShaped : (key: String) -> Boolean
+emitJsUuidShaped key =
+  if not (eq (length key) 36) then false
+  else and (eq (slice key 8 9) "-") (and (eq (slice key 13 14) "-") (and (eq (slice key 18 19) "-") (eq (slice key 23 24) "-")))
+
+@label "Membership fence refusal"
+@description "The Unsupported refusal the membership fence returns for a root name, call head or function-value key. recipe-functions S1 fence."
+@tags "engine" "internal" "recipe-functions"
+@category "engine-internal"
+emitJsMembershipRefusal : (key: String) -> Result a b
+emitJsMembershipRefusal key =
+  Err (Unsupported {
+    reason = concat "recipe-functions S1 fence: std membership (includes / unique / distinctCount) is structural `eq`, and compiled `eq` lowers to JS === (reference equality on objects); a membership spelling or an unresolvable UUID identity is not compiled: " key,
+    node = key
+  })
+
+-- emitJsChecked — the unchanged emitJs body (split out so the JIT admission
+-- above can refuse first; byte-identical output for every admitted input).
+@label "Emit JsAst (checked)"
+@description "The emitJs lowering proper: lower `input.body` via emitExpr and package a JsModule (JsLoopFn for a self-tail-recursive body, JsArrow otherwise). Called by emitJs after the JIT admission check."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+emitJsChecked : (input: { name: String, params: a, body: (CeExpr Any) }) -> (emptyList: List a) -> Result a JsModule
+emitJsChecked input emptyList =
+  let bodyR = emitExpr input.body emptyList
+  case bodyR of
+    Err err -> Err err
+    Ok body ->
+      let paramNames = compileSlotWireNames input.params emptyList
+      if hasTailSelf input.name paramNames body
+      then Ok (JsModule {
+        name = input.name,
+        fieldSlots = input.params,
+        entry = JsLoopFn {
+          params = paramNames,
+          captures = emptyList,
+          body = lowerSpine input.name paramNames paramNames body emptyList
+        }
+      })
+      else Ok (JsModule {
+        name = input.name,
+        fieldSlots = input.params,
+        entry = JsArrow {
+          params = paramNames,
+          captures = emptyList,
+          body = body
+        }
+      })
+
+-- ===================================================================
+-- JIT admission (partial-evaluator-substrate conservative repair,
+-- 2026-10-16). The JIT (`jitEval`, evaluator-strategies ffi) compiles a
+-- residual under the fixed source name `jitResidual` and runs it against a
+-- minimal `$fenel` runtime. Since the conservative PE folds nothing in a
+-- foreign frame, residuals such as `div 1 0` (native 0), `mod 1 0`
+-- (native 0) or `eq [1] [1]` (native structural true) reach this emitter,
+-- whose `/` `%` `===` lowerings answer Infinity / NaN / false: a wrong Ok.
+-- For that source only, refuse (an honest Err) unless every mapped
+-- operator is exact: a binary operator only on exactly two finite non-(-0)
+-- number literals (and a nonzero literal divisor for div / mod), concat only
+-- on exactly two string literals, no unary operator, no match, an `if`
+-- condition only a boolean literal, a faithful number literal or a
+-- comparison call, and every literal JSON-faithful (no NaN, ±Infinity, -0,
+-- objects). Every other compile (parser / resolver artifacts, the
+-- Compilable instance) is unchanged. The frame check (operators mean the
+-- harness's) is in jitEvalNative.
+-- ===================================================================
+
+@label "JIT lowerable"
+@description "JIT admission over a CeExpr: True iff every operator-mapped call lowers exactly (a binary operator on exactly two non-NaN number literals, a nonzero literal divisor for div / mod; no unary operator), every `if` condition is a boolean literal, a non-NaN number literal or a comparison call, and no match occurs. Other calls, literals, variables, lets, closures, constructors and records recurse. partial-evaluator-substrate conservative repair."
+@tags "engine" "internal" "phase-21" "partial-evaluator-substrate"
+@category "engine-internal"
+jitLowerable : (e: (CeExpr Any)) -> Bool
+jitLowerable e =
+  case e of
+    CeLit { value = v } -> jitLitFaithful v
+    CeVar { name = n } -> true
+    CeCall { fnId = f, args = args } ->
+      if all args (\a -> jitLowerable a) then jitCallLowerable f args else false
+    CeIf { cond = c, then = t, else = x } ->
+      and (jitCondExact c) (and (jitLowerable c) (and (jitLowerable t) (jitLowerable x)))
+    CeLet { bindings = bs, body = bd } ->
+      and (all bs (\b -> jitLowerable b.value)) (jitLowerable bd)
+    CeDo { exprs = es } -> all es (\x -> jitLowerable x)
+    CeClosure { params = ps, captures = cs, body = bd } -> jitLowerable bd
+    CeConstruct { ctor = c, args = args } -> all args (\a -> jitLowerable a)
+    CeRecord { fields = fs } -> all fs (\f -> jitLowerable f.value)
+    CeMatch { scrutinee = s, arms = arms } -> false
+
+@label "JIT call lowerable"
+@description "A CeCall lowers exactly in the JIT when its call mapping is a binary operator over exactly two non-NaN number literals (div / mod: a nonzero literal divisor), or it has no operator mapping (a runtime call, honest when the runtime lacks it). Unary operators are refused. partial-evaluator-substrate conservative repair."
+@tags "engine" "internal" "phase-21" "partial-evaluator-substrate"
+@category "engine-internal"
+jitCallLowerable : (fnId: String) -> (args: a) -> Bool
+jitCallLowerable fnId args =
+  case callMappingOf fnId of
+    CMBinOp { op = op } ->
+      if and (eq (length args) 2) (all args (\a -> jitNumberLit a))
+      then (if or (eq op "/") (eq op "%") then not (jitZeroLit (at args 1)) else true)
+      else false
+    CMUnary { op = op } -> false
+    CMConcat -> and (eq (length args) 2) (all args (\a -> jitStringLit a))
+    other -> true
+
+@label "JIT number literal"
+@description "True iff a CeExpr is a literal host number that is not NaN (NaN is the only number not greater-or-equal to itself). partial-evaluator-substrate conservative repair."
+@tags "engine" "internal" "phase-21" "partial-evaluator-substrate"
+@category "engine-internal"
+jitNumberLit : (e: (CeExpr Any)) -> Bool
+jitNumberLit e =
+  case e of
+    CeLit { value = v } -> if isNumber v then jitLitFaithful v else false
+    other -> false
+
+@label "JIT string literal"
+@description "True iff a CeExpr is a string literal (the only operand kind on which the JIT runtime's concat equals std concat). partial-evaluator-substrate conservative repair."
+@tags "engine" "internal" "phase-21" "partial-evaluator-substrate"
+@category "engine-internal"
+jitStringLit : (e: (CeExpr Any)) -> Bool
+jitStringLit e =
+  case e of
+    CeLit { value = v } -> isString v
+    other -> false
+
+@label "JIT faithful literal"
+@description "True iff a literal survives the JIT's JSON serialization unchanged: null, a boolean, a string, a FINITE number other than -0 (JSON writes NaN and ±Infinity as null and -0 as 0), or an array of such literals. Objects are refused. partial-evaluator-substrate conservative repair."
+@tags "engine" "internal" "phase-21" "partial-evaluator-substrate"
+@category "engine-internal"
+jitLitFaithful : (v: a) -> Bool
+jitLitFaithful v =
+  if isNull v then true
+  else if isBoolean v then true
+  else if isString v then true
+  else if isNumber v then (if eq (sub v v) 0 then not (and (eq v 0) (lt (pow v (sub 0 1)) 0)) else false)
+  else if isArray v then all v (\x -> jitLitFaithful x)
+  else false
+
+@label "JIT zero literal"
+@description "True iff a CeExpr is the number literal 0 (or -0). partial-evaluator-substrate conservative repair."
+@tags "engine" "internal" "phase-21" "partial-evaluator-substrate"
+@category "engine-internal"
+jitZeroLit : (e: (CeExpr Any)) -> Bool
+jitZeroLit e =
+  case e of
+    CeLit { value = v } -> if isNumber v then eq v 0 else false
+    other -> false
+
+@label "JIT exact condition"
+@description "True iff an `if` condition's JS truthiness equals Fenel truthiness for every value it can take: a boolean literal, a non-NaN number literal, or a comparison call (eq, neq, lt, lte, gt, gte), which yields a boolean. partial-evaluator-substrate conservative repair."
+@tags "engine" "internal" "phase-21" "partial-evaluator-substrate"
+@category "engine-internal"
+jitCondExact : (c: (CeExpr Any)) -> Bool
+jitCondExact c =
+  case c of
+    CeLit { value = v } -> if isBoolean v then true else jitNumberLit c
+    CeCall { fnId = f } -> or (or (eq f "eq") (eq f "neq")) (or (or (eq f "lt") (eq f "lte")) (or (eq f "gt") (eq f "gte")))
+    other -> false
+
+-- ===================================================================
+-- Self-tail-call → while-loop emission (parser-substrate Phase 6b2,
+-- lever B). POST-emit JsAst rewrite, gated by hasTailSelf: a fn with
+-- >=1 self-TAIL call emits as a JsLoopFn (a `while (true)` spine) so
+-- the JS engine reuses one stack frame — killing the compiled depth
+-- fence corpus-wide (the 210k lower-to-wasm-ast.fenel lexes). Every
+-- non-qualifying fn stays on the byte-identical JsArrow path by
+-- construction (post-emit detection touches no existing emission).
+-- ===================================================================
+
+-- isSelfCall — is `callee` the `$fenel.<name>` member access of the
+-- enclosing fn's own name? (6a confirmed self-recursion emits
+-- `$fenel.<ownName>(…)`.) Used by hasTailSelf + lowerSpine.
+@label "Is self call"
+@description "True when a JsAst callee is `$fenel.<name>` (JsMember over JsVar `$fenel` with property = the enclosing fn's own name). Phase 6b2 self-tail-call detection."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+isSelfCall : (name: String) -> (callee: JsAst) -> Boolean
+isSelfCall name callee =
+  case callee of
+    JsMember { object = o, property = p } ->
+      if eq p name
+      then case o of
+        JsVar { name = vn } -> eq vn "$fenel"
+        other -> false
+      else false
+    other -> false
+
+-- hasTailSelf — does `ast` contain a self-call in TAIL position with
+-- arity == |params| (the arity guard: a partial self-application must
+-- NOT be rewritten)? Tail positions, recursively: the body root;
+-- JsTernary then/else (NOT cond); JsLet body (NOT binding values); the
+-- LAST JsSequence element. Does NOT descend into JsArrow bodies (a
+-- nested closure's self-call is not a tail call of the outer fn — and
+-- `continue` there is illegal JS), call args, binops, objects, arrays.
+@label "Has tail self-call"
+@description "True when `ast` contains a self-call (`$fenel.<name>`) in TAIL position with arity == |params|. Tail positions: body root, JsTernary then/else (not cond), JsLet body (not bindings), last JsSequence element. Does not descend into JsArrow bodies / call args / binops / objects / arrays. The gate for the JsLoopFn rewrite. Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+hasTailSelf : (name: String) -> (params: a) -> (ast: JsAst) -> Boolean
+hasTailSelf name params ast =
+  case ast of
+    JsCall { callee = c, args = as } ->
+      if isSelfCall name c
+      then if eq (length as) (length params)
+           then tailArgsSafe params as
+           else false
+      else false
+    JsTernary { then = t, else = e } ->
+      if hasTailSelf name params t
+      then true
+      else hasTailSelf name params e
+    JsLet { body = b } -> hasTailSelf name params b
+    JsSequence { exprs = es } -> hasTailSelfLast name params es
+    other -> false
+
+-- hasTailSelfLast — the LAST element of a JsSequence is the tail
+-- position; everything before it is sequenced-for-effect (non-tail).
+@label "Has tail self-call (last)"
+@description "Recurse to the last element of a JsSequence's expr list — the only tail position in a sequence — and test it via hasTailSelf. Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+hasTailSelfLast : (name: String) -> (params: a) -> (es: List JsAst) -> Boolean
+hasTailSelfLast name params es =
+  case head es of
+    Nothing -> false
+    Just h ->
+      case tail es of
+        Nothing -> hasTailSelf name params h
+        Just rest -> hasTailSelfLast name params rest
+
+-- lowerSpine — lower a JsAst at a TAIL position into a `List JsStmt`
+-- spine. `declared` tracks names IN SCOPE at this point (seeded with
+-- `params` at the top level; accumulated through enclosing blocks).
+-- Tail self-call ⇒ temp-first reassign + continue; JsTernary ⇒ JsSIf
+-- whose branches INHERIT `declared` (a JS `{ }` block sees enclosing
+-- names — so a shadowing binding whose value references the shadowed
+-- name routes through lowerLet's outer-scope temp, NOT a TDZ-prone
+-- plain `const`); JsLet ⇒ fold the bindings (lowerLet); JsSequence ⇒
+-- all-but-last as JsSExpr, recurse on the last; anything else ⇒
+-- JsSReturn (the expression serializes exactly as today, IIFEs and
+-- all). NOTE the inherit-`declared` design corrects the brief's
+-- reset-to-[] rule, which TDZ-faulted on nested matches whose inner
+-- `$scrut` value reads the outer `$scrut` (measured: 6b2 Step 4).
+@label "Lower spine"
+@description "Lower a tail-position JsAst into a `List JsStmt`. Tail self-call (arity-matched) ⇒ temp-first reassign + JsSContinue; JsTernary ⇒ JsSIf whose branches inherit `declared` (so shadowing bindings route through the outer-scope temp, avoiding a TDZ); JsLet ⇒ binding fold (lowerLet); JsSequence ⇒ non-last as JsSExpr + recurse on last; else ⇒ JsSReturn. Phase 6b2 lever B."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+lowerSpine : (name: String) -> (params: a) -> (declared: a) -> (ast: JsAst) -> (emptyList: List a) -> List JsStmt
+lowerSpine name params declared ast emptyList =
+  case ast of
+    JsCall { callee = c, args = as } ->
+      if isSelfCall name c
+      then if eq (length as) (length params)
+           then if tailArgsSafe params as
+                then lowerTailCall params as emptyList
+                else appendItem (JsSReturn { value = ast }) emptyList
+           else appendItem (JsSReturn { value = ast }) emptyList
+      else appendItem (JsSReturn { value = ast }) emptyList
+    JsTernary { cond = c, then = t, else = e } ->
+      let thenStmts = lowerSpine name params declared t emptyList
+      let elseStmts = lowerSpine name params declared e emptyList
+      appendItem (JsSIf { cond = c, then = thenStmts, else = elseStmts }) emptyList
+    JsLet { bindings = bs, body = b } ->
+      lowerLet name params declared bs b emptyList
+    JsSequence { exprs = es } ->
+      lowerSeq name params declared es emptyList
+    other -> appendItem (JsSReturn { value = ast }) emptyList
+
+-- lowerTailCall — a tail self-call `f(a0, …, an)` becomes
+-- `const $t0 = a0; …; const $tn = an; p0 = $t0; …; pn = $tn; continue;`.
+-- TEMP-FIRST is load-bearing: every new arg computes from OLD params,
+-- so all temps must be bound before any param is reassigned. Temp names
+-- `$t<i>` are positional; each call site terminates its block, so no
+-- cross-site collisions.
+@label "Lower tail call"
+@description "Lower a tail self-call into temp-first reassign + continue: `const $t<i> = arg<i>` for every arg (computed from OLD params), then `param<i> = $t<i>`, then JsSContinue. Temp-first is load-bearing. Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+lowerTailCall : (params: a) -> (args: a) -> (emptyList: List a) -> List JsStmt
+lowerTailCall params args emptyList =
+  let temps = buildTempConsts args 0 emptyList
+  let assigns = buildAssigns params 0 emptyList
+  concat temps (concat assigns (appendItem (JsSContinue) emptyList))
+
+-- buildTempConsts — `const $t<idx> = arg` for each arg, in order.
+@label "Build temp consts"
+@description "Build `const $t<idx> = arg` JsSConst statements for each tail-call arg, in order. Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+buildTempConsts : (args: a) -> (idx: Number) -> (acc: List JsStmt) -> List JsStmt
+buildTempConsts args idx acc =
+  case head args of
+    Nothing -> acc
+    Just arg ->
+      let tempName = concat "$t" (toString idx)
+      let stmt = JsSConst { name = tempName, value = arg }
+      let accNext = appendItem stmt acc
+      case tail args of
+        Nothing -> accNext
+        Just rest -> buildTempConsts rest (add idx 1) accNext
+
+-- buildAssigns — `<param> = $t<idx>` for each param, in order (the
+-- temps from buildTempConsts).
+@label "Build assigns"
+@description "Build `<param> = $t<idx>` JsSAssign statements for each param, in order. Pairs with buildTempConsts. Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+buildAssigns : (params: a) -> (idx: Number) -> (acc: List JsStmt) -> List JsStmt
+buildAssigns params idx acc =
+  case head params of
+    Nothing -> acc
+    Just p ->
+      let tempName = concat "$t" (toString idx)
+      let stmt = JsSAssign { name = p, value = JsVar { name = tempName } }
+      let accNext = appendItem stmt acc
+      case tail params of
+        Nothing -> accNext
+        Just rest -> buildAssigns rest (add idx 1) accNext
+
+-- lowerSeq — a JsSequence's non-last elements emit as JsSExpr
+-- (evaluated for effect); the last element is the tail position, so it
+-- recurses through lowerSpine.
+@label "Lower sequence"
+@description "Lower a JsSequence spine: non-last elements as JsSExpr (effect-position), last element via lowerSpine (tail position). Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+lowerSeq : (name: String) -> (params: a) -> (declared: a) -> (es: List JsAst) -> (emptyList: List a) -> List JsStmt
+lowerSeq name params declared es emptyList =
+  case head es of
+    Nothing -> emptyList
+    Just h ->
+      case tail es of
+        Nothing -> lowerSpine name params declared h emptyList
+        Just rest ->
+          let stmt = JsSExpr { value = h }
+          concat (appendItem stmt emptyList) (lowerSeq name params declared rest emptyList)
+
+-- lowerLet — fold a JsLet's bindings into the current block. A binding
+-- whose name is NOT in scope ⇒ `const name = value`, declared += name.
+-- A binding whose name IS already in scope (this block OR an enclosing
+-- one) ⇒ the temp+block fallback: evaluate the value in the OUTER scope
+-- as `$l<i>` (so a rebinding value sees the OLD binding — a naive inner
+-- `const name = <value referencing name>` is a TDZ error; a same-block
+-- re-`const` is a SyntaxError — the fallback kills both classes), then
+-- open a JsSBlock whose first stmt is `const name = $l<i>` and whose
+-- remainder is the rest of the bindings + body lowered with declared
+-- inheriting the enclosing scope + [name, $l<i>]. Fires on every nested
+-- match (the inner `$scrut` shadows the outer) — the measured common
+-- case, not rare (6b2 corrected the brief's reset-to-[] estimate).
+@label "Lower let"
+@description "Fold a JsLet's bindings into the current block's statement spine. Fresh name ⇒ `const name = value` (declared += name). Name already declared in this block ⇒ temp+block fallback (`const $l<i> = value` in outer scope, then a JsSBlock re-binding name = $l<i> with the remainder nested). Body lowered via lowerSpine. Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+lowerLet : (name: String) -> (params: a) -> (declared: a) -> (bindings: a) -> (body: JsAst) -> (emptyList: List a) -> List JsStmt
+lowerLet name params declared bindings body emptyList =
+  case head bindings of
+    Nothing -> lowerSpine name params declared body emptyList
+    Just b ->
+      let rest = tailOr bindings
+      if elem b.name declared
+      then
+        let tempName = concat "$l" (toString (length declared))
+        let outerConst = JsSConst { name = tempName, value = b.value }
+        let innerFirst = JsSConst { name = b.name, value = JsVar { name = tempName } }
+        let innerDeclared = appendItem tempName (appendItem b.name declared)
+        let innerRest = lowerLet name params innerDeclared rest body emptyList
+        let blockBody = concat (appendItem innerFirst emptyList) innerRest
+        let blockStmt = JsSBlock { body = blockBody }
+        appendItem blockStmt (appendItem outerConst emptyList)
+      else
+        let stmt = JsSConst { name = b.name, value = b.value }
+        let declaredNext = appendItem b.name declared
+        let restStmts = lowerLet name params declaredNext rest body emptyList
+        concat (appendItem stmt emptyList) restStmts
+
+-- tailArgsSafe — a tail self-call is loop-safe ONLY when no argument
+-- contains a closure (JsArrow) that captures a param. The continue
+-- reassigns every param IN PLACE, but a closure captures the param
+-- VARIABLE, not a snapshot — so a closure arg referencing a param
+-- would see the reassigned value (often itself), e.g. mkRed's
+-- red-fusion `\x -> g (f x)` carried as the new `fn` ⇒ unbounded
+-- self-recursion. Temp-first only snapshots VALUE args; closures need
+-- this guard. An unsafe tail self-call stays a recursive `return`
+-- expression call (its depth is bounded structurally — mkRed's by
+-- red-fusion — so it never needed TCO).
+@label "Tail args safe"
+@description "True when no tail-self-call argument contains a param-capturing closure (a JsArrow whose body references a param). The continue reassigns params in place, so a closure capturing a param would be poisoned — such a tail call must NOT be looped (stays a recursive return-call). Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+tailArgsSafe : (params: a) -> (args: a) -> Boolean
+tailArgsSafe params args =
+  case head args of
+    Nothing -> true
+    Just a ->
+      if hasCaptureArrow params a
+      then false
+      else case tail args of
+        Nothing -> true
+        Just rest -> tailArgsSafe params rest
+
+-- hasCaptureArrow — does `ast` contain a JsArrow that captures (freely
+-- references, modulo its own param shadowing) any of `params`?
+-- `referencesAnyName` (serialize-js-module) already recurses through
+-- nested arrows + honours shadowing, so the JsArrow arm is a single
+-- whole-arrow check; the other arms recurse to FIND arrows.
+@label "Has capture arrow"
+@description "True when `ast` contains a JsArrow whose body freely references any of `params` (a param-capturing closure). JsArrow arm delegates to referencesAnyName (handles nesting + shadowing); other arms recurse to locate arrows. Phase 6b2 loop-safety check."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+hasCaptureArrow : (params: a) -> (ast: JsAst) -> Boolean
+hasCaptureArrow params ast =
+  case ast of
+    JsArrow -> referencesAnyName ast params
+    JsCall { callee = c, args = as } ->
+      if hasCaptureArrow params c
+      then true
+      else hasCaptureArrowList params as
+    JsMember { object = o } -> hasCaptureArrow params o
+    JsTernary { cond = c, then = t, else = e } ->
+      if hasCaptureArrow params c
+      then true
+      else if hasCaptureArrow params t
+      then true
+      else hasCaptureArrow params e
+    JsBinOp { left = l, right = r } ->
+      if hasCaptureArrow params l
+      then true
+      else hasCaptureArrow params r
+    JsUnaryOp { arg = a } -> hasCaptureArrow params a
+    JsObject { fields = fs } -> hasCaptureArrowFields params fs
+    JsArray { elements = es } -> hasCaptureArrowList params es
+    JsSequence { exprs = es } -> hasCaptureArrowList params es
+    JsLet { bindings = bs, body = b } ->
+      if hasCaptureArrowBindings params bs
+      then true
+      else hasCaptureArrow params b
+    other -> false
+
+@label "Has capture arrow (list)"
+@description "OR-fold of hasCaptureArrow over a JsAst list. Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+hasCaptureArrowList : (params: a) -> (asts: List JsAst) -> Boolean
+hasCaptureArrowList params asts =
+  case head asts of
+    Nothing -> false
+    Just h ->
+      if hasCaptureArrow params h
+      then true
+      else hasCaptureArrowList params (tailOr asts)
+
+@label "Has capture arrow (fields)"
+@description "OR-fold of hasCaptureArrow over a {key, value} field list's values. Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+hasCaptureArrowFields : (params: a) -> (fields: a) -> Boolean
+hasCaptureArrowFields params fields =
+  case head fields of
+    Nothing -> false
+    Just f ->
+      if hasCaptureArrow params f.value
+      then true
+      else hasCaptureArrowFields params (tailOr fields)
+
+@label "Has capture arrow (bindings)"
+@description "OR-fold of hasCaptureArrow over a {name, value} binding list's values. Phase 6b2."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+hasCaptureArrowBindings : (params: a) -> (bindings: a) -> Boolean
+hasCaptureArrowBindings params bindings =
+  case head bindings of
+    Nothing -> false
+    Just b ->
+      if hasCaptureArrow params b.value
+      then true
+      else hasCaptureArrowBindings params (tailOr bindings)
+
+-- emitExpr — main 10-arm CeExpr walker. Each arm mirrors the TS
+-- oracle's `emitExpr` switch case in compile-js.ts:emitExpr. CeLit /
+-- CeVar produce their JS twin directly. CeIf produces JsTernary. CeLet
+-- / CeDo / CeClosure / CeRecord follow their structural shape. CeCall
+-- dispatches through `emitCall` for the four-way classification
+-- (binop / unary / concat / dyn / effect / default). CeConstruct splits
+-- on whether `fields` is present (Phase 21.1 named-field convergence)
+-- or absent (positional `_<i>` fallback). CeMatch builds a chained
+-- ternary right-to-left over the arms with a `$fenel.matchFail` call
+-- at the innermost position.
+@label "Emit expression"
+@description "Main 10-arm CeExpr walker. Each arm produces the corresponding JsAst shape. CeLit / CeVar / CeIf produce JsLit / JsVar / JsTernary directly (a `$fn:<key>` CeVar, a global function passed as a value, produces the `$fenel` member a call of it uses); CeLet / CeDo / CeClosure / CeRecord follow the structural shape; CeCall dispatches through `emitCall`; CeConstruct splits on `fields` presence for named-key vs positional fallback; CeMatch builds a chained ternary right-to-left via `buildMatchChain`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+emitExpr : (expr: (CeExpr Any)) -> (emptyList: List a) -> Result a JsAst
+emitExpr expr emptyList =
+  case expr of
+    CeLit { value = v } -> Ok (JsLit { value = v })
+    -- A global function passed as a value (`$fn:<runtime key>`, from
+    -- normaliseToCore's compileResolveValueRefs) is the `$fenel` member a call
+    -- of it uses, never a free JS variable.
+    CeVar { name = n } ->
+      if startsWith n "$fn:"
+      then
+        let key = slice n 4 (length n)
+        if emitJsMembershipFenced key
+        then emitJsMembershipRefusal key
+        else Ok (JsMember {
+          object = JsVar { name = "$fenel" },
+          property = key
+        })
+      else Ok (JsVar { name = n })
+    CeIf { cond = c, then = t, else = e } ->
+      let condR = emitExpr c emptyList
+      case condR of
+        Err err -> Err err
+        Ok condJ ->
+          let thenR = emitExpr t emptyList
+          case thenR of
+            Err err -> Err err
+            Ok thenJ ->
+              let elseR = emitExpr e emptyList
+              case elseR of
+                Err err -> Err err
+                Ok elseJ ->
+                  Ok (JsTernary { cond = condJ, then = thenJ, else = elseJ })
+    CeLet { bindings = bs, body = bd } ->
+      let bindingsR = emitLetBindings bs emptyList emptyList
+      case bindingsR of
+        Err err -> Err err
+        Ok jsBindings ->
+          let bodyR = emitExpr bd emptyList
+          case bodyR of
+            Err err -> Err err
+            Ok jsBody ->
+              Ok (JsLet { bindings = jsBindings, body = jsBody })
+    CeDo { exprs = es } ->
+      let exprsR = emitExprList es emptyList emptyList
+      case exprsR of
+        Err err -> Err err
+        Ok jsExprs ->
+          if eq (length jsExprs) 1
+          then Ok (unwrapSingletonAst jsExprs)
+          else Ok (JsSequence { exprs = jsExprs })
+    CeClosure { params = ps, captures = cs, body = bd } ->
+      let bodyR = emitExpr bd emptyList
+      case bodyR of
+        Err err -> Err err
+        Ok jsBody ->
+          Ok (JsArrow { params = ps, captures = cs, body = jsBody })
+    CeCall { fnId = fnId, args = args } ->
+      let argsR = emitExprList args emptyList emptyList
+      case argsR of
+        Err err -> Err err
+        Ok jsArgs ->
+          if and (elem fnId ["and", "or", "std:and", "std:or"]) (eq (lookup expr "structural") (Just false))
+          then
+            if lt (length jsArgs) 2
+            then Err (Unsupported { reason = "ordinary Boolean call requires at least two arguments", node = fnId })
+            else Ok (JsCall { callee = JsMember { object = JsVar { name = "$fenel" }, property = fnId }, args = jsArgs })
+          else emitCall fnId jsArgs emptyList
+    -- Phase 5b13 Bool-construct emitter alignment: zero-arg `True` /
+    -- `False` short-circuit to a JS bool literal so compiled output
+    -- structurally matches the engine's opaque-repr semantics
+    -- (`construct ["True"|"False"]` evaluates to native JS bool —
+    -- json-logic.ts:675-676). Every other ctor falls through to the
+    -- canonical `{$tag: ctor, ...}` JsObject shape.
+    CeConstruct { ctor = c, args = args, fields = fs } ->
+      if eq c "True"
+      then if eq (length args) 0 then Ok (JsLit { value = true }) else emitConstructDefault c args fs emptyList
+      else if eq c "False"
+      then if eq (length args) 0 then Ok (JsLit { value = false }) else emitConstructDefault c args fs emptyList
+      else emitConstructDefault c args fs emptyList
+    CeConstruct { ctor = c, args = args } ->
+      if eq c "True"
+      then if eq (length args) 0 then Ok (JsLit { value = true }) else emitConstructDefault c args emptyList emptyList
+      else if eq c "False"
+      then if eq (length args) 0 then Ok (JsLit { value = false }) else emitConstructDefault c args emptyList emptyList
+      else emitConstructDefault c args emptyList emptyList
+    CeRecord { fields = fs } ->
+      let fieldsR = emitRecordFields fs emptyList emptyList
+      case fieldsR of
+        Err err -> Err err
+        Ok jsFields ->
+          Ok (JsObject { fields = jsFields })
+    CeMatch { scrutinee = scr, arms = arms } ->
+      let scrutineeR = emitExpr scr emptyList
+      case scrutineeR of
+        Err err -> Err err
+        Ok jsScrut ->
+          let matchFailCall = buildMatchFail emptyList
+          let chainR = buildMatchChain arms matchFailCall emptyList
+          case chainR of
+            Err err -> Err err
+            Ok chain ->
+              Ok (JsLet {
+                bindings = appendItem { name = "$scrut", value = jsScrut } emptyList,
+                body = chain
+              })
+
+-- emitConstructDefault — canonical fall-through emit for a CeConstruct
+-- arm. Phase 5b13 factored this out so the True/False short-circuit at
+-- the top of emitExpr's CeConstruct arms can fall through to the
+-- standard `{$tag: ctor, ...}` JsObject shape on every other ctor.
+@label "Emit construct default"
+@description "Canonical fall-through emit for a CeConstruct arm. Phase 5b13 factored this out so the True/False short-circuit at the top of emitExpr's CeConstruct arms can fall through to the standard `{$tag: ctor, ...}` JsObject shape on every other ctor."
+@tags "engine" "internal" "phase-21" "phase-5b13"
+@category "engine-internal"
+emitConstructDefault : (c: String) -> (args: a) -> (fs: a) -> (emptyList: List a) -> a
+emitConstructDefault c args fs emptyList =
+  let argsR = emitExprList args emptyList emptyList
+  case argsR of
+    Err err -> Err err
+    Ok jsArgs ->
+      Ok (JsObject { fields = buildConstructFields c jsArgs fs emptyList })
+
+-- emitExprList — lower a list of CeExpr children into a JsAst list,
+-- accumulating. Errors short-circuit. Used by CeCall.args, CeDo.exprs,
+-- CeConstruct.args.
+@label "Emit expr list"
+@description "Iterate over a list of CeExpr children, lowering each via `emitExpr` and accumulating into a JsAst list. Used by CeCall.args, CeDo.exprs, and CeConstruct.args."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+emitExprList : (exprs: a) -> (emptyList: List a) -> (acc: a) -> Result a a
+emitExprList exprs emptyList acc =
+  case head exprs of
+    Nothing -> Ok acc
+    Just h ->
+      let loweredR = emitExpr h emptyList
+      case loweredR of
+        Err err -> Err err
+        Ok lowered ->
+          let accNext = appendItem lowered acc
+          case tail exprs of
+            Nothing -> Ok accNext
+            Just rest ->
+              emitExprList rest emptyList accNext
+
+-- emitLetBindings — lower each binding's value, accumulate as a list
+-- of named records `{name, value}` (anonymous record shape mirroring
+-- the TS oracle's `{name, value}[]` for JsLet.bindings).
+@label "Emit let bindings"
+@description "Walk a CeLet.bindings list, lowering each value and accumulating `{name, value}` records (anonymous-record shape mirroring the TS oracle's JsLet.bindings)."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+emitLetBindings : (bs: a) -> (emptyList: List a) -> (acc: a) -> Result a a
+emitLetBindings bs emptyList acc =
+  case head bs of
+    Nothing -> Ok acc
+    Just b ->
+      let loweredR = emitExpr b.value emptyList
+      case loweredR of
+        Err err -> Err err
+        Ok lowered ->
+          let accNext = appendItem { name = b.name, value = lowered } acc
+          case tail bs of
+            Nothing -> Ok accNext
+            Just rest ->
+              emitLetBindings rest emptyList accNext
+
+-- emitRecordFields — lower each field's value, accumulate as a list
+-- of `{key, value}` records (note: `key`, not `name` — the TS oracle's
+-- JsObject.fields shape).
+@label "Emit record fields"
+@description "Walk a CeRecord.fields list, lowering each value and accumulating `{key, value}` records (note `key`, not `name` — mirrors the TS oracle's JsObject.fields shape)."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+emitRecordFields : (fs: a) -> (emptyList: List a) -> (acc: a) -> Result a a
+emitRecordFields fs emptyList acc =
+  case head fs of
+    Nothing -> Ok acc
+    Just f ->
+      let loweredR = emitExpr f.value emptyList
+      case loweredR of
+        Err err -> Err err
+        Ok lowered ->
+          let accNext = appendItem { key = f.name, value = lowered } acc
+          case tail fs of
+            Nothing -> Ok accNext
+            Just rest ->
+              emitRecordFields rest emptyList accNext
+
+-- emitCall — the 4-way CeCall dispatch. Args have already been lowered.
+--   1. CALL_MAPPING[fnId] — emit binop / unary / concat shape.
+--   2. fnId starts with `$dyn:` — emit direct `JsCall { callee:
+--      JsVar varName, args }` (no `$fenel.` prefix).
+--   3. parseEffectFnId fnId — emit `$fenel.$effect.<Class>.<method>(args)`.
+--   4. Default — emit `$fenel.<fnId>(args)`.
+@label "Emit call"
+@description "Four-way CeCall dispatch (after args have been lowered): 1) CALL_MAPPING[fnId] → binop / unary / concat shape; 2) `$dyn:` prefix → direct JsCall on a JsVar; 3) parseEffectFnId match → `$fenel.$effect.<Class>.<method>(...)`; 4) default → `$fenel.<fnId>(...)`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+emitCall : (fnId: String) -> (jsArgs: a) -> (emptyList: List a) -> Result a JsAst
+emitCall fnId jsArgs emptyList =
+  let mapping = callMappingOf fnId
+  if emitJsMembershipFenced fnId
+  then emitJsMembershipRefusal fnId
+  else case mapping of
+    CMBinOp { op = op } ->
+      if lt (length jsArgs) 2
+      then Err (Unsupported {
+             reason = concat "binary operator expects at least 2 args: " op,
+             node = fnId
+           })
+      else Ok (foldBinOp op jsArgs)
+    CMUnary { op = op } ->
+      if eq (length jsArgs) 1
+      then Ok (JsUnaryOp { op = op, arg = unwrapSingletonAst jsArgs })
+      else Err (Unsupported {
+             reason = concat "unary operator expects 1 arg: " op,
+             node = fnId
+           })
+    CMConcat ->
+      if lt (length jsArgs) 1
+      then Err (Unsupported {
+             reason = "concat needs at least 1 argument",
+             node = fnId
+           })
+      else Ok (foldConcat jsArgs emptyList)
+    CMNoMapping ->
+      if startsWith fnId "$dyn:"
+      then
+        let varName = slice fnId 5 (length fnId)
+        Ok (JsCall {
+          callee = JsVar { name = varName },
+          args = jsArgs
+        })
+      else
+        let parsed = parseEffectFnId fnId
+        case parsed of
+          Just p ->
+            let effectNs = JsMember {
+              object = JsVar { name = "$fenel" },
+              property = "$effect"
+            }
+            let classNs = JsMember { object = effectNs, property = p.typeName }
+            Ok (JsCall {
+              callee = JsMember { object = classNs, property = p.methodName },
+              args = jsArgs
+            })
+          Nothing ->
+            Ok (JsCall {
+              callee = JsMember {
+                object = JsVar { name = "$fenel" },
+                property = fnId
+              },
+              args = jsArgs
+            })
+
+-- foldBinOp — left-fold over an arg list (length >= 2) into nested
+-- JsBinOp. `add(a, b, c)` → `((a + b) + c)`. Caller guarantees length
+-- >= 2; the unreachable empty-head case returns a placeholder JsLit
+-- that the type checker tolerates.
+@label "Fold binop"
+@description "Left-fold a JsAst arg list (length >= 2) into nested JsBinOp. `add(a, b, c)` → `((a + b) + c)`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+foldBinOp : (op: String) -> (args: a) -> JsAst
+foldBinOp op args =
+  case head args of
+    Nothing -> JsLit { value = false }
+    Just h ->
+      case tail args of
+        Nothing -> h
+        Just rest -> foldBinOpLoop op h rest
+
+@label "Fold binop (loop)"
+@description "Recursive helper to foldBinOp."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+foldBinOpLoop : (op: String) -> (acc: JsAst) -> (rest: a) -> JsAst
+foldBinOpLoop op acc rest =
+  case head rest of
+    Nothing -> acc
+    Just r ->
+      let accNext = JsBinOp { op = op, left = acc, right = r }
+      case tail rest of
+        Nothing -> accNext
+        Just restRest -> foldBinOpLoop op accNext restRest
+
+-- foldConcat — same shape as foldBinOp but wraps each pair in a
+-- `$fenel.concat(a, b)` call. `concat(a, b, c)` →
+-- `$fenel.concat($fenel.concat(a, b), c)`. 1-arg input returns the arg
+-- unchanged.
+@label "Fold concat"
+@description "Left-fold a JsAst arg list (length >= 1) into nested `$fenel.concat(...)` calls. 1-arg input returns the arg unchanged."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+foldConcat : (args: a) -> (emptyList: List a) -> JsAst
+foldConcat args emptyList =
+  case head args of
+    Nothing -> JsLit { value = "" }
+    Just h ->
+      case tail args of
+        Nothing -> h
+        Just rest -> foldConcatLoop h rest emptyList
+
+@label "Fold concat (loop)"
+@description "Recursive helper to foldConcat."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+foldConcatLoop : (acc: JsAst) -> (rest: a) -> (emptyList: List a) -> JsAst
+foldConcatLoop acc rest emptyList =
+  case head rest of
+    Nothing -> acc
+    Just r ->
+      let pairArgs = appendItem r (appendItem acc emptyList)
+      let accNext = JsCall {
+        callee = JsMember {
+          object = JsVar { name = "$fenel" },
+          property = "concat"
+        },
+        args = pairArgs
+      }
+      case tail rest of
+        Nothing -> accNext
+        Just restRest -> foldConcatLoop accNext restRest emptyList
+
+-- unwrapSingletonAst — extract the only element from a 1-element list.
+-- Used by CeDo's "single expr → unwrap to that expr" path and CMUnary's
+-- single-arg JsUnaryOp.arg extraction. The Nothing branch is unreachable
+-- (callers guarantee length=1).
+@label "Unwrap singleton AST"
+@description "Extract the only element from a 1-element JsAst list. Used by CeDo's single-expr unwrap and CMUnary's single-arg path."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+unwrapSingletonAst : (xs: a) -> JsAst
+unwrapSingletonAst xs =
+  case head xs of
+    Nothing -> JsLit { value = false }
+    Just x -> x
+
+-- buildConstructFields — given a ctor name, lowered args, and a
+-- (possibly empty) fields list, build the JsObject.fields entries.
+-- First entry is `{key="$tag", value=JsLit ctor}`; subsequent entries
+-- iterate over args zipped with fields[i] (named-key when fields is
+-- populated for i) or `_<i>` (positional fallback). The
+-- fields-as-empty-list seed makes the "fields absent" case structurally
+-- equivalent to "fields present but length 0", both falling through
+-- to the positional path.
+@label "Build construct fields"
+@description "Given a ctor name, lowered args, and a (possibly empty) fields list, build the JsObject.fields entries. First entry is `{key=\"$tag\", value=JsLit ctor}`; subsequent entries iterate over args zipped with fields[i] (named-key) or `_<i>` (positional fallback)."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+buildConstructFields : (ctor: String) -> (args: a) -> (fields: a) -> (emptyList: List a) -> a
+buildConstructFields ctor args fields emptyList =
+  let initial = appendItem { key = "$tag", value = JsLit { value = ctor } } emptyList
+  buildConstructFieldsLoop args fields 0 initial
+
+@label "Build construct fields (loop)"
+@description "Recursive helper to buildConstructFields."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+buildConstructFieldsLoop : (args: a) -> (fields: a) -> (idx: Number) -> (acc: a) -> a
+buildConstructFieldsLoop args fields idx acc =
+  case head args of
+    Nothing -> acc
+    Just arg ->
+      let key = pickConstructKey fields idx
+      let accNext = appendItem { key = key, value = arg } acc
+      case tail args of
+        Nothing -> accNext
+        Just rest -> buildConstructFieldsLoop rest fields (add idx 1) accNext
+
+-- pickConstructKey — choose the key name for position idx. Phase 10a-6
+-- routing: positional construction emits `_<idx>` (CoreConstruct has no
+-- `fields` slot per `positionalFieldsForCtor → Nothing`, so `fields` is
+-- emptyList here, length 0 < idx for all idx, fallback hits). Named-
+-- record construction (separate path in normaliser) emits CoreConstruct
+-- WITH `fields = <declared-names>`, so `fields[idx]` is used verbatim.
+@label "Pick construct key"
+@description "Choose the key name for position idx: fields[idx] when present, else `_<idx>`. Mirrors the TS oracle's fieldNames-or-positional dispatch."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+pickConstructKey : (fields: a) -> (idx: Number) -> String
+pickConstructKey fields idx =
+  if lt idx (length fields)
+  then
+    if and (gte idx 0) (eq idx (floor idx))
+    then
+      let slot = at fields idx
+      slot.wireName
+    else nthCompileSlotWireName fields idx
+  else concat "_" (toString idx)
+
+-- Explicit final object-property projection for resolved constructor slots.
+nthCompileSlotWireName : (xs: List CompileFieldSlot) -> (idx: Number) -> String
+nthCompileSlotWireName xs idx =
+  case head xs of
+    Nothing -> ""
+    Just slot ->
+      if eq idx 0
+      then slot.wireName
+      else case tail xs of
+        Nothing -> ""
+        Just rest -> nthCompileSlotWireName rest (sub idx 1)
+
+-- nthString — list-indexing helper for a List<String>. Returns "" on
+-- out-of-range (callers guard via `lt idx (length xs)`).
+@label "Nth string"
+@description "List-indexing helper for a List<String>. Returns \"\" on out-of-range; callers guard via `lt idx (length xs)`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+nthString : (xs: List String) -> (idx: Number) -> String
+nthString xs idx =
+  case head xs of
+    Nothing -> ""
+    Just h ->
+      if eq idx 0
+      then h
+      else case tail xs of
+        Nothing -> ""
+        Just rest -> nthString rest (sub idx 1)
+
+-- buildMatchFail — construct the `$fenel.matchFail($scrut)` call used
+-- as the innermost else of a CeMatch's chained ternary. The args list
+-- carries a single JsVar referencing the scrutinee binding.
+@label "Build match fail"
+@description "Construct the `$fenel.matchFail($scrut)` call used as the innermost else of a CeMatch's chained ternary."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+buildMatchFail : (emptyList: List a) -> JsAst
+buildMatchFail emptyList =
+  JsCall {
+    callee = JsMember {
+      object = JsVar { name = "$fenel" },
+      property = "matchFail"
+    },
+    args = appendItem (JsVar { name = "$scrut" }) emptyList
+  }
+
+-- buildMatchChain — fold a CeMatch's arms list into a nested
+-- JsTernary chain. Forward recursion builds the rest of the chain
+-- first (via tail), then wraps it as the else of the current arm's
+-- ternary. End result is identical in shape to the TS oracle's
+-- backward iteration: `ternary(g1, b1, ternary(g2, b2, ... matchFail))`.
+@label "Build match chain"
+@description "Fold a CeMatch's arms list into a nested JsTernary chain. Forward recursion builds the rest of the chain first (via tail), then wraps it as the else of the current arm's ternary. Result is structurally identical to the TS oracle's backwards iteration."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+buildMatchChain : (arms: a) -> (matchFail: JsAst) -> (emptyList: List a) -> Result a JsAst
+buildMatchChain arms matchFail emptyList =
+  case head arms of
+    Nothing -> Ok matchFail
+    Just arm ->
+      let tailChainR = buildTailChain arms matchFail emptyList
+      case tailChainR of
+        Err err -> Err err
+        Ok tailChain ->
+          let scrutJsVar = JsVar { name = "$scrut" }
+          let guardR = emitPatternGuard arm.pattern scrutJsVar emptyList
+          case guardR of
+            Err err -> Err err
+            Ok guard ->
+              let bodyR = emitArmBody arm.pattern scrutJsVar arm.body emptyList
+              case bodyR of
+                Err err -> Err err
+                Ok body ->
+                  Ok (JsTernary { cond = guard, then = body, else = tailChain })
+
+-- buildTailChain — recurse on the tail of an arms list to build the
+-- inner-arm chain. Factored out so buildMatchChain stays single-case
+-- nested (layout-friendlier).
+@label "Build tail chain"
+@description "Recurse on the tail of an arms list to build the inner-arm chain. Factored out so buildMatchChain stays single-case nested (layout-friendlier)."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+buildTailChain : (arms: a) -> (matchFail: JsAst) -> (emptyList: List a) -> Result a JsAst
+buildTailChain arms matchFail emptyList =
+  case tail arms of
+    Nothing -> Ok matchFail
+    Just rest -> buildMatchChain rest matchFail emptyList
+
+-- emitPatternGuard — produce a JS expression that evaluates to true
+-- when `scrut` matches `pattern`. 4-arm CorePattern walker. PatLit
+-- emits a `===` comparison; PatVar / PatWildcard emit `JsLit true`
+-- (always match — bindings handled separately by collectPatternBindings);
+-- PatConstruct emits a `&&`-chain over `$tag === <ctor>` plus each
+-- sub-pattern's recursive guard against the field access. Split into
+-- two arms for the fields-present and fields-absent paths (same
+-- two-pattern trick as the CeConstruct dispatch in emitExpr).
+@label "Emit pattern guard"
+@description "Produce a JS expression that evaluates to true when scrut matches the CorePattern. 4-arm walker. PatLit emits `===`; PatVar / PatWildcard emit JsLit(true) (bindings handled by collectPatternBindings); PatConstruct emits a `&&`-chain over `$tag === <ctor>` plus each sub-pattern's recursive guard. Two-arm PatConstruct dispatch for fields-present vs absent."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+emitPatternGuard : (pat: CorePattern p) -> (scrut: JsAst) -> (emptyList: List a) -> Result a JsAst
+emitPatternGuard pat scrut emptyList =
+  case pat of
+    PatLit { value = v } ->
+      Ok (JsBinOp {
+        op = "===",
+        left = scrut,
+        right = JsLit { value = v }
+      })
+    PatVar -> Ok (JsLit { value = true })
+    PatWildcard -> Ok (JsLit { value = true })
+    PatConstruct { ctor = c, args = subs, fields = fs } ->
+      let tagCheck = JsBinOp {
+        op = "===",
+        left = JsMember { object = scrut, property = "$tag" },
+        right = JsLit { value = c }
+      }
+      -- A null/non-object or inherited tag cannot match a constructor.
+      -- Reuse the existing presence helper before reading the tag itself.
+      let tagPresence = JsCall {
+        callee = JsMember { object = JsVar { name = "$fenel" }, property = "hasOwn" },
+        args = appendItem (JsLit { value = "$tag" }) (appendItem scrut emptyList)
+      }
+      let guardedTagCheck = JsBinOp { op = "&&", left = tagPresence, right = tagCheck }
+      emitPatternGuardLoop subs fs scrut 0 guardedTagCheck emptyList
+    PatConstruct { ctor = c, args = subs } ->
+      let tagCheck = JsBinOp {
+        op = "===",
+        left = JsMember { object = scrut, property = "$tag" },
+        right = JsLit { value = c }
+      }
+      let tagPresence = JsCall {
+        callee = JsMember { object = JsVar { name = "$fenel" }, property = "hasOwn" },
+        args = appendItem (JsLit { value = "$tag" }) (appendItem scrut emptyList)
+      }
+      let guardedTagCheck = JsBinOp { op = "&&", left = tagPresence, right = tagCheck }
+      emitPatternGuardLoop subs emptyList scrut 0 guardedTagCheck emptyList
+
+-- emitPatternGuardLoop — iterate over a PatConstruct's sub-patterns,
+-- building `&&`-conjoined guard chain. Each sub-pattern's scrut is
+-- `JsMember { object = parentScrut, property = fieldName_or_pos }`.
+--
+-- Each sub-position emits a `$fenel.hasOwn(scrut, property)` presence
+-- check conjoined with the recursive sub-guard. Mirrors the engine's
+-- `matchPattern` own-field strictness — a two-arm pattern dispatch that
+-- distinguishes with-field
+-- vs without-field on the same ctor must fail the with-field arm when
+-- the scrutinee lacks the OWN field (an inherited `__proto__` /
+-- `constructor` never counts), falling through to the without-field arm
+-- in both engine eval and compiled JS.
+@label "Emit pattern guard (loop)"
+@description "Iterate over a PatConstruct's sub-patterns, building `&&`-conjoined guard chain. Each sub-pattern's scrut is `JsMember { object = parentScrut, property = fieldName_or_pos }`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+emitPatternGuardLoop : (subs: a) -> (fields: a) -> (scrut: JsAst) -> (idx: Number) -> (acc: JsAst) -> (emptyList: List a) -> Result a JsAst
+emitPatternGuardLoop subs fields scrut idx acc emptyList =
+  case head subs of
+    Nothing -> Ok acc
+    Just sub ->
+      let property = pickConstructKey fields idx
+      let subScrut = JsMember { object = scrut, property = property }
+      let presenceArgs = appendItem (JsLit { value = property }) (appendItem scrut emptyList)
+      let presenceCheck = JsCall {
+        callee = JsMember {
+          object = JsVar { name = "$fenel" },
+          property = "hasOwn"
+        },
+        args = presenceArgs
+      }
+      let subGuardR = emitPatternGuard sub subScrut emptyList
+      case subGuardR of
+        Err err -> Err err
+        Ok subGuard ->
+          let withPresence = JsBinOp { op = "&&", left = presenceCheck, right = subGuard }
+          let accNext = JsBinOp { op = "&&", left = acc, right = withPresence }
+          case tail subs of
+            Nothing -> Ok accNext
+            Just rest ->
+              emitPatternGuardLoop rest fields scrut (add idx 1) accNext emptyList
+
+-- emitArmBody — wrap a match arm's body in a JsLet introducing the
+-- bindings introduced by the arm's pattern (each binding's value is
+-- the field-access path through the scrutinee). When the pattern
+-- introduces no bindings (PatLit / PatWildcard at the top), return
+-- the body verbatim.
+@label "Emit arm body"
+@description "Wrap a match arm's body in a JsLet introducing the bindings introduced by the arm's pattern. When the pattern introduces no bindings (PatLit / PatWildcard at top), return the body verbatim."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+emitArmBody : (pat: CorePattern p) -> (scrut: JsAst) -> (body: (CeExpr Any)) -> (emptyList: List a) -> Result a JsAst
+emitArmBody pat scrut body emptyList =
+  let bindings = collectPatternBindingsForJs pat scrut emptyList emptyList
+  let loweredBodyR = emitExpr body emptyList
+  case loweredBodyR of
+    Err err -> Err err
+    Ok loweredBody ->
+      if eq (length bindings) 0
+      then Ok loweredBody
+      else Ok (JsLet { bindings = bindings, body = loweredBody })
+
+-- collectPatternBindingsForJs — accumulator-threaded walk over a
+-- CorePattern, collecting `{name, value}` entries where `value` is
+-- the JsMember-chain access path through the scrutinee. The TS oracle
+-- mutates an `accum` array via `accum.push(...)`; the Fenel translation
+-- threads the accumulator through the recursion. Same two-arm
+-- PatConstruct dispatch as emitPatternGuard.
+@label "Collect pattern bindings (JS)"
+@description "Accumulator-threaded walk over a CorePattern, collecting `{name, value}` entries where `value` is the JsMember-chain access path through the scrutinee. The TS oracle mutates an `accum` array; the Fenel translation threads the accumulator through recursion. Two-arm PatConstruct dispatch as in emitPatternGuard."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectPatternBindingsForJs : (pat: CorePattern p) -> (scrut: JsAst) -> (acc: a) -> (emptyList: List a) -> a
+collectPatternBindingsForJs pat scrut acc emptyList =
+  case pat of
+    PatLit -> acc
+    PatWildcard -> acc
+    PatVar { name = n } -> appendItem { name = n, value = scrut } acc
+    PatConstruct { args = subs, fields = fs } ->
+      collectPatternBindingsLoop subs fs scrut 0 acc emptyList
+    PatConstruct { args = subs } ->
+      collectPatternBindingsLoop subs emptyList scrut 0 acc emptyList
+
+-- collectPatternBindingsLoop — iterate over a PatConstruct's sub-
+-- patterns, building the JsMember-chain access path for each and
+-- recursing.
+@label "Collect pattern bindings (loop)"
+@description "Iterate over a PatConstruct's sub-patterns, building the JsMember-chain access path for each and recursing into collectPatternBindingsForJs."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+collectPatternBindingsLoop : (subs: a) -> (fields: a) -> (scrut: JsAst) -> (idx: Number) -> (acc: a) -> (emptyList: List a) -> a
+collectPatternBindingsLoop subs fields scrut idx acc emptyList =
+  case head subs of
+    Nothing -> acc
+    Just sub ->
+      let property = pickConstructKey fields idx
+      let subScrut = JsMember { object = scrut, property = property }
+      let accNext = collectPatternBindingsForJs sub subScrut acc emptyList
+      case tail subs of
+        Nothing -> accNext
+        Just rest ->
+          collectPatternBindingsLoop rest fields scrut (add idx 1) accNext emptyList

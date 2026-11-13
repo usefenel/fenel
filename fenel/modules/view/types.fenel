@@ -1,0 +1,1179 @@
+-- =========================================================================
+-- View — the view-substrate's first coded slice (design/view-substrate.md,
+-- V1-of-the-ladder scale; 2026-08-08). Layout, shape, and motion as typed
+-- Fenel values, plus the LOWERING as a Fenel function: `plan` turns a
+-- ViewLayout into a RenderPlan whose constructors say HOW each part renders
+-- on the web surface — CSS where the value sits in the CSS-expressible
+-- fragment, canvas where it does not. The browser interprets a RenderPlan
+-- 1:1 (a dumb IO leaf, `distros/narthex/solid/src/lib/fenel-surface/`);
+-- every decision lives HERE.
+--
+-- The Fenel-centric core, per Rom's framing:
+--   * a Shape is a LIST OF POINTS with a MATH FORMULA between consecutive
+--     points (Edge = Line | Formula f, f : Point -> Point -> Number -> Point,
+--     t ∈ [0,1] — the parametric curve between the two endpoints). HTML/CSS
+--     boxes-with-rounded-corners are one tiny corner of this space.
+--   * responsivity is JUST A FUNCTION Viewport -> ViewLayout (`demoLayout`).
+--   * motion is a value (`Moving seconds layout`) — geometry changes
+--     interpolate; the web egress maps it to CSS transitions, and the
+--     deep model stays Animation's `Time -> Picture` for the canvas side.
+--   * the CSS-vs-canvas split is DECIDED IN FENEL (`planShape`): an
+--     all-Line outline is structurally recognizable → PlanShapeCss
+--     (clip-path polygon); any Formula edge → flatten the math via
+--     `outlinePoints` (pure sampling, the closures run in the evaluator)
+--     → PlanShapePath (canvas). The recognizable fragment IS the total,
+--     executable fragment of design/view-substrate.md §3.2.
+--
+-- Coordinate convention: Shape points are NORMALIZED to [0,1] × [0,1] in
+-- the shape's own box (x right, y down) — the web egress scales them to
+-- percentages (clip-path) or device pixels (canvas). Edges list entry i
+-- curves from points[i] to points[(i+1) mod n]; a missing/short edges list
+-- reads as Line (edgeAtIdx), so `edges = []` is a plain polygon.
+--
+-- Relation to existing vocabulary (reuse, no forks): `Point`/`RgbaPixel` are
+-- picture's entities; `Layout a` (std interface, home-view kind dispatch)
+-- and ux-parity's TypeView/LayoutDef field-plan stack are DISTINCT layers —
+-- this module is the visual-composition floor beneath product surfaces,
+-- hence the distinct entity names (ViewLayout / Cell / RenderPlan).
+-- Pure module: NO natives, no ffi/ — every body is Fenel.
+-- =========================================================================
+
+module view where
+
+Viewport = Viewport width: Number height: Number
+
+Edge = Line | Formula (Point -> Point -> Number -> Point)
+
+Shape = Shape points: List Point edges: List Edge fill: RgbaPixel
+
+Cell = ValueCell value: a | ShapeCell shape: Shape | LayoutCell layout: ViewLayout
+
+ViewLayout = Columns gap: Number cells: List Cell | Rows gap: Number cells: List Cell | Layers cells: List Cell | Moving seconds: Number layout: ViewLayout
+
+RenderPlan = PlanColumns gap: Number cells: List RenderPlan | PlanRows gap: Number cells: List RenderPlan | PlanLayers cells: List RenderPlan | PlanMoving seconds: Number inner: RenderPlan | PlanShapeCss points: List Point fill: RgbaPixel | PlanShapePath points: List Point fill: RgbaPixel | PlanValue value: a
+
+-- A canvas has a DIFFERENT subject from the list it presents. Coordinates
+-- and optional dimensions are ordinary data, supplied to a pure derivation.
+-- Nothing in `placements` means "use the default", including when the source
+-- has grown beyond the authored arguments. The expression retains its source
+-- reference; changing that source therefore changes the derived canvas.
+
+Placement = Placement at: Point width: Maybe Number height: Maybe Number
+
+Placed a = Placed placement: Placement item: a
+
+@label "Default placement"
+@description "A default position for an item in a list. Positions fit a four-column grid in the canvas; dimensions remain automatic until explicitly authored."
+@tags "view" "locus"
+defaultPlacement : Number -> Number -> Placement
+defaultPlacement index count =
+  let x = 0.04 + (mod index 4) * 0.23
+  let y = 0.04 + (floor (index / 4)) * (0.78 / (max 1 (floor ((count - 1) / 4))))
+  Placement { at = point x y, width = Nothing, height = Nothing }
+
+@label "Placement at index"
+@description "Read an authored placement, or compute the default when that argument is absent."
+@tags "view" "locus" "internal"
+placementAt : List (Maybe Placement) -> Number -> Number -> Placement
+placementAt placements index count =
+  if index < 0 || index >= length placements || index != floor index
+  then defaultPlacement index count
+  else case at placements index of
+    Just placement -> placement
+    Nothing -> defaultPlacement index count
+    -- A slot holding native null matches neither arm, and an unmatched case
+    -- evaluates to host-null: one such slot would drop the whole canvas.
+    _ -> defaultPlacement index count
+
+@label "Place the next item"
+@description "One step of placeAll: place an item at the next index, and advance the index."
+@tags "view" "locus" "internal"
+placeNext : List (Maybe Placement) -> Number -> ({ next: Number, placed: List (Placed a) }) -> a -> ({ next: Number, placed: List (Placed a) })
+placeNext placements count state item =
+  { next = state.next + 1, placed = appendItem (Placed { placement = placementAt placements state.next count, item = item }) state.placed }
+
+@label "Create canvas data"
+@description "Derive a list of placed items from a source list and authored placements. Coordinates are data in this expression's second argument; the source stays live. Each source item is retained once, including when there are fewer authored placements than items."
+@tags "view" "locus"
+-- A fold, not recursion: the evaluator has no tail calls, and a recursive walk
+-- grew the stack by one level per item.
+placeAll : List a -> List (Maybe Placement) -> List (Placed a)
+placeAll items placements =
+  let count = length items
+  let done = fold (\state item -> placeNext placements count state item) { next = 0, placed = [] } items
+  done.placed
+
+-- A canvas over a DATA SET keys its placements by each entry's occurrence id,
+-- so removing, reordering or editing an entry moves no other entry's card.
+-- A canvas over an anonymous list value has no identity to key by and stays
+-- positional (`placeAll`).
+KeyedPlacement = KeyedPlacement key: String placement: Placement
+
+@label "Create canvas data from entries"
+@description "Derive placed items from a data set's entries, with placements keyed by each entry's occurrence id. An entry with no authored placement gets the default for its position. Coordinates are data in this expression's second argument; the entries stay live, and a placement whose entry is gone is ignored."
+@tags "view" "locus"
+-- The authored placements become one record keyed by id, built once, so each
+-- entry is a lookup rather than a scan of the placement list.
+placeEntries : List (LocusEntry a) -> List KeyedPlacement -> List (Placed a)
+placeEntries entries placements =
+  let count = length entries
+  let authored = fromEntries (map keyedPlacementEntry placements)
+  let done = fold (\state entry -> placeNextEntry authored count state entry) { next = 0, placed = [] } entries
+  done.placed
+
+@label "Keyed placement entry"
+@description "One authored placement as the key/value pair placeEntries indexes by."
+@tags "view" "locus" "internal"
+keyedPlacementEntry : KeyedPlacement -> { key: String, value: Placement }
+keyedPlacementEntry authoredPlacement = { key = authoredPlacement.key, value = authoredPlacement.placement }
+
+@label "Place the next entry"
+@description "One step of placeEntries: place an entry by its id, or at its default, and advance the index."
+@tags "view" "locus" "internal"
+placeNextEntry : Map String Placement -> Number -> ({ next: Number, placed: List (Placed a) }) -> LocusEntry a -> ({ next: Number, placed: List (Placed a) })
+placeNextEntry authored count state entry =
+  { next = state.next + 1, placed = appendItem (Placed { placement = keyedPlacementFor authored entry.id state.next count, item = entry.value }) state.placed }
+
+@label "Keyed placement for an entry"
+@description "The placement authored for an entry id, or the default placement for its index."
+@tags "view" "locus" "internal"
+keyedPlacementFor : Map String Placement -> String -> Number -> Number -> Placement
+keyedPlacementFor authored key index count =
+  case lookup authored key of
+    Just placement -> placement
+    _ -> defaultPlacement index count
+
+
+-- ----- geometry ------------------------------------------------------------
+
+@label "Lerp point"
+@description "Linear interpolation between two Points at t ∈ [0,1] — the straight-line edge's parametric form."
+@tags "view" "geometry"
+lerpPoint : Point -> Point -> Number -> Point
+lerpPoint a b t = point (lerp a.x b.x t) (lerp a.y b.y t)
+
+@label "Edge point"
+@description "Sample an Edge between endpoints a and b at parameter t ∈ [0,1]: Line interpolates straight; Formula applies the edge's own math."
+@tags "view" "geometry"
+edgePointAt : Point -> Point -> Edge -> Number -> Point
+edgePointAt a b e t =
+  case e of
+    Line -> lerpPoint a b t
+    Formula f -> f a b t
+
+@label "Edge at index"
+@description "The i-th edge of an edge list, defaulting to Line when the list is shorter than the point list (so edges = [] means a plain polygon)."
+@tags "view" "geometry" "internal"
+edgeAtIdx : List Edge -> Number -> Edge
+edgeAtIdx edges i =
+  let e = at edges i
+  if isNull e then Line else e
+
+@label "Is line"
+@description "Structural recognizer for the straight-edge case — the CSS-expressible fragment's membership test."
+@tags "view" "geometry" "internal"
+isLine : Edge -> Boolean
+isLine e =
+  case e of
+    Line -> true
+    _ -> false
+
+@label "All straight"
+@description "True when every edge of a shape is a straight Line — the shape then sits in the CSS-expressible fragment (clip-path polygon)."
+@tags "view" "geometry"
+allStraight : List Edge -> Boolean
+allStraight edges = fold (\acc e -> acc && (isLine e)) true edges
+
+@label "Outline points"
+@description "Flatten a Shape's outline into a closed polyline by sampling each edge at `steps` parameters — the math runs here, in Fenel; the canvas just connects the returned points."
+@tags "view" "geometry"
+outlinePoints : Shape -> Number -> List Point
+outlinePoints s steps = outlineLoop s steps 0 []
+
+@label "Outline loop"
+@description "Edge loop of outlinePoints: recurse i = 0..n-1 over consecutive point pairs, appending each edge's samples. Internal helper."
+@tags "view" "geometry" "internal"
+outlineLoop : Shape -> Number -> Number -> List Point -> List Point
+outlineLoop s steps i acc =
+  if i >= length s.points then acc else outlineLoop s steps (i + 1) (edgeSamples s steps i acc)
+
+@label "Edge samples"
+@description "Sample edge i of a shape (from points[i] to points[(i+1) mod n]) at t = 0, 1/steps, … (steps-1)/steps, appending to the accumulator. Internal helper."
+@tags "view" "geometry" "internal"
+edgeSamples : Shape -> Number -> Number -> List Point -> List Point
+edgeSamples s steps i acc =
+  let n = length s.points
+  let a = at s.points i
+  let b = at s.points (mod (i + 1) n)
+  sampleLoop a b (edgeAtIdx s.edges i) steps 0 acc
+
+@label "Sample loop"
+@description "Parameter loop of one edge's sampling: k = 0..steps-1, t = k/steps. Internal helper."
+@tags "view" "geometry" "internal"
+sampleLoop : Point -> Point -> Edge -> Number -> Number -> List Point -> List Point
+sampleLoop a b e steps k acc =
+  if k >= steps
+    then acc
+    else sampleLoop a b e steps (k + 1) (appendItem (edgePointAt a b e (k / steps)) acc)
+
+-- ----- the lowering: layout value -> render plan ---------------------------
+
+@label "Plan shape"
+@description "THE css-vs-canvas decision, in Fenel: an all-Line outline is CSS-expressible (clip-path polygon over the normalized points); any Formula edge flattens its math via outlinePoints into a canvas path. The web surface obeys; it never decides."
+@tags "view" "plan"
+planShape : Shape -> RenderPlan
+planShape s =
+  if allStraight s.edges
+    then PlanShapeCss { points = s.points, fill = s.fill }
+    else PlanShapePath { points = outlinePoints s 24, fill = s.fill }
+
+@label "Plan cell"
+@description "Lower one Cell: values hand off to the universal value renderer (PlanValue), shapes decide CSS-vs-canvas (planShape), nested layouts recurse (plan)."
+@tags "view" "plan"
+planCell : Cell -> RenderPlan
+planCell c =
+  case c of
+    ValueCell { value = v } -> PlanValue { value = v }
+    ShapeCell { shape = s } -> planShape s
+    LayoutCell { layout = inner } -> plan inner
+
+@label "Plan cells"
+@description "Lower every cell of a layout node. Internal helper (shared by the container arms of plan)."
+@tags "view" "plan" "internal"
+planCells : List Cell -> List RenderPlan
+planCells cs = map (\c -> planCell c) cs
+
+@label "Plan"
+@description "Lower a ViewLayout value into a RenderPlan the web surface interprets 1:1 — Columns/Rows/Layers map to flex/stack CSS, Moving to interpolated geometry changes (CSS transitions on the web egress), shapes per planShape. The lowering is data → data; every rendering decision is made here, in Fenel."
+@tags "view" "plan"
+plan : ViewLayout -> RenderPlan
+plan l =
+  case l of
+    Columns { gap = g, cells = cs } -> PlanColumns { gap = g, cells = planCells cs }
+    Rows { gap = g, cells = cs } -> PlanRows { gap = g, cells = planCells cs }
+    Layers { cells = cs } -> PlanLayers { cells = planCells cs }
+    Moving { seconds = s, layout = inner } -> PlanMoving { seconds = s, inner = plan inner }
+
+-- ----- demo: responsivity is just a function -------------------------------
+
+@label "Demo value"
+@description "The value cell of the view lab: a plain typed record carrying the live viewport numbers — data rendered through the universal value renderer, beside shapes, in one layout."
+@tags "view" "demo"
+demoValue : Viewport -> {}
+demoValue vp = { title = "Fenel view lab", viewportWidth = vp.width, viewportHeight = vp.height, note = "CSS when possible, canvas when not - decided in Fenel" }
+
+@label "Demo bulge"
+@description "The lens demo's edge math: linear interpolation between the endpoints plus a parabolic sideways bulge of magnitude k (positive right, negative left). Partially applied — `Formula (demoBulge 0.46)` — it IS an Edge formula."
+@tags "view" "demo"
+demoBulge : Number -> Point -> Point -> Number -> Point
+demoBulge k a b t = point ((lerp a.x b.x t) + (k * (4 * t * (1 - t)))) (lerp a.y b.y t)
+
+@label "Demo lens cell"
+@description "A two-point Shape whose edges are Formula curves (demoBulge partially applied both ways) — NOT CSS-expressible, so planShape flattens it for canvas. The anti-boxes-with-rounded-corners exhibit."
+@tags "view" "demo"
+demoLensCell : Viewport -> Cell
+demoLensCell vp =
+  let edges = [Formula (demoBulge 0.46), Formula (demoBulge (0 - 0.46))]
+  let lens = Shape { points = [point 0.5 0.03, point 0.5 0.97], edges = edges, fill = color 96 165 250 255 }
+  ShapeCell { shape = lens }
+
+@label "Demo pentagon cell"
+@description "A five-point all-Line Shape — structurally CSS-expressible, so planShape keeps it as a clip-path polygon."
+@tags "view" "demo"
+demoPentagonCell : Viewport -> Cell
+demoPentagonCell vp =
+  let pts = [point 0.5 0.02, point 0.98 0.38, point 0.79 0.95, point 0.21 0.95, point 0.02 0.38]
+  let penta = Shape { points = pts, edges = [], fill = color 52 211 153 255 }
+  ShapeCell { shape = penta }
+
+@label "Demo cells"
+@description "The three demo cells: formula lens (canvas), straight pentagon (CSS), live viewport data (universal value renderer)."
+@tags "view" "demo"
+demoCells : Viewport -> List Cell
+demoCells vp = [demoLensCell vp, demoPentagonCell vp, ValueCell { value = demoValue vp }]
+
+@label "Demo layout"
+@description "Responsivity as a plain function Viewport -> ViewLayout: narrow viewports stack Rows, wide viewports flow Columns."
+@tags "view" "demo"
+demoLayout : Viewport -> ViewLayout
+demoLayout vp =
+  let cs = demoCells vp
+  if vp.width < 700
+    then Rows { gap = 16, cells = cs }
+    else Columns { gap = 16, cells = cs }
+
+@label "Demo plan"
+@description "The view lab's one entry point: Viewport -> RenderPlan. Wraps the responsive demo layout in Moving 0.4 so geometry changes interpolate, then lowers via plan."
+@tags "view" "demo"
+demoPlan : Viewport -> RenderPlan
+demoPlan vp = plan (Moving { seconds = 0.4, layout = demoLayout vp })
+
+-- ----- editing a list of identified values --------------------------------
+-- The editor sends these ordinary values to this pure function. Persistence
+-- supplies the list and stores the result; it does not own list surgery.
+-- Payload a is opaque here, so editing or reordering never evaluates a value,
+-- copies a referent, or changes the meaning of an expression inside it.
+
+LocusEntry a = LocusEntry id: String value: a
+
+LocusCommand a = LocusAppend entry: LocusEntry a | LocusReplace id: String entry: LocusEntry a | LocusRemove id: String | LocusReorder ids: List String
+
+locusEntryIds : List (LocusEntry a) -> List String
+locusEntryIds entries = map (\entry -> entry.id) entries
+
+locusIdsValid : List String -> Boolean
+locusIdsValid ids =
+  (eq (length (unique ids)) (length ids)) && (fold (\valid identity -> valid && not (eq identity "")) true ids)
+
+@label "Validate identified list"
+@description "A list's value identities must be nonempty and unique. The values themselves are retained untouched."
+@tags "view" "data" "locus"
+validateLocusEntries : List (LocusEntry a) -> Result String (List (LocusEntry a))
+validateLocusEntries entries =
+  if locusIdsValid (locusEntryIds entries)
+    then Ok entries
+    else Err "The saved root has duplicate or invalid value identities."
+
+locusHasEntry : List (LocusEntry a) -> String -> Boolean
+locusHasEntry entries identity = elem identity (locusEntryIds entries)
+
+locusOrderStep : List (LocusEntry a) -> Result String (List (LocusEntry a)) -> String -> Result String (List (LocusEntry a))
+locusOrderStep entries result identity =
+  case result of
+    Err message -> Err message
+    Ok ordered -> case find (\entry -> eq entry.id identity) entries of
+      Nothing -> Err "A reordered value is no longer in the root list."
+      Just entry -> Ok (appendItem entry ordered)
+
+-- One declaration per command. The Fenel parser leaves any single declaration
+-- over its token budget to the TypeScript fallback, and a module outside the
+-- enumerated fence may not rely on that.
+
+locusAppendEntry : List (LocusEntry a) -> LocusEntry a -> Result String (List (LocusEntry a))
+locusAppendEntry entries entry =
+  if eq entry.id "" then Err "A saved value has no stable identity."
+  else if locusHasEntry entries entry.id then Err "This value identity already exists."
+  else Ok (appendItem entry entries)
+
+locusReplaceEntry : List (LocusEntry a) -> String -> LocusEntry a -> Result String (List (LocusEntry a))
+locusReplaceEntry entries identity replacement =
+  if not (locusHasEntry entries identity) then Err "This value is no longer in the root list."
+  else if not (eq replacement.id identity) then Err "An edit cannot change a value's identity."
+  else Ok (map (\entry -> if eq entry.id identity then replacement else entry) entries)
+
+locusRemoveEntry : List (LocusEntry a) -> String -> Result String (List (LocusEntry a))
+locusRemoveEntry entries identity =
+  if locusHasEntry entries identity
+    then Ok (filter (\entry -> not (eq entry.id identity)) entries)
+    else Err "This value is no longer in the root list."
+
+locusReorderEntries : List (LocusEntry a) -> List String -> Result String (List (LocusEntry a))
+locusReorderEntries entries identities =
+  if not (eq (length identities) (length entries)) || not (locusIdsValid identities)
+    then Err "A reorder must include every value exactly once."
+    else fold (\result identity -> locusOrderStep entries result identity) (Ok []) identities
+
+locusApplyValid : List (LocusEntry a) -> LocusCommand a -> Result String (List (LocusEntry a))
+locusApplyValid entries command =
+  case command of
+    LocusAppend { entry = entry } -> locusAppendEntry entries entry
+    LocusReplace { id = identity, entry = replacement } -> locusReplaceEntry entries identity replacement
+    LocusRemove { id = identity } -> locusRemoveEntry entries identity
+    LocusReorder { ids = identities } -> locusReorderEntries entries identities
+    -- Unreachable for the four constructors above. An unmatched case would
+    -- evaluate to host-null, and a command decoded from outside must fail as
+    -- an Err rather than as a missing result.
+    _ -> Err "This list edit is not recognized."
+
+@label "Edit identified list"
+@description "Apply an append, replacement, removal or complete reorder to an identified list. Duplicate identities, missing values and identity-changing replacements return Err. Values and references remain ordinary untouched payloads."
+@tags "view" "data" "locus"
+applyLocusCommand : List (LocusEntry a) -> LocusCommand a -> Result String (List (LocusEntry a))
+applyLocusCommand entries command =
+  case validateLocusEntries entries of
+    Err message -> Err message
+    Ok valid -> locusApplyValid valid command
+
+locusApplyNext : Result String (List (LocusEntry a)) -> LocusCommand a -> Result String (List (LocusEntry a))
+locusApplyNext result command =
+  case result of
+    Err message -> Err message
+    Ok entries -> locusApplyValid entries command
+
+@label "Edit identified list together"
+@description "Apply a sequence of ordinary list edits as one pure operation. The first error is returned without a partial list, allowing one atomic persistence commit. An empty sequence validates and returns the input list."
+@tags "view" "data" "locus"
+applyLocusCommands : List (LocusEntry a) -> List (LocusCommand a) -> Result String (List (LocusEntry a))
+applyLocusCommands entries commands = fold locusApplyNext (validateLocusEntries entries) commands
+
+-- ----- personal workspace -------------------------------------------------
+-- A workspace remembers places and presentations, never copies of their
+-- contents. Source coordinates describe reads; the reader's current
+-- authority still decides which referenced data may be read or changed.
+-- WorkspaceLens is a product focus, distinct from the existing Lens class.
+-- A type value's own presentation is a ValuePresentationTarget; a default
+-- for its inhabitants is the separate InhabitantsPresentationTarget.
+
+WorkspaceSource = AllDataSource | PublicSource | AccountSource accountId: String | ThisTabSource
+
+WorkspacePathStep = FieldStep name: String | IndexStep index: Nat
+
+WorkspaceFocus = RootFocus | ListFocus listId: String | ValueFocus listId: String itemId: String path: List WorkspacePathStep rootItem: Boolean passThrough: List Nat
+
+WorkspacePresentation = AutomaticPresentation | ValuePresentation | CodePresentation | ListPresentation | TablePresentation | GridPresentation | DesktopPresentation | TreePresentation | TabsPresentation | CanvasPresentation | CalendarPresentation | TimelinePresentation | MapPresentation | ChartPresentation
+
+-- A docked lens fills its cell in the group. A free lens is its own window:
+-- position and size are pixels in the workspace, and the group does not
+-- stretch it to a tile.
+LensPlacement = DockedPlacement | FreePlacement x: Number y: Number width: Number height: Number
+
+@label "Table fields"
+LensFieldPreferences = LensFieldPreferences order: List String hidden: List String
+
+WorkspaceLens = WorkspaceLens id: String title: Maybe String source: WorkspaceSource focus: WorkspaceFocus presentation: WorkspacePresentation placement: LensPlacement shortcuts: Maybe (List LensShortcut) subject: Maybe LensTypedSubject fields: Maybe LensFieldPreferences
+
+-- merged is the shared hairline between the lenses, the bar and the window.
+-- Absent on older saved groups means the same as True.
+LensGroup = LensGroup id: String layers: List (List String) merged: Boolean
+
+WorkspaceDisplay = SingleLens | TiledLenses | VisibleLenses ids: List String | GroupedLenses groups: List LensGroup activeGroupId: String
+
+WorkspaceBarMode = FloatingBar | DockedBar
+
+WorkspaceBarPosition = BarTop | BarBottom | BarLeft | BarRight
+
+WorkspaceBar = WorkspaceBar mode: WorkspaceBarMode position: WorkspaceBarPosition
+
+@label "Data location"
+WorkspacePresentationTarget = ValuePresentationTarget source: WorkspaceSource focus: WorkspaceFocus | InhabitantsPresentationTarget typeRef: Ref
+
+@label "All data root targets"
+@description "Present each available data source at its root, in the supplied order. The all-data root itself is excluded so the list cannot contain itself."
+@tags "view" "data"
+allDataRootTargets : List WorkspaceSource -> List WorkspacePresentationTarget
+allDataRootTargets sources =
+  map (\source -> ValuePresentationTarget { source = source, focus = RootFocus }) (filter (\source -> not (workspaceSourceEqual source AllDataSource)) sources)
+
+WorkspacePresentationPreference = WorkspacePresentationPreference target: WorkspacePresentationTarget presentation: WorkspacePresentation
+
+WorkspacePreferences = WorkspacePreferences lenses: List WorkspaceLens activeLensId: String display: WorkspaceDisplay bar: WorkspaceBar presentations: List WorkspacePresentationPreference
+
+WorkspaceLensCommand = SetLensSource source: WorkspaceSource | SetLensFocus focus: WorkspaceFocus | SetLensPresentation presentation: WorkspacePresentation | SetLensTitle title: Maybe String | SetLensPlacement placement: LensPlacement | SetLensShortcuts shortcuts: Maybe (List LensShortcut) | SetLensSubject subject: Maybe LensTypedSubject | SetLensFields fields: Maybe LensFieldPreferences
+
+WorkspaceCommand = AddWorkspaceLens lens: WorkspaceLens | ReplaceWorkspaceLens id: String lens: WorkspaceLens | EditWorkspaceLens id: String command: WorkspaceLensCommand | RemoveWorkspaceLens id: String | OpenWorkspaceLens id: String | SplitWorkspaceLens id: String | CloseWorkspaceLens id: String | AddLensGroup id: String | SelectLensGroup id: String | RemoveLensGroup id: String | SetLensGroupMerged id: String merged: Boolean | SetCurrentLensLayer ids: List String | SelectWorkspaceLens id: String | ReorderWorkspaceLenses ids: List String | SetWorkspaceDisplay display: WorkspaceDisplay | SetWorkspaceBar bar: WorkspaceBar | SetWorkspacePresentation target: WorkspacePresentationTarget presentation: WorkspacePresentation
+
+WorkspaceTilePlan = WorkspaceTilePlan columns: Nat rows: Nat lensIds: List String
+
+defaultWorkspaceLens : String -> WorkspaceSource -> WorkspaceLens
+defaultWorkspaceLens identity source =
+  WorkspaceLens { id = identity, title = Nothing, source = source, focus = RootFocus, presentation = AutomaticPresentation, placement = DockedPlacement, shortcuts = Just (defaultLensShortcuts ()), subject = Nothing, fields = Nothing }
+
+defaultWorkspace : String -> WorkspaceSource -> WorkspacePreferences
+defaultWorkspace identity source =
+  WorkspacePreferences { lenses = [defaultWorkspaceLens identity source], activeLensId = identity, display = SingleLens, bar = WorkspaceBar { mode = DockedBar, position = BarTop }, presentations = [] }
+
+workspaceLensIds : List WorkspaceLens -> List String
+workspaceLensIds lenses = map (\lens -> lens.id) lenses
+
+workspaceLensEntries : List WorkspaceLens -> List (LocusEntry WorkspaceLens)
+workspaceLensEntries lenses = map (\lens -> LocusEntry { id = lens.id, value = lens }) lenses
+
+workspaceLensById : WorkspacePreferences -> String -> Maybe WorkspaceLens
+workspaceLensById workspace identity = find (\lens -> eq lens.id identity) workspace.lenses
+
+workspaceActiveLens : WorkspacePreferences -> Maybe WorkspaceLens
+workspaceActiveLens workspace = find (\lens -> eq lens.id workspace.activeLensId) (workspaceVisibleLenses workspace)
+
+workspaceActiveGroup : WorkspaceDisplay -> Maybe LensGroup
+workspaceActiveGroup display =
+  case display of
+    GroupedLenses { groups = groups, activeGroupId = identity } -> find (\group -> eq group.id identity) groups
+    _ -> Nothing
+
+workspaceTopLayer : WorkspaceDisplay -> List String
+workspaceTopLayer display =
+  case workspaceActiveGroup display of
+    Nothing -> []
+    Just group -> fromMaybe [] (head (reverse group.layers))
+
+workspaceDisplayIds : WorkspacePreferences -> List String
+workspaceDisplayIds workspace =
+  case workspace.display of
+    TiledLenses -> workspaceLensIds workspace.lenses
+    VisibleLenses { ids = identities } -> identities
+    GroupedLenses { groups = groups, activeGroupId = identity } -> workspaceTopLayer workspace.display
+    _ -> [workspace.activeLensId]
+
+workspaceGroupedDisplay : WorkspacePreferences -> WorkspaceDisplay
+workspaceGroupedDisplay workspace =
+  let visible = workspaceDisplayIds workspace
+  let layers = if eq (length visible) 0 then [] else [visible]
+  case workspace.display of
+    GroupedLenses { groups = groups, activeGroupId = identity } -> workspace.display
+    _ -> GroupedLenses { groups = [LensGroup { id = "1", layers = layers, merged = True }], activeGroupId = "1" }
+
+-- Older saved groups have no merged field. Anything other than an explicit
+-- False keeps the shared border, which is the default.
+workspaceGroupMerged : LensGroup -> Boolean
+workspaceGroupMerged group =
+  case group.merged of
+    False -> False
+    _ -> True
+
+-- A lens saved before placement existed fills its cell.
+workspaceLensPlacement : WorkspaceLens -> LensPlacement
+workspaceLensPlacement lens =
+  case lens.placement of
+    FreePlacement { x = x, y = y, width = width, height = height } -> FreePlacement { x = x, y = y, width = width, height = height }
+    _ -> DockedPlacement
+
+-- Maybe has boundary erasure: older saved lenses omit these fields. Nothing
+-- selects the ordinary defaults; Just [] is an authored empty shortcut list.
+workspaceLensSavedShortcuts : WorkspaceLens -> Maybe (List LensShortcut)
+workspaceLensSavedShortcuts lens =
+  case lens.shortcuts of
+    Just shortcuts -> Just shortcuts
+    _ -> Nothing
+
+workspaceLensShortcuts : WorkspaceLens -> List LensShortcut
+workspaceLensShortcuts lens =
+  case workspaceLensSavedShortcuts lens of
+    Just shortcuts -> shortcuts
+    Nothing -> defaultLensShortcuts ()
+
+workspaceLensSubject : WorkspaceLens -> Maybe LensTypedSubject
+workspaceLensSubject lens =
+  case lens.subject of
+    Just subject -> Just subject
+    _ -> Nothing
+
+-- Absence on older saved lenses retains declaration order and every field.
+-- These are presentation identities, never replacements for the data's keys.
+workspaceLensFields : WorkspaceLens -> Maybe LensFieldPreferences
+workspaceLensFields lens =
+  case lens.fields of
+    Just fields -> Just fields
+    _ -> Nothing
+
+workspaceFieldAppend : List String -> String -> List String
+workspaceFieldAppend identities identity =
+  if elem identity identities then identities else appendItem identity identities
+
+LensFieldProjection = LensFieldProjection order: List String visible: List String
+
+workspaceFieldProjection : List String -> Maybe LensFieldPreferences -> LensFieldProjection
+workspaceFieldProjection declared preference =
+  case preference of
+    Nothing -> LensFieldProjection { order = declared, visible = declared }
+    Just fields ->
+      let ordered = filter (\identity -> elem identity declared) (fold workspaceFieldAppend [] (concat fields.order declared))
+      LensFieldProjection { order = ordered, visible = filter (\identity -> not (elem identity fields.hidden)) ordered }
+
+workspaceGroupWithLayers : LensGroup -> List (List String) -> LensGroup
+workspaceGroupWithLayers group layers = LensGroup { id = group.id, layers = layers, merged = workspaceGroupMerged group }
+
+workspaceDisplayWithGroup : WorkspaceDisplay -> LensGroup -> WorkspaceDisplay
+workspaceDisplayWithGroup display replacement =
+  case display of
+    GroupedLenses { groups = groups, activeGroupId = identity } -> GroupedLenses { groups = map (\group -> if eq group.id replacement.id then replacement else group) groups, activeGroupId = identity }
+    _ -> display
+
+workspaceRetainGroup : List String -> LensGroup -> LensGroup
+workspaceRetainGroup available group =
+  workspaceGroupWithLayers group (filter (\layer -> length layer > 0) (map (\layer -> filter (\identity -> elem identity available) layer) group.layers))
+
+workspaceGroupWithoutLens : LensGroup -> String -> LensGroup
+workspaceGroupWithoutLens group identity =
+  workspaceGroupWithLayers group (filter (\layer -> length layer > 0) (map (\layer -> filter (\candidate -> neq candidate identity) layer) group.layers))
+
+workspaceRetainedDisplay : WorkspaceDisplay -> List WorkspaceLens -> WorkspaceDisplay
+workspaceRetainedDisplay display lenses =
+  case display of
+    VisibleLenses { ids = identities } -> VisibleLenses { ids = filter (\identity -> elem identity (workspaceLensIds lenses)) identities }
+    GroupedLenses { groups = groups, activeGroupId = identity } -> GroupedLenses { groups = map (workspaceRetainGroup (workspaceLensIds lenses)) groups, activeGroupId = identity }
+    _ -> display
+
+workspaceWithLenses : WorkspacePreferences -> List WorkspaceLens -> String -> WorkspacePreferences
+workspaceWithLenses workspace lenses active =
+  let display = workspaceRetainedDisplay workspace.display lenses
+  WorkspacePreferences { lenses = lenses, activeLensId = active, display = display, bar = workspace.bar, presentations = workspace.presentations }
+
+workspaceValidateDisplay : WorkspacePreferences -> Result String WorkspacePreferences
+workspaceValidateDisplay workspace =
+  case workspace.display of
+    VisibleLenses { ids = identities } ->
+      if eq (length (unique identities)) (length identities) && all identities (\identity -> elem identity (workspaceLensIds workspace.lenses))
+      then Ok workspace
+      else Err "The displayed lenses must be distinct saved lenses."
+    GroupedLenses { groups = groups, activeGroupId = identity } -> workspaceValidateGroups workspace groups identity
+    _ -> Ok workspace
+
+workspaceValidateGroups : WorkspacePreferences -> List LensGroup -> String -> Result String WorkspacePreferences
+workspaceValidateGroups workspace groups identity =
+  if not (locusIdsValid (map (\group -> group.id) groups)) || not (elem identity (map (\group -> group.id) groups))
+  then Err "The selected lens group is no longer available."
+  else if not (all groups (\group -> workspaceGroupValid (workspaceLensIds workspace.lenses) group))
+  then Err "A lens group contains duplicate or unavailable lenses."
+  else Ok workspace
+
+workspaceGroupValid : List String -> LensGroup -> Boolean
+workspaceGroupValid available group =
+  let identities = fold (\ids layer -> concat ids layer) [] group.layers
+  (eq (length (unique identities)) (length identities)) && all identities (\identity -> elem identity available) && all group.layers (\layer -> length layer > 0)
+
+validateWorkspacePreferences : WorkspacePreferences -> Result String WorkspacePreferences
+validateWorkspacePreferences workspace =
+  if eq (length workspace.lenses) 0 then Err "Keep at least one lens in the workspace."
+  else case validateLocusEntries (workspaceLensEntries workspace.lenses) of
+    Err message -> Err message
+    Ok entries ->
+      if elem workspace.activeLensId (locusEntryIds entries)
+      then workspaceValidateDisplay workspace
+      else Err "The selected lens is no longer in the workspace."
+
+-- The generic identified-list rules own insertion, replacement, removal and
+-- complete reordering. Selecting the first survivor after closing the active
+-- lens is a workspace rule; the final lens is retained by refusing its close.
+workspaceCommitLenses : WorkspacePreferences -> String -> Result String (List (LocusEntry WorkspaceLens)) -> Result String WorkspacePreferences
+workspaceCommitLenses workspace selected result =
+  case result of
+    Err message -> Err message
+    Ok entries ->
+      let lenses = map (\entry -> entry.value) entries
+      case head lenses of
+        Nothing -> Err "Keep at least one lens in the workspace."
+        Just first ->
+          let active = if elem selected (workspaceLensIds lenses) then selected else first.id
+          Ok (workspaceWithLenses workspace lenses active)
+
+workspaceAddLens : WorkspacePreferences -> WorkspaceLens -> Result String WorkspacePreferences
+workspaceAddLens workspace lens =
+  workspaceCommitLenses workspace lens.id (applyLocusCommand (workspaceLensEntries workspace.lenses) (LocusAppend { entry = LocusEntry { id = lens.id, value = lens } }))
+
+workspaceReplaceLens : WorkspacePreferences -> String -> WorkspaceLens -> Result String WorkspacePreferences
+workspaceReplaceLens workspace identity lens =
+  workspaceCommitLenses workspace workspace.activeLensId (applyLocusCommand (workspaceLensEntries workspace.lenses) (LocusReplace { id = identity, entry = LocusEntry { id = lens.id, value = lens } }))
+
+workspaceRemoveLens : WorkspacePreferences -> String -> Result String WorkspacePreferences
+workspaceRemoveLens workspace identity =
+  workspaceCommitLenses workspace workspace.activeLensId (applyLocusCommand (workspaceLensEntries workspace.lenses) (LocusRemove { id = identity }))
+
+workspaceReorderLenses : WorkspacePreferences -> List String -> Result String WorkspacePreferences
+workspaceReorderLenses workspace identities =
+  workspaceCommitLenses workspace workspace.activeLensId (applyLocusCommand (workspaceLensEntries workspace.lenses) (LocusReorder { ids = identities }))
+
+workspaceSelectLens : WorkspacePreferences -> String -> Result String WorkspacePreferences
+workspaceSelectLens workspace identity =
+  case workspaceLensById workspace identity of
+    Nothing -> Err "The selected lens is no longer in the workspace."
+    Just lens -> Ok (workspaceWithLenses workspace workspace.lenses lens.id)
+
+-- Saved lenses are ordinary data. Opening and closing only changes which
+-- saved lenses are displayed; closing the last one leaves an empty surface.
+workspaceOpenLens : WorkspacePreferences -> String -> Result String WorkspacePreferences
+workspaceOpenLens workspace identity =
+  case workspaceLensById workspace identity of
+    Nothing -> Err "This saved lens is no longer available."
+    Just lens ->
+      let display = workspaceGroupedDisplay workspace
+      case workspaceActiveGroup display of
+        Nothing -> Err "The selected lens group is no longer available."
+        Just group ->
+          let without = workspaceGroupWithoutLens group identity
+          let layers = appendItem [identity] without.layers
+          Ok (workspaceSetDisplay (workspaceWithLenses workspace workspace.lenses identity) (workspaceDisplayWithGroup display (workspaceGroupWithLayers group layers)))
+
+workspaceSplitLens : WorkspacePreferences -> String -> Result String WorkspacePreferences
+workspaceSplitLens workspace identity =
+  case workspaceLensById workspace identity of
+    Nothing -> Err "This saved lens is no longer available."
+    Just lens -> workspaceSplitAvailable workspace identity (workspaceGroupedDisplay workspace)
+
+workspaceSplitAvailable : WorkspacePreferences -> String -> WorkspaceDisplay -> Result String WorkspacePreferences
+workspaceSplitAvailable workspace identity display =
+  case workspaceActiveGroup display of
+    Nothing -> Err "The selected lens group is no longer available."
+    Just group ->
+      let layers = workspaceSplitLayers group identity
+      Ok (workspaceSetDisplay (workspaceWithLenses workspace workspace.lenses identity) (workspaceDisplayWithGroup display (workspaceGroupWithLayers group layers)))
+
+workspaceSplitLayers : LensGroup -> String -> List (List String)
+workspaceSplitLayers group identity =
+  let without = workspaceGroupWithoutLens group identity
+  let top = fromMaybe [] (head (reverse without.layers))
+  if eq (length without.layers) 0 then [[identity]]
+  else appendItem (appendItem identity top) (take (length without.layers - 1) without.layers)
+
+workspaceGroupSelection : WorkspacePreferences -> WorkspaceDisplay -> WorkspacePreferences
+workspaceGroupSelection workspace display =
+  let top = workspaceTopLayer display
+  let selected = if elem workspace.activeLensId top then workspace.activeLensId else fromMaybe workspace.activeLensId (head top)
+  workspaceSetDisplay (workspaceWithLenses workspace workspace.lenses selected) display
+
+workspaceSetGroupMerged : WorkspacePreferences -> String -> Boolean -> Result String WorkspacePreferences
+workspaceSetGroupMerged workspace identity merged =
+  case workspace.display of
+    GroupedLenses { groups = groups, activeGroupId = current } ->
+      if not (elem identity (map (\group -> group.id) groups)) then Err "The selected lens group is no longer available."
+      else
+        let updated = map (\group -> if eq group.id identity then LensGroup { id = group.id, layers = group.layers, merged = merged } else group) groups
+        Ok (workspaceGroupSelection workspace (GroupedLenses { groups = updated, activeGroupId = current }))
+    _ -> Err "Shared borders belong to a group of lenses."
+
+workspaceAddGroup : WorkspacePreferences -> String -> Result String WorkspacePreferences
+workspaceAddGroup workspace identity =
+  case workspaceGroupedDisplay workspace of
+    GroupedLenses { groups = groups, activeGroupId = current } ->
+      if eq identity "" || elem identity (map (\group -> group.id) groups) then Err "Choose a unique lens group identity."
+      else Ok (workspaceGroupSelection workspace (GroupedLenses { groups = appendItem (LensGroup { id = identity, layers = [], merged = True }) groups, activeGroupId = identity }))
+    _ -> Err "The lens groups are unavailable."
+
+workspaceSelectGroup : WorkspacePreferences -> String -> Result String WorkspacePreferences
+workspaceSelectGroup workspace identity =
+  case workspaceGroupedDisplay workspace of
+    GroupedLenses { groups = groups, activeGroupId = current } ->
+      if elem identity (map (\group -> group.id) groups)
+      then Ok (workspaceGroupSelection workspace (GroupedLenses { groups = groups, activeGroupId = identity }))
+      else Err "The selected lens group is no longer available."
+    _ -> Err "The lens groups are unavailable."
+
+workspaceRemoveGroup : WorkspacePreferences -> String -> Result String WorkspacePreferences
+workspaceRemoveGroup workspace identity =
+  case workspaceGroupedDisplay workspace of
+    GroupedLenses { groups = groups, activeGroupId = current } ->
+      let remaining = filter (\group -> neq group.id identity) groups
+      workspaceRemoveGroupResult workspace identity current groups remaining
+    _ -> Err "The lens groups are unavailable."
+
+workspaceRemoveGroupResult : WorkspacePreferences -> String -> String -> List LensGroup -> List LensGroup -> Result String WorkspacePreferences
+workspaceRemoveGroupResult workspace identity current groups remaining =
+  if eq (length remaining) (length groups) then Err "The selected lens group is no longer available."
+  else case head remaining of
+    Nothing -> Err "Keep at least one lens group."
+    Just first -> Ok (workspaceGroupSelection workspace (GroupedLenses { groups = remaining, activeGroupId = if eq current identity then first.id else current }))
+
+workspaceSetCurrentLayer : WorkspacePreferences -> List String -> Result String WorkspacePreferences
+workspaceSetCurrentLayer workspace identities =
+  if not (locusIdsValid identities) || not (all identities (\identity -> elem identity (workspaceLensIds workspace.lenses)))
+  then Err "The displayed lenses must be distinct saved lenses."
+  else workspaceSetValidLayer workspace identities (workspaceGroupedDisplay workspace)
+
+workspaceSetValidLayer : WorkspacePreferences -> List String -> WorkspaceDisplay -> Result String WorkspacePreferences
+workspaceSetValidLayer workspace identities display =
+  case workspaceActiveGroup display of
+    Nothing -> Err "The selected lens group is no longer available."
+    Just group ->
+      let previousGroup = workspaceGroupWithLayers group (take (max 0 (length group.layers - 1)) group.layers)
+      let without = fold workspaceGroupWithoutLens previousGroup identities
+      let layers = if eq (length identities) 0 then without.layers else appendItem identities without.layers
+      Ok (workspaceGroupSelection workspace (workspaceDisplayWithGroup display (workspaceGroupWithLayers group layers)))
+
+workspaceCloseLens : WorkspacePreferences -> String -> Result String WorkspacePreferences
+workspaceCloseLens workspace identity =
+  case workspaceLensById workspace identity of
+    Nothing -> Err "This saved lens is no longer available."
+    Just lens ->
+      case workspace.display of
+        GroupedLenses { groups = groups, activeGroupId = current } ->
+          let updated = map (\group -> if eq group.id current then workspaceGroupWithoutLens group identity else group) groups
+          Ok (workspaceGroupSelection workspace (GroupedLenses { groups = updated, activeGroupId = current }))
+        _ ->
+          let identities = filter (\candidate -> neq candidate identity) (workspaceLensIds (workspaceVisibleLenses workspace))
+          Ok (workspaceShowIdentities workspace identities)
+
+workspaceShowIdentities : WorkspacePreferences -> List String -> WorkspacePreferences
+workspaceShowIdentities workspace identities =
+  let selected = if elem workspace.activeLensId identities then workspace.activeLensId else fromMaybe workspace.activeLensId (head identities)
+  workspaceSetDisplay (workspaceWithLenses workspace workspace.lenses selected) (VisibleLenses { ids = identities })
+
+-- Moving to another value clears a temporary lens override. The destination's
+-- saved preference is resolved afresh; selecting another source starts at its
+-- root. Neither operation switches the authority of the authenticated reader.
+workspaceLensWithSource : WorkspaceLens -> WorkspaceSource -> WorkspaceLens
+workspaceLensWithSource lens source =
+  WorkspaceLens { id = lens.id, title = lens.title, source = source, focus = RootFocus, presentation = AutomaticPresentation, placement = workspaceLensPlacement lens, shortcuts = workspaceLensSavedShortcuts lens, subject = Nothing, fields = Nothing }
+
+workspaceLensWithFocus : WorkspaceLens -> WorkspaceFocus -> WorkspaceLens
+workspaceLensWithFocus lens focus =
+  WorkspaceLens { id = lens.id, title = lens.title, source = lens.source, focus = focus, presentation = AutomaticPresentation, placement = workspaceLensPlacement lens, shortcuts = workspaceLensSavedShortcuts lens, subject = Nothing, fields = Nothing }
+
+workspaceLensWithPresentation : WorkspaceLens -> WorkspacePresentation -> WorkspaceLens
+workspaceLensWithPresentation lens presentation =
+  WorkspaceLens { id = lens.id, title = lens.title, source = lens.source, focus = lens.focus, presentation = presentation, placement = workspaceLensPlacement lens, shortcuts = workspaceLensSavedShortcuts lens, subject = workspaceLensSubject lens, fields = workspaceLensFields lens }
+
+workspaceLensWithTitle : WorkspaceLens -> Maybe String -> WorkspaceLens
+workspaceLensWithTitle lens title =
+  WorkspaceLens { id = lens.id, title = title, source = lens.source, focus = lens.focus, presentation = lens.presentation, placement = workspaceLensPlacement lens, shortcuts = workspaceLensSavedShortcuts lens, subject = workspaceLensSubject lens, fields = workspaceLensFields lens }
+
+workspaceLensWithPlacement : WorkspaceLens -> LensPlacement -> WorkspaceLens
+workspaceLensWithPlacement lens placement =
+  WorkspaceLens { id = lens.id, title = lens.title, source = lens.source, focus = lens.focus, presentation = lens.presentation, placement = placement, shortcuts = workspaceLensSavedShortcuts lens, subject = workspaceLensSubject lens, fields = workspaceLensFields lens }
+
+workspaceLensWithShortcuts : WorkspaceLens -> Maybe (List LensShortcut) -> WorkspaceLens
+workspaceLensWithShortcuts lens shortcuts =
+  WorkspaceLens { id = lens.id, title = lens.title, source = lens.source, focus = lens.focus, presentation = lens.presentation, placement = workspaceLensPlacement lens, shortcuts = shortcuts, subject = workspaceLensSubject lens, fields = workspaceLensFields lens }
+
+workspaceLensWithSubject : WorkspaceLens -> Maybe LensTypedSubject -> WorkspaceLens
+workspaceLensWithSubject lens subject =
+  WorkspaceLens { id = lens.id, title = lens.title, source = lens.source, focus = lens.focus, presentation = AutomaticPresentation, placement = workspaceLensPlacement lens, shortcuts = workspaceLensSavedShortcuts lens, subject = subject, fields = Nothing }
+
+workspaceLensWithFields : WorkspaceLens -> Maybe LensFieldPreferences -> WorkspaceLens
+workspaceLensWithFields lens fields =
+  WorkspaceLens { id = lens.id, title = lens.title, source = lens.source, focus = lens.focus, presentation = lens.presentation, placement = workspaceLensPlacement lens, shortcuts = workspaceLensSavedShortcuts lens, subject = workspaceLensSubject lens, fields = fields }
+
+workspaceApplyLensCommand : WorkspaceLens -> WorkspaceLensCommand -> Result String WorkspaceLens
+workspaceApplyLensCommand lens command =
+  case command of
+    SetLensSource { source = source } -> Ok (workspaceLensWithSource lens source)
+    SetLensFocus { focus = focus } -> Ok (workspaceLensWithFocus lens focus)
+    SetLensPresentation { presentation = presentation } -> Ok (workspaceLensWithPresentation lens presentation)
+    SetLensTitle { title = title } -> Ok (workspaceLensWithTitle lens title)
+    SetLensPlacement { placement = placement } -> Ok (workspaceLensWithPlacement lens placement)
+    SetLensShortcuts { shortcuts = shortcuts } -> Ok (workspaceLensWithShortcuts lens shortcuts)
+    SetLensSubject { subject = subject } -> Ok (workspaceLensWithSubject lens subject)
+    SetLensFields { fields = fields } -> Ok (workspaceLensWithFields lens fields)
+    _ -> Err "This lens edit is not recognized."
+
+workspaceEditLens : WorkspacePreferences -> String -> WorkspaceLensCommand -> Result String WorkspacePreferences
+workspaceEditLens workspace identity command =
+  case workspaceLensById workspace identity of
+    Nothing -> Err "This lens is no longer in the workspace."
+    Just lens -> case workspaceApplyLensCommand lens command of
+      Err message -> Err message
+      Ok edited -> workspaceReplaceLens workspace identity edited
+
+workspaceSetDisplay : WorkspacePreferences -> WorkspaceDisplay -> WorkspacePreferences
+workspaceSetDisplay workspace display =
+  WorkspacePreferences { lenses = workspace.lenses, activeLensId = workspace.activeLensId, display = display, bar = workspace.bar, presentations = workspace.presentations }
+
+workspaceSetBar : WorkspacePreferences -> WorkspaceBar -> WorkspacePreferences
+workspaceSetBar workspace bar =
+  WorkspacePreferences { lenses = workspace.lenses, activeLensId = workspace.activeLensId, display = workspace.display, bar = bar, presentations = workspace.presentations }
+
+workspaceSourceEqual : WorkspaceSource -> WorkspaceSource -> Boolean
+workspaceSourceEqual left right =
+  case left of
+    AllDataSource -> case right of
+      AllDataSource -> true
+      _ -> false
+    PublicSource -> case right of
+      PublicSource -> true
+      _ -> false
+    AccountSource { accountId = leftId } -> case right of
+      AccountSource { accountId = rightId } -> eq leftId rightId
+      _ -> false
+    ThisTabSource -> case right of
+      ThisTabSource -> true
+      _ -> false
+    _ -> false
+
+workspacePathStepEqual : WorkspacePathStep -> WorkspacePathStep -> Boolean
+workspacePathStepEqual left right =
+  case left of
+    FieldStep { name = leftName } -> case right of
+      FieldStep { name = rightName } -> eq leftName rightName
+      _ -> false
+    IndexStep { index = leftIndex } -> case right of
+      IndexStep { index = rightIndex } -> eq leftIndex rightIndex
+      _ -> false
+    _ -> false
+
+workspacePathCompareStep : List WorkspacePathStep -> ({ index: Nat, equal: Boolean }) -> WorkspacePathStep -> ({ index: Nat, equal: Boolean })
+workspacePathCompareStep right state step =
+  { index = state.index + 1, equal = state.equal && (workspacePathStepEqual step (at right state.index)) }
+
+workspacePathEqual : List WorkspacePathStep -> List WorkspacePathStep -> Boolean
+workspacePathEqual left right =
+  if not (eq (length left) (length right)) then false
+  else
+    let compared = fold (\state step -> workspacePathCompareStep right state step) { index = 0, equal = true } left
+    compared.equal
+
+-- passThrough changes only the breadcrumb's intermediate stops, not which
+-- value is being presented. Record field "1" and list index 1 stay distinct.
+workspaceValueFocusEqual : WorkspaceFocus -> WorkspaceFocus -> Boolean
+workspaceValueFocusEqual left right =
+  case left of
+    ValueFocus { listId = leftList, itemId = leftItem, path = leftPath, rootItem = leftRoot } -> case right of
+      ValueFocus { listId = rightList, itemId = rightItem, path = rightPath, rootItem = rightRoot } -> (eq leftList rightList) && (eq leftItem rightItem) && (eq leftRoot rightRoot) && (workspacePathEqual leftPath rightPath)
+      _ -> false
+    _ -> false
+
+workspaceFocusEqual : WorkspaceFocus -> WorkspaceFocus -> Boolean
+workspaceFocusEqual left right =
+  case left of
+    RootFocus -> case right of
+      RootFocus -> true
+      _ -> false
+    ListFocus { listId = leftId } -> case right of
+      ListFocus { listId = rightId } -> eq leftId rightId
+      _ -> false
+    _ -> workspaceValueFocusEqual left right
+
+workspacePresentationTargetEqual : WorkspacePresentationTarget -> WorkspacePresentationTarget -> Boolean
+workspacePresentationTargetEqual left right =
+  case left of
+    ValuePresentationTarget { source = leftSource, focus = leftFocus } -> case right of
+      ValuePresentationTarget { source = rightSource, focus = rightFocus } -> (workspaceSourceEqual leftSource rightSource) && (workspaceFocusEqual leftFocus rightFocus)
+      _ -> false
+    InhabitantsPresentationTarget { typeRef = leftRef } -> case right of
+      InhabitantsPresentationTarget { typeRef = rightRef } -> eq leftRef rightRef
+      _ -> false
+    _ -> false
+
+workspacePreferenceFor : WorkspacePreferences -> WorkspacePresentationTarget -> Maybe WorkspacePresentationPreference
+workspacePreferenceFor workspace target =
+  find (\preference -> workspacePresentationTargetEqual preference.target target) workspace.presentations
+
+workspaceSetPresentation : WorkspacePreferences -> WorkspacePresentationTarget -> WorkspacePresentation -> WorkspacePreferences
+workspaceSetPresentation workspace target presentation =
+  let others = filter (\preference -> not (workspacePresentationTargetEqual preference.target target)) workspace.presentations
+  let preferences = case presentation of
+    AutomaticPresentation -> others
+    _ -> appendItem (WorkspacePresentationPreference { target = target, presentation = presentation }) others
+  WorkspacePreferences { lenses = workspace.lenses, activeLensId = workspace.activeLensId, display = workspace.display, bar = workspace.bar, presentations = preferences }
+
+-- Type defaults are keyed by resolved nominal Ref identity, never by a
+-- structural type comparison or an ambiguous code name. Nothing means the
+-- caller has no stable identity for this type, so no type default is claimed.
+workspaceTypePresentation : WorkspacePreferences -> Maybe Ref -> WorkspacePresentation
+workspaceTypePresentation workspace typeRef =
+  case typeRef of
+    Nothing -> AutomaticPresentation
+    Just reference -> case workspacePreferenceFor workspace (InhabitantsPresentationTarget { typeRef = reference }) of
+      Nothing -> AutomaticPresentation
+      Just preference -> preference.presentation
+
+workspaceValuePresentation : WorkspacePreferences -> WorkspaceLens -> Maybe Ref -> WorkspacePresentation
+workspaceValuePresentation workspace lens typeRef =
+  case workspacePreferenceFor workspace (ValuePresentationTarget { source = lens.source, focus = lens.focus }) of
+    Nothing -> workspaceTypePresentation workspace typeRef
+    Just preference -> case preference.presentation of
+      AutomaticPresentation -> workspaceTypePresentation workspace typeRef
+      _ -> preference.presentation
+
+workspacePresentationFor : WorkspacePreferences -> WorkspaceLens -> Maybe Ref -> WorkspacePresentation
+workspacePresentationFor workspace lens typeRef =
+  case lens.presentation of
+    AutomaticPresentation -> workspaceValuePresentation workspace lens typeRef
+    _ -> lens.presentation
+
+-- Bootstrap-only metadata, evaluated by the checked projected repository model.
+-- Exported presentation helpers retain their original calls and refusal behavior.
+WorkspacePresentationResolution = WorkspacePresentationResolution presentation: WorkspacePresentation dependsOnType: Boolean
+
+workspacePreferenceHasTypePresentation : WorkspacePresentationPreference -> Boolean
+workspacePreferenceHasTypePresentation preference =
+  case preference.target of
+    InhabitantsPresentationTarget { typeRef = reference } -> case preference.presentation of
+      AutomaticPresentation -> false
+      _ -> true
+    _ -> false
+
+-- Counting a later, shadowed type preference as dependent is conservative.
+workspaceHasTypePresentation : WorkspacePreferences -> Boolean
+workspaceHasTypePresentation workspace =
+  some workspace.presentations workspacePreferenceHasTypePresentation
+
+workspaceResolvePresentation : WorkspacePreferences -> WorkspaceLens -> WorkspacePresentationResolution
+workspaceResolvePresentation workspace lens =
+  let presentation = workspacePresentationFor workspace lens Nothing
+  case presentation of
+    AutomaticPresentation -> WorkspacePresentationResolution { presentation = presentation, dependsOnType = workspaceHasTypePresentation workspace }
+    _ -> WorkspacePresentationResolution { presentation = presentation, dependsOnType = false }
+
+workspaceApplySettingsCommand : WorkspacePreferences -> WorkspaceCommand -> Result String WorkspacePreferences
+workspaceApplySettingsCommand workspace command =
+  case command of
+    SelectWorkspaceLens { id = identity } -> workspaceSelectLens workspace identity
+    ReorderWorkspaceLenses { ids = identities } -> workspaceReorderLenses workspace identities
+    SetWorkspaceDisplay { display = display } -> validateWorkspacePreferences (workspaceSetDisplay workspace display)
+    SetWorkspaceBar { bar = bar } -> Ok (workspaceSetBar workspace bar)
+    SetWorkspacePresentation { target = target, presentation = presentation } -> Ok (workspaceSetPresentation workspace target presentation)
+    SetLensGroupMerged { id = identity, merged = merged } -> workspaceSetGroupMerged workspace identity merged
+    _ -> Err "This workspace edit is not recognized."
+
+workspaceApplyValid : WorkspacePreferences -> WorkspaceCommand -> Result String WorkspacePreferences
+workspaceApplyValid workspace command =
+  case command of
+    OpenWorkspaceLens { id = identity } -> workspaceOpenLens workspace identity
+    SplitWorkspaceLens { id = identity } -> workspaceSplitLens workspace identity
+    CloseWorkspaceLens { id = identity } -> workspaceCloseLens workspace identity
+    AddLensGroup { id = identity } -> workspaceAddGroup workspace identity
+    SelectLensGroup { id = identity } -> workspaceSelectGroup workspace identity
+    RemoveLensGroup { id = identity } -> workspaceRemoveGroup workspace identity
+    SetCurrentLensLayer { ids = identities } -> workspaceSetCurrentLayer workspace identities
+    _ -> workspaceApplyLensMutation workspace command
+
+workspaceApplyLensMutation : WorkspacePreferences -> WorkspaceCommand -> Result String WorkspacePreferences
+workspaceApplyLensMutation workspace command =
+  case command of
+    AddWorkspaceLens { lens = lens } -> workspaceAddLens workspace lens
+    ReplaceWorkspaceLens { id = identity, lens = lens } -> workspaceReplaceLens workspace identity lens
+    EditWorkspaceLens { id = identity, command = edit } -> workspaceEditLens workspace identity edit
+    RemoveWorkspaceLens { id = identity } -> workspaceRemoveLens workspace identity
+    _ -> workspaceApplySettingsCommand workspace command
+
+applyWorkspaceCommand : WorkspacePreferences -> WorkspaceCommand -> Result String WorkspacePreferences
+applyWorkspaceCommand workspace command =
+  case validateWorkspacePreferences workspace of
+    Err message -> Err message
+    Ok valid -> workspaceApplyValid valid command
+
+workspaceApplyNext : Result String WorkspacePreferences -> WorkspaceCommand -> Result String WorkspacePreferences
+workspaceApplyNext result command =
+  case result of
+    Err message -> Err message
+    Ok workspace -> workspaceApplyValid workspace command
+
+applyWorkspaceCommands : WorkspacePreferences -> List WorkspaceCommand -> Result String WorkspacePreferences
+applyWorkspaceCommands workspace commands = fold workspaceApplyNext (validateWorkspacePreferences workspace) commands
+
+workspaceVisibleLenses : WorkspacePreferences -> List WorkspaceLens
+workspaceVisibleLenses workspace =
+  case workspace.display of
+    TiledLenses -> workspace.lenses
+    VisibleLenses { ids = identities } -> workspaceLensesInOrder workspace identities
+    GroupedLenses { groups = groups, activeGroupId = identity } -> workspaceLensesInOrder workspace (workspaceTopLayer workspace.display)
+    _ -> case workspaceLensById workspace workspace.activeLensId of
+      Nothing -> []
+      Just lens -> [lens]
+
+workspaceLensesInOrder : WorkspacePreferences -> List String -> List WorkspaceLens
+workspaceLensesInOrder workspace identities =
+  fold (workspaceAppendById workspace) [] identities
+
+workspaceAppendById : WorkspacePreferences -> List WorkspaceLens -> String -> List WorkspaceLens
+workspaceAppendById workspace shown identity =
+  case workspaceLensById workspace identity of
+    Nothing -> shown
+    Just lens -> appendItem lens shown
+
+-- Wide surfaces have two columns; four lenses therefore form a 2-by-2 grid.
+-- Narrow surfaces stack. The browser supplies the measured width and renders
+-- this plan directly; the responsive rule is ordinary inspectable Fenel.
+workspaceTilePlan : WorkspacePreferences -> Number -> WorkspaceTilePlan
+workspaceTilePlan workspace width =
+  let lenses = workspaceVisibleLenses workspace
+  let count = length lenses
+  let columns = if width >= 700 && count > 1 then 2 else 1
+  WorkspaceTilePlan { columns = columns, rows = floor ((count + columns - 1) / columns), lensIds = workspaceLensIds lenses }
+
+-- Legacy renderer adapters use these codes at the browser boundary. The
+-- saved choice remains the ADT above; an unknown code is a failed conversion.
+workspacePresentationCode : WorkspacePresentation -> String
+workspacePresentationCode presentation =
+  case presentation of
+    AutomaticPresentation -> "auto"
+    ValuePresentation -> "value"
+    CodePresentation -> "code"
+    ListPresentation -> "list"
+    TablePresentation -> "table"
+    GridPresentation -> "grid"
+    DesktopPresentation -> "desktop"
+    TreePresentation -> "tree"
+    TabsPresentation -> "tabs"
+    CanvasPresentation -> "canvas"
+    CalendarPresentation -> "calendar"
+    TimelinePresentation -> "timeline"
+    MapPresentation -> "map"
+    ChartPresentation -> "chart"
+
+workspacePresentationFromCode : String -> Result String WorkspacePresentation
+workspacePresentationFromCode code =
+  case code of
+    "auto" -> Ok AutomaticPresentation
+    "value" -> Ok ValuePresentation
+    "code" -> Ok CodePresentation
+    "list" -> Ok ListPresentation
+    "table" -> Ok TablePresentation
+    "grid" -> Ok GridPresentation
+    "desktop" -> Ok (DesktopPresentation)
+    "tree" -> Ok TreePresentation
+    "tabs" -> Ok TabsPresentation
+    "canvas" -> Ok CanvasPresentation
+    "calendar" -> Ok CalendarPresentation
+    "timeline" -> Ok TimelinePresentation
+    "chart" -> Ok ChartPresentation
+    "map" -> Ok MapPresentation
+    _ -> Err "This presentation is not recognized."
+
+workspaceDefaultForAccount : String -> Maybe String -> WorkspacePreferences
+workspaceDefaultForAccount identity accountId =
+  case accountId of
+    Nothing -> defaultWorkspace identity PublicSource
+    Just account -> defaultWorkspace identity AllDataSource
+
+-- Root persistence stores this ordinary value beside any other personal
+-- data. Recognizing it is Fenel pattern matching; an invalid recognized value
+-- must surface an error during acquisition rather than look like no workspace.
+workspaceReadPreferences : a -> Result String (Maybe WorkspacePreferences)
+workspaceReadPreferences value =
+  case value of
+    WorkspacePreferences { lenses = lenses, activeLensId = active, display = display, bar = bar, presentations = presentations } ->
+      let candidate = WorkspacePreferences { lenses = lenses, activeLensId = active, display = display, bar = bar, presentations = presentations }
+      case validateWorkspacePreferences candidate of
+        Err message -> Err message
+        Ok valid -> Ok (Just valid)
+    _ -> Ok Nothing
+
+workspacePreferencesFromValue : a -> Maybe WorkspacePreferences
+workspacePreferencesFromValue value =
+  case workspaceReadPreferences value of
+    Ok found -> found
+    Err message -> Nothing
+
+workspacePreferenceEntryStep : Result String (Maybe (LocusEntry WorkspacePreferences)) -> LocusEntry a -> Result String (Maybe (LocusEntry WorkspacePreferences))
+workspacePreferenceEntryStep result entry =
+  case result of
+    Err message -> Err message
+    Ok found -> case workspaceReadPreferences entry.value of
+      Err message -> Err message
+      Ok Nothing -> result
+      Ok (Just workspace) -> case found of
+        Nothing -> Ok (Just (LocusEntry { id = entry.id, value = workspace }))
+        Just existing -> Err "More than one saved workspace was found in personal data. Choose which one to keep."
+
+workspacePreferenceEntry : List (LocusEntry a) -> Result String (Maybe (LocusEntry WorkspacePreferences))
+workspacePreferenceEntry entries = fold workspacePreferenceEntryStep (Ok Nothing) entries
+
+-- The browser can show a checked saved workspace before acquiring its editing
+-- registry. The host supplies only source/nominal facts and unevaluated literal
+-- data. A declared computed preference stays with the browser evaluator: this
+-- read path never executes an account's saved expression on the shared server.
+WorkspaceBootstrapPresentation = WorkspaceBootstrapPresentation lensId: String presentation: WorkspacePresentation code: String dependsOnType: Boolean
+
+WorkspaceBootstrapPlan = WorkspaceBootstrapPlan value: WorkspacePreferences itemId: Maybe String visibleLenses: List WorkspaceLens activeLens: Maybe WorkspaceLens tilePlan: WorkspaceTilePlan presentations: List WorkspaceBootstrapPresentation
+
+workspaceBootstrapEntryStep : Result String (Maybe (List (LocusEntry WorkspacePreferences))) -> ({ id: String, declaredWorkspace: Boolean, literal: Maybe a }) -> Result String (Maybe (List (LocusEntry WorkspacePreferences)))
+workspaceBootstrapEntryStep result candidate =
+  case result of
+    Err message -> Err message
+    Ok Nothing -> result
+    Ok (Just entries) -> case candidate.literal of
+      Nothing -> if candidate.declaredWorkspace then Ok Nothing else result
+      Just value -> case workspaceReadPreferences value of
+        Err message -> Err message
+        Ok Nothing -> if candidate.declaredWorkspace then Ok Nothing else result
+        Ok (Just workspace) -> Ok (Just (appendItem (LocusEntry { id = candidate.id, value = workspace }) entries))
+
+workspaceBootstrapPresentation : WorkspacePreferences -> WorkspaceLens -> WorkspaceBootstrapPresentation
+workspaceBootstrapPresentation workspace lens =
+  let resolution = workspaceResolvePresentation workspace lens
+  WorkspaceBootstrapPresentation { lensId = lens.id, presentation = resolution.presentation, code = workspacePresentationCode resolution.presentation, dependsOnType = resolution.dependsOnType }
+
+workspaceBootstrapReady : WorkspacePreferences -> Maybe String -> Number -> WorkspaceBootstrapPlan
+workspaceBootstrapReady workspace itemId width =
+  let visible = workspaceVisibleLenses workspace
+  let presentations = map (workspaceBootstrapPresentation workspace) visible
+  WorkspaceBootstrapPlan { value = workspace, itemId = itemId, visibleLenses = visible, activeLens = workspaceActiveLens workspace, tilePlan = workspaceTilePlan workspace width, presentations = presentations }
+
+workspaceBootstrapPlan : List ({ id: String, declaredWorkspace: Boolean, literal: Maybe a }) -> String -> Maybe String -> Number -> Result String (Maybe WorkspaceBootstrapPlan)
+workspaceBootstrapPlan candidates defaultIdentity defaultAccount width =
+  case fold workspaceBootstrapEntryStep (Ok (Just [])) candidates of
+    Err message -> Err message
+    Ok Nothing -> Ok Nothing
+    Ok (Just entries) -> case workspacePreferenceEntry entries of
+      Err message -> Err message
+      Ok Nothing -> Ok (Just (workspaceBootstrapReady (workspaceDefaultForAccount defaultIdentity defaultAccount) Nothing width))
+      Ok (Just entry) -> Ok (Just (workspaceBootstrapReady entry.value (Just entry.id) width))

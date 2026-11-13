@@ -1,0 +1,206 @@
+module engine where
+
+-- =========================================================================
+-- The LAYOUT pass in Fenel — column-anchored implicit blocks → virtual
+-- delimiter tokens, as a pure token-stream fold. parser-substrate Phase 2
+-- (brief: `workstreams/parser-substrate/briefs/phase-2-lexer-layout.md`).
+--
+--   layoutTokens : List Tok -> List Tok
+--
+-- Input  = the lexer's stream (`lexer.fenel`, `nl` tokens present).
+-- Output = the same stream with `nl` CONSUMED and VIRTUAL delimiter tokens
+--          inserted: `{ t = "vopen"/"vsemi"/"vclose", v = "", ln, col }`.
+-- This is the PHASE-3 INPUT CONTRACT (decision 8) — the expression/declaration
+-- grammar consumes virtuals, never raw columns.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- WHY A PASS (not inline column checks like the TS parser): the pattern-
+-- algebra parser derives over tokens with no lookahead-into-columns, so layout
+-- can't live inside the grammar (P0/decision-of-the-brief). The TS parser does
+-- layout INSIDE recursive descent via `parseBlock(refCol)` / `parseDo` / the
+-- `parseCase` arm-column loop (`fenel-parser.ts:1252,1968,1808`) — there is NO
+-- TS pass to diff against, so corpus-level layout parity is UNPROVABLE until
+-- Phase 3 consumes the virtuals (decision 10). This phase's gate is ~unit pins
+-- over representative shapes; the algorithm below IS the contract those pins
+-- fix, derived from — but not byte-identical to — the TS column discipline.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE RULE TABLE (Haskell-style offside, adapted to the TS block positions):
+--
+--   • A LAYOUT CONTEXT is a column on a stack (a PREPEND stack — `head` is the
+--     innermost/top context; push = `concat [col] stack`, pop = `tailOr`,
+--     since `appendItem` appends to the END). The whole program is one
+--     context, opened at the first token's column (top-level decls = a block).
+--   • An OPENER token arms the next real token to OPEN a context at ITS column
+--     (emit `vopen`, push the column). Opener set = the TS block-introducing
+--     positions:  =  ->  then  else  do  of  where
+--       - `=`  : a function-body block (`fenel-parser.ts:1242`). CAVEAT: a
+--         token pass can't tell a def `=` from a `let x = …` rhs or a record
+--         `{x = …}` field; the latter two open a short-lived context that
+--         closes at the next dedent. Records are inside brackets (suspended),
+--         so only `let`-rhs is affected — a documented Phase-3-resolves wart.
+--       - `->` : a case-arm body (`:1842`). CAVEAT: a type-signature arrow
+--         (`a -> b`) is the SAME token; on one-line sigs the opened context
+--         closes at the line end's dedent (self-correcting, noisy).
+--       - `then`/`else` : if-branches (`:1777,1780`). `do` : a do-body
+--         (`:1968`). `of` : the case arms (`:1808`). `where` : where-bindings
+--         (`:1419`).
+--       - `let` is NOT an opener — the TS parser binds `let x = e` INLINE
+--         (`:1474–1479`), no block (follow-the-code over decision 8's sketch).
+--   • A NEW LINE (a real token whose ln exceeds the previous real token's),
+--     when NOT just-opened and NOT bracket-suspended, compares the token's
+--     column to the top context: `<` ⇒ `vclose` + pop, REPEATED (a dedent can
+--     close MANY blocks); landing `==` ⇒ `vsemi` (sibling statement); `>` ⇒
+--     continuation (no virtual).
+--     At `==`, an infix operator still awaiting its right operand continues
+--     the expression; a bare `and`/`or` function value remains a statement.
+--     A following `@` directive always starts a sibling declaration line.
+--   • BRACKETS `( [ {` SUSPEND layout: a `-1` sentinel is pushed; while it
+--     tops the stack no virtuals are emitted and openers don't arm; `) ] }`
+--     pop it. (`{` is always a bracket here — records/blocks; the layout
+--     openers are keywords + `=`/`->`, never `{`.)
+--   • At `eof`, all open contexts are closed (`vclose` each) before the `eof`.
+--   • Virtual ln/col: `vopen` carries the opening (body) token's position;
+--     `vsemi`/`vclose` carry the triggering (new-line / eof) token's position.
+--
+-- Explicit `do … end` is NOT special-cased — `do` opens a context and `end`
+-- rides as an ordinary token; the Phase-3 grammar treats `end` as an explicit
+-- closer alongside the `vclose` the dedent emits (the TS parser already
+-- accepts both forms, `:1976–1982`).
+--
+-- NO new entities, NO laws (decision 3 — virtuals are plain `{t,v,ln,col}`
+-- records like every other token).
+-- =========================================================================
+
+
+@label "Tail or empty"
+@description "The tail of a list, or `[]` when empty/singleton — total list-rest for the layout fold. Internal layout helper."
+@tags "engine" "internal" "parser" "layout" "parser-substrate" "phase-2"
+@category "engine-internal"
+tailOr : (xs: a) -> a
+tailOr xs =
+  case tail xs of
+    Just r -> r
+    Nothing -> []
+
+@label "Top suspended"
+@description "True when the top layout context is the bracket-suspend sentinel (`-1`) — inside `( [ {`, layout is suspended. Internal layout helper."
+@tags "engine" "internal" "parser" "layout" "parser-substrate" "phase-2"
+@category "engine-internal"
+topSuspended : (stack: a) -> Bool
+topSuspended stack =
+  case head stack of
+    Just t -> eq t (negate 1)
+    Nothing -> false
+
+@label "Close cascade"
+@description "Emit `vclose` for every layout context whose column exceeds `col` (a dedent can close MANY blocks), then a `vsemi` if the landing context column equals `col` (sibling statement), unless an infix operator awaits its right operand and the next token is not an `@` directive; a `>` column is a continuation (nothing). Stops at the bracket-suspend sentinel. Returns `{ out, stack }`. Internal layout helper."
+@tags "engine" "internal" "parser" "layout" "parser-substrate" "phase-2"
+@category "engine-internal"
+closeCascade : (stack: a) -> (out: a) -> (col: a) -> (tln: a) -> (tcol: a) -> (nextType: String) -> a
+closeCascade stack out col tln tcol nextType =
+  case head stack of
+    Nothing -> { out = out, stack = stack }
+    Just top ->
+      if eq top (negate 1) then { out = out, stack = stack }
+      else if lt col top
+      then closeCascade (tailOr stack) (appendItem { t = "vclose", v = "", ln = tln, col = tcol } out) col tln tcol nextType
+      else if eq col top
+      then
+        let count = length out
+        let previous = if gt count 0 then at out (sub count 1) else { t = "", v = "" }
+        let symbolic = elem previous.t ["op", "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "$", ".", "`"]
+        let word = (eq previous.t "ident") && (elem previous.v ["and", "or"])
+        let continues =
+          if (symbolic || word) && not (eq nextType "@")
+          then
+            let before = if gt count 1 then at out (sub count 2) else { t = "", v = "" }
+            elem before.t ["ident", "num", "str", "bool", ")", "]", "}", "str_end"]
+          else false
+        if continues
+        then { out = out, stack = stack }
+        else { out = appendItem { t = "vsemi", v = "", ln = tln, col = tcol } out, stack = stack }
+      else { out = out, stack = stack }
+
+@label "Close all contexts"
+@description "Emit a `vclose` for every remaining real layout context (skipping bracket-suspend sentinels) — run at `eof` to balance every block. Internal layout helper."
+@tags "engine" "internal" "parser" "layout" "parser-substrate" "phase-2"
+@category "engine-internal"
+closeAll : (stack: a) -> (out: a) -> (tln: a) -> (tcol: a) -> a
+closeAll stack out tln tcol =
+  case head stack of
+    Nothing -> out
+    Just top ->
+      if eq top (negate 1)
+      then closeAll (tailOr stack) out tln tcol
+      else closeAll (tailOr stack) (appendItem { t = "vclose", v = "", ln = tln, col = tcol } out) tln tcol
+
+@label "After-emit layout state"
+@description "Update the layout state after emitting token `tk`: a bracket-opener pushes the suspend sentinel; a bracket-closer pops it; an opener (`= -> then else do of where`) arms `pendingOpen` (only when not bracket-suspended); anything else clears it. Returns `{ stack, pendingOpen }`. Internal layout helper."
+@tags "engine" "internal" "parser" "layout" "parser-substrate" "phase-2"
+@category "engine-internal"
+afterEmit : (tk: a) -> (stack: a) -> a
+afterEmit tk stack =
+  if elem tk.t ["(", "[", "{"] then { stack = concat [negate 1] stack, pendingOpen = false }
+  else if elem tk.t [")", "]", "}"] then { stack = tailOr stack, pendingOpen = false }
+  else if elem tk.t ["=", "->", "then", "else", "do", "of", "where"]
+  then { stack = stack, pendingOpen = not (topSuspended stack) }
+  else { stack = stack, pendingOpen = false }
+
+@label "Step layout"
+@description "Process one real token through the layout state: open a context (when armed + not suspended), or cascade-close/`vsemi` on a new line (when not suspended), then emit the token and recompute the arm/bracket state. Returns `{ stack, out, pendingOpen }`. Internal layout helper."
+@tags "engine" "internal" "parser" "layout" "parser-substrate" "phase-2"
+@category "engine-internal"
+stepLayout : (tk: a) -> (stack: a) -> (out: a) -> (pendingOpen: a) -> (newLine: a) -> a
+stepLayout tk stack out pendingOpen newLine =
+  let suspended = topSuspended stack
+  if and pendingOpen (not suspended)
+  then
+    let out1 = appendItem { t = "vopen", v = "", ln = tk.ln, col = tk.col } out
+    let stack1 = concat [tk.col] stack
+    let out2 = appendItem tk out1
+    let ae = afterEmit tk stack1
+    { stack = ae.stack, out = out2, pendingOpen = ae.pendingOpen }
+  else if and newLine (not suspended)
+  then
+    let cc = closeCascade stack out tk.col tk.ln tk.col tk.t
+    let out2 = appendItem tk cc.out
+    let ae = afterEmit tk cc.stack
+    { stack = ae.stack, out = out2, pendingOpen = ae.pendingOpen }
+  else
+    let out2 = appendItem tk out
+    let ae = afterEmit tk stack
+    { stack = ae.stack, out = out2, pendingOpen = ae.pendingOpen }
+
+@label "Layout fold"
+@description "The layout fold over the token stream: drop `nl` tokens, close all contexts before `eof`, and route every other token through `stepLayout` (threading the context stack, the forward-order token accumulator, the `pendingOpen` arm, and the previous real token's line for new-line detection). Internal helper for `layoutTokens`."
+@tags "engine" "internal" "parser" "layout" "parser-substrate" "phase-2"
+@category "engine-internal"
+layoutGo : (toks: a) -> (stack: a) -> (out: a) -> (pendingOpen: a) -> (prevLn: a) -> a
+layoutGo toks stack out pendingOpen prevLn =
+  case head toks of
+    Nothing -> out
+    Just tk ->
+      let rest = tailOr toks
+      if eq tk.t "nl" then layoutGo rest stack out pendingOpen prevLn
+      else if eq tk.t "eof"
+      then appendItem tk (closeAll stack out tk.ln tk.col)
+      else
+        let newLine = and (gte prevLn 0) (gt tk.ln prevLn)
+        let st = stepLayout tk stack out pendingOpen newLine
+        -- A keyword immediately followed by a field delimiter is a field
+        -- label, not a branch/body opener. Keep its token kind unchanged:
+        -- only the contextual field grammar admits it, never a binder/var.
+        let fieldLabel =
+          if elem tk.t ["then", "else", "do", "of", "where"]
+          then case head rest of
+            Just next -> elem next.t [":", "="]
+            Nothing -> false
+          else false
+        layoutGo rest st.stack st.out (if fieldLabel then false else st.pendingOpen) tk.ln
+
+@label "Layout tokens"
+@description "The layout pass: rewrite the lexer's token stream (`nl`-separated) into a virtual-delimited block stream — `nl` consumed, `{t=\"vopen\"/\"vsemi\"/\"vclose\"}` virtuals inserted by column-anchored offside discipline (the whole program is one block, opened at the first token; openers `= -> then else do of where` open nested blocks; dedents cascade-close; brackets suspend). The Phase-3 grammar's input contract (decision 8). parser-substrate Phase 2."
+@tags "engine" "parser" "layout" "parser-substrate" "phase-2"
+layoutTokens : (toks: a) -> a
+layoutTokens toks = layoutGo toks [] [] true (negate 1)

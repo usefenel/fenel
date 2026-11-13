@@ -1,0 +1,343 @@
+module engine where
+
+-- Checked recursive-source schemas for the admitted finite HOF summaries. This is
+-- an independent structural induction gate: it reads immutable source data,
+-- never invokes a recipe/callback and never trusts an identity's spelling.
+-- The live reader separately authenticates source packages and native routes.
+
+@category "engine-internal"
+rcsRest : (xs: List a) -> List a
+rcsRest xs = fromMaybe [] (tail xs)
+
+@category "engine-internal"
+rcsBinder : (name: String) -> Bool
+rcsBinder name = name != "" && length (split name ".") == 1
+
+@category "engine-internal"
+rcsConstructorIdentity : (snapshot: RecipeAnalysisSnapshot) -> (target: String) -> Maybe String
+rcsConstructorIdentity snapshot target =
+  let direct = filter (\row -> row.target == target) snapshot.constructorIdentities
+  let identities = filter (\row -> row.functionId == target) snapshot.constructorIdentities
+  if target == "" || length direct > 1 then Nothing
+  else if length direct == 1 then
+    let selected = at direct 0
+    let identity = selected.functionId
+    if identity == "" || (length identities > 0 && identity != target) then Nothing else Just identity
+  else if length identities > 0 then Just target else Nothing
+
+@category "engine-internal"
+rcsTarget : (snapshot: RecipeAnalysisSnapshot) -> (rows: List ConstructorRef) -> (written: String) -> Maybe String
+rcsTarget snapshot rows written =
+  let matches = filter (\row -> row.written == written) rows
+  if length matches != 1 then Nothing
+  else case at matches 0 of
+    ConstructorRef { target = target } -> case rcsConstructorIdentity snapshot target of
+      Nothing -> Nothing
+      Just identity -> if recipeCheckRepresentationAdmission snapshot identity then Just identity else Nothing
+    _ -> Nothing
+
+@category "engine-internal"
+rcsSourcePackage : (snapshot: RecipeAnalysisSnapshot) -> (identity: String) -> Maybe ReifiedFunction
+rcsSourcePackage snapshot identity =
+  let own = case snapshot.recipe.source of
+        NamedDefinition { identity = owner } -> if owner == identity then [Reified { package = snapshot.recipe }] else []
+        _ -> []
+  let dependencies = filter (\dependency -> dependency.identity == identity) snapshot.recipe.dependencies
+  let outcomes = concat own (map (\dependency -> dependency.outcome) dependencies)
+  if identity == "" || length outcomes != 1 then Nothing
+  else case at outcomes 0 of
+    Reified { package = package } -> case package.source of
+      NamedDefinition { identity = owner } -> if owner == identity && length package.captures == 0 then Just package else Nothing
+      _ -> Nothing
+    _ -> Nothing
+
+@category "engine-internal"
+rcsBindingRole : (bindings: a) -> (name: String) -> Maybe String
+rcsBindingRole bindings name = case head bindings of
+  Nothing -> Nothing
+  Just binding -> if binding.name == name then Just binding.role else rcsBindingRole (rcsRest bindings) name
+
+@category "engine-internal"
+rcsVariable : (expression: Expr) -> (bindings: a) -> (role: String) -> Bool
+rcsVariable expression bindings role = case expression of
+  EVar { name = name } -> deepEqValue (rcsBindingRole bindings name) (Just role)
+  _ -> false
+
+@category "engine-internal"
+rcsFreeHead : (bindings: a) -> (identity: String) -> Bool
+rcsFreeHead bindings identity = deepEqValue (rcsBindingRole bindings (fromMaybe identity (head (split identity ".")))) Nothing
+
+@category "engine-internal"
+rcsOrdinary : (expression: Expr) -> Bool
+rcsOrdinary expression = deepEqValue (fromMaybe false (lookup expression "lit")) false
+
+@category "engine-internal"
+rcsPrimitive : (snapshot: RecipeAnalysisSnapshot) -> (bindings: a) -> (identity: String) -> (role: RecipePrimitiveRole) -> Maybe RecipePrimitiveAdmission
+rcsPrimitive snapshot bindings identity role =
+  let matches = filter (\entry -> entry.identity == identity) snapshot.primitives
+  if not (rcsFreeHead bindings identity) || length matches != 1 then Nothing
+  else
+    let entry = at matches 0
+    if entry.admitted && deepEqValue entry.role role then Just entry else Nothing
+
+@category "engine-internal"
+rcsPrimitiveCall : (snapshot: RecipeAnalysisSnapshot) -> (bindings: a) -> (expression: Expr) -> (role: RecipePrimitiveRole) -> (arity: Nat) -> Bool
+rcsPrimitiveCall snapshot bindings expression role arity = case expression of
+  ECall { fnId = identity, args = args } ->
+    if length args != arity || not (rcsOrdinary expression) then false
+    else case rcsPrimitive snapshot bindings identity role of
+      Just entry -> true
+      Nothing -> false
+  _ -> false
+
+@category "engine-internal"
+rcsEmpty : (expression: Expr) -> Bool
+rcsEmpty expression = case expression of
+  ELit { value = value } -> deepEqValue value []
+  _ -> false
+
+@category "engine-internal"
+rcsConstructorIs : (snapshot: RecipeAnalysisSnapshot) -> (package: ReifiedFunction) -> (written: String) -> (target: String) -> Bool
+rcsConstructorIs snapshot package written target = deepEqValue (rcsTarget snapshot package.constructors written) (Just target)
+
+@category "engine-internal"
+rcsBoolean : (snapshot: RecipeAnalysisSnapshot) -> (package: ReifiedFunction) -> (admission: RecipePrimitiveAdmission) -> (expression: Expr) -> (wanted: Bool) -> Bool
+rcsBoolean snapshot package admission expression wanted = case expression of
+  ELit { value = value } -> deepEqValue value wanted
+  EConstruct { ctor = written, args = args } ->
+    if length args != 0 || length (fromMaybe [] (lookup expression "fields")) != 0 then false
+    else case rcsTarget snapshot admission.constructors (if wanted then "True" else "False") of
+      Nothing -> false
+      Just target -> case rcsTarget snapshot admission.constructors (if wanted then "False" else "True") of
+        Nothing -> false
+        Just opposite -> target != opposite && rcsConstructorIs snapshot package written target
+  _ -> false
+
+-- A positional Just binds its sole _0. If the lift retained field metadata,
+-- require the same positional key and physical wire; named/unknown slots do
+-- not silently become position zero.
+@category "engine-internal"
+rcsPatternFields : (pattern: a) -> (arity: Nat) -> Bool
+rcsPatternFields pattern arity =
+  let fields = fromMaybe [] (lookup pattern "fields")
+  if length fields == 0 then true
+  else if arity != 1 || length fields != 1 then false
+  else
+    let field = at fields 0
+    case lookup field "key" of
+      Nothing -> false
+      Just key -> case key of
+        PositionalField { index = index } -> index == 0 && deepEqValue (fromMaybe "" (lookup field "wireName")) "_0"
+        _ -> false
+
+@category "engine-internal"
+rcsPattern : (snapshot: RecipeAnalysisSnapshot) -> (package: ReifiedFunction) -> (pattern: a) -> (target: String) -> (arity: Nat) -> Bool
+rcsPattern snapshot package pattern target arity = case pattern of
+  PatConstruct { ctor = written, args = args } ->
+    length args == arity && rcsPatternFields pattern arity && rcsConstructorIs snapshot package written target
+  _ -> false
+
+@category "engine-internal"
+rcsLet : (expression: Expr) -> Maybe a
+rcsLet expression = case expression of
+  ECall { fnId = identity, args = args } ->
+    if identity != "$" || length args != 2 || not (rcsOrdinary expression) then Nothing
+    else case at args 0 of
+      ELambda { params = params, body = body } ->
+        if length params != 1 || not (rcsBinder (at params 0)) then Nothing
+        else Just { name = at params 0, value = at args 1, body = body }
+      _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+rcsCallbackHead : (bindings: a) -> (identity: String) -> Bool
+rcsCallbackHead bindings identity =
+  case head bindings of
+    Nothing -> false
+    Just binding ->
+      if identity == concat "$dyn:" binding.name
+      then binding.role == "predicate"
+      else rcsCallbackHead (rcsRest bindings) identity
+
+@category "engine-internal"
+rcsArgumentRoles : (expressions: List Expr) -> (roles: List String) -> (bindings: a) -> Bool
+rcsArgumentRoles expressions roles bindings = case head roles of
+  Nothing -> length expressions == 0
+  Just role -> case head expressions of
+    Nothing -> false
+    Just expression -> rcsVariable expression bindings role && rcsArgumentRoles (rcsRest expressions) (rcsRest roles) bindings
+
+@category "engine-internal"
+rcsCallback : (expression: Expr) -> (bindings: a) -> (roles: List String) -> Bool
+rcsCallback expression bindings roles = case expression of
+  ECall { fnId = identity, args = args } ->
+    if not (rcsOrdinary expression) then false
+    else if identity == "$" then
+      length args == length roles + 1 && rcsVariable (at args 0) bindings "predicate" && rcsArgumentRoles (rcsRest args) roles bindings
+    else rcsCallbackHead bindings identity && rcsArgumentRoles args roles bindings
+  _ -> false
+
+@category "engine-internal"
+rcsTail : (snapshot: RecipeAnalysisSnapshot) -> (expression: Expr) -> (bindings: a) -> Bool
+rcsTail snapshot expression bindings =
+  if not (rcsPrimitiveCall snapshot bindings expression RecipeFromMaybe 2) then false
+  else
+    let args = expression.args
+    let tail = at args 1
+    rcsEmpty (at args 0) && rcsPrimitiveCall snapshot bindings tail RecipeTail 1 && rcsVariable (at tail.args 0) bindings "array"
+
+@category "engine-internal"
+rcsRecurse : (snapshot: RecipeAnalysisSnapshot) -> (admission: RecipePrimitiveAdmission) -> (expression: Expr) -> (bindings: a) -> Bool
+rcsRecurse snapshot admission expression bindings = case expression of
+  ECall { fnId = identity, args = args } ->
+    let arity = if deepEqValue admission.role RecipeFold then 3 else 2
+    if identity != admission.identity || length args != arity || not (rcsOrdinary expression) || not (rcsFreeHead bindings identity) then false
+    else case admission.role of
+      RecipeSome -> rcsTail snapshot (at args 0) bindings && rcsVariable (at args 1) bindings "predicate"
+      RecipeAll -> rcsTail snapshot (at args 0) bindings && rcsVariable (at args 1) bindings "predicate"
+      RecipeFilter -> rcsVariable (at args 0) bindings "predicate" && rcsTail snapshot (at args 1) bindings
+      RecipeMap -> rcsVariable (at args 0) bindings "predicate" && rcsTail snapshot (at args 1) bindings
+      RecipeFold -> rcsVariable (at args 0) bindings "predicate" && rcsVariable (at args 1) bindings "hit" && rcsTail snapshot (at args 2) bindings
+      _ -> false
+  _ -> false
+
+@category "engine-internal"
+rcsSingleton : (snapshot: RecipeAnalysisSnapshot) -> (expression: Expr) -> (bindings: a) -> (role: String) -> Bool
+rcsSingleton snapshot expression bindings role = case expression of
+  ECall { fnId = identity, args = args } ->
+    if length args != 2 || not (deepEqValue (fromMaybe false (lookup expression "lit")) true) then false
+    else
+      let literalHead =
+            if identity == "appendItem" then true
+            else case rcsPrimitive snapshot bindings identity RecipeAppendItem of
+              Just entry -> true
+              Nothing -> false
+      literalHead && rcsVariable (at args 0) bindings role && rcsEmpty (at args 1)
+  _ -> false
+
+@category "engine-internal"
+rcsIf : (expression: Expr) -> Bool
+rcsIf expression = case expression of
+  ECall { fnId = identity, args = args } ->
+    let ready = identity == "if" && length args == 3 && rcsOrdinary expression
+    let structural = case lookup expression "structural" of
+          Nothing -> true
+          Just flag -> deepEqValue flag true
+    ready && structural
+  _ -> false
+
+@category "engine-internal"
+rcsBooleanBranch : (snapshot: RecipeAnalysisSnapshot) -> (package: ReifiedFunction) -> (admission: RecipePrimitiveAdmission) -> (expression: Expr) -> (bindings: a) -> Bool
+rcsBooleanBranch snapshot package admission expression bindings = case expression of
+  ECall { fnId = identity, args = args } ->
+    let ready = rcsIf expression && rcsVariable (at args 0) bindings "hit"
+    let branch = case admission.role of
+          RecipeSome -> rcsBoolean snapshot package admission (at args 1) true && rcsRecurse snapshot admission (at args 2) bindings
+          RecipeAll -> rcsRecurse snapshot admission (at args 1) bindings && rcsBoolean snapshot package admission (at args 2) false
+          _ -> false
+    ready && branch
+  _ -> false
+
+@category "engine-internal"
+rcsJoined : (snapshot: RecipeAnalysisSnapshot) -> (expression: Expr) -> (bindings: a) -> (role: String) -> Bool
+rcsJoined snapshot expression bindings role =
+  rcsPrimitiveCall snapshot bindings expression RecipeConcat 2 &&
+  rcsSingleton snapshot (at expression.args 0) bindings role &&
+  rcsVariable (at expression.args 1) bindings "rest"
+
+@category "engine-internal"
+rcsFilterBranch : (snapshot: RecipeAnalysisSnapshot) -> (expression: Expr) -> (bindings: a) -> Bool
+rcsFilterBranch snapshot expression bindings = case expression of
+  ECall { fnId = identity, args = args } ->
+    if not (rcsIf expression) then false
+    else
+      let kept = at args 1
+      rcsVariable (at args 0) bindings "hit" &&
+      rcsVariable (at args 2) bindings "rest" &&
+      rcsJoined snapshot kept bindings "head"
+  _ -> false
+
+@category "engine-internal"
+rcsPresentBody : (snapshot: RecipeAnalysisSnapshot) -> (package: ReifiedFunction) -> (admission: RecipePrimitiveAdmission) -> (expression: Expr) -> (bindings: a) -> Bool
+rcsPresentBody snapshot package admission expression bindings = case rcsLet expression of
+  Nothing -> false
+  Just hit ->
+    let roles = if deepEqValue admission.role RecipeFold then ["accumulator", "head"] else ["head"]
+    if not (rcsCallback hit.value bindings roles) then false
+    else
+      let withHit = concat [{ name = hit.name, role = "hit" }] bindings
+      case admission.role of
+        RecipeSome -> rcsBooleanBranch snapshot package admission hit.body withHit
+        RecipeAll -> rcsBooleanBranch snapshot package admission hit.body withHit
+        RecipeFilter -> case rcsLet hit.body of
+          Nothing -> false
+          Just rest ->
+            rcsRecurse snapshot admission rest.value withHit &&
+            rcsFilterBranch snapshot rest.body (concat [{ name = rest.name, role = "rest" }] withHit)
+        RecipeMap -> case rcsLet hit.body of
+          Nothing -> false
+          Just rest ->
+            rcsRecurse snapshot admission rest.value withHit &&
+            rcsJoined snapshot rest.body (concat [{ name = rest.name, role = "rest" }] withHit) "hit"
+        RecipeFold -> rcsRecurse snapshot admission hit.body withHit
+        _ -> false
+
+@category "engine-internal"
+rcsMatch : (snapshot: RecipeAnalysisSnapshot) -> (package: ReifiedFunction) -> (admission: RecipePrimitiveAdmission) -> (bindings: a) -> Bool
+rcsMatch snapshot package admission bindings = case package.body of
+  EMatch { scrutinee = scrutinee, arms = arms } ->
+    if length arms != 2 || not (rcsPrimitiveCall snapshot bindings scrutinee RecipeHead 1) then false
+    else if not (rcsVariable (at scrutinee.args 0) bindings "array") then false
+    else case rcsPrimitive snapshot bindings scrutinee.fnId RecipeHead of
+      Nothing -> false
+      Just selectedHead -> case rcsTarget snapshot selectedHead.constructors "Nothing" of
+        Nothing -> false
+        Just emptyTarget -> case rcsTarget snapshot selectedHead.constructors "Just" of
+          Nothing -> false
+          Just presentTarget ->
+            let empty = at arms 0
+            let present = at arms 1
+            if emptyTarget == presentTarget || not (deepEqValue (lookup empty "guard") Nothing) || not (deepEqValue (lookup present "guard") Nothing) then false
+            else if not (rcsPattern snapshot package empty.pattern emptyTarget 0 && rcsPattern snapshot package present.pattern presentTarget 1) then false
+            else
+              let emptyBody = case admission.role of
+                    RecipeSome -> rcsBoolean snapshot package admission empty.body false
+                    RecipeAll -> rcsBoolean snapshot package admission empty.body true
+                    RecipeFilter -> rcsEmpty empty.body
+                    RecipeMap -> rcsEmpty empty.body
+                    RecipeFold -> rcsVariable empty.body bindings "accumulator"
+                    _ -> false
+              case at present.pattern.args 0 of
+                PatVar { name = name } ->
+                  rcsBinder name && emptyBody && rcsPresentBody snapshot package admission present.body (concat [{ name = name, role = "head" }] bindings)
+                _ -> false
+  _ -> false
+
+@category "engine-internal"
+recipeCheckSummarySource : (snapshot: RecipeAnalysisSnapshot) -> (admission: RecipePrimitiveAdmission) -> Bool
+recipeCheckSummarySource snapshot admission =
+  let admitted = filter (\entry -> entry.identity == admission.identity) snapshot.primitives
+  if not admission.admitted || length admitted != 1 || not (deepEqValue (at admitted 0) admission) then false
+  else case admission.role of
+    RecipeSome -> rcsSummaryPackage snapshot admission 0 1
+    RecipeAll -> rcsSummaryPackage snapshot admission 0 1
+    RecipeFilter -> rcsSummaryPackage snapshot admission 1 0
+    RecipeMap -> rcsSummaryPackage snapshot admission 1 0
+    RecipeFold -> rcsSummaryPackage snapshot admission 2 0
+    _ -> false
+
+@category "engine-internal"
+rcsSummaryPackage : (snapshot: RecipeAnalysisSnapshot) -> (admission: RecipePrimitiveAdmission) -> (arrayIndex: Nat) -> (predicateIndex: Nat) -> Bool
+rcsSummaryPackage snapshot admission arrayIndex predicateIndex = case rcsSourcePackage snapshot admission.identity of
+  Nothing -> false
+  Just package ->
+    let folding = deepEqValue admission.role RecipeFold
+    if length package.params != (if folding then 3 else 2) then false
+    else
+      let array = at package.params arrayIndex
+      let predicate = at package.params predicateIndex
+      let accumulator = if folding then at package.params 1 else ""
+      let bindings = [{ name = array, role = "array" }, { name = predicate, role = "predicate" }]
+      rcsBinder array && rcsBinder predicate && array != predicate &&
+      (not folding || (rcsBinder accumulator && accumulator != array && accumulator != predicate)) &&
+      rcsMatch snapshot package admission (if folding then concat [{ name = accumulator, role = "accumulator" }] bindings else bindings)

@@ -1,0 +1,203 @@
+module engine where
+
+-- structural-dispatch Phase 3 — universe-views over the function registry.
+--
+-- The registry exposes UNIVERSE-VIEWS: introspection queries over the in-memory
+-- function registry, computed as pure folds over a marshalled function list
+-- (the `solve ∘ materialize` SHAPE — registry → records → filtered set — but the
+-- DIRECT-FOLD form, NOT the relational `queryRel` form; see
+-- `notes/phase-3-audit.md` §1c). structural-dispatch is the first INTROSPECTION
+-- consumer of the shipped solver foundation; this phase POINTS the fold idiom at
+-- the function registry, it does not build a solver.
+--
+-- Three views (the LIGHT arm — D3 / `phase-2-audit.md` §1; no decider pulled):
+--   • functionsReturning typeName fns       — every fn whose return type's
+--     type-constructor NAME equals `typeName` (nominal eq). Recognises named
+--     refs (Number / String / a registered entity), the inline Maybe / Result
+--     variant SHAPE, and the List opaque.
+--   • applicableOperationsFor valTypeName fns — every fn whose FIRST param accepts
+--     a value of `valTypeName`: a nominal type-name match OR a polymorphic
+--     (type-variable) param (accepts anything).
+--   • effectfulFunctionsWith typeName fns    — every fn whose `requires` carries
+--     the effect/capability class `typeName` (membership over the seam-extracted
+--     class-name list).
+--
+-- Fenel-first split (the audit §4): the DECISION (the recognizer + the three
+-- filtering folds) lives HERE; the TS seam (engine-bodies-dispatch.ts) only
+-- reflects the registry + marshals each fn across the `$`-key barrier into the
+-- plain record `{ id, returnType: TraversalType, paramTypes: List TraversalType,
+-- requiresClasses: List String }` (NO decision logic). The seam invokes these
+-- bodies via `dispatchEngineBody`, the function list arriving as an argument
+-- (the `dispatchedFunctionUsages` precedent) — so the views are pure folds over
+-- whatever registry the caller reflected.
+--
+-- List iteration is the engine-body idiom: the `head` / `tail` Maybe-returning
+-- natives + `appendItem` accumulation (the array-repr List does not pattern-match
+-- Nil / Cons). The marshalled fn records use PLAIN keys (no `$`-prefix), so field
+-- access (`f.id` / `f.returnType` / `f.paramTypes` / `f.requiresClasses`) reads
+-- directly. The TraversalType is the ADT `match-structural.fenel`'s `isRecordType`
+-- already pattern-matches; this file pattern-matches the same cases.
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- typeConstructorName — the head type-constructor NAME of a marshalled return /
+-- param type. The nominal-eq key. A named ref (`{$ref:"Number"}` →
+-- TtNamed "Number") yields its name; the List opaque yields "List" (by repr); an
+-- INLINE Maybe / Result variant yields "Maybe" / "Result" by recognising the case
+-- shape (the probe found Maybe-returns are stored EXPANDED, not as a named ref —
+-- `notes/phase-3-audit.md` §0); everything else (anonymous record, applied-type
+-- whose head the marshaller drops, type-var, …) yields "" (no nominal name).
+-- ───────────────────────────────────────────────────────────────────────────
+
+@label "Type constructor name"
+@description "structural-dispatch Phase 3 / repr-retire 5a — the head type-constructor NAME of a marshalled TraversalType, the nominal-eq key for the universe-views. TtNamed → its name; TtOpaque → its `$opaque.name` DIRECTLY (List/String/Bool/Nat/Int/Rational/…); TtVariant → \"Maybe\" / \"Result\" when the case shape is recognised (Maybe-returns are stored EXPANDED, not as a named ref), else \"\"; everything else (anonymous record, applied-type with a marshaller-dropped head, type-var, …) → \"\" (no nominal name). Pure recognizer over the TraversalType ADT. Pre-5a this read the coarse `repr`-derived atom name (number→Number collapsing Nat/Int/Rational, boolean→Boolean); the precise opaque `name` is byte-identical for List/String and the principled fix for the coarse cases (the workstream thesis: repr was too coarse to distinguish Nat from Int)."
+@tags "engine" "structural-dispatch" "universe-views" "type"
+typeConstructorName : (t: TraversalType) -> String
+typeConstructorName t =
+  case t of
+    TtNamed { name = n } -> n
+    TtOpaque { name = n } -> n
+    TtVariant { cases = cs } -> variantShapeName cs
+    _ -> ""
+
+@label "universe-views: variantShapeName"
+@description "structural-dispatch Phase 3 — recognise a canonical inline variant SHAPE from its case list: a Nothing+Just pair ⇒ \"Maybe\"; an Err+Ok pair ⇒ \"Result\"; anything else ⇒ \"\" (an anonymous / user variant carries no nominal universe name here). The cases are TtVariantCase records; membership is by case `name`. Internal helper for typeConstructorName."
+@tags "engine" "internal" "structural-dispatch" "universe-views"
+@category "engine-internal"
+variantShapeName : (cases: a) -> String
+variantShapeName cases =
+  if hasCaseNamed cases "Just"
+    then (if hasCaseNamed cases "Nothing" then "Maybe" else "")
+    else (if hasCaseNamed cases "Ok"
+            then (if hasCaseNamed cases "Err" then "Result" else "")
+            else "")
+
+@label "universe-views: hasCaseNamed"
+@description "structural-dispatch Phase 3 — true when a variant's case list contains a TtVariantCase whose `name` equals the given name. Internal helper for variantShapeName."
+@tags "engine" "internal" "structural-dispatch" "universe-views"
+@category "engine-internal"
+hasCaseNamed : (cases: a) -> (name: String) -> Bool
+hasCaseNamed cases name =
+  case head cases of
+    Nothing -> false
+    Just c ->
+      case c of
+        TtVariantCase { name = cn } ->
+          if eq cn name then true
+          else
+            case tail cases of
+              Nothing -> false
+              Just rest -> hasCaseNamed rest name
+        _ ->
+          case tail cases of
+            Nothing -> false
+            Just rest -> hasCaseNamed rest name
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- functionsReturning — every fn whose return type's constructor name == typeName.
+-- ───────────────────────────────────────────────────────────────────────────
+
+@label "Functions returning"
+@description "structural-dispatch Phase 3 — the universe-view `functionsReturning(T)`: the ids of every function in the marshalled function list whose return type's head type-constructor NAME equals `typeName` (nominal eq via typeConstructorName). `functionsReturning(\"Number\")` ⇒ the arithmetic family; `functionsReturning(\"Maybe\")` ⇒ the Maybe-shape returners (head / lookup / tail). A no-match ⇒ [] (not an error). Computed as the `solve ∘ materialize` SHAPE — registry→records→filtered set — in the DIRECT-FOLD form (the relational queryRel form is the deferred Instance-domain shape). The function list is supplied by the TS reflection seam (engine-bodies-dispatch.ts), the LIGHT arm (no decider; D3)."
+@tags "engine" "structural-dispatch" "universe-views" "introspection"
+functionsReturning : (typeName: String) -> (fns: List a) -> List String
+functionsReturning typeName fns =
+  functionsReturningFold typeName fns []
+
+@label "universe-views: functionsReturningFold"
+@description "structural-dispatch Phase 3 — the head/tail fold behind functionsReturning: walk the marshalled function list, appending `f.id` whenever `typeConstructorName f.returnType` equals `typeName`. Internal helper."
+@tags "engine" "internal" "structural-dispatch" "universe-views"
+@category "engine-internal"
+functionsReturningFold : (typeName: String) -> (fns: List a) -> (acc: List String) -> List String
+functionsReturningFold typeName fns acc =
+  case head fns of
+    Nothing -> acc
+    Just f ->
+      let acc2 = if eq (typeConstructorName f.returnType) typeName
+                   then appendItem f.id acc
+                   else acc
+      case tail fns of
+        Nothing -> acc2
+        Just rest -> functionsReturningFold typeName rest acc2
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- applicableOperationsFor — every fn whose FIRST param accepts a value of
+-- valTypeName: a nominal type-name match OR a polymorphic (type-variable) param.
+-- ───────────────────────────────────────────────────────────────────────────
+
+@label "Applicable operations for"
+@description "structural-dispatch Phase 3 — the universe-view `applicableOperationsFor(value)`: the ids of every function whose FIRST parameter ACCEPTS a value of `valTypeName` — either the param's type-constructor name equals `valTypeName` (nominal accept) OR the param is a type variable (TtVar — polymorphic, accepts any type). A nullary function (no params) accepts nothing. The LIGHT arm — runs the nominal/polymorphic accept check, no decider (a predicate-bounded param's ⊆-accept is the deferred ⊆ tail). The function list is supplied by the TS reflection seam."
+@tags "engine" "structural-dispatch" "universe-views" "introspection"
+applicableOperationsFor : (valTypeName: String) -> (fns: List a) -> List String
+applicableOperationsFor valTypeName fns =
+  applicableOperationsForFold valTypeName fns []
+
+@label "universe-views: applicableOperationsForFold"
+@description "structural-dispatch Phase 3 — the head/tail fold behind applicableOperationsFor: walk the marshalled function list, appending `f.id` when its first param accepts `valTypeName` (firstParamAccepts). Internal helper."
+@tags "engine" "internal" "structural-dispatch" "universe-views"
+@category "engine-internal"
+applicableOperationsForFold : (valTypeName: String) -> (fns: List a) -> (acc: List String) -> List String
+applicableOperationsForFold valTypeName fns acc =
+  case head fns of
+    Nothing -> acc
+    Just f ->
+      let acc2 = if firstParamAccepts valTypeName f.paramTypes
+                   then appendItem f.id acc
+                   else acc
+      case tail fns of
+        Nothing -> acc2
+        Just rest -> applicableOperationsForFold valTypeName rest acc2
+
+@label "universe-views: firstParamAccepts"
+@description "structural-dispatch Phase 3 — true when a function's FIRST param type accepts a value of `valTypeName`: a polymorphic type-variable param (TtVar) accepts ANY type; otherwise the param's head type-constructor name must equal `valTypeName`. An empty param list (nullary fn) accepts nothing. Internal helper for applicableOperationsFor."
+@tags "engine" "internal" "structural-dispatch" "universe-views"
+@category "engine-internal"
+firstParamAccepts : (valTypeName: String) -> (paramTypes: a) -> Bool
+firstParamAccepts valTypeName paramTypes =
+  case head paramTypes of
+    Nothing -> false
+    Just pt ->
+      case pt of
+        TtVar -> true
+        _ -> eq (typeConstructorName pt) valTypeName
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- effectfulFunctionsWith — every fn whose `requires` carries class `typeName`.
+-- ───────────────────────────────────────────────────────────────────────────
+
+@label "Effectful functions with"
+@description "structural-dispatch Phase 3 — the universe-view `effectfulFunctionsWith(C)`: the ids of every function whose `requires` carries the effect / capability class `typeName` (membership over the seam-extracted constraint class-name list `f.requiresClasses`). `effectfulFunctionsWith(\"HasStateIO\")` ⇒ the state-touching functions. A no-match ⇒ []. The LIGHT arm — a membership fold over the Phase-2 `requires` constraint shape, no decider. The function list is supplied by the TS reflection seam."
+@tags "engine" "structural-dispatch" "universe-views" "introspection" "effects"
+effectfulFunctionsWith : (typeName: String) -> (fns: List a) -> List String
+effectfulFunctionsWith typeName fns =
+  effectfulFunctionsWithFold typeName fns []
+
+@label "universe-views: effectfulFunctionsWithFold"
+@description "structural-dispatch Phase 3 — the head/tail fold behind effectfulFunctionsWith: walk the marshalled function list, appending `f.id` when `typeName` is a member of `f.requiresClasses`. Internal helper."
+@tags "engine" "internal" "structural-dispatch" "universe-views"
+@category "engine-internal"
+effectfulFunctionsWithFold : (typeName: String) -> (fns: List a) -> (acc: List String) -> List String
+effectfulFunctionsWithFold typeName fns acc =
+  case head fns of
+    Nothing -> acc
+    Just f ->
+      let acc2 = if stringMember typeName f.requiresClasses
+                   then appendItem f.id acc
+                   else acc
+      case tail fns of
+        Nothing -> acc2
+        Just rest -> effectfulFunctionsWithFold typeName rest acc2
+
+@label "universe-views: stringMember"
+@description "structural-dispatch Phase 3 — true when a string is equal (std `eq`) to some element of a string list. Internal helper for effectfulFunctionsWith's membership fold."
+@tags "engine" "internal" "structural-dispatch" "universe-views"
+@category "engine-internal"
+stringMember : (s: String) -> (xs: a) -> Bool
+stringMember s xs =
+  case head xs of
+    Nothing -> false
+    Just x ->
+      if eq s x then true
+      else
+        case tail xs of
+          Nothing -> false
+          Just rest -> stringMember s rest

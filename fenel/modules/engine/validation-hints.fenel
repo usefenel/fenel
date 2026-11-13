@@ -1,0 +1,1281 @@
+module engine where
+
+-- validation-hints — structured validation hint generation.
+--
+-- Mirrors the TS oracle at
+-- implementations/typescript/engine/src/validation-hints.ts (now a
+-- thin shim over the dispatched wrappers for the ported entries).
+--
+-- `autoLabel` (the central SetExpr → human-readable description) +
+-- `formatSetError` (the companion SetExpr → "Must be …" error message,
+-- ported from validate.ts to live alongside autoLabel) now WALK THE
+-- CANONICAL `$tag` Se* ADT directly (containment-substrate Phase 1a
+-- render-marshaller harvest). The TS marshaller `marshalSetExprForLbl` +
+-- the `LblSetExpr` / `LblBoundEntry` / `LblIntervalAdt` marshalled-mirror
+-- ADTs are DELETED; the dispatchers normalise to `$tag` (setExprToTag) and
+-- the bodies resolve every leaf in-Fenel:
+--   * `lblWhere`  — the $where JSON-Logic predicate introspection (was the
+--     TS labelWhere carve-out; reads the `$`-keyed op objects via `lookup`)
+--   * `lblClassifyPattern` + `lblPattern` — the $pattern classification
+--     (was patternToRegex + classifyPatternForLbl; rides the already-Fenel
+--     `rxhPatternToRegex ∘ rxhReadPat` + `rxhIsAnchored`)
+--   * `lblEnumReprs` / `lblBoundRepr` — the enum / interval value reprs
+--
+-- All internal helpers are prefixed `lbl…` / `autoLabel…` /
+-- `formatSetError…` to avoid collisions with like-named helpers
+-- already registered by other engine bodies.
+
+-- ---------------------------------------------------------------------------
+-- LblPatternKind — classified regex pattern shape for labelPattern.
+--
+-- `lblClassifyPattern` serialises the Pattern to a regex via the already-Fenel
+-- `rxhPatternToRegex ∘ rxhReadPat`, then `lblClassifyRegex` runs the
+-- regex-shape recognition (length pattern, character class, URL-safe slug, the
+-- anchored / unanchored fallback) and emits one of these variants. `lblPattern`
+-- emits the matching human-readable string.
+--
+-- * `LpkLenExact`         — `^.{N}$` → "exactly N characters"
+-- * `LpkLenAtLeast`       — `^.{N,}$` → "at least N characters"
+-- * `LpkLenRange`         — `^.{N,M}$` → "N to M characters"
+-- * `LpkClassUpper`       — `[A-Z]` → "contains uppercase letter"
+-- * `LpkClassLower`       — `[a-z]` → "contains lowercase letter"
+-- * `LpkClassDigit`       — `[0-9]` or `[\\d]` → "contains digit"
+-- * `LpkClassLetter`      — `[a-zA-Z]` → "contains letter"
+-- * `LpkClassAlnum`       — `[a-zA-Z0-9]` → "contains letter or digit"
+-- * `LpkClassSpecial`     — `[…]` with all-non-alnum stripped inner →
+--   "contains special character"
+-- * `LpkClassOther`       — generic `[…]` → "contains character from
+--   [<inner>]"
+-- * `LpkSlug`             — the URL-safe slug pattern (both `(-…)` and
+--   `(?:-…)` variants) → "URL-safe slug"
+-- * `LpkNoSpaces`         — `\S*` / `\S+` (only non-whitespace characters)
+--   → "no spaces"
+-- * `LpkAnchored`         — fallback for an anchored pattern that
+--   didn't match a specific shape → "matches required format"
+-- * `LpkUnanchored`       — fallback for an unanchored pattern (or
+--   patternToRegex returned null) → "matches pattern"
+LblPatternKind =
+  LpkLenExact n: Number
+  | LpkLenAtLeast n: Number
+  | LpkLenRange minN: Number maxN: Number
+  | LpkClassUpper
+  | LpkClassLower
+  | LpkClassDigit
+  | LpkClassLetter
+  | LpkClassAlnum
+  | LpkClassSpecial inner: String
+  | LpkClassOther inner: String
+  | LpkSlug
+  | LpkNoSpaces
+  | LpkAnchored
+  | LpkUnanchored
+
+-- ---------------------------------------------------------------------------
+-- autoLabel — central labeller. Walks the canonical `$tag` Se* ADT directly
+-- (the printSetExpr / json-schema harvest template). containment-substrate
+-- Phase 1a (render-marshaller harvest): the TS marshaller `marshalSetExprForLbl`
+-- + the `LblSetExpr` / `LblBoundEntry` / `LblIntervalAdt` marshalled-mirror ADTs
+-- are DELETED; `dispatchedAutoLabel` normalises its input to the canonical `$tag`
+-- form via `setExprToTag` and feeds it here. Leaf resolutions are in-Fenel:
+--   * SeWhere → `lblWhere` (the JSON-Logic predicate introspection, was the TS
+--     `labelWhere`; reads the `$`-keyed op objects via `lookup`)
+--   * SeRef   → `autoLabelNamed`
+--   * SeEnum  → `lblEnumReprs` (per-value String() repr) then `autoLabelEnum`
+--   * SeInterval → `autoLabelInterval`
+--   * SePattern → `lblClassifyPattern` (was the TS patternToRegex +
+--     classifyPatternForLbl) then `lblPattern`
+-- The `_` arm is the unknown-shape fallback (was `LbsUnknown` → "valid value").
+-- ---------------------------------------------------------------------------
+
+@label "validation-hints: autoLabel"
+@description "containment-substrate Phase 1a — central SetExpr → human-readable description labeller. Walks the canonical `$tag` Se* ADT (SeAll/SeNone/SeWhere/SeRef/SeEnum/SeInterval/SePattern/SeComplement/SeUnion/SeIntersect/SeDiff) and emits the label string, resolving each leaf in-Fenel (lblWhere predicate introspection / autoLabelNamed / lblEnumReprs+autoLabelEnum / autoLabelInterval / lblClassifyPattern+lblPattern). The TS marshaller marshalSetExprForLbl is deleted; dispatchedAutoLabel normalises to `$tag` via setExprToTag. Mirrors validation-hints.ts:autoLabel (now a thin shim)."
+@tags "engine" "validation-hints" "label" "set-expr" "containment-phase-1a"
+autoLabel : (set: SetExpr) -> String
+autoLabel set = case set of
+  SeAll -> "any value"
+  SeNone -> "no value (impossible)"
+  SeWhere { pred = p } -> lblWhere p
+  SeRef { handle = n } -> autoLabelNamed n
+  SeEnum { values = vs } -> autoLabelEnum (lblEnumReprs vs [])
+  SeInterval { interval = iv } -> autoLabelInterval iv
+  SePattern { pattern = p } -> lblPattern (lblClassifyPattern p)
+  SeComplement { inner = i } -> concat "not " (autoLabel i)
+  SeUnion { branches = bs } ->
+    let parts = mapAutoLabel bs []
+    join parts " or "
+  SeIntersect { branches = bs } ->
+    let parts = mapAutoLabel bs []
+    join parts "; "
+  SeDiff { left = a, right = b } ->
+    concat (autoLabel a) (concat " except " (autoLabel b))
+  -- signature-substrate Phase 4 slice 3a — a token-free label. The `_` arm's
+  -- "valid value" would be an actively WRONG claim about a rigid (nothing is
+  -- known to be valid at κ), and any leaf resolution would leak the token.
+  SeRigid {} -> "a value of an unconstrained type parameter"
+  _ -> "valid value"
+
+-- mapAutoLabel — explicit recursion over the canonical Se* branches (Fenel
+-- lacks closure-friendly map). Builds a List String in original order.
+@label "validation-hints: mapAutoLabel"
+@description "containment-substrate Phase 1a — explicit recursion over the canonical Se* branches; calls autoLabel on each and accumulates strings in original order. Internal helper."
+@tags "engine" "internal" "validation-hints" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+mapAutoLabel : (bs: List SetExpr) -> (acc: List String) -> List String
+mapAutoLabel bs acc = case head bs of
+  Nothing -> acc
+  Just b ->
+    let s = autoLabel b
+    let accNext = appendItem s acc
+    case tail bs of
+      Nothing -> accNext
+      Just rest -> mapAutoLabel rest accNext
+
+-- lblEnumReprs — map each raw enum value to its label repr (String(): toString,
+-- with null → "null"), in original order. Was the TS lblEnumValueRepr (the label
+-- DSL is human-prose, so NO JSON-quoting — unlike the formatter's jsLit-strings).
+@label "validation-hints: lblEnumReprs"
+@description "containment-substrate Phase 1a — map each raw enum value to its label repr (toString / null→\"null\"; no JSON-quoting — the label DSL is human-prose). In original order. Was the TS lblEnumValueRepr. Internal helper."
+@tags "engine" "internal" "validation-hints" "enum" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+lblEnumReprs : (vs: List Any) -> (acc: List String) -> List String
+lblEnumReprs vs acc = case head vs of
+  Nothing -> acc
+  Just v ->
+    let r = if isNull v then "null" else toString v
+    let acc2 = appendItem r acc
+    case tail vs of
+      Nothing -> acc2
+      Just rest -> lblEnumReprs rest acc2
+
+-- lblBoundRepr — render a raw interval-bound value for a label (String():
+-- toString, null → "null"). Was the TS lblBoundReprStr. autoLabel intervals
+-- don't surface $expr-typed bounds in practice; an object value renders as its
+-- toString (matching String()), no `expr(…)` carve-out (that is the formatter's).
+@label "validation-hints: lblBoundRepr"
+@description "containment-substrate Phase 1a — render a raw interval-bound value for a label (toString / null→\"null\"; no `expr(…)` carve-out — that is the formatter's). Was the TS lblBoundReprStr. Internal helper."
+@tags "engine" "internal" "validation-hints" "interval" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+lblBoundRepr : (value: Any) -> String
+lblBoundRepr value = if isNull value then "null" else toString value
+
+-- ---------------------------------------------------------------------------
+-- autoLabelNamed — `$named` dispatch.
+--
+-- Mirrors the TS oracle's chain of startsWith checks + URL/PATH preset
+-- lookups + the well-known atom names (ℤ / ℕ / ℚ / NonEmpty / list:*).
+-- ---------------------------------------------------------------------------
+
+@label "validation-hints: autoLabelNamed"
+@description "Phase 8b sub-step 1 — `$named` arm dispatch. Chain of startsWith checks (format:url:* / format:path:* / format:* / list:* / ℤ / ℕ / etc.) + URL/PATH preset lookups. Internal helper."
+@tags "engine" "internal" "validation-hints" "named" "phase-8b"
+@category "engine-internal"
+autoLabelNamed : (name: String) -> String
+autoLabelNamed name =
+  if startsWith name "format:url:"
+  then autoLabelUrlPreset (slice name 11 (unitLen name))
+  else if startsWith name "format:path:max-depth:"
+  then concat "at most " (concat (slice name 22 (unitLen name)) " segments")
+  else if startsWith name "format:path:max-length:"
+  then concat "at most " (concat (slice name 23 (unitLen name)) " chars")
+  else if startsWith name "format:path:ext:"
+  then autoLabelPathExt (slice name 16 (unitLen name))
+  else if startsWith name "format:path:"
+  then autoLabelPathPreset (slice name 12 (unitLen name))
+  else if eq name "format:path"
+  then "filesystem path"
+  else if startsWith name "format:"
+  then concat "valid " (slice name 7 (unitLen name))
+  else if eq name "ℤ"
+  then "integer"
+  else if eq name "ℕ"
+  then "non-negative integer"
+  else if eq name "ℚ"
+  then "rational number"
+  else if eq name "Rational"
+  then "rational number"
+  else if eq name "NonEmpty"
+  then "non-empty"
+  else if eq name "list:distinct"
+  then "no duplicates"
+  else if eq name "list:ascending"
+  then "strictly increasing"
+  else if eq name "list:descending"
+  then "strictly decreasing"
+  else if eq name "list:nondecreasing"
+  then "non-decreasing"
+  else if eq name "list:nonincreasing"
+  then "non-increasing"
+  else if startsWith name "list:maxdiff:"
+  then concat "max diff " (slice name 13 (unitLen name))
+  else if startsWith name "list:span:"
+  then concat "span ≤ " (slice name 10 (unitLen name))
+  else name
+
+-- autoLabelUrlPreset — URL_PRESET_LABELS lookup. Hardcoded as an
+-- if-chain (the TS table has 10 entries; Fenel maps aren't a Set-shaped
+-- primitive on the body side).
+@label "validation-hints: autoLabelUrlPreset"
+@description "Phase 8b sub-step 1 — URL_PRESET_LABELS lookup (10 entries: web / secure / strict / ws / ftp / nosubdomain / noquery / nofragment / noport / nolocalhost). Internal helper."
+@tags "engine" "internal" "validation-hints" "named" "phase-8b"
+@category "engine-internal"
+autoLabelUrlPreset : (preset: String) -> String
+autoLabelUrlPreset preset =
+  if eq preset "web" then "web URL (http/https)"
+  else if eq preset "secure" then "secure (TLS required)"
+  else if eq preset "strict" then "explicit scheme required"
+  else if eq preset "ws" then "WebSocket URL"
+  else if eq preset "ftp" then "FTP URL"
+  else if eq preset "nosubdomain" then "no subdomains"
+  else if eq preset "noquery" then "no query parameters"
+  else if eq preset "nofragment" then "no fragment"
+  else if eq preset "noport" then "no port"
+  else if eq preset "nolocalhost" then "no localhost"
+  else preset
+
+-- autoLabelPathPreset — PATH_PRESET_LABELS lookup (14 entries).
+@label "validation-hints: autoLabelPathPreset"
+@description "Phase 8b sub-step 1 — PATH_PRESET_LABELS lookup (14 entries: posix / windows / portable / absolute / relative / no-traversal / no-current / no-hidden / no-empty-segment / no-trailing-sep / no-null-byte / no-reserved / no-alt-stream / no-trailing-space-or-dot). Internal helper."
+@tags "engine" "internal" "validation-hints" "named" "phase-8b"
+@category "engine-internal"
+autoLabelPathPreset : (preset: String) -> String
+autoLabelPathPreset preset =
+  if eq preset "posix" then "POSIX path syntax"
+  else if eq preset "windows" then "Windows path syntax"
+  else if eq preset "portable" then "portable path (every OS)"
+  else if eq preset "absolute" then "absolute path"
+  else if eq preset "relative" then "relative path"
+  else if eq preset "no-traversal" then "no parent (`..`) segments"
+  else if eq preset "no-current" then "no current (`.`) segments"
+  else if eq preset "no-hidden" then "no hidden segments (no leading dot)"
+  else if eq preset "no-empty-segment" then "no empty segments (no `//`)"
+  else if eq preset "no-trailing-sep" then "no trailing separator"
+  else if eq preset "no-null-byte" then "no NUL byte"
+  else if eq preset "no-reserved" then "no Windows reserved name (CON, NUL, …)"
+  else if eq preset "no-alt-stream" then "no NTFS alternate stream (`:`)"
+  else if eq preset "no-trailing-space-or-dot" then "no segment ends in space or dot"
+  else preset
+
+-- autoLabelPathExt — handle `format:path:ext:a|b|c` → "extension .a" /
+-- "extension in {.a, .b, .c}". Split on "|" → List String → render.
+@label "validation-hints: autoLabelPathExt"
+@description "Phase 8b sub-step 1 — `format:path:ext:a|b|c` rendering. Split on `|`, single → \"extension .a\"; multi → \"extension in {.a, .b, .c}\". Internal helper."
+@tags "engine" "internal" "validation-hints" "named" "phase-8b"
+@category "engine-internal"
+autoLabelPathExt : (extsRaw: String) -> String
+autoLabelPathExt extsRaw =
+  let exts = split extsRaw "|"
+  if eq (length exts) 1
+  then case head exts of
+    Nothing -> ""
+    Just e -> concat "extension ." e
+  else
+    let withDots = mapPrependDot exts []
+    concat "extension in {" (concat (join withDots ", ") "}")
+
+-- mapPrependDot — prepend "." to each extension. Used by autoLabelPathExt.
+@label "validation-hints: mapPrependDot"
+@description "Phase 8b sub-step 1 — prepend `.` to each extension. Used by autoLabelPathExt. Internal helper."
+@tags "engine" "internal" "validation-hints" "phase-8b"
+@category "engine-internal"
+mapPrependDot : (exts: List String) -> (acc: List String) -> List String
+mapPrependDot exts acc = case head exts of
+  Nothing -> acc
+  Just e ->
+    let accNext = appendItem (concat "." e) acc
+    case tail exts of
+      Nothing -> accNext
+      Just rest -> mapPrependDot rest accNext
+
+-- ---------------------------------------------------------------------------
+-- autoLabelEnum — `$enum`. ≤5 reprs → "one of: a, b, c"; otherwise
+-- "one of N options".
+-- ---------------------------------------------------------------------------
+
+@label "validation-hints: autoLabelEnum"
+@description "Phase 8b sub-step 1 — `$enum` arm. ≤5 reprs → \"one of: a, b, c\"; >5 → \"one of N options\". Internal helper."
+@tags "engine" "internal" "validation-hints" "enum" "phase-8b"
+@category "engine-internal"
+autoLabelEnum : (reprs: List String) -> String
+autoLabelEnum reprs =
+  let n = length reprs
+  if gt n 5
+  then concat "one of " (concat (toString n) " options")
+  else concat "one of: " (join reprs ", ")
+
+-- ---------------------------------------------------------------------------
+-- autoLabelInterval — `$interval`. Assemble per-bound parts with
+-- Unicode comparators (≥/>/≤/<) and join with " and ". Empty (no
+-- bounds) → "any value".
+-- ---------------------------------------------------------------------------
+
+@label "validation-hints: autoLabelInterval"
+@description "Phase 8b sub-step 1 — `$interval` arm. Assemble per-bound parts with Unicode comparators (≥/>/≤/<) and join with \" and \". Empty bounds → \"any value\". Internal helper."
+@tags "engine" "internal" "validation-hints" "interval" "phase-8b"
+@category "engine-internal"
+autoLabelInterval : (iv: { lo: Maybe ({ value: Any, inclusive: Boolean }), hi: Maybe ({ value: Any, inclusive: Boolean }) }) -> String
+autoLabelInterval iv =
+  let parts0 = []
+  let parts1 = case iv.lo of
+    Nothing -> parts0
+    Just b ->
+      let sym = if b.inclusive then "≥" else ">"
+      appendItem (concat sym (concat " " (lblBoundRepr b.value))) parts0
+  let parts2 = case iv.hi of
+    Nothing -> parts1
+    Just b ->
+      let sym = if b.inclusive then "≤" else "<"
+      appendItem (concat sym (concat " " (lblBoundRepr b.value))) parts1
+  if eq (length parts2) 0
+  then "any value"
+  else join parts2 " and "
+
+-- ---------------------------------------------------------------------------
+-- lblPattern — regex pattern → human-readable label. The TS
+-- marshaller pre-classifies into a LblPatternKind variant (regex shape
+-- recognition stays TS-side as it relies on regex matches that don't
+-- port cleanly).
+-- ---------------------------------------------------------------------------
+
+@label "validation-hints: lblPattern"
+@description "containment-substrate Phase 1a — LblPatternKind → human-readable label. `lblClassifyPattern` (rxhPatternToRegex∘rxhReadPat + lblClassifyRegex) produces the kind; this dispatches on it and emits the matching string (\"exactly N characters\", \"contains uppercase letter\", \"URL-safe slug\", etc.). Internal helper."
+@tags "engine" "internal" "validation-hints" "pattern" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+lblPattern : (kind: LblPatternKind) -> String
+lblPattern kind = case kind of
+  LpkLenExact { n = n } -> concat "exactly " (concat (toString n) " characters")
+  LpkLenAtLeast { n = n } -> concat "at least " (concat (toString n) " characters")
+  LpkLenRange { minN = lo, maxN = hi } ->
+    concat (toString lo) (concat " to " (concat (toString hi) " characters"))
+  LpkClassUpper -> "contains uppercase letter"
+  LpkClassLower -> "contains lowercase letter"
+  LpkClassDigit -> "contains digit"
+  LpkClassLetter -> "contains letter"
+  LpkClassAlnum -> "contains letter or digit"
+  LpkClassSpecial { inner = _ } -> "contains special character"
+  LpkClassOther { inner = i } -> concat "contains character from [" (concat i "]")
+  LpkSlug -> "URL-safe slug"
+  LpkNoSpaces -> "no spaces"
+  LpkAnchored -> "matches required format"
+  LpkUnanchored -> "matches pattern"
+
+-- ---------------------------------------------------------------------------
+-- lblWhere — render a $where JSON-Logic predicate to a human label. Was the
+-- TS `labelWhere` (Expression-tree introspection, the Phase-8b carve-out).
+-- Reads the `$`-keyed op objects via `lookup` (`$`-keys ARE readable at
+-- runtime). Tries, in order: the 4 comparison ops (≥/>/≤/<), ==/===, in, and,
+-- or; "custom constraint" fallback.
+-- ---------------------------------------------------------------------------
+
+@label "validation-hints: lblWhere"
+@description "containment-substrate Phase 1a — render a $where JSON-Logic predicate to a human label (was the TS labelWhere). Tries the comparison ops (≥/>/≤/<), ==/===, in, and, or in order; \"custom constraint\" fallback. Internal helper."
+@tags "engine" "internal" "validation-hints" "where" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+lblWhere : (expr: Any) -> String
+lblWhere expr =
+  case lblWhereCall expr of
+    Just s -> s
+    Nothing -> lblWhereLegacy expr
+
+-- lblWhereLegacy — the legacy JSON-Logic operator-keyed shapes.
+@category "engine-internal"
+lblWhereLegacy : (expr: Any) -> String
+lblWhereLegacy expr =
+  case lblWhereCmpAll expr of
+    Just s -> s
+    Nothing ->
+      case lblWhereEq expr of
+        Just s -> s
+        Nothing ->
+          case lblWhereIn expr of
+            Just s -> s
+            Nothing ->
+              case lblWhereAnd expr of
+                Just s -> s
+                Nothing ->
+                  case lblWhereOr expr of
+                    Just s -> s
+                    Nothing -> "custom constraint"
+
+-- lblWhereCall — the call form Fenel source lowers comparisons to (demo 10):
+-- `{call: [op, a, b]}` with op gte/gt/lte/lt/eq/neq (a qualified `std:` or
+-- `std.` id too). `length value` + number → "at least N characters" and the
+-- like; `value` + literal → "≥ 18"; `value.age` + literal → "age ≥ 18"; a
+-- literal on the left flips the comparator. Else Nothing.
+@category "engine-internal"
+lblWhereCall : (expr: Any) -> Maybe String
+lblWhereCall expr =
+  if isString expr then Nothing
+  else if isNumber expr then Nothing
+  else if isBoolean expr then Nothing
+  else if isNull expr then Nothing
+  else if isArray expr then Nothing
+  else case lookup expr "call" of
+    Nothing -> Nothing
+    Just parts ->
+      if (isArray parts) && (eq (length parts) 2)
+      then lblWhereNamedCheck parts
+      else if (isArray parts) && (eq (length parts) 3)
+      then
+        let fname = lblCallName (fromMaybe "" (head parts))
+        let a = fromMaybe 0 (head (tailOr parts))
+        let b = fromMaybe 0 (head (tailOr (tailOr parts)))
+        case lblCallSym fname of
+          Nothing -> lblWhereNamedCheck parts
+          Just sym ->
+            if (lblIsLengthOfValue a) && (isNumber b) then Just (lblLenCallLabel sym b)
+            else if (lblIsLengthOfValue b) && (isNumber a) then Just (lblLenCallLabel (lblFlipSym sym) a)
+            else if (lblIsSimpleVar a) && (lblIsLiteral b) then Just (lblSubjectLabel (lblVarName a) sym b)
+            else if (lblIsLiteral a) && (lblIsSimpleVar b) then Just (lblSubjectLabel (lblVarName b) (lblFlipSym sym) a)
+            else Nothing
+      else Nothing
+
+-- lblWhereNamedCheck — a one-argument check of the value itself (`f value`)
+-- reads as the check's own name in words: `containsADigit` → "contains a
+-- digit". The name is the check's Codeable projection; nothing is guessed
+-- beyond splitting it at its capitals.
+@category "engine-internal"
+lblWhereNamedCheck : (parts: List Any) -> Maybe String
+lblWhereNamedCheck parts =
+  if eq (length parts) 2
+  then
+    let arg = fromMaybe 0 (head (tailOr parts))
+    let fname = lblCallName (fromMaybe "" (head parts))
+    if (lblIsSimpleVar arg) && (eq (lblVarName arg) "value") && (gt (unitLen fname) 0)
+    then Just (lblWords fname "")
+    else Nothing
+  else Nothing
+
+-- lblWords — camelCase to lower-case words.
+@category "engine-internal"
+lblWords : (name: String) -> (acc: String) -> String
+lblWords name acc =
+  let c = slice name 0 1
+  if eq c "" then acc
+  else
+    let lowerC = lower c
+    let piece = if (neq lowerC c) && (gt (unitLen acc) 0) then concat " " lowerC else lowerC
+    lblWords (slice name 1 (unitLen name)) (concat acc piece)
+
+-- lblCallName — the bare function name of a call head (`std:gte` → `gte`).
+@category "engine-internal"
+lblCallName : (h: Any) -> String
+lblCallName h =
+  if not (isString h) then ""
+  else
+    let last1 = lblLastPart (split h ":") h
+    lblLastPart (split last1 ".") last1
+
+@category "engine-internal"
+lblLastPart : (xs: List String) -> (fallback: String) -> String
+lblLastPart xs fallback = case head xs of
+  Nothing -> fallback
+  Just x -> case tail xs of
+    Nothing -> x
+    Just rest -> if eq (length rest) 0 then x else lblLastPart rest x
+
+-- lblCallSym — the comparator of a comparison function name.
+@category "engine-internal"
+lblCallSym : (name: String) -> Maybe String
+lblCallSym name =
+  if eq name "gte" then Just "≥"
+  else if eq name "gt" then Just ">"
+  else if eq name "lte" then Just "≤"
+  else if eq name "lt" then Just "<"
+  else if eq name "eq" then Just "="
+  else if eq name "neq" then Just "≠"
+  else Nothing
+
+-- lblIsLengthOfValue — `length value` / `unitLen value` in call form.
+@category "engine-internal"
+lblIsLengthOfValue : (v: Any) -> Boolean
+lblIsLengthOfValue v =
+  if isString v then false
+  else if isNumber v then false
+  else if isBoolean v then false
+  else if isNull v then false
+  else if isArray v then false
+  else case lookup v "call" of
+    Nothing -> lblIsLengthVar v
+    Just parts ->
+      if (isArray parts) && (eq (length parts) 2)
+      then
+        let fname = lblCallName (fromMaybe "" (head parts))
+        let arg = fromMaybe 0 (head (tailOr parts))
+        ((eq fname "length") || (eq fname "unitLen")) && (lblIsSimpleVar arg) && (eq (lblVarName arg) "value")
+      else false
+
+@category "engine-internal"
+lblIsLiteral : (v: Any) -> Boolean
+lblIsLiteral v = (isNumber v) || (isString v) || (isBoolean v)
+
+-- lblLenCallLabel — ≥ N → "at least N characters", ≤ → "at most", > → "more
+-- than", < → "fewer than", = → "exactly", ≠ → "not exactly".
+@category "engine-internal"
+lblLenCallLabel : (sym: String) -> (n: Number) -> String
+lblLenCallLabel sym n =
+  let count = concat (toString n) " characters"
+  if eq sym "≥" then concat "at least " count
+  else if eq sym "≤" then concat "at most " count
+  else if eq sym ">" then concat "more than " count
+  else if eq sym "<" then concat "fewer than " count
+  else if eq sym "=" then concat "exactly " count
+  else concat "not exactly " count
+
+-- lblSubjectLabel — `value` is the field itself (no subject: "≥ 18"); a path
+-- `value.age` names its last field ("age ≥ 18"); any other variable its name.
+@category "engine-internal"
+lblSubjectLabel : (name: String) -> (sym: String) -> (lit: Any) -> String
+lblSubjectLabel name sym lit =
+  let shown = if isNumber lit then toString lit else jsLit lit
+  let rel = concat sym (concat " " shown)
+  if eq name "value" then rel
+  else
+    let field = if startsWith name "value." then slice name 6 (unitLen name) else name
+    concat field (concat " " rel)
+
+-- lblWhereCmpAll — the 4 comparison ops in TS order (≥ before >, ≤ before <).
+@category "engine-internal"
+lblWhereCmpAll : (expr: Any) -> Maybe String
+lblWhereCmpAll expr =
+  case lblWhereCmp expr ">=" "≥" of
+    Just s -> Just s
+    Nothing ->
+      case lblWhereCmp expr ">" ">" of
+        Just s -> Just s
+        Nothing ->
+          case lblWhereCmp expr "<=" "≤" of
+            Just s -> Just s
+            Nothing -> lblWhereCmp expr "<" "<"
+
+-- lblWhereCmp — one comparison op. `length`-var + number → "at least/at most N
+-- characters" / "length sym N"; simple-var + number → "var sym N"; number +
+-- simple-var → "var flip(sym) N". Else Nothing.
+@category "engine-internal"
+lblWhereCmp : (expr: Any) -> (op: String) -> (sym: String) -> Maybe String
+lblWhereCmp expr op sym =
+  case lookup expr op of
+    Nothing -> Nothing
+    Just args ->
+      if (isArray args) && (eq (length args) 2)
+      then
+        let a0 = lblArg0 args
+        let a1 = lblArg1 args
+        if (lblIsLengthVar a0) && (isNumber a1)
+        then Just (lblLenLabel op sym a1)
+        else if (lblIsSimpleVar a0) && (isNumber a1)
+        then Just (concat (lblVarName a0) (concat " " (concat sym (concat " " (toString a1)))))
+        else if (isNumber a0) && (lblIsSimpleVar a1)
+        then Just (concat (lblVarName a1) (concat " " (concat (lblFlipSym sym) (concat " " (toString a0)))))
+        else Nothing
+      else Nothing
+
+-- lblLenLabel — `>=` → "at least N characters"; `<=` → "at most N characters";
+-- else → "length sym N".
+@category "engine-internal"
+lblLenLabel : (op: String) -> (sym: String) -> (n: Number) -> String
+lblLenLabel op sym n =
+  if eq op ">=" then concat "at least " (concat (toString n) " characters")
+  else if eq op "<=" then concat "at most " (concat (toString n) " characters")
+  else concat "length " (concat sym (concat " " (toString n)))
+
+-- lblArg0 / lblArg1 — the two args of a binary op (guarded len 2; the default
+-- is never reached).
+@category "engine-internal"
+lblArg0 : (args: List Any) -> Any
+lblArg0 args = fromMaybe 0 (head args)
+@category "engine-internal"
+lblArg1 : (args: List Any) -> Any
+lblArg1 args = fromMaybe 0 (head (tailOr args))
+
+-- lblIsSimpleVar — a `{var: "<string>"}` JSON-Logic node (was the TS isSimpleVar).
+@category "engine-internal"
+lblIsSimpleVar : (v: Any) -> Boolean
+lblIsSimpleVar v =
+  if isString v then false
+  else if isNumber v then false
+  else if isBoolean v then false
+  else if isNull v then false
+  else if isArray v then false
+  else case lookup v "var" of
+    Just s -> isString s
+    Nothing -> false
+
+-- lblVarName — the `var` field of a simple-var node.
+@category "engine-internal"
+lblVarName : (v: Any) -> String
+lblVarName v = fromMaybe "" (lookup v "var")
+
+-- lblIsLengthVar — a simple-var whose name is exactly "value.length".
+@category "engine-internal"
+lblIsLengthVar : (v: Any) -> Boolean
+lblIsLengthVar v = if lblIsSimpleVar v then eq (lblVarName v) "value.length" else false
+
+-- lblFlipSym — flip a comparator for the number-on-the-left case (≥↔≤, >↔<).
+@category "engine-internal"
+lblFlipSym : (s: String) -> String
+lblFlipSym s =
+  if eq s "≥" then "≤"
+  else if eq s ">" then "<"
+  else if eq s "≤" then "≥"
+  else if eq s "<" then ">"
+  else s
+
+-- lblWhereEq — `==` / `===` → "var = <jsLit value>".
+@category "engine-internal"
+lblWhereEq : (expr: Any) -> Maybe String
+lblWhereEq expr =
+  let mArgs = case lookup expr "==" of
+    Just a -> Just a
+    Nothing -> lookup expr "==="
+  case mArgs of
+    Nothing -> Nothing
+    Just args ->
+      if (isArray args) && (eq (length args) 2)
+      then
+        let a0 = lblArg0 args
+        let a1 = lblArg1 args
+        if lblIsSimpleVar a0
+        then Just (concat (lblVarName a0) (concat " = " (jsLit a1)))
+        else if lblIsSimpleVar a1
+        then Just (concat (lblVarName a1) (concat " = " (jsLit a0)))
+        else Nothing
+      else Nothing
+
+-- lblWhereIn — `in` → "var is one of: …" (≤5) / "var is one of N options" (>5).
+@category "engine-internal"
+lblWhereIn : (expr: Any) -> Maybe String
+lblWhereIn expr =
+  case lookup expr "in" of
+    Nothing -> Nothing
+    Just args ->
+      if (isArray args) && (eq (length args) 2)
+      then
+        let a0 = lblArg0 args
+        let a1 = lblArg1 args
+        if (lblIsSimpleVar a0) && (isArray a1)
+        then
+          let name = lblVarName a0
+          let n = length a1
+          if gt n 5
+          then Just (concat name (concat " is one of " (concat (toString n) " options")))
+          else Just (concat name (concat " is one of: " (join (lblInVals a1 []) ", ")))
+        else Nothing
+      else Nothing
+
+-- lblInVals — render each `in`-list value via Array-join coercion (toString;
+-- null → "" per JS Array.join).
+@category "engine-internal"
+lblInVals : (vs: List Any) -> (acc: List String) -> List String
+lblInVals vs acc = case head vs of
+  Nothing -> acc
+  Just v ->
+    let r = if isNull v then "" else toString v
+    let acc2 = appendItem r acc
+    case tail vs of
+      Nothing -> acc2
+      Just rest -> lblInVals rest acc2
+
+-- lblWhereAnd / lblWhereOr — recurse on children (dropping "custom constraint"),
+-- join with "; " / " or "; Nothing if no informative child.
+@category "engine-internal"
+lblWhereAnd : (expr: Any) -> Maybe String
+lblWhereAnd expr =
+  case lookup expr "and" of
+    Nothing -> Nothing
+    Just children ->
+      if isArray children
+      then
+        let labels = lblWhereChildren children []
+        if gt (length labels) 0 then Just (join labels "; ") else Nothing
+      else Nothing
+
+@category "engine-internal"
+lblWhereOr : (expr: Any) -> Maybe String
+lblWhereOr expr =
+  case lookup expr "or" of
+    Nothing -> Nothing
+    Just children ->
+      if isArray children
+      then
+        let labels = lblWhereChildren children []
+        if gt (length labels) 0 then Just (join labels " or ") else Nothing
+      else Nothing
+
+-- lblWhereChildren — map lblWhere over children, dropping "custom constraint".
+@category "engine-internal"
+lblWhereChildren : (children: List Any) -> (acc: List String) -> List String
+lblWhereChildren children acc = case head children of
+  Nothing -> acc
+  Just c ->
+    let l = lblWhere c
+    let acc2 = if eq l "custom constraint" then acc else appendItem l acc
+    case tail children of
+      Nothing -> acc2
+      Just rest -> lblWhereChildren rest acc2
+
+-- ---------------------------------------------------------------------------
+-- lblClassifyPattern — classify a $pattern into a LblPatternKind. Was the TS
+-- patternToRegex + classifyPatternForLbl. patternToRegex is the already-Fenel
+-- `rxhPatternToRegex ∘ rxhReadPat` (ok = false → LpkUnanchored, matching the
+-- TS `re ? … : "matches pattern"`); the regex-shape recognition is in-Fenel.
+-- ---------------------------------------------------------------------------
+
+@category "engine-internal"
+lblClassifyPattern : (p: Any) -> LblPatternKind
+lblClassifyPattern p =
+  let r = rxhPatternToRegex (rxhReadPat p)
+  if r.ok then lblClassifyRegex r.value else LpkUnanchored
+
+-- lblClassifyRegex — strip `^`/`$` anchors, then try the length shape `.{N}` /
+-- `.{N,}` / `.{N,M}`, the character-class shape `[…]`, the URL-safe slug, and
+-- finally the anchored / unanchored fallback (rxhIsAnchored on the ORIGINAL).
+@category "engine-internal"
+lblClassifyRegex : (pattern: String) -> LblPatternKind
+lblClassifyRegex pattern =
+  let p0 = if startsWith pattern "^" then slice pattern 1 (unitLen pattern) else pattern
+  let p = if (endsWith p0 "$") && (not (endsWith p0 "\\$")) then slice p0 0 (sub (unitLen p0) 1) else p0
+  case lblMatchLen p of
+    Just k -> k
+    Nothing ->
+      case lblMatchClass p of
+        Just k -> k
+        Nothing -> lblClassifyRest pattern p
+
+-- lblClassifyRest — a "contains" pattern (a regex without anchors is wrapped in
+-- `.*` on both sides when it becomes a Pattern, so it serializes back as
+-- `^.*X.*$`) labels as its inner class; then the slug, no-spaces and
+-- anchored / unanchored fallbacks.
+@category "engine-internal"
+lblClassifyRest : (pattern: String) -> (p: String) -> LblPatternKind
+lblClassifyRest pattern p =
+  let inner = lblStripContains p [".*", concat "[^" (concat (charFromCode 10) "]*"), "[\\s\\S]*", "[\\S\\s]*", "[^]*"]
+  case inner of
+    Just i -> case lblMatchClass i of
+      Just k -> k
+      Nothing -> lblClassifyShape pattern p
+    Nothing -> lblClassifyShape pattern p
+
+-- lblStripContains — the X of `W X W` for the first any-character run W.
+@category "engine-internal"
+lblStripContains : (p: String) -> (wrappers: List String) -> Maybe String
+lblStripContains p wrappers = case head wrappers of
+  Nothing -> Nothing
+  Just w ->
+    let n = unitLen w
+    if (startsWith p w) && (endsWith p w) && (gt (unitLen p) (add n n))
+    then Just (slice p n (sub (unitLen p) n))
+    else lblStripContains p (tailOr wrappers)
+
+@category "engine-internal"
+lblClassifyShape : (pattern: String) -> (p: String) -> LblPatternKind
+lblClassifyShape pattern p =
+          if (eq p "[a-z0-9]+(-[a-z0-9]+)*") || (eq p "[a-z0-9]+(?:-[a-z0-9]+)*")
+          then LpkSlug
+          else if lblIsNoSpaces p
+          then LpkNoSpaces
+          else if rxhIsAnchored pattern then LpkAnchored else LpkUnanchored
+
+-- lblIsNoSpaces — `\S*` / `\S+`, also as the class spellings the Pattern
+-- serializer may print for `\S` (a negated whitespace class). Demo 10.
+@category "engine-internal"
+lblIsNoSpaces : (p: String) -> Boolean
+lblIsNoSpaces p =
+  let body = if (endsWith p "*") || (endsWith p "+") then slice p 0 (sub (unitLen p) 1) else ""
+  if eq body "" then false
+  else if eq body "\\S" then true
+  else if eq body "[^\\s]" then true
+  else if eq body "[^ ]" then true
+  else (startsWith body "[^") && (endsWith body "]") && (elem " " body) && ((elem "\\t" body) || (elem (charFromCode 9) body))
+
+-- lblMatchLen — `.{N}` / `.{N,}` / `.{N,M}` → Just LpkLen*; else Nothing.
+@category "engine-internal"
+lblMatchLen : (p: String) -> Maybe LblPatternKind
+lblMatchLen p =
+  let anyLine = concat "[^" (concat (charFromCode 10) "]")
+  if (startsWith p ".{") && (endsWith p "}")
+  then lblParseLen (slice p 2 (sub (unitLen p) 1))
+  else if (startsWith p (concat anyLine "{")) && (endsWith p "}")
+  then lblParseLen (slice p (add (unitLen anyLine) 1) (sub (unitLen p) 1))
+  else Nothing
+
+-- lblParseLen — parse the `.{…}` inner: "N" → LenExact; "N," → LenAtLeast;
+-- "N,M" → LenRange; anything else (non-digits / extra commas) → Nothing.
+@category "engine-internal"
+lblParseLen : (inner: String) -> Maybe LblPatternKind
+lblParseLen inner =
+  let parts = split inner ","
+  if eq (length parts) 1
+  then
+    let n = fromMaybe "" (head parts)
+    if lblNonEmptyDigits n then Just (LpkLenExact { n = toNumber n }) else Nothing
+  else if eq (length parts) 2
+  then
+    let lo = fromMaybe "" (head parts)
+    let hi = fromMaybe "" (head (tailOr parts))
+    if not (lblNonEmptyDigits lo) then Nothing
+    else if eq hi "" then Just (LpkLenAtLeast { n = toNumber lo })
+    else if lblNonEmptyDigits hi then Just (LpkLenRange { minN = toNumber lo, maxN = toNumber hi })
+    else Nothing
+  else Nothing
+
+-- lblMatchClass — `[…]` (non-empty, no inner `]`) → Just (lblClassKind inner);
+-- else Nothing.
+@category "engine-internal"
+lblMatchClass : (p: String) -> Maybe LblPatternKind
+lblMatchClass p =
+  if (startsWith p "[") && (endsWith p "]")
+  then
+    let inner = slice p 1 (sub (unitLen p) 1)
+    if (eq inner "") || (elem "]" inner)
+    then Nothing
+    else Just (lblClassKind inner)
+  else Nothing
+
+-- lblClassKind — the named character classes, else special-vs-other by whether
+-- the backslash-stripped inner is all-non-alphanumeric.
+@category "engine-internal"
+lblClassKind : (inner: String) -> LblPatternKind
+lblClassKind inner =
+  if eq inner "A-Z" then LpkClassUpper
+  else if eq inner "a-z" then LpkClassLower
+  else if (eq inner "0-9") || (eq inner "\\d") then LpkClassDigit
+  else if eq inner "a-zA-Z" then LpkClassLetter
+  else if eq inner "a-zA-Z0-9" then LpkClassAlnum
+  else
+    let stripped = lblStripEsc inner ""
+    if lblAllNonAlnum stripped then LpkClassSpecial { inner = inner } else LpkClassOther { inner = inner }
+
+-- lblStripEsc — drop every `\X` escape pair (was inner.replace(/\\./g, "")).
+@category "engine-internal"
+lblStripEsc : (s: String) -> (acc: String) -> String
+lblStripEsc s acc =
+  let c = slice s 0 1
+  if eq c "" then acc
+  else if eq c "\\" then lblStripEsc (slice s 2 (unitLen s)) acc
+  else lblStripEsc (slice s 1 (unitLen s)) (concat acc c)
+
+-- lblAllNonAlnum — non-empty AND every char non-alphanumeric (was /^[^a-zA-Z0-9]+$/).
+@category "engine-internal"
+lblAllNonAlnum : (s: String) -> Boolean
+lblAllNonAlnum s = if eq s "" then false else lblAllNonAlnumGo s
+@category "engine-internal"
+lblAllNonAlnumGo : (s: String) -> Boolean
+lblAllNonAlnumGo s =
+  let c = slice s 0 1
+  if eq c "" then true
+  else if elem c "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" then false
+  else lblAllNonAlnumGo (slice s 1 (unitLen s))
+
+-- lblNonEmptyDigits — non-empty AND all `[0-9]` (the regex `\d+`).
+@category "engine-internal"
+lblNonEmptyDigits : (s: String) -> Boolean
+lblNonEmptyDigits s = if eq s "" then false else lblAllDigitsGo s
+@category "engine-internal"
+lblAllDigitsGo : (s: String) -> Boolean
+lblAllDigitsGo s =
+  let c = slice s 0 1
+  if eq c "" then true
+  else if elem c "0123456789" then lblAllDigitsGo (slice s 1 (unitLen s))
+  else false
+
+-- ---------------------------------------------------------------------------
+-- formatSetError — error-message companion to autoLabel. Mirrors the
+-- TS oracle at validate.ts:formatSetError (now also a Fenel body —
+-- moved here in Phase 8b sub-step 1 to share the LblSetExpr ADT with
+-- autoLabel).
+--
+-- The dispatch only emits per-variant special-case strings for
+-- $named / $enum / $pattern / $interval; every other variant falls
+-- through to the generic "Value does not satisfy constraint" fallback
+-- (this mirrors the TS oracle's behaviour — formatSetError doesn't
+-- handle composite arms; it's intended for leaf constraints).
+-- ---------------------------------------------------------------------------
+
+@label "validation-hints: formatSetError"
+@description "containment-substrate Phase 1a — \"Must be …\" error-message companion to autoLabel. Walks the canonical `$tag` Se* ADT and emits per-variant error messages for the leaf constraints (SeRef / SeEnum / SePattern / SeInterval, with ASCII comparators for intervals to match the TS oracle exactly); every other variant (the `_` arm) falls through to the generic \"Value does not satisfy constraint\" (formatSetError only handles leaf constraints per the TS oracle). The TS marshaller marshalSetExprForLbl is deleted; dispatchedFormatSetError normalises to `$tag` via setExprToTag. Mirrors validate.ts:formatSetError."
+@tags "engine" "validation-hints" "error" "set-expr" "containment-phase-1a"
+formatSetError : (set: SetExpr) -> String
+formatSetError set = case set of
+  SeRef { handle = n } -> formatSetErrorNamed n
+  SeEnum { values = vs } -> formatSetErrorEnum (lblEnumReprs vs [])
+  SePattern { pattern = p } -> "Does not match required pattern"
+  SeInterval { interval = iv } -> formatSetErrorInterval iv
+  _ -> "Value does not satisfy constraint"
+
+-- formatSetErrorNamed — `$named` arm. Mirrors the TS oracle's
+-- `format:` prefix handling + ℤ/ℕ specials + generic "Must be in set X"
+-- fallback.
+@label "validation-hints: formatSetErrorNamed"
+@description "Phase 8b sub-step 1 — formatSetError's `$named` arm. `format:*` → \"Invalid X format\"; ℤ/ℕ → specials; otherwise → \"Must be in set X\". Internal helper."
+@tags "engine" "internal" "validation-hints" "named" "phase-8b"
+@category "engine-internal"
+formatSetErrorNamed : (name: String) -> String
+formatSetErrorNamed name =
+  if startsWith name "format:"
+  then concat "Invalid " (concat (slice name 7 (unitLen name)) " format")
+  else if eq name "ℤ"
+  then "Must be an integer"
+  else if eq name "ℕ"
+  then "Must be a non-negative integer"
+  else concat "Must be in set " name
+
+-- formatSetErrorEnum — `$enum` arm. ≤5 reprs → "Must be one of: …";
+-- otherwise "Invalid option".
+@label "validation-hints: formatSetErrorEnum"
+@description "Phase 8b sub-step 1 — formatSetError's `$enum` arm. ≤5 reprs → \"Must be one of: …\"; >5 → \"Invalid option\". Internal helper."
+@tags "engine" "internal" "validation-hints" "enum" "phase-8b"
+@category "engine-internal"
+formatSetErrorEnum : (reprs: List String) -> String
+formatSetErrorEnum reprs =
+  if gt (length reprs) 5
+  then "Invalid option"
+  else concat "Must be one of: " (join reprs ", ")
+
+-- formatSetErrorInterval — `$interval` arm. Uses ASCII comparators
+-- (>=, >, <=, <) — matches the TS oracle exactly.
+@label "validation-hints: formatSetErrorInterval"
+@description "Phase 8b sub-step 1 — formatSetError's `$interval` arm. ASCII comparators (>=, >, <=, <) + \"Must be \" prefix. Matches the TS oracle byte-for-byte. Internal helper."
+@tags "engine" "internal" "validation-hints" "interval" "phase-8b"
+@category "engine-internal"
+formatSetErrorInterval : (iv: { lo: Maybe ({ value: Any, inclusive: Boolean }), hi: Maybe ({ value: Any, inclusive: Boolean }) }) -> String
+formatSetErrorInterval iv =
+  let parts0 = []
+  let parts1 = case iv.lo of
+    Nothing -> parts0
+    Just b ->
+      let sym = if b.inclusive then ">=" else ">"
+      appendItem (concat sym (concat " " (lblBoundRepr b.value))) parts0
+  let parts2 = case iv.hi of
+    Nothing -> parts1
+    Just b ->
+      let sym = if b.inclusive then "<=" else "<"
+      appendItem (concat sym (concat " " (lblBoundRepr b.value))) parts1
+  concat "Must be " (join parts2 " and ")
+
+-- ---------------------------------------------------------------------------
+-- Phase 8b sub-step 2 — validateWithHints (top-level dispatcher).
+--
+-- The wrapper does the heavy lifting:
+--   * Pre-expands `$named` composites (`format:url:web+secure` →
+--     `$intersect [$named "format:url", $named "format:url:web",
+--     $named "format:url:secure"]`) via expandNamed — TS-side carve-out,
+--     small ~10 LOC TS helper.
+--   * Pre-computes per-constraint ConstraintHint records (id + label +
+--     passed) by calling dispatchedAutoLabel + dispatchedContains
+--     body-to-body for each branch.
+--   * Pre-computes the first non-Nothing cursor by walking the
+--     $intersect arms TS-side via cursorFromSet (which calls
+--     regexHint — now Fenel-bodied via `engine:regexHint`,
+--     regex-derivative-to-fenel Slice C; the TS is a shim).
+--   * Pre-builds FieldHint[] + suggestedNext for object-typed values
+--     via buildFieldHints (sub-step 3 carve-out — Expression-tree
+--     introspection).
+--   * Pre-builds ListHint for list-typed values via buildListHints
+--     (sub-step 3 carve-out — fold/reduce predicate introspection).
+--   * Packs everything into a pre-classified VwhSchema ADT (3
+--     variants: VwhIntersect / VwhUnion / VwhLeaf).
+--
+-- The body's reasoning is the boolean folding (`all passed` for
+-- $intersect, `any passed` for $union) + output assembly with optional
+-- field embedding via Maybe matching. Sub-step 3 may move the
+-- pre-computed FieldHint[] + ListHint construction into the body via
+-- the JsonLogicExpr marshalling pattern (or DEFER-PROVISIONAL if the
+-- substrate doesn't carry).
+-- ---------------------------------------------------------------------------
+
+-- VwhSchema — pre-classified validateWithHints input.
+--
+-- * `VwhIntersect`  — top-level $intersect; carries per-branch
+--   ConstraintHints + pre-computed cursor/fieldHints/suggestedNext/listHint.
+-- * `VwhUnion`      — top-level $union; carries per-branch
+--   ConstraintHints only (no cursor/fieldHints/listHint emitted for
+--   union per the TS oracle).
+-- * `VwhLeaf`       — leaf shape; single ConstraintHint + same
+--   optional cursor/fieldHints/suggestedNext/listHint as VwhIntersect.
+VwhSchema =
+  VwhIntersect constraints: List ({ id: String, label: String, passed: Boolean }) cursorMaybe: Maybe Any fieldHintsListMaybe: Maybe (List Any) suggestedNextMaybe: Maybe String listHintMaybe: Maybe Any
+  | VwhUnion constraints: List ({ id: String, label: String, passed: Boolean })
+  | VwhLeaf constraint: ({ id: String, label: String, passed: Boolean }) cursorMaybe: Maybe Any fieldHintsListMaybe: Maybe (List Any) suggestedNextMaybe: Maybe String listHintMaybe: Maybe Any
+
+-- validateWithHints — dispatcher. Returns a ValidationHint record with
+-- `valid` computed via constraintsAllPassed / constraintsAnyPassed /
+-- constraint.passed (per shape) and the per-branch optional fields
+-- embedded via Maybe → ValidationHint slot.
+--
+-- Multi-line record/pattern literals don't parse in Fenel, so each
+-- record literal is on a single line + each case arm pattern is on
+-- one line.
+@label "validation-hints: validateWithHints"
+@description "Phase 8b sub-step 2 — top-level dispatcher for validateWithHints. Dispatches on VwhSchema (VwhIntersect / VwhUnion / VwhLeaf) and computes the valid flag via constraintsAllPassed/constraintsAnyPassed/c.passed, then assembles the ValidationHint output with Maybe-typed optional fields (cursor / fieldHints / suggestedNext / listHint). The TS wrapper does the per-constraint pre-computation + expandNamed + FieldHint/ListHint construction (the latter two are sub-step 3 carve-outs). Boundary adapter; dispatched via `dispatchedValidateWithHints`. Mirrors implementations/typescript/engine/src/validation-hints.ts:validateWithHints."
+@tags "engine" "validation-hints" "dispatch" "boundary" "phase-8b"
+validateWithHints : (schema: VwhSchema) -> ({ valid: Boolean, constraints: List ({ id: String, label: String, passed: Boolean }), cursor: Maybe Any, fieldHints: Maybe (List Any), suggestedNext: Maybe String, listHint: Maybe Any })
+validateWithHints schema = case schema of
+  VwhIntersect { constraints = cs, cursorMaybe = curM, fieldHintsListMaybe = fhM, suggestedNextMaybe = snM, listHintMaybe = lhM } ->
+    let v = constraintsAllPassed cs
+    { valid = v, constraints = cs, cursor = curM, fieldHints = fhM, suggestedNext = snM, listHint = lhM }
+  VwhUnion { constraints = cs } ->
+    let v = constraintsAnyPassed cs
+    { valid = v, constraints = cs, cursor = Nothing, fieldHints = Nothing, suggestedNext = Nothing, listHint = Nothing }
+  VwhLeaf { constraint = c, cursorMaybe = curM, fieldHintsListMaybe = fhM, suggestedNextMaybe = snM, listHintMaybe = lhM } ->
+    { valid = c.passed, constraints = appendItem c [], cursor = curM, fieldHints = fhM, suggestedNext = snM, listHint = lhM }
+
+-- constraintsAllPassed — true if every constraint's `passed` is true.
+-- Empty list → true (vacuous truth for $intersect, matches TS
+-- `[].every(...) === true`).
+@label "validation-hints: constraintsAllPassed"
+@description "Phase 8b sub-step 2 — true if every constraint's `passed` is true. Empty list → true (vacuous truth). Used by validateWithHints's $intersect arm. Internal helper."
+@tags "engine" "internal" "validation-hints" "phase-8b"
+@category "engine-internal"
+constraintsAllPassed : (cs: List ({ id: String, label: String, passed: Boolean })) -> Boolean
+constraintsAllPassed cs = case head cs of
+  Nothing -> true
+  Just c ->
+    if c.passed
+    then case tail cs of
+      Nothing -> true
+      Just rest -> constraintsAllPassed rest
+    else false
+
+-- constraintsAnyPassed — true if any constraint's `passed` is true.
+-- Empty list → false (matches TS `[].some(...) === false`).
+@label "validation-hints: constraintsAnyPassed"
+@description "Phase 8b sub-step 2 — true if any constraint's `passed` is true. Empty list → false. Used by validateWithHints's $union arm. Internal helper."
+@tags "engine" "internal" "validation-hints" "phase-8b"
+@category "engine-internal"
+constraintsAnyPassed : (cs: List ({ id: String, label: String, passed: Boolean })) -> Boolean
+constraintsAnyPassed cs = case head cs of
+  Nothing -> false
+  Just c ->
+    if c.passed
+    then true
+    else case tail cs of
+      Nothing -> false
+      Just rest -> constraintsAnyPassed rest
+
+-- ---------------------------------------------------------------------------
+-- membershipHints (demo 10, 2026-11-08) — the membership judgment's own
+-- structured answer for (expected set, current value), for ANY value: the
+-- whole value's state, one hint per rule, and each rule's named parts as a
+-- tree (a Pattern's named groups, each with its own state and sub-parts).
+-- Derived from the type alone: a password, an email, a URL, an age bound or a
+-- record-level rule all take this path; nothing is specific to one type.
+--
+-- `refinementConjuncts` flattens a refinement into its rules: every
+-- `SeIntersect` branch (recursively) and every child of a `$where`
+-- predicate's structural `and` (the comma form `T where a, b`), each as its
+-- own `SeWhere`. Any other SetExpr (a union, a complement, a named set, a
+-- pattern) is ONE rule: a union is one hint, never split.
+--
+-- `membershipHints` classifies each rule from the existing judgments the host
+-- wrapper passes through (B3): the rule's own Tri membership answer and, for
+-- a text value, the pattern cursor of the rule's own pattern (the Fenel
+-- `regexHint`), with `exact` telling whether that pattern IS the rule's
+-- definition. Five states:
+--   * HintPass     — membership says yes;
+--   * HintUnknown  — membership is undecided (never shown as a failure);
+--   * HintNotYet   — membership says no, and the exact pattern can still
+--                    match a longer text without accepting this one (typing
+--                    more can fix it);
+--   * HintBlocked  — membership says no, and the exact pattern matches NO
+--                    extension (empty derivative: typing more cannot fix it);
+--   * HintNotMet   — membership says no, with no exact pattern to judge how
+--                    the text can grow, or the two answers disagree (Rule C:
+--                    no promise either way).
+-- Display only: no new decider; it re-reads `contains` and `regexHint`.
+-- ---------------------------------------------------------------------------
+
+HintRuleState = HintPass | HintBlocked | HintNotYet | HintNotMet | HintUnknown
+
+@label "Hint part"
+@description "One named part of a value inside a rule's hint (a Pattern's named group, such as a URL's scheme or host): its text span, its own state, and its sub-parts."
+HintPart = HintPart name: String start: Number end: Number state: HintRuleState parts: List HintPart
+
+@label "Refinement rules"
+@description "Flatten a refinement into its rules: every intersection branch (recursively) and every child of a where-predicate's structural `and` (the comma form `T where a, b`) become separate rules; any other set expression (a union, a complement, a named set, a pattern) is one rule. Used to show one live hint per rule."
+@tags "engine" "validation-hints" "set-expr" "refinement" "hints"
+refinementConjuncts : (set: SetExpr) -> List SetExpr
+refinementConjuncts set = rcGo set []
+
+@category "engine-internal"
+rcGo : (set: SetExpr) -> (acc: List SetExpr) -> List SetExpr
+rcGo set acc = case set of
+  SeIntersect { branches = bs } -> rcList bs acc
+  SeWhere { pred = p } -> rcWhere p acc
+  _ -> appendItem set acc
+
+@category "engine-internal"
+rcList : (bs: List SetExpr) -> (acc: List SetExpr) -> List SetExpr
+rcList bs acc = case head bs of
+  Nothing -> acc
+  Just b ->
+    let acc2 = rcGo b acc
+    case tail bs of
+      Nothing -> acc2
+      Just rest -> rcList rest acc2
+
+-- rcWhere — a structural `and` splits into one SeWhere per child (nested
+-- `and`s flatten too); any other predicate stays one rule.
+@category "engine-internal"
+rcWhere : (pred: Any) -> (acc: List SetExpr) -> List SetExpr
+rcWhere pred acc =
+  case rcAndChildren pred of
+    Nothing -> appendItem (SeWhere { pred = pred }) acc
+    Just children -> rcWhereList children acc
+
+@category "engine-internal"
+rcWhereList : (children: List Any) -> (acc: List SetExpr) -> List SetExpr
+rcWhereList children acc = case head children of
+  Nothing -> acc
+  Just c ->
+    let acc2 = rcWhere c acc
+    case tail children of
+      Nothing -> acc2
+      Just rest -> rcWhereList rest acc2
+
+-- rcAndChildren — the conjuncts of a predicate: the children of a structural
+-- `{and: [..]}` node (the comma form), or the arguments of a call to `and`
+-- (`a && b` lowers to `{call: ["and", a, b]}`); Nothing for any other shape.
+@category "engine-internal"
+rcAndChildren : (pred: Any) -> Maybe (List Any)
+rcAndChildren pred =
+  if isString pred then Nothing
+  else if isNumber pred then Nothing
+  else if isBoolean pred then Nothing
+  else if isNull pred then Nothing
+  else if isArray pred then Nothing
+  else case lookup pred "and" of
+    Just cs -> if (isArray cs) && (gt (length cs) 0) then Just cs else Nothing
+    Nothing -> case lookup pred "call" of
+      Nothing -> Nothing
+      Just parts ->
+        if (isArray parts) && (gt (length parts) 2) && (eq (lblCallName (fromMaybe "" (head parts))) "and")
+        then Just (tailOr parts)
+        else Nothing
+
+@label "Membership hints"
+@description "The membership judgment's structured answer for an expected set and a current value: the whole value's state, one hint per rule (label, state, the rule's pattern cursor) and each rule's named parts as a tree. States: Pass (membership yes), Unknown (undecided), Not yet (no, and the rule's exact pattern can still match a longer text), Blocked (no, and no extension of the text can match the exact pattern), Not met (no, with no exact pattern to judge growth, or the two answers disagree). The whole value is Blocked when a rule is blocked; Not yet requires a single rule that itself is Not yet, because separate rules need not share an extension. Other refusals are Not met. Display only: it reads the existing membership and pattern-cursor answers."
+@tags "engine" "validation-hints" "refinement" "hints"
+membershipHints : (whole: Maybe Boolean) -> (inputs: List ({ id: String, label: String, source: Maybe String, verdict: Maybe Boolean, exact: Boolean, cursor: Maybe Any })) -> ({ state: HintRuleState, rules: List ({ id: String, label: String, state: HintRuleState, cursor: Maybe Any, parts: List HintPart }) })
+membershipHints whole inputs =
+  let rules = mhRules inputs []
+  { state = hintWholeState whole rules, rules = rules }
+
+@category "engine-internal"
+mhRules : (inputs: List ({ id: String, label: String, source: Maybe String, verdict: Maybe Boolean, exact: Boolean, cursor: Maybe Any })) -> (acc: List ({ id: String, label: String, state: HintRuleState, cursor: Maybe Any, parts: List HintPart })) -> List ({ id: String, label: String, state: HintRuleState, cursor: Maybe Any, parts: List HintPart })
+mhRules inputs acc = case head inputs of
+  Nothing -> acc
+  Just r ->
+    let state = hintRuleState r.verdict r.exact r.cursor
+    let label = hintRuleLabel r.label r.source
+    let parts = case r.cursor of
+      Nothing -> []
+      Just c -> hintParts c state
+    let item = { id = r.id, label = label, state = state, cursor = r.cursor, parts = parts }
+    let acc2 = appendItem item acc
+    case tail inputs of
+      Nothing -> acc2
+      Just rest -> mhRules rest acc2
+
+@label "Membership rule state"
+@description "One rule's live state from its Tri membership answer and, when the rule's own pattern judges it exactly, the pattern cursor's can-still-match and can-end answers. Undecided membership is Unknown, never a failure; a refusal promises Not yet or Blocked only when the exact pattern agrees, otherwise Not met."
+@tags "engine" "validation-hints" "refinement" "hints"
+hintRuleState : (verdict: Maybe Boolean) -> (exact: Boolean) -> (cursor: Maybe Any) -> HintRuleState
+hintRuleState verdict exact cursor = case verdict of
+  Nothing -> HintUnknown
+  Just true -> HintPass
+  Just false ->
+    if exact
+    then case cursor of
+      Nothing -> HintNotMet
+      Just c ->
+        if c.canEnd then HintNotMet
+        else if c.canMatch then HintNotYet
+        else HintBlocked
+    else HintNotMet
+
+@category "engine-internal"
+hintRuleLabel : (label: String) -> (source: Maybe String) -> String
+hintRuleLabel label source =
+  if eq label "custom constraint"
+  then fromMaybe label source
+  else label
+
+-- hintWholeState — the whole value: the whole set's own membership answer
+-- decides Pass / Unknown; a refusal is Blocked when a rule is blocked.
+-- Only a single whole rule can establish Not yet here: separate pattern
+-- derivatives may each be nonempty while their intersection is empty.
+@category "engine-internal"
+hintWholeState : (whole: Maybe Boolean) -> (rules: List ({ id: String, label: String, state: HintRuleState, cursor: Maybe Any, parts: List HintPart })) -> HintRuleState
+hintWholeState whole rules = case whole of
+  Nothing -> HintUnknown
+  Just true -> HintPass
+  Just false ->
+    if hwsAny rules
+    then HintBlocked
+    else if eq (length rules) 1
+    then case head rules of
+      Just r -> case r.state of
+        HintNotYet -> HintNotYet
+        _ -> HintNotMet
+      Nothing -> HintNotMet
+    else HintNotMet
+
+@category "engine-internal"
+hwsAny : (rules: List ({ id: String, label: String, state: HintRuleState, cursor: Maybe Any, parts: List HintPart })) -> Boolean
+hwsAny rules = case head rules of
+  Nothing -> false
+  Just r ->
+    let blocked = case r.state of
+      HintBlocked -> true
+      _ -> false
+    if blocked then true else hwsAny (tailOr rules)
+
+-- hintParts — a rule's named parts from its pattern cursor's segments: each
+-- depth-0 segment is a part, its depth-1 segments inside its span are its
+-- sub-parts. A part holding the failing position is Blocked; the part being
+-- typed (the cursor's active group) of an unmet rule is Not yet; any other
+-- part's text matched its group.
+@category "engine-internal"
+hintParts : (cursor: Any) -> (ruleState: HintRuleState) -> List HintPart
+hintParts cursor ruleState =
+  let segs = fromMaybe [] (lookup cursor "segments")
+  let failPos = case lookup cursor "failedAt" of
+    Nothing -> sub 0 1
+    Just f -> if isNull f then sub 0 1 else f.position
+  let active = case lookup cursor "activeGroup" of
+    Nothing -> ""
+    Just g -> if isString g then g else ""
+  hpTop segs segs failPos active ruleState []
+
+@category "engine-internal"
+hpTop : (segs: List Any) -> (segsAll: List Any) -> (failPos: Number) -> (active: String) -> (ruleState: HintRuleState) -> (acc: List HintPart) -> List HintPart
+hpTop segs segsAll failPos active ruleState acc = case head segs of
+  Nothing -> acc
+  Just s ->
+    let acc2 = if eq (hpDepth s) 0 then appendItem (hpPart s failPos active ruleState (hpChildren segsAll s failPos active ruleState [])) acc else acc
+    hpTop (tailOr segs) segsAll failPos active ruleState acc2
+
+@category "engine-internal"
+hpChildren : (segs: List Any) -> (parent: Any) -> (failPos: Number) -> (active: String) -> (ruleState: HintRuleState) -> (acc: List HintPart) -> List HintPart
+hpChildren segs parent failPos active ruleState acc = case head segs of
+  Nothing -> acc
+  Just s ->
+    let inside = (eq (hpDepth s) 1) && (gte s.start parent.start) && (lte s.end parent.end)
+    let acc2 = if inside then appendItem (hpPart s failPos active ruleState []) acc else acc
+    hpChildren (tailOr segs) parent failPos active ruleState acc2
+
+@category "engine-internal"
+hpDepth : (s: Any) -> Number
+hpDepth s = case lookup s "depth" of
+  Nothing -> 0
+  Just d -> if isNumber d then d else 0
+
+@category "engine-internal"
+hpPart : (s: Any) -> (failPos: Number) -> (active: String) -> (ruleState: HintRuleState) -> (children: List HintPart) -> HintPart
+hpPart s failPos active ruleState children =
+  let failing = (gte failPos s.start) && (lte failPos s.end)
+  let typing = case ruleState of
+    HintPass -> false
+    _ -> eq s.name active
+  let state = if failing then HintBlocked else if typing then HintNotYet else HintPass
+  HintPart { name = s.name, start = s.start, end = s.end, state = state, parts = children }

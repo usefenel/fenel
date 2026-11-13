@@ -1,0 +1,11 @@
+-- A value's name is a `Labelable` instance, not a field of `SavedQuery`.
+--
+-- `saved_queries.name` was NOT NULL, which made naming mandatory three ways:
+-- the column, the `state.create_saved_query` leaf, and `validationRecordRows`
+-- (a `String` field is not erasable, so it is required and `""` is refused).
+-- A value has an id; a name is something you may or may not have given it.
+--
+-- The column survives as the denormalised mirror that ORDER BY and ILIKE
+-- search read — the `$opaque` repr discipline applied to storage. Existing
+-- rows keep their text, so no name is lost; new unnamed values write NULL.
+ALTER TABLE saved_queries ALTER COLUMN name DROP NOT NULL;

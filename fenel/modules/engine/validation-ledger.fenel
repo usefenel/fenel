@@ -1,0 +1,1471 @@
+module engine where
+
+-- =========================================================================
+-- validation-ledger.fenel — the Phase 4+4b signature-use ledger (P4-D3's
+-- first half; the S1 proof gate's landed mechanism).
+--
+-- THE FAITHFUL RAW-BODY CARRIER. Every occurrence row in this ledger is
+-- produced by walking the RAW stored body (the `JsonLogic` ADT marshalled
+-- by the existing `marshalJsonLogic` seam — no second marshaller), NOT by
+-- re-lifting through `jsonLogicToSyntax`. The S1 gate proved the re-lift is
+-- non-injective and execution-unfaithful; this walker mirrors the RUNTIME
+-- (`json-logic.ts` `evaluate` / `applyOp` / `invokeFunction`), arm for arm:
+--
+--   1. ARRAY LITERALS. `evaluate` maps an array elementwise. The re-lift
+--      invents a left-folded `SCall "appendItem"` chain, i.e. N-1 signature
+--      uses that the runtime never performs. Here a `JlArray` is an array
+--      literal: its items are walked at `VpsSeq i` and NO call row is
+--      emitted for the container.
+--   2. TEMPLATE / OPERATOR KEYS. `opNotationToCodeName` maps `cat` to
+--      `concat`, but the runtime dispatches the RAW key `cat` — registry
+--      first (`ctx.getFunction`), `BUILTIN_OP_NATIVES` second. Rows here
+--      carry `rawKey` verbatim and resolve it through the FROZEN source
+--      route; a builtin-native fallback is an INTRINSIC rule, never a
+--      function edge.
+--   3. LAZY STRUCTURAL OPS. `if` / `?:` / `and` / `or` short-circuit in the
+--      runtime; the re-lift strictifies them into `SCall`s. Here they are
+--      `VurIntrinsic` rows with an exact versioned rule id and their args
+--      are walked in raw index order.
+--   4. `let` / `do` NESTING. `syntaxToJsonLogic` flattens and `jlsDoOp`
+--      re-nests, so a path depends on which representation was walked.
+--      Here paths follow the RAW representation only.
+--   5. TAGGED VALUES. `evaluate` returns a `$tag`-bearing object untouched
+--      (self-evaluating). The re-lift emits `SConstruct` and recurses. Here
+--      a `JlTagged` node contributes NO rows.
+--   6. KEY-AS-FNID DISAMBIGUATION. The re-lift decides call-vs-record by
+--      VALUE SHAPE (non-empty array ⇒ call); the runtime decides by
+--      RESOLUTION (`ctx.getFunction(op) || op in BUILTIN_OP_NATIVES`, with
+--      `argList = Array.isArray(args) ? args : [args]`). Here resolution
+--      decides, exactly as the runtime does.
+--
+-- FROZEN-FRAME RESOLUTION, AND ITS ONE KNOWN GAP (P4-D0a). Validation may
+-- only consume the declaring module's FROZEN source frame; a spelling that
+-- frame reports `missing`/`ambiguous`/`fenced` yields a NEGATIVE row and
+-- fences, and is never retried through another resolver.
+--
+-- That is fail-closed for NEGATIVE rows. It is NOT, however, a proof that
+-- every POSITIVE row agrees with the runtime, and an earlier draft of this
+-- header wrongly claimed it was (refuted by adversarial review, 2026-07-25).
+-- The counterexample is a code-name collision on the key-as-fnId form: with
+-- `A:f` declared locally in module A and `B:g` carrying the code name `f`,
+-- the source-frame resolver gives the local declaration priority and answers
+-- `A:f`, while the runtime's key-as-fnId path asks the FLAT `ctx.getFunction`
+-- first and dispatches `B:g`. Both answers are positive and they differ.
+--
+-- Slice 2b is INERT, so nothing is mis-certified by this today. Closing it is
+-- an explicit SLICE-3 obligation: the key-as-fnId route needs its own frozen
+-- carrier for the flat runtime target, and any occurrence whose source-frame
+-- and flat targets disagree must fence before it can supply evidence.
+--
+-- PATH DISCIPLINE. `SignatureUseSite` carries a LIST of typed segments
+-- (never a concatenated string). Sibling walks are segment-discriminated so
+-- a match arm's guard and body, a pattern's argument and a call's argument,
+-- and two record fields can never collide. `VpsCond`/`VpsThen`/`VpsElse`
+-- are NOT used by this raw walker: `{if: [...]}` is a FLAT arg list at rest
+-- (a multi-arm chain would reuse `VpsCond` and break injectivity), so every
+-- structural argument is `VpsArg i` in raw index order. Those three
+-- segments remain reserved for a surface-Syntax face.
+--
+-- PATTERNS ARE NOT EVALUATED. `matchPattern` is structural — the runtime
+-- never evaluates a pattern node. Patterns therefore contribute NO use rows;
+-- they contribute BINDERS (`{$bind: "n"}`, recursively) that scope over the
+-- arm's guard and body.
+--
+-- SLICE-2 POSTURE: INERT. This module computes rows and an inventory; it
+-- mints no authority, consults no certificate, and is consumed by no
+-- checker, decider, kernel, or dispatch path. Locality
+-- (`VulExternal`/`VulCurrentScc`) is deliberately NOT decided here — it is
+-- a P4-D4 join against the certificate-SCC partition. The phase-4 static
+-- gate proves non-judgment-reachability until the slice-3 cutover.
+--
+-- Constructor names carry family prefixes (Uls/Lgo/Vri/Vrc) because
+-- constructor ids are repo-global.
+-- =========================================================================
+
+-- ---- the enriched frozen route carrier (P4-D0a) --------------------------
+
+-- One frozen source-frame row, enriched past P2's `SignatureResolutionRow`:
+-- an ambiguous row retains its COMPLETE canonically sorted candidate list
+-- (P2 discarded it) and every row declares a closed resolution `kind`
+-- (`function` | `constructor` | `capability` | `entity`). The validator may
+-- not reconstruct registry candidates or target kind; it consumes this row
+-- as published.
+ValidationRoute = ValidationRoute name: String status: String targetId: String kind: String candidates: [String] diagnostics: [Any]
+
+-- Declared arity of a resolvable target, so saturation is a resolved fact
+-- rather than an assumption. `arity` is the target's declared param count.
+ValidationArity = ValidationArity targetId: String arity: Nat
+
+-- ---- ledger rows ---------------------------------------------------------
+
+-- The closed status of one occurrence. `UlsResolved` extends the site with
+-- the exact target identity and closed authority KIND; the remaining five
+-- are complete negative results that fence validation (they are cache and
+-- invalidation material, never checker input).
+UseLedgerStatus =
+  UlsResolved targetId: String kind: String
+  | UlsFenced targetId: String diagnostics: [Any]
+  | UlsLexical binderId: String
+  | UlsMissing spelling: String
+  | UlsAmbiguous candidates: [String]
+  | UlsDynamicOrReflective detail: String
+
+-- One occurrence. `site` carries the caller, the syntactic ROLE, and the
+-- typed path. Saturation, enters-target, and the raw runtime key are
+-- ORTHOGONAL resolved fields (a same-SCC underapplication is not two
+-- overlapping kinds). `templateOrigin` records that the raw key came from a
+-- parser template/operator spelling rather than a written call.
+UseLedgerRow = UseLedgerRow site: SignatureUseSite rawKey: String status: UseLedgerStatus saturation: UseSaturation suppliedArgs: Nat entersTarget: Boolean templateOrigin: Boolean
+
+-- The body-representation provenance (S1 finding 9). A representation not
+-- proven equivalent to the authoritative one yields the closed
+-- `RsnParserRepresentationDivergence` fence rather than a reusable id.
+LedgerBodyProvenance = LedgerBodyProvenance bodyHash: String astAbi: String parser: String
+
+SignatureUseLedger = SignatureUseLedger callerId: String provenance: LedgerBodyProvenance rows: [UseLedgerRow]
+
+-- The ledger walk is total over well-formed input; a malformed body or a
+-- divergent parser representation fences with a closed reason.
+LedgerOutcome =
+  LgoLedger ledger: SignatureUseLedger
+  | LgoFenced reason: ValidationReason
+
+-- ---- primitive-root inventory (P4-D5, pre-verification) ------------------
+
+-- One inventory row's classification, computed from inventory facts ALONE —
+-- independently of whether any certificate happens to verify. This is what
+-- prevents "eligible only because a root happened to verify" circularity.
+PrimitiveRootClass =
+  VrcConvertToFenel
+  | VrcRootRequired policy: PrimitiveClaimPolicyDecision
+  | VrcFenced reason: ValidationReason
+
+-- One active non-Fenel implementation. `origin` is the exact
+-- `ImplementationOrigin` tag; `tier`/`key` are the POST-FLATTEN winning
+-- native/handler map coordinates (a coarse map tag is not implementation
+-- identity); `handlerInstalled` distinguishes an `ExternalHandlerDeclaration`
+-- from an `InstalledExternalHandler`; `attested` is the CALLER'S ASSERTION that
+-- an exact reviewed attestation row exists for this root. The honest reading:
+-- the finite reviewed register it names DOES NOT EXIST YET (D5a-2), so this
+-- classifier neither holds nor checks one — it classifies exactly the rows it
+-- is handed, and the wrapper copies `attested*` through unchanged. Do not read
+-- `attested = true` as register-backed.
+--
+-- `refutations` (slice 3j, D5a-3) is the CLOSED NEGATIVE-AUTHORITY input, and
+-- it is ONE field on purpose. Two independent sources are INTENDED to feed it —
+-- the GENERATED honesty artifact's `WitnessedEscape` rows and the committed
+-- hand-audit register's `Refuted` rows — and the policy must not care which: a
+-- root the repository already refutes may never be admissible, whatever an
+-- attestation row asserts. Each element is a clause tag from the closed set
+-- `purity` | `totality` | `signature-honesty`. NON-EMPTY FENCES, and it is
+-- checked BEFORE every positive claim, exactly as `requires` already is.
+--
+-- ⚠ NEITHER SOURCE IS WIRED YET — the paragraph above describes the INTENDED
+-- dataflow, not a live one. D5a-2, the register that would supply both, was CUT
+-- from slice 3j. And the sharper fact, because "every production caller passes
+-- an empty list" is vacuously true over an EMPTY SET and misleads: **there is
+-- no known production caller of this classifier at all.** This field fences
+-- nothing. `std:at` (generated `WitnessedEscape` in both
+-- profiles) and `std:replaceAll` (a committed totality refutation) both still
+-- classify `VrcRootRequired {ClaimAdmissible}` under maximal attestation. This
+-- is a POLICY HOOK, not a closed hole — see `design/tcb-ledger.md` row
+-- `vlg.refutation.first`, SIDE-CONDITIONED for exactly this reason.
+PrimitiveRootRow = PrimitiveRootRow functionId: String origin: String tier: String key: String handlerInstalled: Boolean bodyPresent: Boolean groundScheme: Boolean requires: [String] refutations: [String] attested: Boolean attestedPure: Boolean attestedTotal: Boolean attestedHonest: Boolean classification: PrimitiveRootClass
+
+PrimitiveRootInventory = PrimitiveRootInventory profile: String rows: [PrimitiveRootRow] convertToFenel: Nat rootRequired: Nat fenced: Nat
+
+-- =========================================================================
+-- the walker
+-- =========================================================================
+
+-- vlgLedger — the entry. Walks one raw stored body into the complete
+-- occurrence ledger for `callerId`. `binders` seeds the lexical scope with
+-- the function's declared parameter names. A body whose parser provenance
+-- is not the authoritative representation fences BEFORE any row is minted,
+-- so a divergent representation can never mint a reusable use id.
+@label "Validation use ledger"
+@description "Walk one RAW stored body (the marshalled JsonLogic ADT) into the complete signature-use ledger. Faithful to the runtime evaluator: array literals are literals (no invented appendItem edges), lazy structural ops stay intrinsic, key-as-fnId resolves by resolution not value shape, raw runtime keys are preserved verbatim, `$tag` values are inert, and patterns contribute binders but no uses. Resolution consumes the FROZEN source frame only — a negative row fences and is never retried through another resolver. INERT in slice 2: mints no authority and is consumed by no judgment path."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgLedger : (callerId: String) -> (body: (JsonLogic Any)) -> (paramNames: List String) -> (routes: List ValidationRoute) -> (arities: List ValidationArity) -> (provenance: LedgerBodyProvenance) -> LedgerOutcome
+vlgLedger callerId body paramNames routes arities provenance =
+  if vlgProvenanceDivergent provenance
+  then LgoFenced (RsnParserRepresentationDivergence { bodyHash = provenance.bodyHash, provenance = provenance.parser })
+  else
+    let env = { callerId = callerId, routes = routes, arities = arities, binders = paramNames }
+    let rows = vlgWalk body [] env []
+    LgoLedger (SignatureUseLedger { callerId = callerId, provenance = provenance, rows = rows })
+
+-- vlgProvenanceDivergent — the S1 representation gate. The authoritative
+-- body representation is the one the registry published; anything else
+-- (a cache-miss reparse under a different parser, an unknown AST ABI) is a
+-- closed fence, never a reusable id. Empty fields are treated as unknown.
+@label "Ledger provenance divergent"
+@description "True when a body's parser provenance is not the authoritative representation (unknown parser or unknown AST ABI). Fences the ledger before any row is minted."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgProvenanceDivergent : (provenance: LedgerBodyProvenance) -> Boolean
+vlgProvenanceDivergent provenance =
+  if eq provenance.astAbi ""
+  then true
+  else if eq provenance.bodyHash ""
+  then true
+  else if eq provenance.parser "authoritative"
+  then false
+  else true
+
+-- vlgEnvWith — rebuild the walk environment with an extended binder set.
+@label "Ledger env with binders"
+@description "Rebuild the ledger walk environment with a replacement lexical binder list."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgEnvWith : (env: a) -> (binders: List String) -> a
+vlgEnvWith env binders =
+  { callerId = env.callerId, routes = env.routes, arities = env.arities, binders = binders }
+
+-- =========================================================================
+-- the node walk
+-- =========================================================================
+
+-- vlgWalk — the shape cascade. SLICE 3e: the cascade itself is no longer
+-- re-derived here. `fdcNodePlan` (form-decomposition.fenel) owns the
+-- correspondence with `evaluate`'s dispatch tiers, and this walker consumes
+-- the plan. Divergence 1 (an array literal invents no container call) and
+-- divergence 5 (a `$tag` value is self-evaluating) are properties of that
+-- shared plan now, not of this file.
+@label "Ledger walk node"
+@description "The faithful node walk, DELEGATING its form recognition to the shared `fdcNodePlan`: an inert plan contributes nothing, a sequence plan walks elementwise at VpsSeq, a record plan walks fields at VpsField, an op plan carries the runtime's own child schedule, and a keyed plan is the resolution-decided call form with its unresolved fallback attached."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgWalk : (node: (JsonLogic Any)) -> (path: List UsePathSeg) -> (env: a) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgWalk node path env acc =
+  case fdcNodePlan node of
+    FdcPlanInert -> acc
+    FdcPlanSeq { items = xs } -> vlgWalkSeq xs path 0 env acc
+    FdcPlanRecord { fields = fs } -> vlgWalkFields fs path env acc
+    FdcPlanOp { op = op, rawArgs = raw, argList = args, schedule = sched } -> vlgFormOp op raw args sched path env acc
+    FdcPlanKeyed { op = op, rawArgs = raw, argList = args, unresolved = fb } -> vlgKeyAsFnId op raw args fb path env acc
+
+-- vlgWalkSeq — walk a positional item list at `VpsSeq i`.
+@label "Ledger walk sequence"
+@description "Walk a positional JsonLogic item list, each item at its VpsSeq index."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgWalkSeq : (items: a) -> (path: List UsePathSeg) -> (index: Nat) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgWalkSeq items path index env acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let next = vlgWalk item (appendItem (VpsSeq { index = index }) path) env acc
+      case tail items of
+        Nothing -> next
+        Just rest -> vlgWalkSeq rest path (add index 1) env next
+
+-- vlgWalkArgs — walk a positional argument list at `VpsArg i`.
+@label "Ledger walk args"
+@description "Walk a positional JsonLogic argument list, each argument at its VpsArg index."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgWalkArgs : (items: a) -> (path: List UsePathSeg) -> (index: Nat) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgWalkArgs items path index env acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let next = vlgWalk item (appendItem (VpsArg { index = index }) path) env acc
+      case tail items of
+        Nothing -> next
+        Just rest -> vlgWalkArgs rest path (add index 1) env next
+
+-- vlgWalkFields — walk a record literal's fields at `VpsField key`.
+@label "Ledger walk fields"
+@description "Walk a record-literal field list, each value at its VpsField key segment."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgWalkFields : (fields: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgWalkFields fields path env acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let next = vlgWalk f.value (appendItem (VpsField { key = f.name }) path) env acc
+      case tail fields of
+        Nothing -> next
+        Just rest -> vlgWalkFields rest path env next
+
+-- =========================================================================
+-- the form dispatcher — driven by the SHARED schedule, not a local cascade
+-- =========================================================================
+
+-- vlgFormOp — dispatch one KNOWN_OP by the shared decomposition's closed
+-- semantic form. SLICE 3e: the four local predicate tables this replaces
+-- (`vlgIsLazyIntrinsic` / `vlgIsRawRuleIntrinsic` / `vlgIsEagerIntrinsic` /
+-- `vlgIsDynamicApplication`) were a second copy of the evaluator's own
+-- classification, and they were wrong in two places — see `vlgWalkSlots`.
+@label "Ledger form op"
+@description "Dispatch one KNOWN_OP by the shared decomposition's closed semantic form. Replaces four local predicate tables that duplicated the evaluator's classification; the schedule now comes from `fdcOpSchedule`, which is the single table."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgFormOp : (op: String) -> (rawArgs: (JsonLogic Any)) -> (argList: a) -> (sched: FdcSchedule) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgFormOp op rawArgs argList sched path env acc =
+  case sched.form of
+    FdcFormVar -> vlgVarUse argList path env acc
+    -- The env-path ops KEEP their intrinsic row — the runtime really performs
+    -- the operation, and the row is an exact versioned language rule rather
+    -- than a certificate demand. What they lose is the ARGUMENT walk: their
+    -- arguments are raw PATH NAMES the runtime never evaluates, so a row minted
+    -- from one describes an edge that does not execute.
+    FdcFormEnvPath -> appendItem (vlgIntrinsicRow op path env (length argList)) acc
+    FdcFormLazy -> vlgIntrinsicForm op argList sched path env acc
+    FdcFormEager -> vlgIntrinsicForm op argList sched path env acc
+    FdcFormAnn -> vlgWalkSlots (fdcScheduledSlots sched.slots argList) path env acc
+    FdcFormWithInstance -> vlgWalkSlots (fdcScheduledSlots sched.slots argList) path env acc
+    FdcFormTypeDef -> acc
+    FdcFormRawRule -> vlgRawRuleForm op argList sched path env acc
+    FdcFormDynamicApply ->
+      let row = vlgDynamicRow op path env (length argList) "dynamic-application"
+      vlgWalkSlots (fdcScheduledSlots sched.slots argList) path env (appendItem row acc)
+    FdcFormBinding { kind = k } -> vlgBindingForm k rawArgs argList path env acc
+    FdcFormMatch -> vlgMatchOp argList path env acc
+    FdcFormLambda -> vlgFnOp argList path env acc
+    FdcFormCall -> vlgCallOp argList path env acc
+    FdcFormConstruct -> vlgConstructOp argList path env acc
+    FdcFormMethod -> vlgMethodOp argList path env acc
+
+-- The lazy and eager intrinsics share a row shape: an exact versioned
+-- language rule, never a certificate-bearing function edge. `if` / `?:` /
+-- `and` / `or` short-circuit (divergence 3 — the re-lift's strict `SCall`
+-- image is exactly the unfaithfulness this rejects); the rest are eager.
+@label "Ledger intrinsic form"
+@description "The lazy and eager intrinsic ops: one exact versioned language-rule row plus the SCHEDULED argument slots. Never a certificate-bearing function edge."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgIntrinsicForm : (op: String) -> (argList: a) -> (sched: FdcSchedule) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgIntrinsicForm op argList sched path env acc =
+  let row = vlgIntrinsicRow op path env (length argList)
+  vlgWalkSlots (fdcScheduledSlots sched.slots argList) path env (appendItem row acc)
+
+-- vlgRawRuleForm — the KNOWN_OPS that evaluate their RULE argument once per
+-- element in a DERIVED data context.
+--
+-- They do NOT apply a callable (an earlier draft claimed they did; the
+-- adversarial review refuted it): `arrayOp` evaluates the rule slot as a raw
+-- AST with the item's own fields merged over `data`, and `reduceOp` injects
+-- `current`/`accumulator` the same way. A `{fn: …}` rule argument therefore
+-- builds a closure per item and is never entered.
+--
+-- They still FENCE, for the real reason: because the rule runs under a data
+-- context this walker cannot see, a bare `{var: n}` inside it may bind to an
+-- ITEM FIELD rather than to any lexical binder or registered name. Resolving
+-- such a spelling through the frozen frame would mint a positive reference to
+-- a target the runtime never reads. Nested CALLS inside the rule are real and
+-- stay ledgered — the fence covers the variable-resolution uncertainty, not
+-- the calls.
+@label "Ledger raw-rule form"
+@description "The KNOWN_OPS that evaluate their rule argument per element in a DERIVED data context (map/filter/reduce/all/some/none). They do NOT enter a callable; they fence because a bare variable inside the rule may bind to an item field rather than a lexical binder or registered name. The rule slot comes from the shared form's ruleIndex, so it is never confused with an ordinary evaluated argument."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgRawRuleForm : (op: String) -> (argList: a) -> (sched: FdcSchedule) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgRawRuleForm op argList sched path env acc =
+  let row = vlgDynamicRow op path env (length argList) "raw-rule intrinsic evaluates its rule in a derived per-item data context"
+  let evaluated = vlgWalkSlots (fdcScheduledSlots sched.slots argList) path env (appendItem row acc)
+  case sched.form of
+    FdcFormRawRule { ruleIndex = i } -> vlgWalk (ifNthArg argList i) (appendItem (VpsArg { index = i }) path) env evaluated
+    _ -> evaluated
+
+-- vlgWalkSlots — walk exactly the argument slots the runtime EVALUATES.
+--
+-- SLICE 3e, and this is where the ledger was over-reporting. The eager
+-- intrinsics do not all consume every slot: the bitwise binaries read two,
+-- `~` and `length` one, `in` two, `substr` two plus an optional third, and
+-- `deepEq` / `withInstance` evaluate NOTHING at any arity but two. Walking
+-- the residue minted rows for children the runtime is guaranteed never to
+-- reach, which demanded certificates for edges that do not execute.
+@label "Ledger walk slots"
+@description "Walk exactly the argument slots the runtime evaluates, at their VpsArg index. Replaces the blanket every-argument walk, which minted rows for guaranteed-dead trailing children of the eager intrinsics."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgWalkSlots : (slots: [FdcCallSlot]) -> (path: List UsePathSeg) -> (env: a) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgWalkSlots slots path env acc =
+  case head slots of
+    Nothing -> acc
+    Just s ->
+      let next =
+            if s.evaluated
+            then vlgWalk s.node (appendItem (VpsArg { index = s.logicalIndex }) path) env acc
+            else acc
+      vlgWalkSlots (eufRest slots) path env next
+
+@label "Ledger slot nodes"
+@description "The raw argument nodes of an evaluated slot list, in order — the input the named-argument recognizer needs. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgSlotNodes : (slots: [FdcCallSlot]) -> (acc: a) -> a
+vlgSlotNodes slots acc =
+  case head slots of
+    Nothing -> acc
+    Just s ->
+      let next = if s.evaluated then appendItem s.node acc else acc
+      vlgSlotNodes (eufRest slots) next
+
+-- vlgBindingForm — `let` / `do` / `where`, all three through the shared
+-- binding layout.
+@label "Ledger binding form"
+@description "Dispatch the three sequentially-scoped binding forms through the shared binding layout."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgBindingForm : (kind: String) -> (rawArgs: (JsonLogic Any)) -> (argList: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgBindingForm kind rawArgs argList path env acc =
+  if eq kind "let"
+  then vlgLetOp argList path env acc
+  else if eq kind "do"
+  then vlgDoOp argList path env acc
+  else vlgWhereOp argList path env acc
+
+-- =========================================================================
+-- the individual forms
+-- =========================================================================
+
+-- vlgVarUse — `{var: "n"}`. A name bound in the lexical scope is an ordinary
+-- lexical occurrence (explicit evidence, never a DAG edge). An unbound name
+-- that the FROZEN frame resolves to a registered function is a REFERENCE
+-- use: a registered arrow value consumed without application. Anything else
+-- is a negative row.
+@label "Ledger var use"
+@description "`{var: name}` — a lexically bound name is a Lexical row; an unbound name resolving through the frozen frame to a registered target is a Reference row (an arrow value consumed without application); otherwise a negative row."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgVarUse : (argList: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgVarUse argList path env acc =
+  case head argList of
+    Nothing -> appendItem (vlgDynamicRow "var" path env 0 "var without a string name") acc
+    Just first ->
+      case first of
+        JlString { value = name } ->
+          -- The runtime's `resolveVar` reads DOTTED PATHS off a bound value
+          -- (`{var: "bot.token"}` projects the field of the binder `bot`), so
+          -- binder matching is by path root, not by the whole spelling.
+          -- Matching only the full string would push every field access into a
+          -- frozen-frame lookup, i.e. a spurious `missing` fence on the most
+          -- common shape in the corpus.
+          if vlgHasBinderPath env.binders name
+          then
+            appendItem (UseLedgerRow {
+              site = SignatureUseSite { callerId = env.callerId, role = VurLexical, path = path },
+              rawKey = name,
+              status = UlsLexical { binderId = name },
+              saturation = VusExact,
+              suppliedArgs = 0,
+              entersTarget = false,
+              templateOrigin = false
+            }) acc
+          -- An UNBOUND DOTTED spelling is data-dependent, never a registered
+          -- name: `resolveVar` walks a dotted path through the data context
+          -- and only falls back to the function registry for a SINGLE
+          -- segment. Frozen-resolving `M.f` would mint a positive reference
+          -- to a target the runtime never reads.
+          else if vlgIsDotted name
+          then appendItem (vlgDynamicRow name path env 0 "data-dependent dotted variable path") acc
+          else
+            appendItem (vlgResolvedRow name VurReference path env 0 false false false) acc
+        JlNull -> appendItem (vlgDynamicRow "var" path env 0 "var without a string name") acc
+        JlBool -> appendItem (vlgDynamicRow "var" path env 0 "var without a string name") acc
+        JlNumber -> appendItem (vlgDynamicRow "var" path env 0 "var without a string name") acc
+        JlArray -> appendItem (vlgDynamicRow "var" path env 0 "var without a string name") acc
+        JlTagged -> appendItem (vlgDynamicRow "var" path env 0 "var without a string name") acc
+        JlObject -> appendItem (vlgDynamicRow "var" path env 0 "var without a string name") acc
+
+-- vlgLetOp — `{let: {…}}`. SLICE 3e: the carrier recognition delegates to
+-- the shared `fdcBindingLayout`. The runtime folds the bindings SEQUENTIALLY
+-- into a copied data context, so binding i sees binders 0..i-1, and the whole
+-- form value is the LAST binding (there is no separate body at rest).
+--
+-- A carrier the shared layout reports NOT TOTAL fences. Previously this
+-- silently bound nothing there, which is the unsafe UNDER-binding direction:
+-- a later `{var: n}` fell through to the frozen frame and resolved to a
+-- registered target while the runtime read a local binding.
+@label "Ledger let op"
+@description "`{let: {...}}` - sequential bindings, each value walked at its VpsBinding segment with the preceding binders in scope. No separate body at rest (the runtime result is the last binding). A carrier the shared layout reports NOT TOTAL fences rather than silently binding nothing."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgLetOp : (argList: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgLetOp argList path env acc =
+  let layout = fdcBindingLayout "let" argList
+  if not layout.total
+  then appendItem (vlgDynamicRow "let" path env 0 layout.reason) acc
+  else vlgBindings layout.entries path env acc
+
+@label "Ledger bindings"
+@description "Walk a sequential binding entry list at VpsBinding, threading each binder into scope for the following bindings."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgBindings : (entries: [FdcBindingEntry]) -> (path: List UsePathSeg) -> (env: a) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgBindings entries path env acc =
+  case head entries of
+    Nothing -> acc
+    Just e ->
+      let seg = VpsBinding { name = e.name, index = e.index }
+      let next = vlgWalk e.value (appendItem seg path) env acc
+      let envNext = vlgEnvWith env (appendItem e.name env.binders)
+      vlgBindings (eufRest entries) path envNext next
+
+@label "Ledger binder names"
+@description "Collect the binder names a binding entry list introduces."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgBinderNames : (entries: [FdcBindingEntry]) -> (acc: List String) -> List String
+vlgBinderNames entries acc =
+  case head entries of
+    Nothing -> acc
+    Just e -> vlgBinderNames (eufRest entries) (appendItem e.name acc)
+
+-- vlgDoOp — `{do: [...]}`. FLAT statement list (divergence 4 — never
+-- re-nested). An item carrying a `let` KEY injects its bindings FORWARD into
+-- the local scope, exactly as the runtime does.
+@label "Ledger do op"
+@description "`{do: [...]}` - a FLAT statement list walked at VpsSeq (never re-nested into SLet/SDo). An item carrying a `let` key injects its binders forward into the local scope, matching the runtime."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgDoOp : (items: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgDoOp items path env acc = vlgDoItems items path 0 env acc
+
+-- SLICE 3e — THE INLINE-LET BRANCH, AND WHY IT WAS UNSAFE.
+--
+-- The runtime detects the inline let by PRESENCE of the key (`"let" in expr`)
+-- and then evaluates the BINDING VALUES INSTEAD OF THE ITEM: sibling fields
+-- are never evaluated at all. This walker previously walked the whole item
+-- as an ordinary expression AND collected the binder names separately, which
+-- is not merely surplus reporting — a multi-key item binding values were
+-- walked through the record-literal path, i.e. WITHOUT the sequential scope
+-- `vlgBindings` gives them, so a later binding value could resolve a spelling
+-- to a registered target where the runtime sees an earlier local binder.
+@label "Ledger do items"
+@description "The do-list worker: an item carrying a `let` KEY has ONLY its binding values walked, in sequential scope, and its binders thread forward; every other item is an ordinary expression at VpsSeq. The runtime never evaluates an inline-let item siblings, so neither does this walk."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgDoItems : (items: a) -> (path: List UsePathSeg) -> (index: Nat) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgDoItems items path index env acc =
+  case head items of
+    Nothing -> acc
+    Just item ->
+      let seg = appendItem (VpsSeq { index = index }) path
+      let inline = fdcInlineLet item
+      if not inline.present
+      then vlgDoItems (eufRest items) path (add index 1) env (vlgWalk item seg env acc)
+      else if not inline.total
+      then vlgDoItems (eufRest items) path (add index 1) env (appendItem (vlgDynamicRow "do" seg env 0 inline.reason) acc)
+      else
+        let next = vlgBindings inline.entries seg env acc
+        let envNext = vlgEnvWith env (vlgBinderNames inline.entries env.binders)
+        vlgDoItems (eufRest items) path (add index 1) envNext next
+
+-- vlgWhereOp — `{where: [body, bindings]}`. The runtime evaluates the
+-- bindings first (into a copied context) and then the body, so the ledger
+-- walks bindings at `VpsWhereBinding name i` and the body at `VpsArg 0` with
+-- every binder in scope.
+@label "Ledger where op"
+@description "`{where: [body, bindingsObject]}` - bindings first at VpsWhereBinding, then the body at VpsArg 0 with all binders in scope (the runtime order). A bindings carrier the shared layout reports NOT TOTAL fences."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgWhereOp : (argList: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgWhereOp argList path env acc =
+  let layout = fdcBindingLayout "where" argList
+  if not layout.total
+  then appendItem (vlgDynamicRow "where" path env 0 layout.reason) acc
+  else
+    let withBindings = vlgWhereBindings layout.entries path env acc
+    let envNext = vlgEnvWith env (vlgBinderNames layout.entries env.binders)
+    vlgWalk layout.body (appendItem (VpsArg { index = 0 }) path) envNext withBindings
+
+@label "Ledger where bindings"
+@description "Walk a where-clause binding entry list at VpsWhereBinding, threading each binder forward."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgWhereBindings : (entries: [FdcBindingEntry]) -> (path: List UsePathSeg) -> (env: a) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgWhereBindings entries path env acc =
+  case head entries of
+    Nothing -> acc
+    Just e ->
+      let seg = VpsWhereBinding { name = e.name, index = e.index }
+      let next = vlgWalk e.value (appendItem seg path) env acc
+      let envNext = vlgEnvWith env (appendItem e.name env.binders)
+      vlgWhereBindings (eufRest entries) path envNext next
+
+-- vlgMatchOp — `{match: [scrut, p1, b1, p2, b2, …]}`. SLICE 3e: the arm
+-- pairing and the guard split delegate to the shared `fdcMatchLayout`.
+-- Faithful details it now owns:
+--  * a match with FEWER THAN TWO arguments evaluates NOTHING — the runtime
+--    returns before it reaches the scrutinee, so no row is minted for it;
+--  * PATTERNS ARE NOT EVALUATED — they contribute binders, not uses;
+--  * a guarded arm is `{$guard: [pattern, condition]}` on EITHER carrier (a
+--    `$tag`-bearing arm included — this file previously omitted the tagged
+--    carrier, leaving that guard entirely unwalked); the CONDITION is
+--    evaluated in the extended scope at `VpsArmGuard i`, a different segment
+--    kind from `VpsArmBody i`;
+--  * a lone trailing element is the runtime DEFAULT arm — an expression, not
+--    a pattern — evaluated in the OUTER scope.
+@label "Ledger match op"
+@description "`{match: [scrut, p1, b1, ...]}` - scrutinee at VpsScrutinee (and NOT walked at all below two arguments, where the runtime returns before evaluating it); patterns contribute BINDERS but no uses; a guarded arm on EITHER carrier walks its condition at VpsArmGuard and its body at VpsArmBody; a lone trailing element is the default arm body."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgMatchOp : (argList: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgMatchOp argList path env acc =
+  let layout = fdcMatchLayout argList
+  if not layout.scrutineePresent
+  then acc
+  else
+    let withScrutinee = vlgWalk layout.scrutinee (appendItem VpsScrutinee path) env acc
+    let withArms = vlgMatchArms layout.arms path env withScrutinee
+    if not layout.fallbackPresent
+    then withArms
+    else vlgWalk layout.fallback (appendItem (VpsArmBody { index = layout.fallbackIndex }) path) env withArms
+
+-- SLICE 3e — THE ARM FENCE. A pattern whose binder writes are not TOTAL
+-- fences the arm instead of contributing a partial binder set.
+--
+-- Both directions are unsafe here, which is why neither dropping nor
+-- inventing is acceptable. UNDER-binding leaves a body occurrence resolving
+-- through the frozen frame to a registered target the runtime has shadowed.
+-- OVER-binding turns a genuine registered occurrence into a lexical row and
+-- ERASES ITS EVIDENCE EDGE. Two shapes trip it: a `$bind` whose payload is
+-- not a literal name (the runtime installs `String(value)`, a spelling this
+-- walker will not manufacture), and a binder underneath a Boolean-
+-- representation pattern, which the runtime may match with an EMPTY binding
+-- set before the structural arm ever runs.
+@label "Ledger match arms"
+@description "Walk the shared layout arms: pattern binders, then the guard at VpsArmGuard, then the body at VpsArmBody. An arm whose binder writes are not TOTAL fences rather than contributing a partial binder set - under-binding misses a shadow and over-binding erases an evidence edge."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgMatchArms : (arms: [FdcMatchArm]) -> (path: List UsePathSeg) -> (env: a) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgMatchArms arms path env acc =
+  case head arms of
+    Nothing -> acc
+    Just arm -> vlgMatchArms (eufRest arms) path env (vlgMatchArm arm path env acc)
+
+@label "Ledger match arm"
+@description "One match arm: the pattern binder set (or a fence when it is not total), then the guard condition, then the body, both in the arm-extended scope."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgMatchArm : (arm: FdcMatchArm) -> (path: List UsePathSeg) -> (env: a) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgMatchArm arm path env acc =
+  if not (fdcPatternBindsTotal arm.pattern)
+  then appendItem (vlgDynamicRow "match" (appendItem (VpsArmPattern { index = arm.index }) path) env 0 "an arm pattern introduces a binder whose runtime spelling is not reproducible or whose write is conditional on the scrutinee") acc
+  else
+    let names = fdcBindWriteSpellings (fdcPatternBindWrites arm.pattern) []
+    let envArm = vlgEnvWith env (vlgConcatNames env.binders names)
+    let withGuard = vlgWalkGuard arm path envArm acc
+    vlgWalk arm.body (appendItem (VpsArmBody { index = arm.index }) path) envArm withGuard
+
+@label "Ledger walk guard"
+@description "Walk a guarded arm condition at VpsArmGuard in the pattern-extended scope; an unguarded arm contributes nothing."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgWalkGuard : (arm: FdcMatchArm) -> (path: List UsePathSeg) -> (env: a) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgWalkGuard arm path env acc =
+  if arm.guarded
+  then vlgWalk arm.guard (appendItem (VpsArmGuard { index = arm.index }) path) env acc
+  else acc
+
+-- vlgFnOp — `{fn: [...]}`. SLICE 3e: the whole grammar recognition delegates
+-- to the shared `fdcLambdaLayout`, which closes two defects at once.
+--
+--  1. THE CANONICAL FORM DROPPED NON-LITERAL PARAMETERS. `args[0]` is taken
+--     VERBATIM by the runtime and each entry becomes a property key at bind
+--     time, so `{fn: [[["x"]], body]}` binds the name `x`. This file answered
+--     the accumulator for every non-string entry, i.e. bound nothing — and a
+--     body occurrence then stayed resolved against a registered `x` while
+--     execution saw the lambda-local one.
+--  2. THE FLAT FORM EXPANDED AN ARRAY PARAMETER INTO SEVERAL BINDERS. The
+--     runtime String()-coerces each leading argument, so
+--     `{fn: ["x", ["y","z"], body]}` binds TWO names, `x` and `"y,z"`. BOTH
+--     analyses expanded it into three, agreed with each other, and were both
+--     wrong — which is why walker agreement is not the safety net here.
+--
+-- A parameter whose spelling is genuinely not reproducible still fences, and
+-- the fence does not walk the body: the row is `DynamicOrReflective`, which
+-- fences the whole validation, and walking with an incomplete binder set
+-- could mint a positive row for a target the runtime never reaches.
+@label "Ledger fn op"
+@description "`{fn: [...]}` - the lambda parameter spellings enter lexical scope and the body is walked at VpsLambdaBody, both taken from the shared lambda layout. Closes two defects: the canonical form no longer drops a non-literal parameter entry (the runtime binds its string coercion), and a flat array parameter is ONE binder under its coerced spelling rather than several."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgFnOp : (argList: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgFnOp argList path env acc =
+  let layout = fdcLambdaLayout argList
+  if not layout.namesTotal
+  then appendItem (vlgDynamicRow "fn" path env 0 "a lambda parameter spelling is not reproducible, so the binder it introduces cannot be named") acc
+  else if not layout.bodyPresent
+  then acc
+  else
+    let envNext = vlgEnvWith env (vlgConcatNames env.binders (fdcParamSpellings layout.params []))
+    vlgWalk layout.body (appendItem VpsLambdaBody path) envNext acc
+
+@label "Ledger concat names"
+@description "Append every name of the second list to the first."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgConcatNames : (left: List String) -> (right: List String) -> List String
+vlgConcatNames left right =
+  case head right of
+    Nothing -> left
+    Just name ->
+      case tail right of
+        Nothing -> appendItem name left
+        Just rest -> vlgConcatNames (appendItem name left) rest
+
+-- vlgCallOp — `{call: [callee, …args]}`. SLICE 3e: the callee position and
+-- the actual indices come from the shared `fdcCallLayout`.
+--
+-- THE `$` VEHICLE WAS A POSITIVE WRONG ROW, NOT A FENCE. `{call: ["$", callee,
+-- …args]}` is application by a language-core head: the runtime takes the
+-- callee from raw slot 1 and BYPASSES registry resolution entirely. This file
+-- read slot 0 as an ordinary literal callee, so it resolved the spelling `$`
+-- through the frozen frame — and a registered `($)` exists, so the row was a
+-- RESOLVED positive naming a target the runtime never dispatches, with every
+-- actual index off by one.
+@label "Ledger call op"
+@description "`{call: [callee, ...args]}` - the callee position and actual indices come from the shared call layout. A literal string callee is a direct registered call resolved through the frozen frame; the `$` application vehicle takes its callee from raw slot 1 and bypasses registry resolution, so it is dynamic; a lexically bound {var} callee is DynamicOrReflective; an unbound {var} callee resolves through the frozen frame."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgCallOp : (argList: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgCallOp argList path env acc =
+  let layout = fdcCallLayout "call" argList
+  let supplied = layout.actualCount
+  let namedish = vlgNamedish (vlgSlotNodes layout.slots [])
+  let row = vlgCalleeRow layout path env supplied namedish
+  let withCallee = vlgWalkCalleeNode layout path env (appendItem row acc)
+  vlgWalkSlots layout.slots path env withCallee
+
+@label "Ledger callee row"
+@description "Classify a call layout callee into its ledger row: a direct string target, the `$` application vehicle (dynamic - the runtime bypasses registry resolution), a lexically bound name (dynamic), a dotted data-dependent path (dynamic), or a frozen-frame resolution of an indirect name."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgCalleeRow : (layout: FdcCallLayout) -> (path: List UsePathSeg) -> (env: a) -> (supplied: Nat) -> (namedish: Boolean) -> UseLedgerRow
+vlgCalleeRow layout path env supplied namedish =
+  case layout.callee of
+    FdcCalleeName { name = name } -> vlgResolvedRow name VurCall path env supplied true false namedish
+    FdcCalleeDollar -> vlgDynamicRow "$" path env supplied "the $ application vehicle applies a callee VALUE and bypasses registry resolution"
+    FdcCalleeVar { name = name } ->
+      if vlgHasBinderPath env.binders name
+      then vlgDynamicRow name path env supplied "lexical callable applied without an exact origin"
+      else if vlgIsDotted name
+      then vlgDynamicRow name path env supplied "data-dependent dotted callable path"
+      else vlgResolvedRow name VurCall path env supplied true false namedish
+    FdcCalleeExpr -> vlgDynamicRow "call" path env supplied "callee is not a fnId or {var}"
+    FdcCalleeAbsent -> vlgDynamicRow "call" path env supplied "callee is not a fnId or {var}"
+
+-- A callee that is neither a literal name nor a `{var}` is an ordinary
+-- expression position and is walked at `VpsCallee` so no evidence-consuming
+-- use inside it can disappear. The `$` vehicle callee is exactly such a
+-- position.
+@label "Ledger walk callee node"
+@description "Walk a non-name call callee as an ordinary expression at VpsCallee so nested uses are not lost. The `$` vehicle callee is such a position, at raw slot 1."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgWalkCalleeNode : (layout: FdcCallLayout) -> (path: List UsePathSeg) -> (env: a) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgWalkCalleeNode layout path env acc =
+  case layout.callee of
+    FdcCalleeExpr -> vlgWalk layout.calleeNode (appendItem VpsCallee path) env acc
+    FdcCalleeDollar -> vlgWalk layout.calleeNode (appendItem VpsCallee path) env acc
+    _ -> acc
+
+-- vlgConstructOp — `{construct: [ctorName, …fields]}`. SLICE 3e: the name,
+-- the payload, and the availability of the named-record reading come from the
+-- shared `fdcCtorLayout`. The constructor occurrence carries the OWNER-EXACT
+-- semantic target from the frozen frame; the short wire tag is representation
+-- only and is projected elsewhere.
+@label "Ledger construct op"
+@description "`{construct: [ctor, ...]}` - the constructor occurrence resolves to its owner-exact semantic target through the frozen frame (never a short wire tag); the payload shape comes from the shared constructor layout."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgConstructOp : (argList: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgConstructOp argList path env acc =
+  let layout = fdcCtorLayout argList
+  let supplied = length layout.payload
+  if not layout.namePresent
+  then appendItem (vlgDynamicRow "construct" path env supplied "constructor name is not a literal") acc
+  else
+    let row = vlgResolvedRow layout.name VurConstructor path env supplied true false (vlgNamedish layout.payload)
+    vlgConstructPayload layout path env (appendItem row acc)
+
+-- THE READING IS UNRESOLVED AND THIS CONSUMER TAKES THE UNION, DELIBERATELY.
+-- The shared layout publishes BOTH payload readings and flags `needsTable`,
+-- because `applyOp` decides named-versus-positional from the registered field
+-- names, which a pure body does not have. So BOTH are walked whenever the named
+-- reading is live.
+--
+-- CHOOSING ONE WAS AN UNDER-REPORT, and the result review produced the
+-- counterexample: for a ONE-FIELD op-shaped payload such as
+-- `{construct: ["R", {ann: [0, {call: ["g", 1]}]}]}` the positional reading sees
+-- an `ann` form and walks argument 0 only, while the runtime NAMED branch
+-- evaluates the whole field value and reaches `g`. Picking positional there lost
+-- the edge entirely. The union over-reports instead, which is the conservative
+-- direction for a use ledger: an extra edge demands MORE evidence, never less.
+-- The two readings cannot collide, because the positional walk prefixes
+-- `VpsArg 0` and the named walk does not.
+@label "Ledger construct payload"
+@description "Walk a constructor payload from the shared layout. The named-versus-positional reading needs the constructor table a pure body lacks, so this consumer walks the UNION of both published readings whenever the named one is live. Choosing one was an under-report: for a one-field op-shaped payload the positional reading walks argument 0 only while the runtime named branch evaluates the whole field value."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgConstructPayload : (layout: FdcCtorLayout) -> (path: List UsePathSeg) -> (env: a) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgConstructPayload layout path env acc =
+  if not layout.namedPossible
+  then vlgWalkArgs layout.payload path 0 env acc
+  else vlgWalkFields layout.namedFields path env (vlgWalkArgs layout.payload path 0 env acc)
+
+-- vlgMethodOp — `{method: [class, method, …args]}`. Qualified capability
+-- dispatch has no concrete scope snapshot in this phase, so it is ALWAYS
+-- `ScopeDependentDispatch`. An interface declaration, provider record,
+-- handler string, or dispatch dictionary supplies no dependency evidence and
+-- no miss retries through provider or global lookup. SLICE 3e: the two
+-- leading slots are RAW NAMES the runtime String()-reads rather than
+-- evaluates, and the shared layout marks them as such.
+@label "Ledger method op"
+@description "`{method: [class, method, ...]}` - qualified capability dispatch is ALWAYS ScopeDependentDispatch in this phase (no concrete scope snapshot); no provider, handler, or dictionary datum supplies dependency evidence. The two leading slots are raw names the runtime never evaluates."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgMethodOp : (argList: a) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgMethodOp argList path env acc =
+  let layout = fdcCallLayout "method" argList
+  let row = UseLedgerRow {
+        site = SignatureUseSite { callerId = env.callerId, role = VurCapabilityDispatch, path = path },
+        rawKey = "method",
+        status = UlsDynamicOrReflective { detail = "scope-dependent capability dispatch" },
+        saturation = VusExact,
+        suppliedArgs = layout.actualCount,
+        entersTarget = false,
+        templateOrigin = false
+      }
+  vlgWalkSlots layout.slots path env (appendItem row acc)
+
+-- vlgKeyAsFnId — the universal call form. The runtime decides by RESOLUTION
+-- (divergence 6), so this arm does too: the frozen frame first, then the
+-- builtin-op-native intrinsic fallback, and finally the UNRESOLVED fallback
+-- the shared plan attached (an inert `$`-prefixed marker or a single-field
+-- record literal). A raw operator/template key is preserved verbatim and
+-- never rewritten to a codeName (divergence 2).
+@label "Ledger key as fnId"
+@description "The universal key-as-fnId call form, decided by RESOLUTION exactly as the runtime does: the frozen frame first (registry precedence), then the builtin-op-native intrinsic fallback, then the unresolved fallback the shared plan attached. The raw key is never rewritten to a codeName."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgKeyAsFnId : (op: String) -> (rawArgs: (JsonLogic Any)) -> (argList: a) -> (fb: FdcKeyedFallback) -> (path: List UsePathSeg) -> (env: b) -> (acc: List UseLedgerRow) -> List UseLedgerRow
+vlgKeyAsFnId op rawArgs argList fb path env acc =
+  let template = vlgIsOperatorNotation op
+  case vlgLookupRoute env.routes op of
+    Just route ->
+      let row = vlgRouteRow op route VurCall path env (length argList) true template (vlgNamedish argList)
+      vlgWalkArgs argList path 0 env (appendItem row acc)
+    Nothing ->
+      if vlgIsBuiltinOpNative op
+      then
+        let row = UseLedgerRow {
+              site = SignatureUseSite { callerId = env.callerId, role = VurIntrinsic, path = path },
+              rawKey = op,
+              status = UlsResolved { targetId = concat "@intrinsic/builtin-op-native/" op, kind = "intrinsic" },
+              saturation = VusExact,
+              suppliedArgs = length argList,
+              entersTarget = true,
+              templateOrigin = template
+            }
+        vlgWalkArgs argList path 0 env (appendItem row acc)
+      else
+        case fb of
+          FdcKeyedInert -> acc
+          FdcKeyedField { key = k } -> vlgWalk rawArgs (appendItem (VpsField { key = k }) path) env acc
+
+-- vlgIsOperatorNotation — the parser's operator/template spellings. A hit
+-- records `templateOrigin`, which participates in occurrence identity, but
+-- never rewrites the raw key.
+@label "Ledger operator notation"
+@description "True for a parser operator/template spelling (`+`, `==`, `cat`, `!`, …). Records template origin; never rewrites the raw key."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgIsOperatorNotation : (op: String) -> Boolean
+vlgIsOperatorNotation op =
+  case opNotationToCodeName op of
+    Nothing -> false
+    Just -> true
+
+-- vlgIsBuiltinOpNative — the registry-less `BUILTIN_OP_NATIVES` fallback set
+-- (`json-logic.ts`). The registry wins when a route exists; this set is only
+-- consulted on a frozen-frame miss and yields an INTRINSIC rule, never a
+-- certificate-bearing function edge.
+@label "Ledger builtin op native"
+@description "The registry-less BUILTIN_OP_NATIVES fallback set (codeName and notation keys). Consulted only on a frozen-frame miss; yields an intrinsic rule, never a function edge."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgIsBuiltinOpNative : (op: String) -> Boolean
+vlgIsBuiltinOpNative op =
+  if eq op "add" then true
+  else if eq op "sub" then true
+  else if eq op "mul" then true
+  else if eq op "div" then true
+  else if eq op "mod" then true
+  else if eq op "negate" then true
+  else if eq op "eq" then true
+  else if eq op "neq" then true
+  else if eq op "lt" then true
+  else if eq op "lte" then true
+  else if eq op "gt" then true
+  else if eq op "gte" then true
+  else if eq op "and" then true
+  else if eq op "or" then true
+  else if eq op "not" then true
+  else if eq op "concat" then true
+  else if eq op "ifElse" then true
+  else if eq op "cat" then true
+  else vlgIsOperatorNotation op
+
+-- =========================================================================
+-- row construction + frozen-frame resolution
+-- =========================================================================
+
+-- vlgResolvedRow — build one row by resolving a spelling through the FROZEN
+-- source frame. Every negative status is a complete result: it is never
+-- retried through a flat registry lookup, a code-name hit, a provider
+-- method, or an id-prefix-derived module.
+@label "Ledger resolved row"
+@description "Build one ledger row by resolving a spelling through the frozen source frame only. Missing, ambiguous, and fenced are complete negative results and are never retried through another resolver."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgResolvedRow : (name: String) -> (role: UseRole) -> (path: List UsePathSeg) -> (env: a) -> (supplied: Nat) -> (applied: Boolean) -> (template: Boolean) -> (namedish: Boolean) -> UseLedgerRow
+vlgResolvedRow name role path env supplied applied template namedish =
+  case vlgLookupRoute env.routes name of
+    Nothing ->
+      UseLedgerRow {
+        site = SignatureUseSite { callerId = env.callerId, role = role, path = path },
+        rawKey = name,
+        status = UlsMissing { spelling = name },
+        saturation = VusExact,
+        suppliedArgs = supplied,
+        entersTarget = false,
+        templateOrigin = template
+      }
+    Just route -> vlgRouteRow name route role path env supplied applied template namedish
+
+-- vlgRouteRow — project one frozen route row into a ledger row, computing
+-- saturation and enters-target from the target's DECLARED arity. An
+-- underapplication never enters the target, so it contributes no execution
+-- edge; only a saturated application does.
+@label "Ledger route row"
+@description "Project a frozen route into a ledger row: resolved/fenced/missing/ambiguous status, with saturation and enters-target computed from the target's declared arity (an underapplication never enters the target)."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgRouteRow : (name: String) -> (route: ValidationRoute) -> (role: UseRole) -> (path: List UsePathSeg) -> (env: a) -> (supplied: Nat) -> (applied: Boolean) -> (template: Boolean) -> (namedish: Boolean) -> UseLedgerRow
+vlgRouteRow name route role path env supplied applied template namedish =
+  let arity = vlgLookupArity env.arities route.targetId
+  let saturation = vlgSaturation applied arity supplied
+  let enters = if applied then vlgEnters arity supplied else false
+  UseLedgerRow {
+    site = SignatureUseSite { callerId = env.callerId, role = role, path = path },
+    rawKey = name,
+    status = vlgAppliedStatus route saturation applied namedish role,
+    saturation = saturation,
+    suppliedArgs = supplied,
+    entersTarget = enters,
+    templateOrigin = template
+  }
+
+-- vlgAppliedStatus — the two saturation-shaped soundness fences.
+--
+-- OVERAPPLICATION: `invokeFunction` eta-applies leftover arguments to a
+-- CALLABLE RESULT, so `f x` where `f` returns a registered reference actually
+-- enters a SECOND target this walker never saw. The row cannot claim an exact
+-- resolved target for that tail, so it fences.
+--
+-- SINGLE-RECORD UNDERAPPLICATION: the runtime expands a named-argument record
+-- to positional arguments BEFORE its partial-application check, so
+-- `f {a = 1, b = 2}` enters a 2-ary `f` even though the raw tail length is 1.
+-- Counting raw arguments would publish `entersTarget = false` for a call that
+-- really executes — an omitted execution edge. Until the frozen formal names
+-- are carried, any single-record application that would read as underapplied
+-- fences instead.
+@label "Ledger applied status"
+@description "Fence the two saturation shapes whose entering-ness this slice cannot decide: an overapplication (the eta tail enters an unledgered callable) and a single-record underapplication (named arguments expand to positional before the partial check)."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgAppliedStatus : (route: ValidationRoute) -> (saturation: UseSaturation) -> (applied: Boolean) -> (namedish: Boolean) -> (role: UseRole) -> UseLedgerStatus
+vlgAppliedStatus route saturation applied namedish role =
+  -- Both fences are about FUNCTION application and must not reach a
+  -- CONSTRUCTOR: `construct` has no eta path (extra arguments become extra
+  -- positional fields) and its named-record form is ordinary construction,
+  -- not the arity-changing reorder the partial check sees. Applying them to
+  -- constructors fenced the whole multi-field named-construction corpus.
+  if not applied
+  then vlgRouteStatus route
+  else
+    case role of
+      VurConstructor -> vlgRouteStatus route
+      VurCall -> vlgAppliedCallStatus route saturation namedish
+      VurReference -> vlgRouteStatus route
+      VurIntrinsic -> vlgRouteStatus route
+      VurCapabilityDispatch -> vlgRouteStatus route
+      VurLexical -> vlgRouteStatus route
+
+@label "Ledger applied call status"
+@description "The two function-application fences: an overapplication's eta tail, and a single plain-record argument that may be a named-argument application."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgAppliedCallStatus : (route: ValidationRoute) -> (saturation: UseSaturation) -> (namedish: Boolean) -> UseLedgerStatus
+vlgAppliedCallStatus route saturation namedish =
+  case saturation of
+    -- SLICE 3h — OVERAPPLICATION RETAINS ITS RESOLVED TARGET. Degrading to
+    -- `UlsDynamicOrReflective` discarded the route, the target and the supplied
+    -- count, so the carrier turned the occurrence into `VrtRouteFenced` +
+    -- `VciFenced` and the checker's stagewise rule had nothing to classify —
+    -- the demand was named and then the material needed to meet it was thrown
+    -- away in the same step. The row now keeps the resolved route; the DEMAND
+    -- survives as the `VrpCertifiedEtaStage` pending the carrier's readiness
+    -- re-raises from the row's own saturation (`vckRowNeedsEtaStage`), so
+    -- nothing became admissible by this change — the pending still has to be
+    -- discharged by the checker's rule (c) or refuse.
+    --
+    -- An UNRESOLVED over-applied callee degrades exactly as before: there is no
+    -- target to retain, and `vlgRouteStatus` would publish the negative row
+    -- WITHOUT the eta-tail detail, losing the reason entirely.
+    VusOver ->
+      if eq route.status "resolved"
+      then vlgRouteStatus route
+      else UlsDynamicOrReflective { detail = "overapplication eta-tail may enter an unledgered callable" }
+    VusUnder ->
+      if namedish
+      then UlsDynamicOrReflective { detail = "single-record argument may be a named-argument application" }
+      else vlgRouteStatus route
+    VusExact -> vlgRouteStatus route
+
+-- vlgNamedish — could this argument list be a NAMED-argument record?
+--
+-- Mirrors `maybeReorderNamedArgs`' preconditions as closely as the raw AST
+-- allows: EXACTLY ONE argument, a non-empty PLAIN record, no `$`-prefixed key
+-- (a `$`-keyed record is a wire value, never named args), and not a
+-- single-key expression form (`{var:…}` / `{fn:…}` / any op or key-as-fnId
+-- shape evaluates to a VALUE, and the runtime reorders only a literal record).
+-- The one precondition that cannot be checked here is "every key is a formal
+-- param name" — the frozen formals are not carried yet — so this stays
+-- conservative, but an earlier draft that fenced ANY single object argument
+-- also fenced every ordinary curried call whose argument was expression-
+-- shaped.
+@label "Ledger namedish args"
+@description "True when an argument list is exactly one non-empty plain record with no `$`-prefixed key and no single-key expression shape — the runtime's precondition for expanding named arguments to positional."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgNamedish : (args: a) -> Boolean
+vlgNamedish args =
+  if not (eq (length args) 1)
+  then false
+  else
+    case head args of
+      Nothing -> false
+      Just only ->
+        case only of
+          JlObject { fields = fs } ->
+            if eq (length fs) 0
+            then false
+            else if objectHasDollarPrefixedKey fs
+            then false
+            else if eq (length fs) 1
+            then false
+            else true
+          JlNull -> false
+          JlBool -> false
+          JlNumber -> false
+          JlString -> false
+          JlArray -> false
+          JlTagged -> false
+
+@label "Ledger route status"
+@description "Project a frozen route's status string into the closed UseLedgerStatus, retaining a fenced row's exact target and diagnostics and an ambiguous row's complete sorted candidates."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgRouteStatus : (route: ValidationRoute) -> UseLedgerStatus
+vlgRouteStatus route =
+  if eq route.status "resolved"
+  then UlsResolved { targetId = route.targetId, kind = route.kind }
+  else if eq route.status "fenced"
+  then UlsFenced { targetId = route.targetId, diagnostics = route.diagnostics }
+  else if eq route.status "ambiguous"
+  then UlsAmbiguous { candidates = route.candidates }
+  else UlsMissing { spelling = route.name }
+
+@label "Ledger saturation"
+@description "Classify an application's saturation against the target's declared arity (exact / under / over). A non-application reference is exact by construction."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgSaturation : (applied: Boolean) -> (arity: Maybe Nat) -> (supplied: Nat) -> UseSaturation
+vlgSaturation applied arity supplied =
+  if not applied
+  then VusExact
+  else
+    case arity of
+      Nothing -> VusUnder { supplied = supplied }
+      Just n ->
+        if eq supplied n
+        then VusExact
+        else if lt supplied n
+        then VusUnder { supplied = supplied }
+        else VusOver { supplied = supplied }
+
+@label "Ledger enters target"
+@description "True when a saturated application actually enters the target (supplied >= declared arity). An unknown arity fails closed."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgEnters : (arity: Maybe Nat) -> (supplied: Nat) -> Boolean
+vlgEnters arity supplied =
+  case arity of
+    Nothing -> false
+    Just n -> not (lt supplied n)
+
+@label "Ledger intrinsic row"
+@description "Build an intrinsic-rule row for an exact versioned language form (lazy or eager KNOWN_OP)."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgIntrinsicRow : (op: String) -> (path: List UsePathSeg) -> (env: a) -> (supplied: Nat) -> UseLedgerRow
+vlgIntrinsicRow op path env supplied =
+  UseLedgerRow {
+    site = SignatureUseSite { callerId = env.callerId, role = VurIntrinsic, path = path },
+    rawKey = op,
+    status = UlsResolved { targetId = concat "@intrinsic/known-op/" op, kind = "intrinsic" },
+    saturation = VusExact,
+    suppliedArgs = supplied,
+    entersTarget = true,
+    templateOrigin = false
+  }
+
+@label "Ledger dynamic row"
+@description "Build a DynamicOrReflective row with its stable classifier reason. Such a row always fences validation."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgDynamicRow : (rawKey: String) -> (path: List UsePathSeg) -> (env: a) -> (supplied: Nat) -> (detail: String) -> UseLedgerRow
+vlgDynamicRow rawKey path env supplied detail =
+  UseLedgerRow {
+    site = SignatureUseSite { callerId = env.callerId, role = VurCall, path = path },
+    rawKey = rawKey,
+    status = UlsDynamicOrReflective { detail = detail },
+    saturation = VusExact,
+    suppliedArgs = supplied,
+    entersTarget = false,
+    templateOrigin = false
+  }
+
+@label "Ledger lookup route"
+@description "Look one spelling up in the frozen source frame. This is the ONLY resolution path available to validation."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgLookupRoute : (routes: List ValidationRoute) -> (name: String) -> Maybe ValidationRoute
+vlgLookupRoute routes name =
+  case head routes of
+    Nothing -> Nothing
+    Just route ->
+      if eq route.name name
+      then Just route
+      else
+        case tail routes of
+          Nothing -> Nothing
+          Just rest -> vlgLookupRoute rest name
+
+@label "Ledger lookup arity"
+@description "Look a target's declared parameter count up in the supplied arity table."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgLookupArity : (arities: List ValidationArity) -> (targetId: String) -> Maybe Nat
+vlgLookupArity arities targetId =
+  case head arities of
+    Nothing -> Nothing
+    Just entry ->
+      if eq entry.targetId targetId
+      then Just entry.arity
+      else
+        case tail arities of
+          Nothing -> Nothing
+          Just rest -> vlgLookupArity rest targetId
+
+-- vlgIsDotted — does this spelling carry a path separator? An unbound dotted
+-- `{var}` is data-dependent (see `vlgVarUse`), so it never frozen-resolves.
+-- Written as an explicit scan: bare `contains` is an AMBIGUOUS spelling in
+-- this registry (`set:contains` vs `std:contains`).
+@label "Ledger is dotted"
+@description "True when a variable spelling contains a `.` path separator."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgIsDotted : (name: String) -> Boolean
+vlgIsDotted name = vlgDotFrom name 0
+
+-- Terminates on an EMPTY slice, not on `length`. `length` counts Unicode code
+-- POINTS while `slice` indexes UTF-16 code UNITS, so bounding the scan by
+-- `length` stopped early on any astral character: `"<astral><astral>.f"` has
+-- length 4 but its dot sits at UTF-16 index 4, and the separator was missed —
+-- which silently turned a data-dependent path back into a positive
+-- frozen-frame resolution. Exhausting the slice is domain-correct under
+-- either indexing.
+@label "Ledger dot scan"
+@description "Scan a spelling for a `.` separator, terminating on an exhausted slice rather than a code-point length (slice indexes UTF-16 units; length counts code points)."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgDotFrom : (name: String) -> (index: Nat) -> Boolean
+vlgDotFrom name index =
+  let ch = slice name index (add index 1)
+  if eq ch ""
+  then false
+  else if eq ch "."
+  then true
+  else vlgDotFrom name (add index 1)
+
+-- vlgHasBinderPath — binder matching by PATH ROOT, mirroring the runtime's
+-- dotted var-path projection: `{var: "b.f"}` resolves against the binder `b`.
+-- A binder matches when it IS the name or is a proper dotted prefix of it.
+@label "Ledger has binder path"
+@description "True when a lexical binder is the name or a dotted-path root of it (`b` binds `b.f`), mirroring the runtime's `resolveVar` field projection."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgHasBinderPath : (binders: List String) -> (name: String) -> Boolean
+vlgHasBinderPath binders name =
+  case head binders of
+    Nothing -> false
+    Just binder ->
+      if eq binder name
+      then true
+      else if startsWith name (concat binder ".")
+      then true
+      else
+        case tail binders of
+          Nothing -> false
+          Just rest -> vlgHasBinderPath rest name
+
+-- =========================================================================
+-- P4-D5 — the pre-verification primitive-root inventory
+-- =========================================================================
+
+-- vlgRootInventory — classify every SUPPLIED non-Fenel implementation row
+-- BEFORE any certificate is consulted. The partition over the supplied rows is
+-- exhaustive by construction and prevents "eligible only because a root
+-- happened to verify" circularity.
+--
+-- SCOPE, because the older wording overstated it: this function classifies the
+-- rows its CALLER passes. It performs no enumeration, no coverage assertion and
+-- no authenticity check of its own, and there is no known production caller
+-- (see `vlg.refutation.first` in design/tcb-ledger.md). "Classify every active
+-- root" is the INTENDED contract, not a property this code enforces.
+--
+-- CLAIM BASIS (the S3 amendment). Effective `requires` is NEGATIVE evidence
+-- only: its ABSENCE never proves purity (`ai:callLLM` is bodyless with no
+-- `@requires` while its handler performs network IO). A positive
+-- purity/honesty/totality claim therefore requires a positive per-root
+-- attestation ON THE INPUT ROW; every unattested root is fenced.
+--
+-- READ THAT PRECISELY. The intended basis is an exact per-root REVIEWED
+-- attestation row, and this classifier does NOT establish that: the input
+-- carries caller-controlled booleans, nothing authenticates them, and the
+-- reviewed register they are meant to project (D5a-2) does not exist yet. A
+-- caller supplying `attested* = true` with no reviewed row behind it receives
+-- `ClaimAdmissible`. The authenticity obligation is the successor's; this arm
+-- only refuses to invent a positive claim where the input asserts none.
+@label "Primitive root inventory"
+@description "Classify each SUPPLIED HostNative / active-native NativeWithFallback / ExternalHandler row as ConvertToFenel | RootRequired(policy) | Fenced(reason), independently of certificate presence. A declared handler with no installed implementation is Fenced MissingActiveHandler. A positive claim requires an attestation row on the input — `requires` absence never proves purity. It classifies the rows it is given: it enumerates nothing, asserts no coverage, and holds no register of its own."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgRootInventory : (profile: String) -> (rows: List PrimitiveRootRow) -> PrimitiveRootInventory
+vlgRootInventory profile rows =
+  let classified = vlgClassifyRoots rows []
+  PrimitiveRootInventory {
+    profile = profile,
+    rows = classified,
+    convertToFenel = vlgCountClass classified "convert" 0,
+    rootRequired = vlgCountClass classified "required" 0,
+    fenced = vlgCountClass classified "fenced" 0
+  }
+
+@label "Classify primitive roots"
+@description "Apply the inventory classifier to every row, replacing each row's classification slot."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgClassifyRoots : (rows: List PrimitiveRootRow) -> (acc: List PrimitiveRootRow) -> List PrimitiveRootRow
+vlgClassifyRoots rows acc =
+  case head rows of
+    Nothing -> acc
+    Just row ->
+      let next = appendItem (vlgClassifyRoot row) acc
+      case tail rows of
+        Nothing -> next
+        Just rest -> vlgClassifyRoots rest next
+
+-- vlgClassifyRoot — the classifier itself, in fail-closed order. This list is
+-- NORMATIVE and it spans TWO functions; an arm added without updating it is how
+-- the documented order drifts from the real one. It has drifted twice already:
+-- slice 3j added the refutation arm and left the list at the pre-3j order, and
+-- the first repair of that list still omitted the `requires` contradiction arm
+-- and described conversion as native-only.
+--
+-- `vlgRootClass` (origin routing):
+--   1. an UNRECOGNIZED origin spelling fences — an unknown string must not fall
+--      through into claim classification;
+--   2. an `ExternalHandler` DECLARATION with no installed handler fences
+--      (`MissingActiveHandler`) — declaring an origin does not install one;
+--   3. ANY recognized origin carrying an active Fenel body CONVERTS — natives
+--      AND installed external handlers alike (prefer a Fenel body to a minted
+--      root); otherwise fall through to the claim half.
+--
+-- `vlgRootClaimClass` (claim gating), in exactly this order:
+--   4. ANY live refutation clause fences, BEFORE every positive claim is read
+--      (slice 3j — `vlg.refutation.first`; the `refutations` note above says
+--      why nothing supplies one yet);
+--   5. a non-ground scheme fences — this phase's primitive fragment is ground
+--      only;
+--   6. no attestation row on the input fences — absence of `requires` is not
+--      purity;
+--   7. `attestedPure = false` fences;
+--   8. a NON-EMPTY `requires` fences even when purity is asserted — presence
+--      CONTRADICTS a purity attestation, and contradictory inputs fence rather
+--      than letting the attestation win. This arm is distinct from 7 and is
+--      reachable with all four positive bits true;
+--   9. `attestedTotal = false` fences;
+--  10. `attestedHonest = false` fences; and
+--  11. only then is a root REQUIRED, carrying the admissible claim policy.
+@label "Classify primitive root"
+@description "The fail-closed inventory classifier: missing active handler, convert-to-Fenel, non-ground scheme, unattested, and negative-claim cases all fence before any root is required."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgClassifyRoot : (row: PrimitiveRootRow) -> PrimitiveRootRow
+vlgClassifyRoot row =
+  let classification = vlgRootClass row
+  PrimitiveRootRow {
+    functionId = row.functionId,
+    origin = row.origin,
+    tier = row.tier,
+    key = row.key,
+    handlerInstalled = row.handlerInstalled,
+    bodyPresent = row.bodyPresent,
+    groundScheme = row.groundScheme,
+    requires = row.requires,
+    refutations = row.refutations,
+    attested = row.attested,
+    attestedPure = row.attestedPure,
+    attestedTotal = row.attestedTotal,
+    attestedHonest = row.attestedHonest,
+    classification = classification
+  }
+
+@label "Primitive root class"
+@description "Compute one root's pre-verification classification."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgRootClass : (row: PrimitiveRootRow) -> PrimitiveRootClass
+vlgRootClass row =
+  -- An UNRECOGNIZED origin must fence rather than fall through to claim
+  -- classification: the carrier is a string, and an unknown spelling
+  -- otherwise became a certificate-requiring root by default.
+  if not (vlgKnownOrigin row.origin)
+  then VrcFenced { reason = RsnPrimitiveClaimMismatch { functionId = row.functionId, detail = concat "unrecognized implementation origin " row.origin } }
+  else if eq row.origin "ExternalHandler"
+  then
+    if not row.handlerInstalled
+    then VrcFenced { reason = RsnMissingActiveHandler { functionId = row.functionId } }
+    -- bodyPresent applies to EVERY origin, not just natives: an installed
+    -- handler that also carries an active Fenel body should be converted,
+    -- never certified (the documented order said so; the code did not).
+    else if row.bodyPresent
+    then VrcConvertToFenel
+    else vlgRootClaimClass row
+  else if row.bodyPresent
+  then VrcConvertToFenel
+  else vlgRootClaimClass row
+
+@label "Ledger known origin"
+@description "The closed set of non-Fenel implementation origins this inventory admits."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgKnownOrigin : (origin: String) -> Boolean
+vlgKnownOrigin origin =
+  if eq origin "HostNative" then true
+  else if eq origin "NativeWithFallback" then true
+  else if eq origin "ExternalHandler" then true
+  else false
+
+@label "Join refuted clauses"
+@description "Render a closed refutation-clause list as a comma-separated string for the fence reason. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgJoinClauses : (clauses: [String]) -> (acc: String) -> String
+vlgJoinClauses clauses acc =
+  case head clauses of
+    Nothing -> acc
+    Just clause ->
+      let next = if eq acc "" then clause else concat acc (concat ", " clause)
+      vlgJoinClauses (eufRest clauses) next
+
+@label "Primitive root claim class"
+@description "The claim half of the classifier: negative authority FIRST (any refuted clause fences before any positive claim is read), then ground-scheme, attestation presence, and the three positive claims, each fencing with its exact reason."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgRootClaimClass : (row: PrimitiveRootRow) -> PrimitiveRootClass
+vlgRootClaimClass row =
+  -- NEGATIVE AUTHORITY PRECEDES EVERY POSITIVE CLAIM (slice 3j, D5a-3 (i)+(ii)).
+  --
+  -- Two holes were live before this arm existed, and both were reachable with
+  -- data the repository ALREADY contains:
+  --
+  --  (i) `std:at` carries a GENERATED `WitnessedEscape` in both profiles
+  --      (declared result `a`, out-of-range call returns `null`). A mistaken
+  --      `Attested {pure,total,honest}` row for it produced `ClaimAdmissible`
+  --      for a signature the honesty artifact MECHANICALLY REFUTES — the
+  --      classifier never consulted that artifact at all.
+  --
+  -- (ii) A committed hand-audit refuting a root (the arithmetic five, and now
+  --      `std:replaceAll` on totality) had no path into this decision either,
+  --      so an `Attested` row simply won. The 3v-0 measurement had to carry a
+  --      refutation register in a TEST-TOOL const to compensate, which is not
+  --      where a production language fact belongs.
+  --
+  -- Both sources are INTENDED to normalize to ONE closed clause list, and its
+  -- PRESENCE fences — the same contradiction discipline `requires` already
+  -- applies below, and for the same reason: contradictory inputs must fence
+  -- rather than letting the attestation win.
+  --
+  -- ⚠ BUT NEITHER (i) NOR (ii) IS WIRED. D5a-2 was cut, and there is no
+  -- known production caller of this classifier AT ALL, so BOTH holes are LIVE.
+  -- This arm decides correctly on the rows it is given; nothing gives it one.
+  -- Ordering is what this rule actually establishes today.
+  if gt (length row.refutations) 0
+  then VrcFenced { reason = RsnPrimitiveClaimMismatch { functionId = row.functionId, detail = concat "refuted clause(s): " (vlgJoinClauses row.refutations "") } }
+  else if not row.groundScheme
+  then VrcFenced { reason = RsnUnsupportedRankOrKind { detail = concat "non-ground primitive scheme for " row.functionId } }
+  else if not row.attested
+  then VrcFenced { reason = RsnMissingPrimitiveCertificate { functionId = row.functionId } }
+  else if not row.attestedPure
+  then VrcFenced { reason = RsnEffectfulScEff { requires = row.requires } }
+  -- `requires` is NEGATIVE evidence: its absence proves nothing, but its
+  -- PRESENCE contradicts a purity attestation. Contradictory inputs fence
+  -- rather than letting the attestation win.
+  else if gt (length row.requires) 0
+  then VrcFenced { reason = RsnEffectfulScEff { requires = row.requires } }
+  else if not row.attestedTotal
+  then VrcFenced { reason = RsnTotalityUnknown { detail = concat "unattested totality for " row.functionId } }
+  else if not row.attestedHonest
+  then VrcFenced { reason = RsnPrimitiveClaimMismatch { functionId = row.functionId, detail = "no attested signature-honesty claim" } }
+  else
+    VrcRootRequired {
+      policy = ClaimAdmissible {
+        functionId = row.functionId,
+        schemeHash = ValidationHash { domain = "fenel.validation.scheme.v1", hex = "" },
+        implementationHash = ValidationHash { domain = "fenel.validation.implementation.v1", hex = "" },
+        requiredSignatureHonesty = true,
+        requiredPurityEffect = "pure",
+        requiredTotality = "total"
+      }
+    }
+
+@label "Count root class"
+@description "Count inventory rows in one classification bucket (convert / required / fenced)."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation"
+@category "engine-internal"
+vlgCountClass : (rows: List PrimitiveRootRow) -> (bucket: String) -> (acc: Nat) -> Nat
+vlgCountClass rows bucket acc =
+  case head rows of
+    Nothing -> acc
+    Just row ->
+      let hit =
+            case row.classification of
+              VrcConvertToFenel -> eq bucket "convert"
+              VrcRootRequired -> eq bucket "required"
+              VrcFenced -> eq bucket "fenced"
+      let next = if hit then add acc 1 else acc
+      case tail rows of
+        Nothing -> next
+        Just rest -> vlgCountClass rest bucket next

@@ -1,0 +1,525 @@
+module engine where
+
+-- serializeJsModule — encode a JsModule into a JS source string. The
+-- final step of the JS pipeline: a typed-ADT walker (JsAst → String)
+-- with no remaining IR stages downstream. Mirrors the TS oracle at
+-- implementations/typescript/engine/src/modules/compile-js.ts:serializeJsModuleNative.
+--
+-- Phase 21.6.1 — closes the JS pipeline end-to-end. After this body
+-- ships, every step from raw source to JS source text has a Fenel
+-- body when FENEL_DISPATCH_FENEL_PASSES=1. Wasm/LLVM lowerings
+-- (`lowerToWasmAst`, `lowerToLlvmAst`) remain TS-only — they're
+-- substantially larger and depend on a substrate fix surfaced by
+-- Phase 21.5 (string-field preservation through deep ADT walks).
+--
+-- The body's input is `JsModule` — already a typed Fenel ADT
+-- declared in `emit-js.fenel`. No marshalling layer is needed; the
+-- body walks `input.entry: JsArrow` via serializeAst's 12-arm match.
+-- JsAst variants are also declared in `emit-js.fenel`; this body
+-- only references them, never re-declares.
+--
+-- Substrate addition (Phase 21.6.1): `std:jsLit` — a new pure
+-- primitive `(value: a) → String` that wraps `JSON.stringify`. Used
+-- for both JsLit values AND JsObject field keys (both need JS-source-
+-- valid string encoding with proper quote / backslash / control-char
+-- escaping). `std:toString` is insufficient — it returns `hello` not
+-- `"hello"` for string inputs.
+
+-- referencesName — conservative free-variable check used by the
+-- serializer to pick between flat-IIFE and nested-IIFE shapes for
+-- `let` blocks. Returns True if `name` appears at any reading
+-- position in `ast`. 12-arm Bool walker mirroring the TS oracle's
+-- `referencesName` in compile-js.ts.
+--
+-- JsVar: prefix-with-dot match handles dotted-path references like
+-- `scanResult.effects` depending on the outer `scanResult` binding —
+-- Phase 21.2 surfaced this on `let sortedEffects = sortLex
+-- scanResult.effects` where flat-IIFE produced incorrect output.
+--
+-- JsArrow / JsLet: shadow-aware. JsArrow.params shadow the outer
+-- binding (no recursion into body when name appears in params).
+-- JsLet checks binding values FIRST (they're in outer scope, so they
+-- CAN reference name), then short-circuits to False if any binding
+-- name == name (shadowed), otherwise recurses into body.
+@label "References name"
+@description "Conservative free-variable check used by the serializer to pick between flat-IIFE and nested-IIFE shapes for `let` blocks. 12-arm Bool walker. JsVar uses prefix-with-dot match (`ast.name === name || ast.name.startsWith(name + \".\")`) to handle dotted-path references like `scanResult.effects` depending on outer `scanResult` binding. JsArrow / JsLet are shadow-aware: JsArrow.params shadow the outer name; JsLet checks binding values FIRST (outer scope) then shadowing for the body."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+referencesName : (ast: JsAst) -> (name: String) -> Boolean
+referencesName ast name =
+  case ast of
+    JsLit -> false
+    JsVar { name = n } ->
+      if eq n name
+      then true
+      else startsWith n (concat name ".")
+    JsMember { object = o } -> referencesName o name
+    JsCall { callee = c, args = as } ->
+      if referencesName c name
+      then true
+      else referencesNameList as name
+    JsArrow { params = ps, body = b } ->
+      if elem name ps
+      then false
+      else referencesName b name
+    JsLet { bindings = bs, body = b } ->
+      if referencesNameInBindingValues bs name
+      then true
+      else if bindingNamesContain bs name
+      then false
+      else referencesName b name
+    JsTernary { cond = c, then = t, else = e } ->
+      if referencesName c name
+      then true
+      else if referencesName t name
+      then true
+      else referencesName e name
+    JsBinOp { left = l, right = r } ->
+      if referencesName l name
+      then true
+      else referencesName r name
+    JsUnaryOp { arg = a } -> referencesName a name
+    JsObject { fields = fs } -> referencesNameInFieldValues fs name
+    JsArray { elements = es } -> referencesNameList es name
+    JsSequence { exprs = es } -> referencesNameList es name
+
+-- referencesNameList — OR-fold of `referencesName a name` over a
+-- list of JsAst. Used by JsCall.args, JsArray.elements,
+-- JsSequence.exprs.
+@label "References name (list)"
+@description "OR-fold of `referencesName a name` over a list of JsAst. Used by referencesName's JsCall.args, JsArray.elements, JsSequence.exprs arms."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+referencesNameList : (asts: List JsAst) -> (name: String) -> Boolean
+referencesNameList asts name =
+  case head asts of
+    Nothing -> false
+    Just h ->
+      if referencesName h name
+      then true
+      else case tail asts of
+        Nothing -> false
+        Just rest -> referencesNameList rest name
+
+-- referencesNameInBindingValues — OR-fold of `referencesName b.value
+-- name` over a list of {name, value} bindings. Used by the JsLet arm
+-- of referencesName to check whether any binding's value (which
+-- lives in the OUTER scope) refers to `name`.
+@label "References name in binding values"
+@description "OR-fold of `referencesName b.value name` over a list of {name, value} bindings. Used by referencesName's JsLet arm to check whether any binding's value (which lives in the OUTER scope) refers to `name`."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+referencesNameInBindingValues : (bindings: a) -> (name: String) -> Boolean
+referencesNameInBindingValues bindings name =
+  case head bindings of
+    Nothing -> false
+    Just b ->
+      if referencesName b.value name
+      then true
+      else case tail bindings of
+        Nothing -> false
+        Just rest -> referencesNameInBindingValues rest name
+
+-- bindingNamesContain — predicate: is `name` the .name of any
+-- binding in the list? Used by the JsLet arm of referencesName to
+-- detect shadowing.
+@label "Binding names contain"
+@description "Predicate: is `name` the .name of any binding in the list? Used by referencesName's JsLet arm to detect shadowing."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+bindingNamesContain : (bindings: a) -> (name: String) -> Boolean
+bindingNamesContain bindings name =
+  case head bindings of
+    Nothing -> false
+    Just b ->
+      if eq b.name name
+      then true
+      else case tail bindings of
+        Nothing -> false
+        Just rest -> bindingNamesContain rest name
+
+-- referencesNameInFieldValues — OR-fold of `referencesName f.value
+-- name` over a list of {key, value} fields. Used by the JsObject arm.
+@label "References name in field values"
+@description "OR-fold of `referencesName f.value name` over a list of {key, value} fields. Used by referencesName's JsObject arm."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+referencesNameInFieldValues : (fields: a) -> (name: String) -> Boolean
+referencesNameInFieldValues fields name =
+  case head fields of
+    Nothing -> false
+    Just f ->
+      if referencesName f.value name
+      then true
+      else case tail fields of
+        Nothing -> false
+        Just rest -> referencesNameInFieldValues rest name
+
+-- referencesAnyName — predicate: does `ast` reference ANY name in
+-- the given list? Used by needsNesting to check whether the current
+-- binding's value depends on any earlier-binding name. The "outer"
+-- analogue of referencesName for one ast vs many names.
+@label "References any name"
+@description "Predicate: does `ast` reference ANY name in the given list? Used by needsNesting to check whether the current binding's value depends on any earlier-binding name. The outer-loop analogue of referencesName for one ast vs many names."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+referencesAnyName : (ast: JsAst) -> (names: List String) -> Boolean
+referencesAnyName ast names =
+  case ast of
+    JsLit -> false
+    other ->
+      case head names of
+        Nothing -> false
+        Just n ->
+          if referencesName other n
+          then true
+          else case tail names of
+            Nothing -> false
+            Just rest -> referencesAnyName other rest
+
+-- needsNesting — flat-vs-nested IIFE predicate for JsLet. Mirrors
+-- the TS oracle's `ast.bindings.some((b, i) =>
+-- ast.bindings.slice(0, i).some((earlier) =>
+-- referencesName(b.value, earlier.name)))`. Iterates bindings
+-- forward, threading a "seen so far" name list; for each new
+-- binding, checks whether any seen name is referenced in its value.
+@label "Needs nesting"
+@description "Flat-vs-nested IIFE predicate for JsLet. Mirrors the TS oracle's `ast.bindings.some((b, i) => ast.bindings.slice(0, i).some((earlier) => referencesName(b.value, earlier.name)))`. Iterates bindings forward, threading a `seen` name list."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+needsNesting : (bindings: a) -> (emptyList: List a) -> Boolean
+needsNesting bindings emptyList =
+  needsNestingLoop bindings emptyList
+
+@label "Needs nesting (loop)"
+@description "Recursive worker for needsNesting. For each binding in turn, checks whether any seen-so-far name is referenced in the current binding's value; if so returns True. Otherwise extends `seen` with the current binding's name and recurses on the tail."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+needsNestingLoop : (bindings: a) -> (seen: List String) -> Boolean
+needsNestingLoop bindings seen =
+  case head bindings of
+    Nothing -> false
+    Just b ->
+      if referencesAnyName b.value seen
+      then true
+      else
+        let seenNext = appendItem b.name seen
+        case tail bindings of
+          Nothing -> false
+          Just rest -> needsNestingLoop rest seenNext
+
+-- serializeAst — main 12-arm JsAst walker. Each arm produces a
+-- String via concat-chains or list-builder+join over the arm's
+-- substrings. Mirrors the TS oracle's `serializeAst` switch case in
+-- compile-js.ts.
+--
+-- JsLit / JsObject keys use the new std:jsLit primitive (wraps
+-- JSON.stringify) to produce JS-source-valid string literals with
+-- proper quote / backslash / control-char escaping.
+--
+-- JsLet picks between flat IIFE `((p1, p2) => body)(v1, v2)` and
+-- nested IIFE `((p1) => ((p2) => body)(v2))(v1)` based on
+-- needsNesting (any later binding refs an earlier name) OR
+-- bindings.length === 1. Both single-binding and any-cross-ref cases
+-- produce nested form; only multi-binding-with-no-cross-ref produces
+-- flat form (matches TS oracle exactly).
+@label "Serialize JsAst"
+@description "12-arm JsAst walker producing a JS source string. JsLit / JsObject keys use std:jsLit (wraps JSON.stringify) for JS-source-valid string-literal encoding. JsLet picks between flat IIFE `((p1, p2) => body)(v1, v2)` and nested IIFE `((p1) => ((p2) => body)(v2))(v1)` based on needsNesting (any later binding refs an earlier name) OR bindings.length === 1. Mirrors the TS oracle at compile-js.ts:serializeAst."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+serializeAst : (ast: JsAst) -> (emptyList: List a) -> String
+serializeAst ast emptyList =
+  case ast of
+    JsLit { value = v } -> jsLit v
+    JsVar { name = n } -> n
+    JsMember { object = o, property = p } ->
+      let objStr = serializeAst o emptyList
+      if jsMemberPropertySafe p
+      then concat objStr (concat "." p)
+      else concat objStr (concat "[" (concat (jsLit p) "]"))
+    JsCall { callee = c, args = as } ->
+      let calleeStr = serializeAst c emptyList
+      let argStrs = serializeAstList as emptyList emptyList
+      let argsJoined = join argStrs ", "
+      concat calleeStr (concat "(" (concat argsJoined ")"))
+    JsArrow { params = ps, body = b } ->
+      let paramsJoined = join ps ", "
+      let bodyStr = serializeAst b emptyList
+      concat "((" (concat paramsJoined (concat ") => " (concat bodyStr ")")))
+    JsLet { bindings = bs, body = b } ->
+      let bodyStr = serializeAst b emptyList
+      let needsN = needsNesting bs emptyList
+      if needsN
+      then wrapNestedIIFE bs bodyStr emptyList
+      else if eq (length bs) 1
+      then wrapNestedIIFE bs bodyStr emptyList
+      else
+        let paramNames = bindingNames bs emptyList
+        let paramsJoined = join paramNames ", "
+        let valueStrs = bindingValueStrs bs emptyList emptyList
+        let valuesJoined = join valueStrs ", "
+        concat "((" (concat paramsJoined (concat ") => " (concat bodyStr (concat ")(" (concat valuesJoined ")")))))
+    JsTernary { cond = c, then = t, else = e } ->
+      let condStr = serializeAst c emptyList
+      let thenStr = serializeAst t emptyList
+      let elseStr = serializeAst e emptyList
+      concat "(" (concat condStr (concat " ? " (concat thenStr (concat " : " (concat elseStr ")")))))
+    JsBinOp { op = op, left = l, right = r } ->
+      let leftStr = serializeAst l emptyList
+      let rightStr = serializeAst r emptyList
+      concat "(" (concat leftStr (concat " " (concat op (concat " " (concat rightStr ")")))))
+    JsUnaryOp { op = op, arg = a } ->
+      let argStr = serializeAst a emptyList
+      concat "(" (concat op (concat argStr ")"))
+    JsObject { fields = fs } ->
+      let partStrs = serializeObjectFields fs emptyList emptyList
+      let joined = join partStrs ", "
+      concat "({ " (concat joined " })")
+    JsArray { elements = es } ->
+      let elemStrs = serializeAstList es emptyList emptyList
+      let joined = join elemStrs ", "
+      concat "[" (concat joined "]")
+    JsSequence { exprs = es } ->
+      let exprStrs = serializeAstList es emptyList emptyList
+      let joined = join exprStrs ", "
+      concat "(" (concat joined ")")
+
+-- Full Fenel function ids contain ':' and therefore cannot ride JavaScript's
+-- dotted member syntax. Keep the compact dotted form for ordinary identifiers
+-- and use a quoted computed property for every other exact runtime key.
+@label "JS member property safe"
+@description "True when a property is a non-empty ASCII JavaScript identifier accepted by dotted member syntax. Other keys, including full module:function ids, serialize through bracket notation."
+@tags "engine" "compiler" "js" "resolution" "phase-3"
+@category "engine-internal"
+jsMemberPropertySafe : (property: String) -> Bool
+jsMemberPropertySafe property =
+  if eq (length property) 0
+  then false
+  else if not (or (eq (charAt property 0) "$") (isIdentStart (charAt property 0)))
+  then false
+  else jsMemberPropertyTailSafe property 1
+
+@category "engine-internal"
+jsMemberPropertyTailSafe : (property: String) -> (index: Number) -> Bool
+jsMemberPropertyTailSafe property index =
+  if gte index (length property)
+  then true
+  else if or (eq (charAt property index) "$") (isIdentCont (charAt property index))
+  then jsMemberPropertyTailSafe property (add index 1)
+  else false
+
+-- serializeAstList — map serializeAst over a list of JsAst into a
+-- List<String>. Used by JsCall.args, JsArray.elements,
+-- JsSequence.exprs.
+@label "Serialize JsAst list"
+@description "Map serializeAst over a list of JsAst into a List<String>. Used by JsCall.args, JsArray.elements, JsSequence.exprs serialization."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+serializeAstList : (asts: List JsAst) -> (emptyList: List a) -> (acc: List String) -> List String
+serializeAstList asts emptyList acc =
+  case head asts of
+    Nothing -> acc
+    Just h ->
+      let s = serializeAst h emptyList
+      let accNext = appendItem s acc
+      case tail asts of
+        Nothing -> accNext
+        Just rest -> serializeAstList rest emptyList accNext
+
+-- bindingNames — extract the `.name` field from each {name, value}
+-- binding into a List<String>. Used by JsLet's flat-IIFE arm to
+-- build the params list.
+@label "Binding names"
+@description "Extract the `.name` field from each {name, value} binding into a List<String>. Used by JsLet's flat-IIFE arm to build the params list."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+bindingNames : (bindings: a) -> (acc: List String) -> List String
+bindingNames bindings acc =
+  case head bindings of
+    Nothing -> acc
+    Just b ->
+      let accNext = appendItem b.name acc
+      case tail bindings of
+        Nothing -> accNext
+        Just rest -> bindingNames rest accNext
+
+-- bindingValueStrs — serialize each binding's `.value` into a
+-- List<String>. Used by JsLet's flat-IIFE arm to build the IIFE
+-- values list.
+@label "Binding value strings"
+@description "Serialize each binding's `.value` into a List<String>. Used by JsLet's flat-IIFE arm to build the IIFE values list."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+bindingValueStrs : (bindings: a) -> (emptyList: List a) -> (acc: List String) -> List String
+bindingValueStrs bindings emptyList acc =
+  case head bindings of
+    Nothing -> acc
+    Just b ->
+      let s = serializeAst b.value emptyList
+      let accNext = appendItem s acc
+      case tail bindings of
+        Nothing -> accNext
+        Just rest -> bindingValueStrs rest emptyList accNext
+
+-- serializeObjectFields — build a `[<jsLit key>]: <serialized value>`
+-- string for each {key, value} field, accumulating into a List<String>.
+-- Used by the JsObject arm of serializeAst. The key is JS-source-
+-- encoded via jsLit (e.g. `hello` → `"hello"`) and ALWAYS emitted as a
+-- computed property. Computed syntax keeps `"__proto__"` an own data
+-- property instead of triggering the object-literal prototype setter.
+-- The value is recursively serialized.
+@label "Serialize object fields"
+@description "Build a `[<jsLit key>]: <serialized value>` string for each {key, value} field, accumulating into a List<String>. Used by the JsObject arm of serializeAst. Every JS-source-encoded key uses computed property syntax so __proto__ remains an own data property; the value is recursively serialized."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+serializeObjectFields : (fields: a) -> (emptyList: List a) -> (acc: List String) -> List String
+serializeObjectFields fields emptyList acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let keyStr = jsLit f.key
+      let valueStr = serializeAst f.value emptyList
+      let partStr = concat "[" (concat keyStr (concat "]: " valueStr))
+      let accNext = appendItem partStr acc
+      case tail fields of
+        Nothing -> accNext
+        Just rest -> serializeObjectFields rest emptyList accNext
+
+-- wrapNestedIIFE — fold a bindings list into nested IIFEs around a
+-- body string. The OUTER wrap is bindings[0]; the INNER wrap is
+-- bindings[last]. Mirrors the TS oracle's backward loop:
+--   body = "((b.name) => body)(<serialized b.value>)"
+-- but written as forward recursion (recurse on tail to build inner
+-- first, then wrap with head).
+--
+-- Empty bindings: return bodyStr unchanged (degenerate; the caller
+-- never invokes wrapNestedIIFE with empty input since needsNesting
+-- returns false and length==1 is false for empty lists — that path
+-- goes to flat IIFE instead).
+@label "Wrap nested IIFE"
+@description "Fold a bindings list into nested IIFEs around a body string. The OUTER wrap is bindings[0]; the INNERMOST is bindings[last]. Mirrors the TS oracle's backward loop, written as forward recursion (recurse on tail to build inner first, then wrap with head)."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+wrapNestedIIFE : (bindings: a) -> (bodyStr: String) -> (emptyList: List a) -> String
+wrapNestedIIFE bindings bodyStr emptyList =
+  case head bindings of
+    Nothing -> bodyStr
+    Just b ->
+      let valueStr = serializeAst b.value emptyList
+      case tail bindings of
+        Nothing -> buildIIFEFrame b.name bodyStr valueStr emptyList
+        Just rest ->
+          let innerStr = wrapNestedIIFE rest bodyStr emptyList
+          buildIIFEFrame b.name innerStr valueStr emptyList
+
+-- buildIIFEFrame — single IIFE wrap: `((<name>) => <innerStr>)(<valueStr>)`.
+-- List-builder + join "" pattern keeps the 7-piece concat readable.
+@label "Build IIFE frame"
+@description "Build a single IIFE wrap string: `((<name>) => <innerStr>)(<valueStr>)`. List-builder + `join \"\"` pattern keeps the 7-piece concat readable."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+buildIIFEFrame : (name: String) -> (innerStr: String) -> (valueStr: String) -> (emptyList: List a) -> String
+buildIIFEFrame name innerStr valueStr emptyList =
+  let xs0 = appendItem "((" emptyList
+  let xs1 = appendItem name xs0
+  let xs2 = appendItem ") => " xs1
+  let xs3 = appendItem innerStr xs2
+  let xs4 = appendItem ")(" xs3
+  let xs5 = appendItem valueStr xs4
+  let xs = appendItem ")" xs5
+  join xs ""
+
+-- serializeStmt — JsStmt walker (parser-substrate Phase 6b2, lever B).
+-- Prints one statement of a JsLoopFn's `while (true)` spine. Expression
+-- payloads route through serializeAst (the untouched 12-arm walker);
+-- the JsSIf branches + JsSBlock body are themselves `List JsStmt` and
+-- route through serializeStmts. One-line text (single-space joins) to
+-- match the rest of the pipeline's serialization convention.
+@label "Serialize JsStmt"
+@description "JsStmt walker for the self-tail-call loop spine (Phase 6b2). JsSConst/JsSAssign/JsSExpr/JsSReturn route their expression payload through serializeAst; JsSIf/JsSBlock route their `List JsStmt` bodies through serializeStmts; JsSContinue is the literal `continue;`. One-line text."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+serializeStmt : (stmt: JsStmt) -> (emptyList: List a) -> String
+serializeStmt stmt emptyList =
+  case stmt of
+    JsSConst { name = n, value = v } ->
+      let vStr = serializeAst v emptyList
+      concat "const " (concat n (concat " = " (concat vStr ";")))
+    JsSAssign { name = n, value = v } ->
+      let vStr = serializeAst v emptyList
+      concat n (concat " = " (concat vStr ";"))
+    JsSExpr { value = v } ->
+      let vStr = serializeAst v emptyList
+      concat vStr ";"
+    JsSIf { cond = c, then = t, else = e } ->
+      let cStr = serializeAst c emptyList
+      let tStr = serializeStmts t emptyList
+      let eStr = serializeStmts e emptyList
+      concat "if (" (concat cStr (concat ") { " (concat tStr (concat " } else { " (concat eStr " }")))))
+    JsSBlock { body = b } ->
+      let bStr = serializeStmts b emptyList
+      concat "{ " (concat bStr " }")
+    JsSReturn { value = v } ->
+      let vStr = serializeAst v emptyList
+      concat "return " (concat vStr ";")
+    JsSContinue -> "continue;"
+
+-- serializeStmts — join a `List JsStmt` with single spaces into one
+-- line of source. Used by serializeLoopFn (the loop body) and by
+-- serializeStmt's JsSIf / JsSBlock arms (the nested-block frames).
+@label "Serialize JsStmt list"
+@description "Join a `List JsStmt` with single spaces into one line of source. Used by serializeLoopFn and serializeStmt's JsSIf / JsSBlock arms."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+serializeStmts : (stmts: List JsStmt) -> (emptyList: List a) -> String
+serializeStmts stmts emptyList =
+  let parts = serializeStmtList stmts emptyList emptyList
+  join parts " "
+
+@label "Serialize JsStmt list (loop)"
+@description "Map serializeStmt over a list of JsStmt into a List<String>. Recursive worker for serializeStmts."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+serializeStmtList : (stmts: List JsStmt) -> (emptyList: List a) -> (acc: List String) -> List String
+serializeStmtList stmts emptyList acc =
+  case head stmts of
+    Nothing -> acc
+    Just h ->
+      let s = serializeStmt h emptyList
+      let accNext = appendItem s acc
+      case tail stmts of
+        Nothing -> accNext
+        Just rest -> serializeStmtList rest emptyList accNext
+
+-- serializeLoopFn — print a JsLoopFn entry as a block-bodied arrow:
+-- `((p1, p2) => { while (true) { <stmts> } })`. The outer parens match
+-- the JsArrow convention so the loader's `return(<body>)` takes it as
+-- an expression; `while` / `continue` are statement-only and unaffected
+-- by the loader's `with($ns)` wrap (B0-proven).
+@label "Serialize JsLoopFn"
+@description "Print a JsLoopFn entry as a block-bodied arrow `((p1, p2) => { while (true) { <stmts> } })`. Outer parens match the JsArrow convention. Phase 6b2 lever B."
+@tags "engine" "internal" "phase-21" "phase-6b2"
+@category "engine-internal"
+serializeLoopFn : (params: List String) -> (body: List JsStmt) -> (emptyList: List a) -> String
+serializeLoopFn params body emptyList =
+  let paramsJoined = join params ", "
+  let stmtsStr = serializeStmts body emptyList
+  concat "((" (concat paramsJoined (concat ") => { while (true) { " (concat stmtsStr " } })")))
+
+-- serializeJsModuleEntry — top-level entry. Walks `input.entry`
+-- (a JsArrow whose params + body capture the source function's
+-- signature + lowered body) via serializeAst. The Result wrap
+-- mirrors the TS oracle's `Codec<JsAst, String>` encode shape:
+-- `{$tag: "Ok"; value: string} | {$tag: "Err"; value: string}`.
+-- The body always returns Ok — the TS oracle's Err path catches
+-- (a) malformed-input rejection (the dispatcher's typed-ADT input
+-- rules this out) and (b) runtime exceptions (Fenel evaluator
+-- surfaces those as crashes, not Err values).
+@label "Serialize JsModule (entry)"
+@description "Top-level entry. Walks `input.entry` (a JsArrow whose params + body capture the source function's signature + lowered body) via serializeAst. The Result wrap mirrors the TS oracle's `Codec<JsAst, String>` encode shape: `{$tag: \"Ok\", value: string} | {$tag: \"Err\", value: string}`. The body always returns Ok — the TS oracle's Err path catches malformed-input rejection (the dispatcher's typed-ADT input rules this out) and runtime exceptions (Fenel evaluator surfaces those as crashes, not Err values). Mirrors the TS oracle at implementations/typescript/engine/src/modules/compile-js.ts:serializeJsModuleNative. Phase 21.6.1 — closes the JS pipeline end-to-end; every step from raw source to JS source text has a Fenel body when FENEL_DISPATCH_FENEL_PASSES=1."
+@tags "engine" "ir" "serialize" "codec" "self-host" "phase-21"
+serializeJsModuleEntry : (input: JsModule) -> (emptyList: List a) -> Result String String
+serializeJsModuleEntry input emptyList =
+  case input.entry of
+    JsLoopFn { params = ps, body = b } -> Ok (serializeLoopFn ps b emptyList)
+    other -> Ok (serializeAst other emptyList)

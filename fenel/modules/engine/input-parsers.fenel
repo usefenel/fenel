@@ -1,0 +1,343 @@
+module engine where
+
+-- input-parsers — type-driven input parsers.
+--
+-- Phase 9 port. Mirrors the TS oracle at
+-- implementations/typescript/engine/src/input-parsers.ts (now a thin
+-- shim over the dispatched wrappers for the ported entries).
+--
+-- Sub-step 2 PARTIAL lands the simple atomic parsers: parseEmail
+-- (trim + lowercase + empty check) / parseNumber (typeof + trim +
+-- toNumber + isFinite) / parseString (typeof + null check). Each
+-- parser body operates on a pre-classified `ParseInput` ADT carrying
+-- the pre-typed value + pre-computed coerced forms — the TS wrapper
+-- handles the typeof/instanceof passthrough so the body only sees
+-- String / Number / Bool / Null / Other variants.
+--
+-- The parsers emit a `ParseResult` ADT (POk value: a | PFail error:
+-- String) which the wrapper unmarshalls back to the TS
+-- `{ok: true, value} | {ok: false, error}` shape.
+--
+-- parsePhone / parseHandle / parseBoolean / parseDate DEFER-PROVISIONAL
+-- per sub-step 2 carve-outs:
+--   * parsePhone — char-by-char regex strip (`.replace(/[\\s\\-().]/g,
+--     "")`, `.replace(/\\D/g, "")`) needs recursive char-iter helpers
+--     + decision tree; pursuable but adds ~30 lines beyond the
+--     minimal-viable port.
+--   * parseHandle — 12 platform-URL regexes with 7 distinct character-
+--     class restrictions; carve-out to TS as parseHandleShim per
+--     Decision 2 option B (regex-derivative leaf, Phase 11+ candidate
+--     when std gains a regex primitive or std:matchCaptureGroup
+--     native).
+--   * parseBoolean — body would mirror std:tryParseBoolean (already
+--     Fenel-bodied at fenel/modules/std/tryParseBoolean.fenel); the
+--     extra value of a dedicated parseBoolean fnId over reusing the
+--     existing tryParseBoolean is low (parseBoolean's input is
+--     unknown vs tryParseBoolean's String; the type-passthrough
+--     branches are TS-side regardless).
+--   * parseDate — `new Date(s)` is irreducible host behaviour per
+--     Decision 3 option A; the parseDate body would do trim + empty
+--     check, then the wrapper does the Date validation. The minimal
+--     reasoning gained body-side doesn't justify the marshalling
+--     overhead at this scope.
+--
+-- The simple parsers (parseEmail / parseNumber / parseString) prove
+-- the per-parser-fnId pattern (Decision 1 option A) — each parser is
+-- its own fnId with sample-set rows in the matrix. The complex
+-- parsers can land later as the substrate evolves (char-iter
+-- primitives, regex helpers, std:tryParseDate).
+--
+-- All internal helpers are prefixed `parser…` / `pp…` to avoid
+-- collisions with like-named helpers already registered by other
+-- engine bodies.
+
+-- ---------------------------------------------------------------------------
+-- ParseResult — the canonical output shape.
+-- ---------------------------------------------------------------------------
+
+-- Same shape as the TS `ParseResult<T> = { ok: true, value: T } |
+-- { ok: false, error: string }`. The body emits POk/PFail; the
+-- wrapper unmarshalls to the TS shape.
+ParseResult a = POk value: a | PFail error: String
+
+-- ---------------------------------------------------------------------------
+-- Per-parser input ADTs.
+--
+-- Each parser dispatches on a pre-classified shape that hides the
+-- typeof/passthrough plumbing TS-side. The body only sees the cases
+-- it can reason about; "raw value not a string" / "raw value already
+-- the right type" pass through via dedicated arms.
+-- ---------------------------------------------------------------------------
+
+-- parseEmail input — pre-classified String-or-passthrough.
+-- * ParseEmailStr — raw input was a string (the wrapper passes it
+--   through as-is for trim + lower body-side).
+-- * ParseEmailPass — raw input wasn't a string (passthrough; body
+--   emits POk with the raw value preserved by the wrapper).
+ParseEmailInput =
+  ParseEmailStr s: String
+  | ParseEmailPass passValue: Any
+
+-- parseNumber input — pre-classified Number-or-passthrough.
+-- * ParseNumNum — raw was already a number (body emits POk with the
+--   pre-extracted number).
+-- * ParseNumStr — raw was a string; the wrapper pre-computes trim +
+--   toNumber + isFinite into trimmedEmpty / numValue / numIsFinite.
+-- * ParseNumPass — raw wasn't a number or string (passthrough).
+ParseNumberInput =
+  ParseNumNum numValue: Number
+  | ParseNumStr trimmedEmpty: Boolean numValue: Number numIsFinite: Boolean rawStr: String
+  | ParseNumPass passValue: Any
+
+-- Exact numeric text delegates to each existing std parser. Already typed
+-- values use the same three-valued Membership body as validation; no Number
+-- coercion or unit/currency-specific parsing participates at this boundary.
+ParseExactNumericInput =
+  ParseExactStr text: String
+  | ParseExactTyped value: Any
+
+-- parseString input — pre-classified String-or-coerce.
+-- * ParseStrStr — raw was already a string (body emits POk).
+-- * ParseStrNull — raw was null/undefined (body emits PFail with
+--   "Empty string" message).
+-- * ParseStrCoerce — raw was non-string non-null (the wrapper
+--   pre-computes String(value)).
+ParseStringInput =
+  ParseStrStr s: String
+  | ParseStrNull
+  | ParseStrCoerce coercedStr: String
+
+-- ---------------------------------------------------------------------------
+-- parseEmail — trim + lowercase + empty check.
+--
+-- Mirrors the TS oracle:
+--   if (typeof raw !== "string") return { ok: true, value: raw };
+--   const normalized = raw.trim().toLowerCase();
+--   if (!normalized) return { ok: false, error: "Empty email" };
+--   return { ok: true, value: normalized };
+-- ---------------------------------------------------------------------------
+
+@label "input-parsers: parseEmail"
+@description "Phase 9 sub-step 2 PARTIAL — trim + lowercase + empty check email parser. The TS wrapper pre-classifies the raw input into ParseEmailInput (ParseEmailStr s for string inputs, ParseEmailPass passValue for non-string passthrough); the body dispatches on the variant and emits POk{value=normalized} / PFail{error=\"Empty email\"} / POk{value=passValue}. Boundary adapter; dispatched via `dispatchedParseEmail` in engine-bodies-dispatch.ts. Mirrors implementations/typescript/engine/src/input-parsers.ts:parseEmail."
+@tags "engine" "input-parsers" "boundary" "phase-9"
+parseEmail : (input: ParseEmailInput) -> ParseResult Any
+parseEmail input = case input of
+  ParseEmailPass { passValue = v } -> POk { value = v }
+  ParseEmailStr { s = s } ->
+    let normalized = lower (trim s)
+    if eq normalized ""
+      then PFail { error = "Empty email" }
+      else POk { value = normalized }
+
+-- ---------------------------------------------------------------------------
+-- parseNumber — typeof Number passthrough; String → trim + toNumber +
+-- isFinite check; otherwise passthrough.
+--
+-- Mirrors the TS oracle:
+--   if (typeof raw === "number") return { ok: true, value: raw };
+--   if (typeof raw !== "string") return { ok: true, value: raw };
+--   if (raw.trim() === "") return { ok: false, error: "Empty number" };
+--   const n = Number(raw);
+--   if (!Number.isFinite(n)) return { ok: false, error: `Not a number: ${raw}` };
+--   return { ok: true, value: n };
+-- ---------------------------------------------------------------------------
+
+@label "input-parsers: parseNumber"
+@description "Phase 9 sub-step 2 PARTIAL — number coercion parser. Number passthrough; String → trim + Number() + isFinite check; otherwise passthrough. The TS wrapper pre-computes Number(value)/isFinite/trimmed-empty into ParseNumberInput; the body emits POk{value=n} / PFail{error=msg}. Boundary adapter; dispatched via `dispatchedParseNumber`. Mirrors implementations/typescript/engine/src/input-parsers.ts:parseNumber."
+@tags "engine" "input-parsers" "boundary" "phase-9"
+parseNumber : (input: ParseNumberInput) -> ParseResult Any
+parseNumber input = case input of
+  ParseNumNum { numValue = n } -> POk { value = n }
+  ParseNumPass { passValue = v } -> POk { value = v }
+  ParseNumStr { trimmedEmpty = empty, numValue = n, numIsFinite = fin, rawStr = raw } ->
+    if empty
+      then PFail { error = "Empty number" }
+      else if fin
+        then POk { value = n }
+        else PFail { error = join ["Not a number: ", raw] "" }
+
+@label "input-parsers: parseExactRational"
+@description "Parse exact Rational text through std.parseRational, or admit an already typed Rational through std.rationalMembership. Refuse nonmembers and bounded-work abstention; preserve admitted typed values without a floating Number conversion."
+@tags "engine" "input-parsers" "boundary" "rational"
+parseExactRational : (input: ParseExactNumericInput) -> ParseResult Any
+parseExactRational input = parserExactNumericInput input std.parseRational std.rationalMembership "Rational"
+
+@label "input-parsers: parseExactNat"
+@description "Parse Nat text through std.parseNatExact, or preserve an already typed Nat only when std.natExactMembership admits it. Exact digit carriers and pure constructors share the existing membership fragment; abstention refuses."
+@tags "engine" "input-parsers" "boundary" "numeric"
+parseExactNat : (input: ParseExactNumericInput) -> ParseResult Any
+parseExactNat input = parserExactNumericInput input std.parseNatExact std.natExactMembership "Nat"
+
+@label "input-parsers: parseExactInt"
+@description "Parse signed Int text through std.parseIntExact, or preserve an already typed Int only when std.intExactMembership admits it. Exact digit carriers and pure constructors share the existing membership fragment; abstention refuses."
+@tags "engine" "input-parsers" "boundary" "numeric"
+parseExactInt : (input: ParseExactNumericInput) -> ParseResult Any
+parseExactInt input = parserExactNumericInput input std.parseIntExact std.intExactMembership "Int"
+
+@category "engine-internal"
+parserExactNumericInput : (input: ParseExactNumericInput) -> (readText: String -> Result String Any) -> (membership: Any -> Maybe Bool) -> (typeName: String) -> ParseResult Any
+parserExactNumericInput input readText membership typeName = case input of
+  ParseExactStr { text = text } -> case readText text of
+    Ok value -> POk { value = value }
+    Err reason -> PFail { error = reason }
+  ParseExactTyped { value = value } -> case membership value of
+    Just answer ->
+      if std.boolToNative answer then POk { value = value }
+      else PFail { error = join ["Use an admitted exact ", typeName, " value or its numeric text."] "" }
+    Nothing -> PFail { error = join [typeName, " membership exceeds the bounded parser work."] "" }
+
+-- ---------------------------------------------------------------------------
+-- parseString — typeof String passthrough; null → "Empty string"
+-- error; otherwise pre-coerced String() from the wrapper.
+--
+-- Mirrors the TS oracle:
+--   if (typeof raw === "string") return { ok: true, value: raw };
+--   if (raw == null) return { ok: false, error: "Empty string" };
+--   return { ok: true, value: String(raw) };
+-- ---------------------------------------------------------------------------
+
+@label "input-parsers: parseString"
+@description "Phase 9 sub-step 2 PARTIAL — string coercion parser. String passthrough; null/undefined → PFail \"Empty string\"; otherwise String(value) coerced. The TS wrapper pre-classifies into ParseStringInput (ParseStrStr s / ParseStrNull / ParseStrCoerce coercedStr); the body emits POk{value} / PFail{error}. Boundary adapter; dispatched via `dispatchedParseString`. Mirrors implementations/typescript/engine/src/input-parsers.ts:parseString."
+@tags "engine" "input-parsers" "boundary" "phase-9"
+parseString : (input: ParseStringInput) -> ParseResult String
+parseString input = case input of
+  ParseStrStr { s = s } -> POk { value = s }
+  ParseStrNull -> PFail { error = "Empty string" }
+  ParseStrCoerce { coercedStr = c } -> POk { value = c }
+
+-- ---------------------------------------------------------------------------
+-- Phase 9 sub-step 3 — input-layer.ts top-level dispatcher.
+--
+-- setExprAtom + resolveAtom + parseInput — the central type-to-atom-name
+-- resolution flow that powers `parseInput(raw, type, ctx?)`. The wrapper
+-- supplies one complete shared TraversalType. Source classifies it into
+-- ResolvedAtomInput without re-entering the host at recursive positions,
+-- preserving an opaque declaration's identified fields and owner context.
+--
+-- setExprAtom reads the canonical SetExpr name-ref and strips a "format:"
+-- prefix when present; other SetExpr shapes do not select a parser.
+--
+-- parseInput is a publish-surface boundary adapter — its body delegates
+-- to resolveAtom. The wrapper handles the parser-registry lookup +
+-- invocation TS-side (parseFns map stays TS-side per Decision 2 — public
+-- extension hook via registerParseFn).
+-- ---------------------------------------------------------------------------
+
+-- ResolvedAtomInput — pre-classified FenelType view for resolveAtom.
+-- Recursive positions carry already-classified source sub-ADTs. Opaque
+-- and Tagged positions also retain their complete shared TraversalType;
+-- source owns canonical-carrier and reference-phantom parser selection.
+ResolvedAtomInput =
+  RaiOpaqueInner inner: ResolvedAtomInput type: TraversalType
+  | RaiRefinedSetMatch atomName: String
+  | RaiRefinedBase base: ResolvedAtomInput
+  | RaiTagged base: ResolvedAtomInput type: TraversalType
+  | RaiNamed name: String
+  | RaiNone
+
+@category "engine-internal"
+parserMaybeInputType : (type: TraversalType) -> Maybe TraversalType
+parserMaybeInputType type = case type of
+  TtRefined { base = base } -> parserMaybeInputType base
+  TtVariant { cases = cases } -> typeTraversalMaybeInner cases
+  _ -> Nothing
+
+@label "input-layer: classifyResolvedAtomInput"
+@description "Classify one complete shared TraversalType for input parser selection. Reuse exact Maybe and refinement-name readers; preserve identified opaque fields and the Tagged base plus phantom without a recursive host re-entry."
+@tags "engine" "input-layer" "boundary" "field-identity"
+@category "engine-internal"
+classifyResolvedAtomInput : (type: TraversalType) -> ResolvedAtomInput
+classifyResolvedAtomInput type = case parserMaybeInputType type of
+  Just inner -> classifyResolvedAtomInput inner
+  Nothing -> case type of
+    TtOpaque { pure = pure } -> RaiOpaqueInner { inner = classifyResolvedAtomInput pure, type = type }
+    TtRefined { base = base, setView = set } -> case setExprAtom set of
+      Just name -> RaiRefinedSetMatch { atomName = name }
+      Nothing -> RaiRefinedBase { base = classifyResolvedAtomInput base }
+    TtTagged { value = base } -> RaiTagged { base = classifyResolvedAtomInput base, type = type }
+    TtNamed { name = name, origin = origin } ->
+      if eq origin "ref" then RaiNamed { name = name } else RaiNone
+    _ -> RaiNone
+
+-- ---------------------------------------------------------------------------
+-- setExprAtom — extract the atom name from a name-ref SetExpr.
+--
+-- containment-substrate Phase 1a (render-marshaller harvest): walks the
+-- canonical `$tag` Se* ADT directly (the printSetExpr / decider harvest
+-- template) — the TS marshaller `marshalSetExprForAtom` is DELETED. The
+-- dispatch normalises its input to the canonical `$tag` form via
+-- `setExprToTag` before feeding it here, so a name-ref leaf is exactly the
+-- `SeRef handle` case (the legacy `$`-key `{$ref}`/`{$named}` forms are
+-- folded onto `SeRef` by `setExprToTag` upstream — `$named` is fully retired
+-- to `$ref`, [[project_named_to_ref_status]]). Any non-name-ref variant
+-- (the `other` catch-all) yields Nothing.
+--
+-- Mirrors the TS oracle:
+--   const n = refHandle(set);              // the $ref name-handle
+--   if (n === undefined) return undefined;
+--   return n.startsWith("format:") ? n.slice("format:".length) : n;
+--
+-- The body strips a "format:" prefix when present ("format:" has length 7
+-- → slice from index 7 onwards); returns Nothing for non-name-ref shapes.
+-- ---------------------------------------------------------------------------
+
+@label "input-layer: setExprAtom"
+@description "containment-substrate Phase 1a — extract the atom name from a name-ref SetExpr. Walks the canonical `$tag` Se* ADT (SeRef handle) directly; the dispatch normalises legacy `$`-key forms to `$tag` upstream via setExprToTag. Strips a \"format:\" prefix when present (e.g. \"format:email\" → \"email\"); Nothing for non-name-ref shapes. Internal helper; dispatched via `dispatchedSetExprAtom` (which now feeds the canonical SetExpr — the TS marshaller marshalSetExprForAtom is deleted)."
+@tags "engine" "internal" "input-layer" "set-expr" "containment-phase-1a"
+@category "engine-internal"
+setExprAtom : (set: SetExpr) -> Maybe String
+setExprAtom set = case set of
+  SeRef { handle = h } ->
+    if startsWith h "format:"
+      then Just (slice h 7 (unitLen h))
+      else Just h
+  other -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- resolveAtom — recursive FenelType-to-atom resolver.
+--
+-- Tagged numeric/unit data follows its base parser. Id and GeoPath retain
+-- the existing entity-phantom route; other tags never choose a parser from
+-- a currency/unit name. The shared canonical representation-name judgment
+-- selects nominal Nat/Int/Rational for their exact identified signatures.
+--
+-- The body's recursion arms (RaiOpaqueInner / RaiRefinedBase) call back
+-- through resolveAtom on the already-classified inner ADT — no TS
+-- marshalling callback needed.
+-- ---------------------------------------------------------------------------
+
+@label "input-layer: resolveAtom"
+@description "Resolve the input parser from source-classified type data. Tagged values follow their base except the existing Id/GeoPath reference-phantom route; canonical numeric opaque declarations retain exact nominal parsing through the shared signature judgment. Recursive source markers preserve the complete identified TraversalType."
+@tags "engine" "internal" "input-layer" "phase-9"
+@category "engine-internal"
+resolveAtom : (input: ResolvedAtomInput) -> Maybe String
+resolveAtom input = case input of
+  RaiNone -> Nothing
+  RaiNamed { name = n } -> Just n
+  RaiTagged { base = base, type = type } -> case base of
+    RaiNamed { name = name } ->
+      if or (eq name "Id") (eq name "GeoPath")
+        then typeTraversalPhantomEntityName type
+        else resolveAtom base
+    _ -> resolveAtom base
+  RaiRefinedSetMatch { atomName = n } -> Just n
+  RaiOpaqueInner { inner = i, type = type } ->
+    let representationName = canonicalRepresentationName type
+    if eq representationName "" then resolveAtom i else Just representationName
+  RaiRefinedBase { base = b } -> resolveAtom b
+
+-- ---------------------------------------------------------------------------
+-- parseInput — publish-surface boundary adapter.
+--
+-- Mirrors the TS oracle at input-layer.ts:parseInput. The Fenel body
+-- resolves the atom name (delegating to resolveAtom); the wrapper handles
+-- the TS-side parseFns registry lookup + parser invocation. The body's
+-- input is the same ResolvedAtomInput that resolveAtom dispatches on —
+-- the wrapper pre-classifies the FenelType once at the boundary.
+-- ---------------------------------------------------------------------------
+
+@label "input-layer: parseInput"
+@description "Phase 9 sub-step 3 — publish-surface boundary adapter for the unified parseInput contract. The Fenel body resolves the atom name (delegating to resolveAtom); the wrapper handles the parseFns registry lookup + parser invocation TS-side (parseFns map stays TS per Decision 2 — public extension hook via registerParseFn). std:parseInput delegates to input-layer.ts:parseInput which dispatches via `dispatchedParseInput`. Boundary adapter. Mirrors implementations/typescript/engine/src/input-layer.ts:parseInput."
+@tags "engine" "input-layer" "boundary" "phase-9"
+parseInput : (input: ResolvedAtomInput) -> Maybe String
+parseInput input = resolveAtom input

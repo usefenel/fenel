@@ -1,0 +1,1635 @@
+-- =========================================================================
+-- module authority where — the authority grammar, the admission predicate,
+-- and THE CHECKER.
+--
+-- rights R2a (Authority spine I). `perform` (engine/src/perform.ts) is the one
+-- host-act boundary. It authenticates the frame's opaque `AuthorityRef` against
+-- a host-private table and then asks THIS module whether the argued act is in
+-- the authenticated envelope. The verdict is `Maybe Boolean`; the gate proceeds
+-- on the exact value `Just true` and refuses on everything else — so an
+-- abstention, a malformed envelope, and a throw are all refusals.
+--
+-- WHY THE JUDGMENT IS HERE AND NOT IN TYPESCRIPT (AGENTS.md, Fenel-first): a
+-- policy decision is pure logic. The TypeScript at the gate is the private
+-- table, the mint, the marshalling seam, and ONE branch on the verdict's shape.
+-- There is no switch over envelope cases in the host.
+--
+-- WHY THIS IS NOT A NEW REASONING SUBSYSTEM (Cornerstone 2): `memberScalar` is
+-- the SAME membership judgment, restricted to a fragment chosen so that it is
+-- TOTAL. Its eight rules are PRESENTATION rows of the `mem.*` rows in
+-- `design/tcb-ledger.md` (group `AU`), each cross-face pinned against
+-- `setAlgebraContains` on the same inputs. It deliberately does NOT call
+-- `setAlgebraContains` / `set:decideSubset`: those need the decider harness,
+-- which is a process-global cached context, and they would drag all 15 arms —
+-- including the UNSOUND-KNOWN rows at HEAD — into the reference monitor's
+-- reachable closure.
+--
+-- THE FRAGMENT (`scalarSetOk`): `SeEnum` of scalars, `SeInterval` with at least
+-- one literal bound of ONE scalar kind, `SeNone`, `SeUnion` / `SeIntersect`
+-- (non-empty) / `SeDiff`, with `SeComplement` admitted ONLY as a `SeDiff`
+-- subtrahend. `SeAll` is refused everywhere, and so are the two other spellings
+-- of the universe that would sneak past a naive `SeAll` check: the EMPTY
+-- `SeIntersect` (vacuously true, matching the decider's own mEvery identity)
+-- and the DOUBLY-UNBOUNDED `SeInterval` (no bound left to fail).
+-- `SeRef` / `SeWhere` / `SePattern` / `SeCtor` / `SeMu` / `SeArrow` / `SeRigid`
+-- are refused: each is either registry-dependent (so the same policy and the
+-- same value would change verdict under a registry change) or undecidable here.
+--
+-- ADMISSION RUNS TWICE, DELIBERATELY. `mintAuthority` validates through
+-- `envelopeWellFormed` — the loud fence, which names the reason — and `permits`
+-- RE-VALIDATES every set with `scalarSetOk` before asking for membership. The
+-- mint-time check is the diagnostic; the exercise-time check is the one that
+-- cannot be bypassed by any future writer of the private table.
+--
+-- NULLARY DEFS ARE A TRAP (json-logic.ts `resolveVar`, the bare-ident
+-- fall-through): a bare reference to a registered zero-parameter function
+-- resolves to `{$ref: id}` — the HANDLE — not to its value. Every constant here
+-- therefore takes an ignored `unit` parameter and is CALLED. Getting this wrong
+-- is silent rather than loud: `elem d <handle>` returns `false` for every `d`,
+-- which would have left every identity leaf inside the member envelope.
+--
+-- Canonical: `design/authority.md`,
+-- `workstreams/rights/briefs/r2a-authority-spine-i.md`.
+-- =========================================================================
+
+module authority where
+
+@entity
+@label "Act"
+@description "A protected operation as the authority gate sees it: the descriptor naming the host leaf, the positional arguments, and the own-entry field projection of a single record argument."
+Act = Act descriptor: String args: List Any fields: List ActField
+
+@entity
+@label "ActField"
+@description "One own entry of an act's single record argument — the argument axis an ArgField restriction names."
+ActField = ActField name: String value: Any
+
+@entity
+@label "Envelope"
+@description "The set of permitted argued acts. EvTop is the universe and is mintable only by the registry bootstrap; EvRows is a disjunction of rows, and the EMPTY row list is the empty set, which permits nothing."
+Envelope = EvTop | EvRows rows: List ActRow
+
+@entity
+@label "ActRow"
+@description "One permitted-act clause: a set of descriptors and a positional list of argument-axis restrictions. A row permits an act when the descriptor is in the set AND every axis admits its argument."
+-- Multiline on purpose: this is the corpus's indented-constructor-field
+-- continuation pin (`source-scheme-parser.test.ts`), inherited from the deleted
+-- PolicyView. Field ORDER is load-bearing — the axes are positional.
+ActRow = ActRow
+  descriptors: SetExpr
+  args: List ArgAxis
+
+@entity
+@label "ArgAxis"
+@description "A restriction on one argument position: ArgAny is unconstrained, ArgValue constrains the positional argument itself, ArgField constrains one named own entry of a record argument, ArgRecord constrains SEVERAL named own entries of the same record argument."
+ArgAxis = ArgAny | ArgValue set: SetExpr | ArgField name: String set: SetExpr | ArgRecord fields: List FieldAxis
+
+@entity
+@label "FieldAxis"
+@description "One named-entry restriction inside an ArgRecord: the own entry named by `name` must exist and be a member of `set`."
+-- WHY ArgRecord EXISTS AT ALL, when ArgField already names one entry.
+-- Argument axes walk in LOCKSTEP with the act's arguments (ledger au.mem.row),
+-- and an IO act carries exactly ONE argument: the params record. So a SECOND
+-- ArgField in the same row is "more axes than arguments", which refuses. Two
+-- named-entry restrictions on one record argument therefore cannot be written
+-- as two axes; they are one axis with two entries. That is the whole of it.
+-- ArgField was not wrong; it was one-per-position by construction.
+FieldAxis = FieldAxis name: String set: SetExpr
+
+@entity
+@label "StorageDescriptor"
+@description "One StorageHandler backend method as the policy sees it: which backend, which method, and the descriptor the runtime performs for it. Projected from the registered StorageHandler instances, so it is data rather than policy."
+StorageDescriptor = StorageDescriptor backend: String method: String descriptor: String
+
+-- =========================================================================
+-- THE CHECKER
+-- =========================================================================
+
+@label "authority: permits"
+@description "THE authority judgment — is the argued act in the envelope? Returns Just true to permit, Just false to refuse, Nothing when the envelope is ill-formed or membership is undecided at the admitted fragment. The gate proceeds ONLY on Just true, so abstention refuses."
+@tags "authority" "rights" "gate" "judgment"
+permits : (envelope: Envelope) -> (act: Act) -> Maybe Boolean
+permits envelope act = case envelope of
+  EvTop -> Just true
+  EvRows { rows = rs } -> authorityRowsPermit rs act false
+  _ -> Nothing
+
+-- Kleene OR over rows (mSome, mirroring setAlgebraContainsUnion): any Just
+-- true wins; all Just false refutes; a Nothing with no Just true abstains. An
+-- EMPTY row list is Just false — the empty set permits nothing.
+authorityRowsPermit : (rows: List ActRow) -> (act: Act) -> (sawNothing: Boolean) -> Maybe Boolean
+authorityRowsPermit rows act sawNothing =
+  case head rows of
+    Nothing ->
+      if sawNothing then Nothing else Just false
+    Just first ->
+      let r = authorityRowPermits first act
+      case r of
+        Just true -> Just true
+        Just false ->
+          case tail rows of
+            Nothing -> if sawNothing then Nothing else Just false
+            Just rest -> authorityRowsPermit rest act sawNothing
+        Nothing ->
+          case tail rows of
+            Nothing -> Nothing
+            Just rest -> authorityRowsPermit rest act true
+
+-- One row: Kleene AND of the descriptor axis and every argument axis.
+authorityRowPermits : (row: ActRow) -> (act: Act) -> Maybe Boolean
+authorityRowPermits row act =
+  let onDescriptor = authorityAxisMember row.descriptors act.descriptor
+  case onDescriptor of
+    Just false -> Just false
+    _ -> authorityKleeneAnd onDescriptor (authorityArgsPermit row.args act.args act false)
+
+authorityKleeneAnd : (left: Maybe Boolean) -> (right: Maybe Boolean) -> Maybe Boolean
+authorityKleeneAnd left right = case left of
+  Just false -> Just false
+  Just true -> right
+  _ ->
+    case right of
+      Just false -> Just false
+      _ -> Nothing
+
+-- EXERCISE-TIME RE-VALIDATION. A set outside the admitted fragment is Nothing —
+-- refused — no matter how it got into the envelope.
+--
+-- ⚠ IT RE-CHECKS THE DENOTATION, NOT THE HYGIENE, AND THE SPLIT IS MEASURED.
+-- `scalarSetOk` walks EVERY enum element, and the member envelope is one enum
+-- over every descriptor the registry exposes — 1718 of them — so re-running it
+-- per act cost 12 ms of interpreted `all`, on EVERY IO act. `scalarSetShapeOk`
+-- keeps every check that can change what a set DENOTES and drops the ones that
+-- only bound its size:
+--   · a `values` that is a STRING is refused at BOTH, because the host `elem`
+--     does SUBSTRING search on a string haystack — that one widens membership;
+--   · a non-scalar or oversized ELEMENT does not widen anything. `elem` matches
+--     an object by reference across a boundary no Fenel value crosses, and an
+--     over-long string is simply one more member the envelope's author put
+--     there. Those are resource bounds, and the mint is where they belong.
+authorityAxisMember : (set: SetExpr) -> (value: Any) -> Maybe Boolean
+authorityAxisMember set value =
+  if scalarSetShapeOk set 0
+  then memberScalar set value
+  else Nothing
+
+-- Argument axes walk in lockstep with the act's arguments. More axes than
+-- arguments refuses; fewer leaves the unlisted arguments unconstrained.
+authorityArgsPermit : (axes: List ArgAxis) -> (args: List Any) -> (act: Act) -> (sawNothing: Boolean) -> Maybe Boolean
+authorityArgsPermit axes args act sawNothing =
+  case head axes of
+    Nothing ->
+      if sawNothing then Nothing else Just true
+    Just axis ->
+      case head args of
+        Nothing -> Just false
+        Just arg -> authorityArgsStep axes args act sawNothing axis arg
+
+authorityArgsStep : (axes: List ArgAxis) -> (args: List Any) -> (act: Act) -> (sawNothing: Boolean) -> (axis: ArgAxis) -> (arg: Any) -> Maybe Boolean
+authorityArgsStep axes args act sawNothing axis arg =
+  let r = authorityAxisPermits axis arg act
+  case r of
+    Just false -> Just false
+    Just true -> authorityArgsRest axes args act sawNothing
+    Nothing -> authorityArgsRest axes args act true
+
+authorityArgsRest : (axes: List ArgAxis) -> (args: List Any) -> (act: Act) -> (sawNothing: Boolean) -> Maybe Boolean
+authorityArgsRest axes args act sawNothing =
+  case tail axes of
+    Nothing ->
+      if sawNothing then Nothing else Just true
+    Just restAxes ->
+      case tail args of
+        Nothing -> authorityArgsPermit restAxes [] act sawNothing
+        Just restArgs -> authorityArgsPermit restAxes restArgs act sawNothing
+
+authorityAxisPermits : (axis: ArgAxis) -> (arg: Any) -> (act: Act) -> Maybe Boolean
+authorityAxisPermits axis arg act = case axis of
+  ArgAny -> Just true
+  ArgValue { set = s } -> authorityAxisMember s arg
+  ArgField { name = n, set = s } -> authorityFieldMember act n s
+  ArgRecord { fields = fs } -> authorityRecordAxisMember act fs
+  _ -> Nothing
+
+-- EXERCISE-TIME RE-VALIDATION of the one structural property that changes what
+-- the axis DENOTES. The empty list is vacuously Just true — i.e. NO restriction,
+-- which is what ArgAny spells — so an envelope written into the private table
+-- past the mint would get a free pass on that axis. `scalarSetShapeOk` already
+-- re-checks every SET at exercise for the same reason; this is the same rule
+-- one level up. The size and distinctness bounds stay mint-only: neither can
+-- widen what the axis admits (a duplicate name conjoins the same entry twice,
+-- and 33 entries is a resource question), and re-walking them per act is the
+-- cost the shape/ok split exists to avoid.
+authorityRecordAxisMember : (act: Act) -> (axes: List FieldAxis) -> Maybe Boolean
+authorityRecordAxisMember act axes =
+  if eq (length axes) 0
+  then Nothing
+  else authorityRecordAxis act axes false
+
+-- Kleene AND over the named entries (ledger au.mem.axis.record). An entry the
+-- act does not carry is Just false, for the same reason ArgField refuses it: a
+-- restriction on a field the act does not carry is not satisfied by the act's
+-- silence.
+authorityRecordAxis : (act: Act) -> (axes: List FieldAxis) -> (sawNothing: Boolean) -> Maybe Boolean
+authorityRecordAxis act axes sawNothing =
+  case head axes of
+    Nothing ->
+      if sawNothing then Nothing else Just true
+    Just f -> authorityRecordAxisStep act axes f sawNothing
+
+authorityRecordAxisStep : (act: Act) -> (axes: List FieldAxis) -> (f: FieldAxis) -> (sawNothing: Boolean) -> Maybe Boolean
+authorityRecordAxisStep act axes f sawNothing =
+  let r = authorityFieldMember act f.name f.set
+  case r of
+    Just false -> Just false
+    Just true -> authorityRecordAxisRest act axes sawNothing
+    Nothing -> authorityRecordAxisRest act axes true
+
+authorityRecordAxisRest : (act: Act) -> (axes: List FieldAxis) -> (sawNothing: Boolean) -> Maybe Boolean
+authorityRecordAxisRest act axes sawNothing =
+  case tail axes of
+    Nothing ->
+      if sawNothing then Nothing else Just true
+    Just rest -> authorityRecordAxis act rest sawNothing
+
+-- The unique own entry named n. An absent field refuses: a restriction on a
+-- field the act does not carry is not satisfied by the act's silence.
+authorityFieldMember : (act: Act) -> (name: String) -> (set: SetExpr) -> Maybe Boolean
+authorityFieldMember act name set =
+  case authorityFindField act.fields name of
+    Nothing -> Just false
+    Just f -> authorityAxisMember set f.value
+
+authorityFindField : (fields: List ActField) -> (name: String) -> Maybe ActField
+authorityFindField fields name =
+  case head fields of
+    Nothing -> Nothing
+    Just f ->
+      if eq f.name name
+      then Just f
+      else
+        case tail fields of
+          Nothing -> Nothing
+          Just rest -> authorityFindField rest name
+
+-- =========================================================================
+-- memberScalar — the eight PRESENTATION rows (ledger group AU)
+--
+-- Each arm mirrors the corresponding arm of `setAlgebraContains`
+-- (fenel/modules/engine/set-algebra-deciders.fenel) EXACTLY, so the agreement
+-- pin is a statement about two spellings of ONE rule rather than about two
+-- rules. The SeAll arm is unreachable through `authorityAxisMember` (admission
+-- refuses it) and exists so the cross-face pin can exercise it.
+-- =========================================================================
+
+@label "authority: memberScalar"
+@description "Membership over the closed positive scalar fragment of SetExpr — the eight PRESENTATION rows au.mem.scalar.* of the ledger's mem.* rules. Every constructor outside the fragment is Nothing. Agreement with setAlgebraContains on admitted inputs is the ledger pin."
+@tags "authority" "rights" "set-algebra" "membership"
+memberScalar : (set: SetExpr) -> (v: Any) -> Maybe Boolean
+memberScalar set v = case set of
+  SeAll -> Just true
+  SeNone -> Just false
+  SeEnum { values = vs } -> authorityEnumMember vs v
+  SeInterval { interval = iv } -> Just (authorityInInterval iv v)
+  SeUnion { branches = bs } -> authorityMemberUnion bs v false
+  SeIntersect { branches = bs } -> authorityMemberIntersect bs v false
+  SeDiff { left = a, right = b } -> authorityMemberDiff a b v
+  SeComplement { inner = i } -> authorityMemberComplement i v
+  _ -> Nothing
+
+-- `elem` is the host membership native. Since recipe-functions S1 its array arm
+-- compares with structural `eq` (structuralEq — exactly std `includes`), the
+-- decider's element equality on data, so this agrees with setEnumContains on
+-- every scalar enum, NaN included (before S1 it was SameValueZero, which differed on NaN
+-- only, and admission refuses NaN in an enum). It stays the NATIVE on purpose:
+-- it iterates and costs no stack, where a Fenel recursive loop (the decider's,
+-- or the `includes` body) would descend once per element on every perform.
+authorityEnumMember : (values: List Any) -> (v: Any) -> Maybe Boolean
+authorityEnumMember values v =
+  if elem v values then Just true else Just false
+
+authorityMemberUnion : (branches: List SetExpr) -> (v: Any) -> (sawNothing: Boolean) -> Maybe Boolean
+authorityMemberUnion branches v sawNothing =
+  case head branches of
+    Nothing ->
+      if sawNothing then Nothing else Just false
+    Just first ->
+      let r = memberScalar first v
+      case r of
+        Just true -> Just true
+        Just false ->
+          case tail branches of
+            Nothing -> if sawNothing then Nothing else Just false
+            Just rest -> authorityMemberUnion rest v sawNothing
+        Nothing ->
+          case tail branches of
+            Nothing -> Nothing
+            Just rest -> authorityMemberUnion rest v true
+
+authorityMemberIntersect : (branches: List SetExpr) -> (v: Any) -> (sawNothing: Boolean) -> Maybe Boolean
+authorityMemberIntersect branches v sawNothing =
+  case head branches of
+    Nothing ->
+      if sawNothing then Nothing else Just true
+    Just first ->
+      let r = memberScalar first v
+      case r of
+        Just false -> Just false
+        Just true ->
+          case tail branches of
+            Nothing -> if sawNothing then Nothing else Just true
+            Just rest -> authorityMemberIntersect rest v sawNothing
+        Nothing ->
+          case tail branches of
+            Nothing -> Nothing
+            Just rest -> authorityMemberIntersect rest v true
+
+authorityMemberDiff : (a: SetExpr) -> (b: SetExpr) -> (v: Any) -> Maybe Boolean
+authorityMemberDiff a b v =
+  let inA = memberScalar a v
+  case inA of
+    Just false -> Just false
+    _ -> authorityMemberDiffRight inA b v
+
+authorityMemberDiffRight : (inA: Maybe Boolean) -> (b: SetExpr) -> (v: Any) -> Maybe Boolean
+authorityMemberDiffRight inA b v =
+  let inB = memberScalar b v
+  case inB of
+    Just true -> Just false
+    Just false ->
+      case inA of
+        Just true -> Just true
+        _ -> Nothing
+    Nothing -> Nothing
+
+authorityMemberComplement : (inner: SetExpr) -> (v: Any) -> Maybe Boolean
+authorityMemberComplement inner v =
+  let r = memberScalar inner v
+  case r of
+    Just b -> Just (not b)
+    Nothing -> Nothing
+
+-- Interval membership, mirroring inInterval after classifyIntervalValue. A
+-- value whose kind does not match the bounds' kind is `false` — NOT an
+-- abstention: that is the decider's total reading, and the agreement pin is
+-- what makes these rows PRESENTATION rather than a second opinion.
+authorityInInterval : (iv: Any) -> (v: Any) -> Boolean
+authorityInInterval iv v =
+  if isNumber v
+  then authorityIntervalNumberValue iv v
+  else if isString v
+  then authorityIntervalString iv (toString v)
+  else false
+
+-- `eq v v` is false only for NaN, which classifyIntervalValue sends to IvOther.
+authorityIntervalNumberValue : (iv: Any) -> (v: Any) -> Boolean
+authorityIntervalNumberValue iv v =
+  if eq v v
+  then authorityIntervalNumeric iv (toNumber v)
+  else false
+
+authorityIntervalNumeric : (iv: Any) -> (v: Number) -> Boolean
+authorityIntervalNumeric iv v =
+  if authorityLoOkNumeric iv.lo v
+  then authorityHiOkNumeric iv.hi v
+  else false
+
+authorityLoOkNumeric : (mLo: Any) -> (v: Number) -> Boolean
+authorityLoOkNumeric mLo v = case mLo of
+  Nothing -> true
+  Just b -> authorityLoBoundNumeric b v
+  _ -> false
+
+authorityLoBoundNumeric : (b: Any) -> (v: Number) -> Boolean
+authorityLoBoundNumeric b v =
+  if isNumber b.value
+  then authorityLoCompare b.inclusive v (toNumber b.value)
+  else false
+
+authorityLoCompare : (inclusive: Boolean) -> (v: Any) -> (bound: Any) -> Boolean
+authorityLoCompare inclusive v bound =
+  if inclusive
+  then not (lt v bound)
+  else not (lte v bound)
+
+authorityHiOkNumeric : (mHi: Any) -> (v: Number) -> Boolean
+authorityHiOkNumeric mHi v = case mHi of
+  Nothing -> true
+  Just b -> authorityHiBoundNumeric b v
+  _ -> false
+
+authorityHiBoundNumeric : (b: Any) -> (v: Number) -> Boolean
+authorityHiBoundNumeric b v =
+  if isNumber b.value
+  then authorityHiCompare b.inclusive v (toNumber b.value)
+  else false
+
+authorityHiCompare : (inclusive: Boolean) -> (v: Any) -> (bound: Any) -> Boolean
+authorityHiCompare inclusive v bound =
+  if inclusive
+  then not (gt v bound)
+  else not (gte v bound)
+
+authorityIntervalString : (iv: Any) -> (v: String) -> Boolean
+authorityIntervalString iv v =
+  if authorityLoOkString iv.lo v
+  then authorityHiOkString iv.hi v
+  else false
+
+authorityLoOkString : (mLo: Any) -> (v: String) -> Boolean
+authorityLoOkString mLo v = case mLo of
+  Nothing -> true
+  Just b -> authorityLoBoundString b v
+  _ -> false
+
+authorityLoBoundString : (b: Any) -> (v: String) -> Boolean
+authorityLoBoundString b v =
+  if isString b.value
+  then authorityLoCompare b.inclusive v (toString b.value)
+  else false
+
+authorityHiOkString : (mHi: Any) -> (v: String) -> Boolean
+authorityHiOkString mHi v = case mHi of
+  Nothing -> true
+  Just b -> authorityHiBoundString b v
+  _ -> false
+
+authorityHiBoundString : (b: Any) -> (v: String) -> Boolean
+authorityHiBoundString b v =
+  if isString b.value
+  then authorityHiCompare b.inclusive v (toString b.value)
+  else false
+
+-- =========================================================================
+-- scalarSetOk — the admission predicate (positive-support form)
+-- =========================================================================
+
+@label "authority: scalarSetShapeOk"
+@description "The EXERCISE-time half of admission: every check that can change what a set denotes, and none that merely bounds its size. Same formers, same depth cap, same refusal of every spelling of the universe; the only difference from `scalarSetOk` is that an enum is checked for being a LIST rather than element-by-element. See the note on `authorityAxisMember` for why that split is sound and why it is necessary."
+@tags "authority" "rights" "admission" "fragment"
+scalarSetShapeOk : (set: SetExpr) -> (depth: Number) -> Boolean
+scalarSetShapeOk set depth =
+  if gt depth 8
+  then false
+  else authoritySetShapeAtDepth set depth
+
+authoritySetShapeAtDepth : (set: SetExpr) -> (depth: Number) -> Boolean
+authoritySetShapeAtDepth set depth = case set of
+  SeNone -> true
+  SeEnum { values = vs } -> not (isString vs)
+  SeInterval { interval = iv } -> authorityIntervalOk iv
+  SeUnion { branches = bs } -> authorityBranchShapesOk bs (add depth 1)
+  SeIntersect { branches = bs } -> authorityIntersectShapeOk bs depth
+  SeDiff { left = a, right = b } -> authorityDiffShapeOk a b depth
+  _ -> false
+
+authorityIntersectShapeOk : (branches: List SetExpr) -> (depth: Number) -> Boolean
+authorityIntersectShapeOk branches depth =
+  if eq (length branches) 0
+  then false
+  else authorityBranchShapesOk branches (add depth 1)
+
+authorityDiffShapeOk : (a: SetExpr) -> (b: SetExpr) -> (depth: Number) -> Boolean
+authorityDiffShapeOk a b depth =
+  if scalarSetShapeOk a (add depth 1)
+  then authorityDiffRightShapeOk b (add depth 1)
+  else false
+
+authorityDiffRightShapeOk : (right: SetExpr) -> (depth: Number) -> Boolean
+authorityDiffRightShapeOk right depth = case right of
+  SeComplement { inner = i } -> scalarSetShapeOk i (add depth 1)
+  _ -> scalarSetShapeOk right depth
+
+authorityBranchShapesOk : (branches: List SetExpr) -> (depth: Number) -> Boolean
+authorityBranchShapesOk branches depth =
+  case head branches of
+    Nothing -> true
+    Just first -> authorityBranchShapesStep branches first depth
+
+authorityBranchShapesStep : (branches: List SetExpr) -> (first: SetExpr) -> (depth: Number) -> Boolean
+authorityBranchShapesStep branches first depth =
+  if scalarSetShapeOk first depth
+  then authorityBranchShapesRest branches depth
+  else false
+
+authorityBranchShapesRest : (branches: List SetExpr) -> (depth: Number) -> Boolean
+authorityBranchShapesRest branches depth =
+  case tail branches of
+    Nothing -> true
+    Just rest -> authorityBranchShapesOk rest depth
+
+@label "authority: scalarSetOk"
+@description "The admission predicate for the closed positive scalar fragment. Refuses every spelling of the universe — SeAll, the empty SeIntersect, and the doubly-unbounded SeInterval — and every registry-dependent or undecidable former. SeComplement is admitted only as a SeDiff subtrahend, where A minus NOT-B reduces to A intersect B and therefore stays bounded by A."
+@tags "authority" "rights" "admission" "fragment"
+scalarSetOk : (set: SetExpr) -> (depth: Number) -> Boolean
+scalarSetOk set depth =
+  if gt depth 8
+  then false
+  else authoritySetOkAtDepth set depth
+
+authoritySetOkAtDepth : (set: SetExpr) -> (depth: Number) -> Boolean
+authoritySetOkAtDepth set depth = case set of
+  SeNone -> true
+  SeEnum { values = vs } -> authorityEnumOk vs
+  SeInterval { interval = iv } -> authorityIntervalOk iv
+  SeUnion { branches = bs } -> authorityBranchesOk bs (add depth 1)
+  SeIntersect { branches = bs } -> authorityIntersectOk bs depth
+  SeDiff { left = a, right = b } -> authorityDiffOk a b depth
+  _ -> false
+
+-- The EMPTY intersect is the universe under the decider's own mEvery identity
+-- (setAlgebraContainsIntersect returns Just true for no branches), so it is
+-- refused here exactly as SeAll is.
+authorityIntersectOk : (branches: List SetExpr) -> (depth: Number) -> Boolean
+authorityIntersectOk branches depth =
+  if eq (length branches) 0
+  then false
+  else authorityBranchesOk branches (add depth 1)
+
+authorityDiffOk : (a: SetExpr) -> (b: SetExpr) -> (depth: Number) -> Boolean
+authorityDiffOk a b depth =
+  if scalarSetOk a (add depth 1)
+  then authorityDiffRightOk b (add depth 1)
+  else false
+
+-- The ONE place a complement is admitted. A minus NOT-B is A intersect B: still
+-- bounded by A, so no double negative can widen a positive envelope.
+authorityDiffRightOk : (right: SetExpr) -> (depth: Number) -> Boolean
+authorityDiffRightOk right depth = case right of
+  SeComplement { inner = i } -> scalarSetOk i (add depth 1)
+  _ -> scalarSetOk right depth
+
+authorityBranchesOk : (branches: List SetExpr) -> (depth: Number) -> Boolean
+authorityBranchesOk branches depth =
+  case head branches of
+    Nothing -> true
+    Just first -> authorityBranchesStep branches first depth
+
+authorityBranchesStep : (branches: List SetExpr) -> (first: SetExpr) -> (depth: Number) -> Boolean
+authorityBranchesStep branches first depth =
+  if scalarSetOk first depth
+  then authorityBranchesRest branches depth
+  else false
+
+authorityBranchesRest : (branches: List SetExpr) -> (depth: Number) -> Boolean
+authorityBranchesRest branches depth =
+  case tail branches of
+    Nothing -> true
+    Just rest -> authorityBranchesOk rest depth
+
+-- ⚠ `values` MUST BE A LIST, and the check is not decoration. A STRING passed
+-- here reaches `all` as an empty array (`toArr` yields `[]`), so the scalar
+-- check is vacuously true — and the host `elem` does SUBSTRING search on a
+-- string haystack, so `SeEnum { values = "state.list_instances_by_name" }`
+-- would permit `state.list_instances`, and `""` would permit everything.
+-- An empty enum is legal (it denotes ∅); a non-list is not.
+authorityEnumOk : (values: List Any) -> Boolean
+authorityEnumOk values =
+  if isString values
+  then false
+  else authorityEnumListOk values
+
+-- ⚠ THE CARDINALITY CAP IS A DoS BOUND, NOT A PRODUCT BOUND, and the first
+-- number chosen was the wrong kind. The member envelope is ONE `SeEnum` over
+-- EVERY descriptor the registry exposes — 1714 of them at the time this was
+-- written — so a 4096 cap put a total outage roughly 2400 functions away, and
+-- its failure mode is `mintAuthority` throwing on every request. The real cost
+-- of a large enum is one host `includes` per perform, which is microseconds at
+-- any of these sizes; the depth cap (8) is what bounds the RECURSION.
+authorityEnumListOk : (values: List Any) -> Boolean
+authorityEnumListOk values =
+  if gt (length values) 65536
+  then false
+  else all values authorityScalarOk
+
+authorityScalarOk : (x: Any) -> Boolean
+authorityScalarOk x =
+  if isString x
+  then lte (length x) 256
+  else if isNumber x
+  then authorityFiniteNumber x
+  else isBoolean x
+
+-- Finite: not NaN (`eq x x` is false only for NaN) and within plus or minus
+-- Number.MAX_VALUE, which excludes both infinities.
+-- ⚠ THE LOWER BOUND IS WRITTEN AS A SUBTRACTION ON PURPOSE. Spelled
+-- `gte x -1.7976931348623157e308`, BOTH parsers lower it as
+-- `sub (gte x) 1.79e308` — the leading minus binds as an infix operator, not as
+-- a negative literal — which made the whole clause dead code and admitted
+-- `-Infinity` as a "finite" number. A parser-parity check does not catch this:
+-- both parsers agree, and they agree on the WRONG lowering. Keep the explicit
+-- `sub 0 …` form, or re-measure before changing it.
+authorityFiniteNumber : (x: Any) -> Boolean
+authorityFiniteNumber x =
+  if eq x x
+  then authorityWithinFiniteRange x
+  else false
+
+authorityWithinFiniteRange : (x: Any) -> Boolean
+authorityWithinFiniteRange x =
+  let lowest = sub 0 1.7976931348623157e308
+  if lte x 1.7976931348623157e308
+  then gte x lowest
+  else false
+
+-- At least one bound, both (when present) of ONE scalar kind. A doubly
+-- unbounded interval is the universe of its kind and is refused for the same
+-- reason SeAll is.
+authorityIntervalOk : (iv: Any) -> Boolean
+authorityIntervalOk iv =
+  if and (authorityMaybeBoundOk iv.lo) (authorityMaybeBoundOk iv.hi)
+  then authorityIntervalBoundedOk iv
+  else false
+
+-- ⚠ BOTH BOUNDS ARE REQUIRED, not "at least one". A half-open interval is the
+-- universe of its kind whenever the present bound is the kind's extreme:
+-- `lo = Just {"" , inclusive}` with no `hi` denotes EVERY string, which is a
+-- spelling of ⊤ that a `SeAll` check and an "at least one bound" check both
+-- miss. Requiring both closes it without a value-level special case. The cost
+-- is that a genuinely half-open range must be written with the kind's extreme
+-- as its other bound — R2b can revisit that with a real reason to.
+authorityIntervalBoundedOk : (iv: Any) -> Boolean
+authorityIntervalBoundedOk iv =
+  if or (authorityBoundAbsent iv.lo) (authorityBoundAbsent iv.hi)
+  then false
+  else authorityBoundsSameKind iv.lo iv.hi
+
+authorityMaybeBoundOk : (mb: Any) -> Boolean
+authorityMaybeBoundOk mb = case mb of
+  Nothing -> true
+  Just b -> authorityBoundOk b
+  _ -> false
+
+authorityBoundAbsent : (mb: Any) -> Boolean
+authorityBoundAbsent mb = case mb of
+  Nothing -> true
+  _ -> false
+
+authorityBoundsSameKind : (lo: Any) -> (hi: Any) -> Boolean
+authorityBoundsSameKind lo hi = case lo of
+  Just l -> authorityBoundsSameKindRight l hi
+  _ -> true
+
+authorityBoundsSameKindRight : (l: Any) -> (hi: Any) -> Boolean
+authorityBoundsSameKindRight l hi = case hi of
+  Just h -> authoritySameKind l.value h.value
+  _ -> true
+
+authorityBoundOk : (b: Any) -> Boolean
+authorityBoundOk b =
+  if isBoolean b.inclusive
+  then authorityBoundValueOk b.value
+  else false
+
+authorityBoundValueOk : (v: Any) -> Boolean
+authorityBoundValueOk v =
+  if isNumber v
+  then authorityFiniteNumber v
+  else if isString v
+  then lte (length v) 256
+  else false
+
+authoritySameKind : (a: Any) -> (b: Any) -> Boolean
+authoritySameKind a b =
+  if and (isNumber a) (isNumber b)
+  then true
+  else and (isString a) (isString b)
+
+-- =========================================================================
+-- envelopeWellFormed — the mint-time fence (names the reason)
+-- =========================================================================
+
+@label "authority: envelopeWellFormed"
+@description "The mint-time admission fence. Nothing means well-formed; Just reason names the first violation. Structural caps: 256 rows, 32 axes per row, 4096 total nodes, plus scalarSetOk on every set."
+@tags "authority" "rights" "admission" "mint"
+envelopeWellFormed : (envelope: Envelope) -> Maybe String
+envelopeWellFormed envelope = case envelope of
+  EvTop -> Nothing
+  EvRows { rows = rs } -> authorityEnvelopeRowsOk rs
+  _ -> Just "value is not an Envelope"
+
+authorityEnvelopeRowsOk : (rows: List ActRow) -> Maybe String
+authorityEnvelopeRowsOk rows =
+  if gt (length rows) 256
+  then Just "envelope has more than 256 rows"
+  else authorityRowsWellFormed rows rows
+
+authorityRowsWellFormed : (rows: List ActRow) -> (allRows: List ActRow) -> Maybe String
+authorityRowsWellFormed rows allRows =
+  case head rows of
+    Nothing -> authorityNodeBudgetOk allRows
+    Just row -> authorityRowsStep rows allRows row
+
+authorityRowsStep : (rows: List ActRow) -> (allRows: List ActRow) -> (row: ActRow) -> Maybe String
+authorityRowsStep rows allRows row =
+  let bad = authorityRowWellFormed row
+  case bad of
+    Just reason -> Just reason
+    Nothing -> authorityRowsRest rows allRows
+
+authorityRowsRest : (rows: List ActRow) -> (allRows: List ActRow) -> Maybe String
+authorityRowsRest rows allRows =
+  case tail rows of
+    Nothing -> authorityNodeBudgetOk allRows
+    Just rest -> authorityRowsWellFormed rest allRows
+
+authorityRowWellFormed : (row: ActRow) -> Maybe String
+authorityRowWellFormed row =
+  if not (scalarSetOk row.descriptors 0)
+  then Just "row descriptor set is outside the admitted scalar fragment"
+  else authorityRowAxesWellFormed row
+
+authorityRowAxesWellFormed : (row: ActRow) -> Maybe String
+authorityRowAxesWellFormed row =
+  if gt (length row.args) 32
+  then Just "row has more than 32 argument axes"
+  else authorityAxesWellFormed row.args
+
+authorityAxesWellFormed : (axes: List ArgAxis) -> Maybe String
+authorityAxesWellFormed axes =
+  case head axes of
+    Nothing -> Nothing
+    Just axis -> authorityAxesStep axes axis
+
+authorityAxesStep : (axes: List ArgAxis) -> (axis: ArgAxis) -> Maybe String
+authorityAxesStep axes axis =
+  let bad = authorityAxisWellFormed axis
+  case bad of
+    Just reason -> Just reason
+    Nothing -> authorityAxesRest axes
+
+authorityAxesRest : (axes: List ArgAxis) -> Maybe String
+authorityAxesRest axes =
+  case tail axes of
+    Nothing -> Nothing
+    Just rest -> authorityAxesWellFormed rest
+
+authorityAxisWellFormed : (axis: ArgAxis) -> Maybe String
+authorityAxisWellFormed axis = case axis of
+  ArgAny -> Nothing
+  ArgValue { set = s } -> authorityAxisSetWellFormed s "argument axis set is outside the admitted scalar fragment"
+  ArgField { name = n, set = s } -> authorityFieldAxisWellFormed n s
+  ArgRecord { fields = fs } -> authorityRecordAxisWellFormed fs
+  _ -> Just "value is not an ArgAxis"
+
+-- Non-empty, at most 32 entries, every name non-empty and DISTINCT, every set
+-- inside the admitted fragment. The empty list is refused because it denotes
+-- "no restriction", which ArgAny already spells; admitting both would give one
+-- envelope two readings. Duplicates are refused because the entries are
+-- conjoined, so a duplicate name makes one of the two silently redundant.
+authorityRecordAxisWellFormed : (axes: List FieldAxis) -> Maybe String
+authorityRecordAxisWellFormed axes =
+  if eq (length axes) 0
+  then Just "record axis has no field axes"
+  else authorityRecordAxisLimits axes
+
+authorityRecordAxisLimits : (axes: List FieldAxis) -> Maybe String
+authorityRecordAxisLimits axes =
+  if gt (length axes) 32
+  then Just "record axis has more than 32 field axes"
+  else authorityRecordFieldsWellFormed axes axes
+
+authorityRecordFieldsWellFormed : (axes: List FieldAxis) -> (allAxes: List FieldAxis) -> Maybe String
+authorityRecordFieldsWellFormed axes allAxes =
+  case head axes of
+    Nothing -> Nothing
+    Just f -> authorityRecordFieldsStep axes allAxes f
+
+authorityRecordFieldsStep : (axes: List FieldAxis) -> (allAxes: List FieldAxis) -> (f: FieldAxis) -> Maybe String
+authorityRecordFieldsStep axes allAxes f =
+  let bad = authorityFieldAxisWellFormed f.name f.set
+  case bad of
+    Just reason -> Just reason
+    Nothing -> authorityRecordFieldsDistinct axes allAxes f
+
+authorityRecordFieldsDistinct : (axes: List FieldAxis) -> (allAxes: List FieldAxis) -> (f: FieldAxis) -> Maybe String
+authorityRecordFieldsDistinct axes allAxes f =
+  if gt (length (filter (\x -> eq x.name f.name) allAxes)) 1
+  then Just "record axis has duplicate field names"
+  else authorityRecordFieldsRest axes allAxes
+
+authorityRecordFieldsRest : (axes: List FieldAxis) -> (allAxes: List FieldAxis) -> Maybe String
+authorityRecordFieldsRest axes allAxes =
+  case tail axes of
+    Nothing -> Nothing
+    Just rest -> authorityRecordFieldsWellFormed rest allAxes
+
+authorityAxisSetWellFormed : (s: SetExpr) -> (reason: String) -> Maybe String
+authorityAxisSetWellFormed s reason =
+  if scalarSetOk s 0 then Nothing else Just reason
+
+authorityFieldAxisWellFormed : (n: String) -> (s: SetExpr) -> Maybe String
+authorityFieldAxisWellFormed n s =
+  if eq (length n) 0
+  then Just "field axis has an empty field name"
+  else authorityAxisSetWellFormed s "field axis set is outside the admitted scalar fragment"
+
+-- The node budget runs LAST, after every set is known admitted, so the count
+-- itself is a bounded walk (depth at most 8, enum at most 4096 per leaf).
+-- Same correction as the cardinality cap: the budget bounds a hostile envelope,
+-- and the member envelope is a legitimate one whose size tracks the registry.
+authorityNodeBudgetOk : (rows: List ActRow) -> Maybe String
+authorityNodeBudgetOk rows =
+  if gt (authorityRowsNodes rows) 262144
+  then Just "envelope exceeds the 262144-node budget"
+  else Nothing
+
+authorityRowsNodes : (rows: List ActRow) -> Number
+authorityRowsNodes rows =
+  case head rows of
+    Nothing -> 0
+    Just row -> authorityRowsNodesStep rows row
+
+authorityRowsNodesStep : (rows: List ActRow) -> (row: ActRow) -> Number
+authorityRowsNodesStep rows row =
+  let mine = add 1 (add (authoritySetNodes row.descriptors) (authorityAxesNodes row.args))
+  case tail rows of
+    Nothing -> mine
+    Just rest -> add mine (authorityRowsNodes rest)
+
+authorityAxesNodes : (axes: List ArgAxis) -> Number
+authorityAxesNodes axes =
+  case head axes of
+    Nothing -> 0
+    Just axis -> authorityAxesNodesStep axes axis
+
+authorityAxesNodesStep : (axes: List ArgAxis) -> (axis: ArgAxis) -> Number
+authorityAxesNodesStep axes axis =
+  let mine = authorityAxisNodes axis
+  case tail axes of
+    Nothing -> mine
+    Just rest -> add mine (authorityAxesNodes rest)
+
+authorityAxisNodes : (axis: ArgAxis) -> Number
+authorityAxisNodes axis = case axis of
+  ArgAny -> 1
+  ArgValue { set = s } -> add 1 (authoritySetNodes s)
+  ArgField { set = s } -> add 1 (authoritySetNodes s)
+  ArgRecord { fields = fs } -> add 1 (authorityFieldAxesNodes fs)
+  _ -> 1
+
+authorityFieldAxesNodes : (axes: List FieldAxis) -> Number
+authorityFieldAxesNodes axes =
+  case head axes of
+    Nothing -> 0
+    Just f -> authorityFieldAxesNodesStep axes f
+
+authorityFieldAxesNodesStep : (axes: List FieldAxis) -> (f: FieldAxis) -> Number
+authorityFieldAxesNodesStep axes f =
+  let mine = add 1 (authoritySetNodes f.set)
+  case tail axes of
+    Nothing -> mine
+    Just rest -> add mine (authorityFieldAxesNodes rest)
+
+authoritySetNodes : (set: SetExpr) -> Number
+authoritySetNodes set = case set of
+  SeEnum { values = vs } -> add 1 (length vs)
+  SeUnion { branches = bs } -> add 1 (authorityBranchesNodes bs)
+  SeIntersect { branches = bs } -> add 1 (authorityBranchesNodes bs)
+  SeDiff { left = a, right = b } -> add 1 (add (authoritySetNodes a) (authoritySetNodes b))
+  SeComplement { inner = i } -> add 1 (authoritySetNodes i)
+  _ -> 1
+
+authorityBranchesNodes : (branches: List SetExpr) -> Number
+authorityBranchesNodes branches =
+  case head branches of
+    Nothing -> 0
+    Just first -> authorityBranchesNodesStep branches first
+
+authorityBranchesNodesStep : (branches: List SetExpr) -> (first: SetExpr) -> Number
+authorityBranchesNodesStep branches first =
+  let mine = authoritySetNodes first
+  case tail branches of
+    Nothing -> mine
+    Just rest -> add mine (authorityBranchesNodes rest)
+
+-- =========================================================================
+-- The envelopes this phase ships
+--
+-- Every one of these is a UNIT-PARAMETER function, never a nullary def — see
+-- the header. They are called by the TypeScript mint seam through
+-- `evaluateAuthorityFunction`, and by each other BY CALL.
+-- =========================================================================
+
+@label "authority: topIssuerRefusalReason"
+@description "The ISSUER half of the mint fence, on its own. The host memoises the STRUCTURAL half on the envelope value (it is a question about an immutable structure, with no act, no frame and no time in it) and re-asks this one every mint, because who may hold an envelope is a question about the CALLER and caching it would be a caller-keyed decision cache."
+@tags "authority" "rights" "admission" "mint"
+topIssuerRefusalReason : (envelope: Envelope) -> (issuer: String) -> Maybe String
+topIssuerRefusalReason envelope issuer = authorityTopIssuerOk envelope issuer
+
+@label "authority: mintRefusalReason"
+@description "THE mint-time fence, complete: structural well-formedness plus the issuer rule for EvTop. Nothing means the mint may proceed; Just reason names the refusal. The host mint makes exactly one call here and branches only on Just-versus-Nothing, so no policy rule about who may hold what is spelled in TypeScript."
+@tags "authority" "rights" "admission" "mint"
+mintRefusalReason : (envelope: Envelope) -> (issuer: String) -> Maybe String
+mintRefusalReason envelope issuer =
+  let structural = envelopeWellFormed envelope
+  case structural of
+    Just reason -> Just reason
+    Nothing -> authorityTopIssuerOk envelope issuer
+
+-- EvTop is the universe. Exactly one issuer may hold it, and rights R4 retires
+-- that one too.
+authorityTopIssuerOk : (envelope: Envelope) -> (issuer: String) -> Maybe String
+authorityTopIssuerOk envelope issuer = case envelope of
+  EvTop -> authorityBootstrapIssuerOnly issuer
+  _ -> Nothing
+
+authorityBootstrapIssuerOnly : (issuer: String) -> Maybe String
+authorityBootstrapIssuerOnly issuer =
+  if eq issuer "registry-bootstrap"
+  then Nothing
+  else Just "the Top envelope may be minted only by the registry-bootstrap issuer"
+
+@label "authority: knownRoles"
+@description "The built-in role names a membership row may carry. An unknown role denotes the EMPTY envelope (ledger au.policy.role.unknown), so a row whose role is not here mints successfully and refuses every act. Per-account custom policies are rights R9."
+@tags "authority" "rights" "policy"
+knownRoles : (unit: Any) -> List String
+knownRoles unit = ["owner", "member", "viewer", "personal"]
+
+@label "authority: sessionLeafDescriptors"
+@description "THE SESSION AND PASSWORD LEAVES - the acts that mint sessions, read users by email, write password hashes and list a user's memberships across accounts. They are in NO account envelope, at any role, and they additionally keep R1's privileged-realm bit at the leaf (rights R2b ruling 5: the realm bit stays where there is no product reason for any frame but the login chain to reach it). The runtime state handlers assert set-equality with this list at REGISTRATION time and in BOTH directions."
+@tags "authority" "rights" "identity"
+-- ⚠ ONE SPELLING (rights R2b). R2a carried BOTH the dotted `@ioAction` and the
+-- colon function id for every leaf, because `listPerformDescriptors` returned
+-- both and an exclusion list holding one left the other inside the member
+-- envelope. That was the phase's most serious defect and it survived two review
+-- rounds. Canonical acts retire the dual spelling at the source: the function
+-- id is the implementation-bearing name, the dotted action is an alias, and
+-- `perform` canonicalises the requested descriptor BEFORE judging it. A dotted
+-- spelling appearing anywhere in this module is now an audit finding
+-- (`descriptor-canonical`).
+sessionLeafDescriptors : (unit: Any) -> List String
+sessionLeafDescriptors unit = ["state:createSession", "state:getSessionByHash", "state:touchSession", "state:deleteSessionByHash", "state:getUserByEmail", "state:getOrCreateUserByEmail", "state:setUserPasswordHash", "state:listUserMemberships", "state:ensurePersonalAccount"]
+
+@label "authority: membershipLeafDescriptors"
+@description "INTRODUCING AUTHORITY - the acts that create, re-role and remove a membership. Present ONLY in the owner envelope, argued there on the account, and on the ROLE wherever the act carries one. A member's body that reaches one of these is refused at the gate. DERIVED from the two row sets below rather than written out, so the general row's exclusion is their union by construction."
+@tags "authority" "rights" "grant"
+-- ⚠ DERIVED, AND THAT IS LOAD-BEARING. This list feeds the GENERAL row's
+-- exclusion. If it were written out independently of the two row sets, a leaf
+-- added to one row and forgotten here would land in the general row for EVERY
+-- role, with no axis at all — a silent widening, by the same arithmetic that
+-- makes rows a Kleene OR. Deriving it makes "excluded from general" and "in
+-- exactly one membership row" one fact.
+membershipLeafDescriptors : (unit: Any) -> List String
+membershipLeafDescriptors unit = concat (membershipRoleArguedDescriptors 0) (membershipDeleteDescriptors 0)
+
+@label "authority: membershipRoleArguedDescriptors"
+@description "The membership writes that CARRY a role, and are therefore argued on it: create and re-role. Split from the delete leaf because an axis on a field the act does not carry REFUSES (au.mem.axis.field) - the act's silence does not satisfy a restriction."
+@tags "authority" "rights" "grant"
+membershipRoleArguedDescriptors : (unit: Any) -> List String
+membershipRoleArguedDescriptors unit = ["state:createMembership", "state:setMembershipRole"]
+
+@label "authority: membershipDeleteDescriptors"
+@description "The membership write that carries NO role. Argued on the account alone. ⚠ Its descriptor set must stay DISJOINT from membershipRoleArguedDescriptors: rows are a Kleene OR, so a descriptor appearing in both rows would take the union of their restrictions and the role axis would be bypassed."
+@tags "authority" "rights" "grant"
+membershipDeleteDescriptors : (unit: Any) -> List String
+membershipDeleteDescriptors unit = ["state:deleteMembership"]
+
+@label "authority: membershipReadDescriptors"
+@description "Reading the member roster. Every role may, argued on the account: a roster is not a secret and the row carries no hash. Deliberately NOT in the write family - reading whether a membership exists is an ordinary authorization input, not an identity mutation."
+@tags "authority" "rights" "grant"
+membershipReadDescriptors : (unit: Any) -> List String
+membershipReadDescriptors unit = ["state:getMembership", "state:listAccountMembers"]
+
+-- Locus editing is a narrow write family over the existing state leaves.
+-- Every role's general row excludes it. Owner/member receive it explicitly;
+-- a viewer keeps the root/list/saved-query reads and receives none of these
+-- writes. This does not classify unrelated state or network leaves by role.
+
+@label "authority: locusRootWriteDescriptors"
+@description "The explicit root writer. Its id argument is the account root identity, so the granted row constrains that exact field to the authenticated account."
+@tags "authority" "rights" "locus"
+locusRootWriteDescriptors : (unit: Any) -> List String
+locusRootWriteDescriptors unit = ["state:editLocusRoot"]
+
+@label "authority: locusAmbientWriteDescriptors"
+@description "Locus-list and saved-expression mutations whose handlers derive their partition from the authenticated account. Includes the retained pinToView alias, which now appends ordinary root data."
+@tags "authority" "rights" "locus"
+locusAmbientWriteDescriptors : (unit: Any) -> List String
+locusAmbientWriteDescriptors unit = ["state:clearAllActiveLocusViews", "state:createLocusView", "state:updateLocusView", "state:deleteLocusViewById", "state:promoteOldestLocusView", "state:pinToView", "state:createSavedQuery", "state:updateSavedQuery", "state:deleteSavedQuery"]
+
+@label "authority: locusWriteDescriptors"
+@description "The complete narrow locus-write family, derived from its argued-root and ambient-account subfamilies. Excluded from every general row and absent from viewer authority."
+@tags "authority" "rights" "locus"
+locusWriteDescriptors : (unit: Any) -> List String
+locusWriteDescriptors unit = concat (locusRootWriteDescriptors 0) (locusAmbientWriteDescriptors 0)
+
+@label "authority: accountArguedStateDescriptors"
+@description "The `state` module's HasStateIO natives that take an account id and query it DIRECTLY, without passing through a `storage:` leaf. They are partitioned on the same axis and by the same rule as the storage rows; they are not storage acts, so nothing else would have caught them. Every role reads them - the partition is the only restriction this row adds, because the general row it replaces had none."
+@tags "authority" "rights" "partition"
+-- ⚠ WHY THIS LIST EXISTS SEPARATELY FROM THE STORAGE INDEX, and how to keep it
+-- honest. The storage index is DERIVED (the `storage` module's own
+-- HasStateIO-carrying members), so it cannot go stale. This one is AUTHORED, and
+-- an authored list is a list that rots — so it is pinned to a MEASUREMENT rather
+-- than to itself: `rights-r2b-partition.test.ts` walks every module's functions,
+-- selects the bodiless HasStateIO natives outside `storage` whose first declared
+-- parameter is named `accountId`, and asserts set-equality with this list. A new
+-- leaf of that shape makes the pin RED instead of silently landing in the general
+-- row.
+--
+-- The measured escalation this closes (review round 3): a `viewer` of account A,
+-- arguing account B, was permitted `state:getProfileHandles`,
+-- `state:findBotIdForAccount`, `state:findInventoryBySlug` and
+-- `state:getInventoryStatus` — all four `Just true` — while the control
+-- `storage:dbLoad(B)` was `Just false`. The leaves predate rights R2b; the
+-- general row that made them reachable with no axis does not.
+--
+-- ⚠ THREE ACTS OF THIS SHAPE ARE NOT HERE AND CANNOT BE, and the first draft of
+-- this comment said ONE (review round 4). Each argues an account by SLUG, and an
+-- axis over account UUIDs cannot express that — the mint holds the uuid and
+-- nothing else:
+--
+--   · state:findProxyLinkByAccountSlugAndTag  (accountSlug, tag)
+--   · state:getPageBySlug                     (accountSlug, pageSlug)
+--   · state:findAccountBySlug                 (slug)
+--
+-- All three join `accounts` on a caller-supplied handle and all three sit in the
+-- general row: measured, a `viewer` of account A is permitted every one of them
+-- against a foreign slug. The first two return data that is already served
+-- anonymously (a published page, a public redirect target); `findAccountBySlug`
+-- returns the whole `accounts` row including its free-form `config`. No Fenel
+-- body calls any of them today. Giving them a uuid parameter they do not use
+-- would be worse than leaving them declared: the gate would then constrain a
+-- value the handler never reads, which is the property `au.policy.partition`
+-- rests on.
+--
+-- ⚠ AND THE PIN'S WALK CANNOT SEE THAT SHAPE. It selects on the first parameter
+-- being NAMED `accountId`, so `accountSlug` — and, for `findAccountBySlug`, plain
+-- `slug` — is invisible to it. A fourth account-slug-argued leaf would land in the
+-- general row with the walk green. The guard is a SECOND pin that enumerates every
+-- slug-first `HasStateIO` leaf and classifies each as account-handle-argued (these
+-- three), ambient-scoped (`findItemBySlug` / `findPlanBySlug` read `ctx.accountId`,
+-- so the FRAME decides the account and there is nothing to argue) or not an account
+-- handle at all.
+--
+-- ⚠ ONE FURTHER SHAPE IS NOT INVENTORIED AND IS NOT CLAIMED TO BE: a leaf with NO
+-- account handle in its arguments. `state:findSubscriptionBySlug` reads globally by
+-- slug. That is a different question from the partition axis — an act that argues
+-- no account cannot be judged on one — and it is R3's.
+--
+-- ⚠ THEY ARE JUDGED ON `accountId` AS A FIELD, not positionally, because each
+-- carries an `@ioAction` and is therefore performed under the IO calling
+-- convention — the params RECORD lands in argument slot 0. That is the same
+-- reason `authorityMembershipReadRows` uses the record axes and the storage rows
+-- use the positional ones; the axis follows the CALLING CONVENTION, never the
+-- module name.
+accountArguedStateDescriptors : (unit: Any) -> List String
+accountArguedStateDescriptors unit = ["state:getProfileHandles", "state:findBotIdForAccount", "state:findInventoryBySlug", "state:getInventoryStatus"]
+
+@label "authority: discoveryDescriptors"
+@description "THE DISCOVERY FAMILY - the leaves that return AUTHENTICATION MATERIAL and argue no account at all. They are in NO role's envelope, at any role, and appear only in the acquisition envelope an ingress door holds while it is finding the row it is about to verify against. An act that argues no account cannot be judged on one, so this needs a FENCE and not an axis."
+@tags "authority" "rights" "discovery" "acquisition"
+-- ⚠ THE SHAPE `authority.fenel` PREDICTED AND THEN LOST. The comment on
+-- `accountArguedStateDescriptors` above says, in its own words: "ONE FURTHER
+-- SHAPE IS NOT INVENTORIED AND IS NOT CLAIMED TO BE: a leaf with NO account
+-- handle in its arguments. `state:findSubscriptionBySlug` reads globally by
+-- slug. That is a different question from the partition axis ... and it is R3's."
+-- R3 was then split into R3a (registry partition) and R3b (facts), and the class
+-- went with NEITHER. This list is that note, re-homed. The reusable lesson: when
+-- a phase is split, its unowned notes are the first thing to re-home.
+--
+-- WHAT WAS MEASURED (rights R4a §0.1): a probe using the production registry,
+-- the real `mintRequestAuthority` and this very checker returned `Just true` for
+-- BOTH `member` and `viewer` on the first three, with FOREIGN resource ids —
+-- and the dashboard invoke route supplies ordinary request authority, so it was
+-- one authenticated HTTP call away for any member of any account.
+--
+--   · state:findIntegrationByIdAndType  selects integration CREDENTIALS with
+--     no requesting-account predicate
+--   · state:findBotByIdGlobal           returns the global bot row: token and
+--     webhook secret included
+--   · state:findSubscriptionBySlug      returns the complete subscription row,
+--     secret included
+--   · state:findAccountBySlug           returns the complete foreign `accounts`
+--     row including its free-form `config`
+--
+-- ⚠ THE FOURTH IS HERE ON A DIFFERENT GROUND, and the difference must not be
+-- blurred. It is NOT established that a current `accounts.config` value holds a
+-- credential, and this module does not claim it does; what it exposes is a
+-- foreign account's arbitrary private configuration. Its only production
+-- consumer is receipt discovery, so moving it under acquisition is coherent.
+--
+-- ⚠ THREE ALTERNATIVES WERE CONSIDERED AND REJECTED — do not re-propose them.
+-- An ARGUED-ACCOUNT AXIS cannot apply: these acts argue no account BY DESIGN,
+-- which is exactly what the note above says. A LEAF PROJECTION cannot apply:
+-- discovery needs the secret in order to verify against it. A
+-- TRUSTED-VS-PRODUCT SPLIT INSIDE THE TS LEAF would be a branch on issuer in the
+-- host, which this arc forbids.
+--
+-- ⚠ AND THE CENSUS IS RE-DERIVED INDEPENDENTLY BY THE PIN, not inherited from
+-- this list — otherwise removing a descriptor here would also remove its test
+-- case. The independent instrument scans handler projections for a
+-- secret-bearing carrier (`integrations.credentials`, `subscriptions.secret`,
+-- `users.password_hash`, `sessions.token_hash`, and the bot token/webhook secret
+-- inside an `entity_instances.data` blob) and reports which of those handlers
+-- carry NO account coordinate. It found exactly these three plus the session and
+-- password leaves, which are already fenced by `sessionLeafDescriptors`. No
+-- fifth direct, global, previously-unfenced credential reader exists.
+discoveryDescriptors : (unit: Any) -> List String
+discoveryDescriptors unit = ["state:findIntegrationByIdAndType", "state:findBotByIdGlobal", "state:findSubscriptionBySlug", "state:findAccountBySlug"]
+
+@label "authority: outboundFetchDescriptors"
+@description "THE OUTBOUND-TRANSPORT FAMILY - leaves whose whole job is to issue an HTTP request to a URL the CALLER names, with no format constraint on that URL. They are in NO role envelope and appear only in the acquisition envelope, where the caller is an ingress door and the URL came from a signed envelope the verifier has already constrained."
+@tags "authority" "rights" "acquisition" "outbound"
+-- WARNING: THIS FAMILY EXISTS BECAUSE R4a C1a CREATED THE HOLE IT CLOSES, and
+-- saying that plainly is the point. Bringing the two SNS transports under
+-- `perform` made them DESCRIPTORS, and a new descriptor lands in the POSITIVE
+-- GENERAL ROW for every role by construction - so `owner`, `member` AND `viewer`
+-- each gained an unconstrained URL fetch. Found by adversarial review, not by
+-- the gate, and it is the exact shape brief 4.3 warns about from the other
+-- direction: a fence that relocates a capability has to relocate ALL of it.
+--
+-- The scenario, concretely: a `viewer` posts to the dashboard invoke route with
+-- `emailWebhooks:snsFetchSigningCertificate` and
+-- `http://169.254.169.254/latest/meta-data/iam/security-credentials/`. The act
+-- is a bodiless native with an `@ioAction`, so the invoke door answers
+-- `OneShotRun`; the general row admits it; the leaf fetches and returns up to
+-- 16 KiB of the response body. The confirm leaf is the same caller blind GET.
+--
+-- AND THE COMPARISON THAT MAKES IT A REGRESSION RATHER THAN A RELOCATION: the
+-- only other general-row HTTP leaf, `http_request`, enforces the
+-- `web+secure+noprivate` URL format on the first hop AND on the redirect target.
+-- These two enforce nothing - the URL constraint lives in the api verifier
+-- (the regional-endpoint check and `snsSubscriptionUrl`), which is exactly the
+-- part that did NOT move. So the transport belongs to the realm whose caller has
+-- already been through that constraint, and nowhere else.
+outboundFetchDescriptors : (unit: Any) -> List String
+outboundFetchDescriptors unit = ["emailWebhooks:snsFetchSigningCertificate", "emailWebhooks:snsConfirmSubscription"]
+
+@label "authority: acquisitionDescriptors"
+@description "THE ACQUISITION REALM'S ADMITTED CALL SET - everything an ingress door may perform BEFORE it knows which account it is acting for, and therefore before it can mint a product grant. Discovery, the public-surface reads, the published-form type resolution, the verify leaves and the pure formatters. Nothing else, and in particular no storage WRITE: the storage row this envelope carries is restricted to `storageReadMethods`."
+@tags "authority" "rights" "acquisition"
+-- ⚠ MEASURED, NOT DECLARED. A descriptor belongs here iff ALL THREE hold:
+--   1. an ingress route performs it BEFORE its product-grant mint;
+--   2. it is a read, a verify, or a pure format — its storage method is in
+--      `storageReadMethods`, or it is a requires-free native, or it is a
+--      crypto/verify leaf, or it is a discovery-family member;
+--   3. it argues no account, or it argues the lookup partition.
+-- The pin compares this literal against the set the routes actually reach and
+-- additionally re-checks (2) against the storage index, so adding a write here
+-- is red twice.
+--
+-- ⚠ WHY THERE IS NO "PARTITION-ARGUED" ROW FOR THE FORMS LEAVES. Measured at
+-- HEAD: `types:embedResolve`, `state:getType`, `state:getTypeById`,
+-- `state:listTypes` and `state:listInstancesByName` argue NO account — each
+-- takes a name or an id and reads `ctx.accountId` from the frame. So there is no
+-- argument for an axis to constrain, and the partition narrows where it actually
+-- lives: the leaf CONTEXT the acquisition door supplies. What those five DO
+-- reach is the storage seam (`loadType` / `loadTypeByName` / `list`), and THOSE
+-- descriptors are positionally argued on the account — which is the second row
+-- below, bound to the partition. The partition is a LOOKUP coordinate; the
+-- selection account of an acquisition handle is null.
+--
+-- ⚠ THE MAILGUN AND RESEND VERIFIERS ARE NOT HERE, and their absence is a
+-- measurement rather than an omission: `verifyMailgunSignature` and
+-- `verifyResendSignatureWithBody` are exported TypeScript helpers their routes
+-- call directly. They are not registered descriptors, so they never enter
+-- `perform` and no envelope can name them. That is not a hole — each takes the
+-- secret as an argument and performs nothing.
+acquisitionDescriptors : (unit: Any) -> List String
+acquisitionDescriptors unit = concat (discoveryDescriptors 0) (acquisitionNonDiscoveryDescriptors 0)
+
+-- Split out because `discoveryDescriptors` is ALSO the fenced family, and a
+-- single literal would have to repeat its four members — which is the
+-- "one list, two purposes, they drift" shape `membershipLeafDescriptors`
+-- already avoids by derivation.
+acquisitionNonDiscoveryDescriptors : (unit: Any) -> List String
+acquisitionNonDiscoveryDescriptors unit = concat (acquisitionPublicSurfaceDescriptors 0) (concat (acquisitionFormsDescriptors 0) (acquisitionVerifyDescriptors 0))
+
+-- The two account-handle-argued-BY-SLUG public reads. Both sit in every role's
+-- general row today and both return data already served anonymously (a published
+-- page, a public redirect target); they are named here because an ingress door
+-- reaches them BEFORE it holds any product grant.
+acquisitionPublicSurfaceDescriptors : (unit: Any) -> List String
+acquisitionPublicSurfaceDescriptors unit = ["state:getPageBySlug", "state:findProxyLinkByAccountSlugAndTag"]
+
+-- Published-form discovery. `types:embedResolve` is BODIED, so the acquisition
+-- door must supply an execution identity and not merely a lookup partition —
+-- running it durably would insert a `function_instances` row and a trace under a
+-- principal the request has not yet acquired.
+--
+-- ⚠ `dispatch:listSystemEntities` IS PART OF THIS SET, and it is the member the
+-- brief's candidate list did not have. `resolveType`'s THIRD arm
+-- (`resolveTypeBySystemEntity`, `fenel/modules/types/resolve.fenel`) reads the
+-- compile-time system-entity catalog, and that arm exists precisely because the
+-- live page lane's `profile` typeRef is a system entity rather than a `types`
+-- row — so omitting it 404s every public surface whose slug resolves that way.
+-- It is account-agnostic repository data and argues nothing.
+acquisitionFormsDescriptors : (unit: Any) -> List String
+acquisitionFormsDescriptors unit = concat (acquisitionFormsLeafDescriptors 0) (acquisitionFormsClosureDescriptors 0)
+
+-- The LEAVES the resolver reaches: four `state` natives plus the compile-time
+-- system-entity catalog, and the entry point itself.
+acquisitionFormsLeafDescriptors : (unit: Any) -> List String
+acquisitionFormsLeafDescriptors unit = ["types:embedResolve", "state:getType", "state:getTypeById", "state:listTypes", "state:listInstancesByName", "dispatch:listSystemEntities"]
+
+-- ⚠ THE RESOLVER'S OWN BODIES, AND THEY ARE NOT AN IMPLEMENTATION DETAIL HERE.
+-- `registerFenelBodyDispatchers` registers EVERY bodied function as a perform
+-- descriptor, so each of these is judged on its own name when `embedResolve`
+-- calls it. Naming only the entry point leaves discovery REFUSED at the first
+-- hop -- measured: `types:embedResolve` under the shipped envelope threw
+-- `perform: authority refused "types:resolveType" (refused)`.
+--
+-- ⚠ AND THE SEVEN ARE A UNION OF TWO PATHS, because a single probe finds only
+-- one of them. A slug that MISSES takes the fallback chain
+-- (`resolveTypeByCodeNameOrSystem` -> `resolveTypeByCodeName` ->
+-- `resolveTypeBySystemEntity`); a slug that HITS takes the bind-and-publication
+-- chain (`embedBindById` -> `embedRefuseGrantStore` -> `embedRequirePublication`).
+-- Both were driven against real staging rows -- a published `CFApplication` type
+-- with its `EmbedPublication` -- and this list is their union. The three pure
+-- helpers (`resolveTypeCodeableRow`, `selectResolvedTypeCodeables`,
+-- `sesArnMatches`-style folds) never yield IO and are therefore never gated.
+--
+-- ⚠ A NEW HELPER IN THAT CHAIN BREAKS FORMS SILENTLY, because the route turns
+-- every refusal into one indistinguishable 404. That is correct of the route (the
+-- alternative is an existence oracle for a private schema roster) and it is why
+-- the pin drives the real path rather than reading this list.
+acquisitionFormsClosureDescriptors : (unit: Any) -> List String
+acquisitionFormsClosureDescriptors unit = ["types:resolveType", "types:resolveTypeByCodeNameOrSystem", "types:resolveTypeByCodeName", "types:resolveTypeBySystemEntity", "types:embedBindById", "types:embedRefuseGrantStore", "types:embedRequirePublication"]
+
+-- Verification, the two SNS transports, and pure formatting.
+--
+-- Every verify leaf takes its secret as an ARGUMENT — the row was read by a
+-- discovery leaf above — so none of them reads ambient state.
+--
+-- ⚠ THE TWO SNS LEAVES ARE OUTBOUND, and that is why they are here rather than
+-- merely tolerated. Both were bare `fetch` calls inside `api/src/sns-signature.ts`,
+-- and the first is easy to miss because it lives inside the VERIFIER: a cold
+-- certificate cache makes SNS verification itself reach the network before
+-- anything has been verified. An act that leaves the process must be an act the
+-- gate judged.
+--
+-- `crypto:sha256Hex` and `std:escapeHtml` are pure formatters the public
+-- surfaces reach BEFORE they know an account — the redirect lane hashes a
+-- visitor IP and both the redirect and receipt lanes escape HTML into a 404
+-- page, all on the pre-mint path.
+acquisitionVerifyDescriptors : (unit: Any) -> List String
+acquisitionVerifyDescriptors unit = concat ["crypto:verifyTelegramSecret", "crypto:verifyStripeSignature", "crypto:verifyCalendlySignature", "crypto:sha256Hex", "std:escapeHtml"] (outboundFetchDescriptors 0)
+
+@label "authority: storageReadMethods"
+@description "The StorageHandler methods that only READ. A viewer holds the storage row restricted to these, which is what makes `viewer` a restriction that can be defended: a viewer's body runs, reaches the storage leaf, and is refused THERE, before the database."
+@tags "authority" "rights" "storage"
+storageReadMethods : (unit: Any) -> List String
+storageReadMethods unit = ["load", "list", "loadType", "loadTypeByName"]
+
+@label "authority: storagePositionalMethods"
+@description "The StorageHandler methods whose FIRST positional argument is the account id. They are judged with an ArgValue axis at position 0; `appendEvent` is the one method that argues its account inside a record and gets its own row. A storage method in NEITHER list is in no row at all and is therefore refused, which is the intended failure mode of adding one without deciding how it argues its partition."
+@tags "authority" "rights" "storage"
+storagePositionalMethods : (unit: Any) -> List String
+storagePositionalMethods unit = ["store", "load", "update", "delete", "list", "loadType", "loadTypeByName"]
+
+@label "authority: identityRealmDescriptors"
+@description "The identity realm LEAVES and crypto primitives - the acts that mint sessions, set password hashes and create memberships. The auth module's own descriptors are NOT listed here: `identityRealmEnvelope` selects those from the registry by prefix, because every bodied auth function including the private helpers is a descriptor. Of the membership family this lists createMembership ONLY, which is what the bootstrap and dev-login chains reach through `ensureMembership`."
+@tags "authority" "rights" "identity"
+-- ⚠ THE CHAIN IS PROVED BY THE LOGIN SENTINEL, NOT BY READING. R1's outage
+-- shape is a chain member missing from this list: every login refused at the
+-- first leaf. `api/src/login-self-check.ts` against staging and the DB-free
+-- chain pins are what make this list evidence. rights R2b re-observed that RED
+-- by removing `crypto:randomTokenHex` and watching the live login answer
+-- 403 naming it.
+identityRealmDescriptors : (unit: Any) -> List String
+identityRealmDescriptors unit = ["state:createSession", "state:getSessionByHash", "state:touchSession", "state:deleteSessionByHash", "state:getUserByEmail", "state:getOrCreateUserByEmail", "state:getMembership", "state:listUserMemberships", "state:createMembership", "state:setUserPasswordHash", "crypto:sha256Hex", "crypto:randomTokenHex", "crypto:hashPassword", "crypto:verifyPassword", "crypto:uuidV4", "state:ensurePersonalAccount"]
+
+@label "authority: topEnvelope"
+@description "The universe. Mintable only by the registry bootstrap issuer; mintAuthority refuses it for every other issuer. rights R4 retires the last consumer."
+@tags "authority" "rights" "envelope"
+topEnvelope : (unit: Any) -> Envelope
+topEnvelope unit = EvTop
+
+@label "authority: emptyEnvelope"
+@description "The empty set — every perform is refused. This is the anonymous authority."
+@tags "authority" "rights" "envelope"
+emptyEnvelope : (unit: Any) -> Envelope
+emptyEnvelope unit = EvRows { rows = [] }
+
+@label "authority: descriptorEnvelope"
+@description "The one-row envelope over an explicit descriptor enumeration and no argument restrictions. Every envelope this phase ships is one of these; a policy that restricts arguments builds its rows directly."
+@tags "authority" "rights" "envelope"
+descriptorEnvelope : (names: List String) -> Envelope
+descriptorEnvelope names = EvRows { rows = authorityDescriptorRows names }
+
+-- The row list is built by its own def rather than inline. A parse divergence
+-- between the two parsers on the inline nesting (a record field holding a list
+-- of nested constructor literals) is filed as a parser-substrate defect; this
+-- spelling is byte-identical under both and is pinned by the module-wide
+-- parser-parity check.
+authorityDescriptorRows : (names: List String) -> List ActRow
+authorityDescriptorRows names = [ActRow { descriptors = SeEnum { values = names }, args = [] }]
+
+@label "authority: roleEnvelope"
+@description "THE ROLE POLICY - the request-session envelope, derived from the membership row's live role. `owner` holds the general descriptors plus storage, locus writes and membership; argued storage, root and membership acts are constrained to its account. `member` is the same minus membership WRITES. `viewer` is the same minus storage, locus and membership writes. An UNKNOWN role denotes the empty envelope: the mint succeeds and every act refuses."
+@tags "authority" "rights" "envelope" "grant"
+-- ⚠ WHAT `viewer` DOES NOT RESTRICT, said plainly rather than implied. It
+-- restricts PERSISTENCE - the storage write methods and narrow locus-write
+-- family (including its saved-expression write-through) - and the membership
+-- family. It does NOT restrict any other effect in the general row: an email
+-- leaf, an HTTP leaf, a Telegram send are all reachable by a viewer, because
+-- nothing in this repository classifies the ~1500 general descriptors by effect
+-- family and a hand-written list at that size is the "the list is incomplete"
+-- trap. That classification is rights R9's policy-authoring work over effect
+-- inference.
+--
+-- ⚠ ROWS ARE PER FAMILY, NEVER PER DESCRIPTOR. The row count is O(FAMILIES) and
+-- INDEPENDENT of the ~1500 descriptors the registry exposes; the exact integer
+-- is a free parameter of this decomposition and is deliberately not asserted
+-- here. A per-descriptor envelope would be ~1500 rows of linear walk, each
+-- re-shaping its sets - the 12 ms/act regression R2a measured, with no enum to
+-- hoist. The cost model is bounded by CONSTRUCTION rather than by an index, and
+-- the measured constants live in the phase completion note.
+roleEnvelope : (role: String) -> (acct: String) -> (names: List String) -> (storage: List StorageDescriptor) -> Envelope
+roleEnvelope role acct names storage =
+  if eq role "owner"
+  then EvRows { rows = authorityOwnerRows acct names storage }
+  else authorityNonOwnerEnvelope role acct names storage
+
+authorityNonOwnerEnvelope : (role: String) -> (acct: String) -> (names: List String) -> (storage: List StorageDescriptor) -> Envelope
+authorityNonOwnerEnvelope role acct names storage =
+  if eq role "member"
+  then EvRows { rows = authorityMemberRows acct names storage }
+  else authorityViewerOrUnknownEnvelope role acct names storage
+
+-- The wildcard arm, and it is the EMPTY envelope. A case with no wildcard falls
+-- to host null, which reads as neither a permit nor a refusal downstream; an
+-- unknown role has to denote something, and the only fail-closed something is
+-- the empty set.
+authorityViewerOrUnknownEnvelope : (role: String) -> (acct: String) -> (names: List String) -> (storage: List StorageDescriptor) -> Envelope
+authorityViewerOrUnknownEnvelope role acct names storage =
+  if eq role "viewer"
+  then EvRows { rows = authorityViewerRows acct names storage }
+  else if eq role "personal"
+  then EvRows { rows = authorityPersonalRows acct storage }
+  else EvRows { rows = [] }
+
+-- ----- the rows, one def per row list (R2a 3.3: never inline a nested
+-- constructor list inside a record field; the two parsers diverged on it) -----
+
+-- Each role's rows are read straight off the table in the brief. What varies
+-- between roles is which METHODS the positional storage row selects and which
+-- families are concatenated; the COUNT is a property of this decomposition
+-- rather than of the policy, so nothing asserts a specific integer.
+authorityOwnerRows : (acct: String) -> (names: List String) -> (storage: List StorageDescriptor) -> List ActRow
+authorityOwnerRows acct names storage =
+  concat (authorityMemberRows acct names storage) (authorityMembershipWriteRows acct)
+
+authorityMemberRows : (acct: String) -> (names: List String) -> (storage: List StorageDescriptor) -> List ActRow
+authorityMemberRows acct names storage =
+  concat (authorityCommonRows acct names storage (storagePositionalMethods 0)) (concat (authorityStorageEventRows acct storage) (authorityLocusWriteRows acct))
+
+authorityViewerRows : (acct: String) -> (names: List String) -> (storage: List StorageDescriptor) -> List ActRow
+authorityViewerRows acct names storage =
+  authorityCommonRows acct names storage (storageReadMethods 0)
+
+-- The FOUR rows every role holds: the general enumeration, the positional
+-- storage row over whichever methods the role reaches, the membership roster
+-- read, and the account-argued state leaves. A viewer is exactly these; a member
+-- adds the event and locus-write families; an owner adds the membership writes.
+authorityCommonRows : (acct: String) -> (names: List String) -> (storage: List StorageDescriptor) -> (methods: List String) -> List ActRow
+authorityCommonRows acct names storage methods =
+  concat (authorityGeneralRows names storage) (concat (authorityStoragePositionalRows acct methods storage) (concat (authorityMembershipReadRows acct) (authorityAccountArguedStateRows acct)))
+
+authorityAccountArguedStateRows : (acct: String) -> List ActRow
+authorityAccountArguedStateRows acct = [ActRow { descriptors = SeEnum { values = accountArguedStateDescriptors 0 }, args = authorityAccountRecordAxes acct }]
+
+authorityLocusWriteRows : (acct: String) -> List ActRow
+authorityLocusWriteRows acct = concat (authorityLocusRootWriteRows acct) (authorityLocusAmbientWriteRows 0)
+
+authorityLocusRootWriteRows : (acct: String) -> List ActRow
+authorityLocusRootWriteRows acct = [ActRow { descriptors = SeEnum { values = locusRootWriteDescriptors 0 }, args = authorityLocusRootIdAxes acct }]
+
+authorityLocusAmbientWriteRows : (unit: Any) -> List ActRow
+authorityLocusAmbientWriteRows unit = [ActRow { descriptors = SeEnum { values = locusAmbientWriteDescriptors 0 }, args = [] }]
+
+authorityGeneralRows : (names: List String) -> (storage: List StorageDescriptor) -> List ActRow
+authorityGeneralRows names storage = [ActRow { descriptors = SeEnum { values = authorityGeneralDescriptors names storage }, args = [] }]
+
+authorityStoragePositionalRows : (acct: String) -> (methods: List String) -> (storage: List StorageDescriptor) -> List ActRow
+authorityStoragePositionalRows acct methods storage = [ActRow { descriptors = SeEnum { values = authorityStorageNamesFor methods storage }, args = authorityAccountValueAxes acct }]
+
+authorityStorageEventRows : (acct: String) -> (storage: List StorageDescriptor) -> List ActRow
+authorityStorageEventRows acct storage = [ActRow { descriptors = SeEnum { values = authorityStorageEventNames storage }, args = authorityAccountRecordAxes acct }]
+
+authorityMembershipReadRows : (acct: String) -> List ActRow
+authorityMembershipReadRows acct = [ActRow { descriptors = SeEnum { values = membershipReadDescriptors 0 }, args = authorityAccountRecordAxes acct }]
+
+-- TWO rows, not one, and the reason is `au.mem.axis.record`: an ABSENT entry is
+-- Just false. `state:deleteMembership` carries no `role`, so a single row
+-- carrying a role axis refuses it for the OWNER too — measured, not reasoned.
+-- Giving the leaf a vestigial `role` purely to satisfy the axis would be worse
+-- than a second row: the gate would then constrain a value the handler never
+-- reads, which is exactly the property `au.policy.partition` rests on (the
+-- judged entry IS the used entry).
+authorityMembershipWriteRows : (acct: String) -> List ActRow
+authorityMembershipWriteRows acct =
+  concat (authorityMembershipRoleArguedRows acct) (authorityMembershipDeleteRows acct)
+
+authorityMembershipRoleArguedRows : (acct: String) -> List ActRow
+authorityMembershipRoleArguedRows acct = [ActRow { descriptors = SeEnum { values = membershipRoleArguedDescriptors 0 }, args = authorityMembershipWriteAxes acct }]
+
+authorityMembershipDeleteRows : (acct: String) -> List ActRow
+authorityMembershipDeleteRows acct = [ActRow { descriptors = SeEnum { values = membershipDeleteDescriptors 0 }, args = authorityAccountRecordAxes acct }]
+
+-- ----- the axes -----
+
+authorityAccountValueAxes : (acct: String) -> List ArgAxis
+authorityAccountValueAxes acct = [ArgValue { set = authorityAccountSet acct }]
+
+authorityAccountRecordAxes : (acct: String) -> List ArgAxis
+authorityAccountRecordAxes acct = [ArgRecord { fields = authorityAccountFieldAxes acct }]
+
+authorityLocusRootIdAxes : (acct: String) -> List ArgAxis
+authorityLocusRootIdAxes acct = [ArgField { name = "id", set = authorityAccountSet acct }]
+
+authorityMembershipWriteAxes : (acct: String) -> List ArgAxis
+authorityMembershipWriteAxes acct = [ArgRecord { fields = authorityMembershipWriteFieldAxes acct }]
+
+authorityMembershipWriteFieldAxes : (acct: String) -> List FieldAxis
+authorityMembershipWriteFieldAxes acct = concat (authorityAccountFieldAxes acct) (authorityRoleFieldAxes 0)
+
+authorityAccountFieldAxes : (acct: String) -> List FieldAxis
+authorityAccountFieldAxes acct = [FieldAxis { name = "accountId", set = authorityAccountSet acct }]
+
+authorityRoleFieldAxes : (unit: Any) -> List FieldAxis
+authorityRoleFieldAxes unit = [FieldAxis { name = "role", set = authorityKnownRoleSet 0 }]
+
+authorityAccountSet : (acct: String) -> SetExpr
+authorityAccountSet acct = SeEnum { values = authorityAccountValues acct }
+
+authorityAccountValues : (acct: String) -> List String
+authorityAccountValues acct = [acct]
+
+authorityKnownRoleSet : (unit: Any) -> SetExpr
+authorityKnownRoleSet unit = SeEnum { values = knownRoles 0 }
+
+-- ----- the descriptor selections -----
+
+-- The general row is POSITIVE BY CONSTRUCTION: it enumerates what the registry
+-- exposes minus four small closed families, never a complement. A complement
+-- over an open universe grants every future kind automatically
+-- (design/authority.md 7), which is the one thing an envelope must not do.
+authorityGeneralDescriptors : (names: List String) -> (storage: List StorageDescriptor) -> List String
+authorityGeneralDescriptors names storage =
+  let excluded = authorityExcludedDescriptors storage
+  filter (\d -> not (elem d excluded)) names
+
+authorityExcludedDescriptors : (storage: List StorageDescriptor) -> List String
+authorityExcludedDescriptors storage =
+  concat (authorityAllStorageNames storage) (authorityFencedDescriptors 0)
+
+-- rights R4a — TWO more fenced families. `discoveryDescriptors` and
+-- `outboundFetchDescriptors` both join the union, so
+-- the positive general row excludes it for EVERY role and it appears only in the
+-- acquisition envelope.
+-- The locus write family is fenced here too: the owner and member envelopes
+-- grant it through their own rows (`authorityLocusWriteRows`), and the viewer
+-- envelope has no such row. Dropping it from this union puts every locus write
+-- back in the general row, for viewers included (`locus-authority.test.ts`).
+authorityFencedDescriptors : (unit: Any) -> List String
+authorityFencedDescriptors unit =
+  concat (sessionLeafDescriptors 0) (concat (membershipLeafDescriptors 0) (concat (membershipReadDescriptors 0) (concat (accountArguedStateDescriptors 0) (concat (locusWriteDescriptors 0) (concat (discoveryDescriptors 0) (outboundFetchDescriptors 0))))))
+
+authorityAllStorageNames : (storage: List StorageDescriptor) -> List String
+authorityAllStorageNames storage = map (\sd -> sd.descriptor) storage
+
+-- Selected by METHOD, never by string surgery on the descriptor name: the
+-- descriptor is an opaque function id and its spelling is not a policy input.
+authorityStorageNamesFor : (methods: List String) -> (storage: List StorageDescriptor) -> List String
+authorityStorageNamesFor methods storage = map (\sd -> sd.descriptor) (filter (\sd -> elem sd.method methods) storage)
+
+authorityStorageEventNames : (storage: List StorageDescriptor) -> List String
+authorityStorageEventNames storage = map (\sd -> sd.descriptor) (filter (\sd -> eq sd.method "appendEvent") storage)
+
+@label "authority: acquisitionEnvelope"
+@description "THE ACQUISITION REALM - a bounded NON-ROW authority an ingress door holds while it finds and verifies the row it is about to mint a product grant from. Two rows: the measured admitted call set with no argument restriction, and the storage READ descriptors argued positionally on the caller-supplied lookup PARTITION. It permits no storage write, no membership act, no session act, and nothing outside the measured set."
+@tags "authority" "rights" "envelope" "acquisition"
+-- ⚠ "EVERY AUTHORITY IS A ROW" IS FALSE, and this is one of the legitimate
+-- non-row authorities (`design/authority.md:842` — deliberate public policy and
+-- bearer evidence with no authenticated human). The thesis R4a ships is narrower
+-- and true: every PRODUCT-LANE authority derives from a typed grant reference.
+-- Anonymous, the identity-chain door, this realm and the bootstrap universe are
+-- the four that are not rows.
+--
+-- ⚠ THE PARTITION ONLY NARROWS. Discovery reads are either public or
+-- secret-bearing-BY-ID, so a hostile partition cannot widen anything: it selects
+-- which account's types a published form resolves against and which account's
+-- storage rows the read row admits, and both are the coordinate the URL already
+-- named. It is NOT the selection account — an acquisition handle's selection
+-- account is null, so dispatch sees global rows only and no account-owned
+-- storage-handler override is selected.
+--
+-- ⚠ `""` IS NOT AN ACCOUNT, AND THE PRECISE STATEMENT IS NARROWER THAN THE
+-- OBVIOUS ONE. A door with no partition produces a storage row whose axis is the
+-- one-element set `{""}`. It does NOT "refuse every storage read" — an act
+-- performed under a `""` door argues the leaf context account, which is also
+-- `""`, so the axis ADMITS it. What contains it is that `""` selects no rows: it
+-- is not an account id any database row carries. Say it that way, because the
+-- stronger phrasing attributes to the CHECKER a containment that actually rests
+-- on the data. (Corrected by adversarial review; the pin already asserted the
+-- true behaviour while three prose sites asserted the false one.)
+acquisitionEnvelope : (partition: String) -> (storage: List StorageDescriptor) -> Envelope
+acquisitionEnvelope partition storage = EvRows { rows = authorityAcquisitionRows partition storage }
+
+authorityAcquisitionRows : (partition: String) -> (storage: List StorageDescriptor) -> List ActRow
+authorityAcquisitionRows partition storage =
+  concat (authorityDescriptorRows (acquisitionDescriptors 0)) (authorityStoragePositionalRows partition (storageReadMethods 0) storage)
+
+@label "authority: identityRealmEnvelope"
+@description "The privileged door envelope. Two parts, and the split is the point: the AUTH MODULE's own descriptors are selected from the registry by prefix, because every bodied auth function is registered as a descriptor and the private helpers are on the chain exactly as much as the doors are; the IDENTITY LEAVES and crypto primitives stay an explicit enumeration, because those are the acts that mint sessions and set password hashes and a prefix rule must never reach them."
+@tags "authority" "rights" "envelope"
+identityRealmEnvelope : (allDescriptors: List String) -> Envelope
+identityRealmEnvelope allDescriptors = descriptorEnvelope (authorityIdentityRealmSet allDescriptors)
+
+-- ⚠ WHY THE AUTH MODULE IS A PREFIX RULE AND THE LEAVES ARE NOT.
+--
+-- `registerFenelBodyDispatchers` registers EVERY bodied function as a perform
+-- descriptor, so `auth:verifyAndIssue` and `auth:resolveFromRow` — private
+-- helpers the chain calls by name — are acts in their own right. Enumerating
+-- them by hand made login refuse the moment one was added or renamed, which is
+-- a total outage caused by a bookkeeping slip. Selecting them by prefix is
+-- safe HERE and only here: `invokeIOActionPrivileged` resolves the BASE
+-- registry unconditionally, so no account-installed module can contribute an
+-- `auth:` descriptor, and being in the `auth` module IS being on the chain.
+--
+-- The identity LEAVES get no such courtesy. `state.create_session` and its
+-- siblings are the acts that actually mint sessions and write password hashes;
+-- they stay named, one by one, so that adding one is a decision someone makes
+-- rather than a prefix someone inherits.
+authorityIdentityRealmSet : (allDescriptors: List String) -> List String
+authorityIdentityRealmSet allDescriptors =
+  concat (identityRealmDescriptors 0) (authorityAuthChainDescriptors allDescriptors)
+
+-- ⚠ THE PREFIX RULE IS FILTERED, because rights R2b put a PRODUCT SURFACE in
+-- the `auth` module and the rule's own rationale stops applying to it.
+--
+-- "Being in the auth module IS being on the chain" was true while the module
+-- held only the session lifecycle. `membership.fenel` joins the same union, so
+-- an unfiltered prefix hands the privileged door `auth:inviteMember` — and the
+-- realm envelope is a ONE-ROW `descriptorEnvelope` with NO axes, so
+-- `state:createMembership` is granted there with no account and no role
+-- restriction. Nothing reaches it today (the door's action names are literals in
+-- `core/src/auth.ts`), which is exactly why it is worth closing now rather than
+-- after something does.
+authorityAuthChainDescriptors : (allDescriptors: List String) -> List String
+authorityAuthChainDescriptors allDescriptors =
+  let excluded = membershipModuleDescriptors 0
+  filter (\d -> and (authorityIsAuthDescriptor d) (not (elem d excluded))) allDescriptors
+
+@label "authority: membershipModuleDescriptors"
+@description "EVERY bodied function `membership.fenel` declares - the four public orchestrators and the five private helpers they call. They live in the `auth` module because the loader unions by header, but they are a PRODUCT surface rather than part of the authentication chain, so the identity realm's auth-module prefix rule filters all nine out. They are reached under the CALLER's own request authority, where the gate refuses a member at `state:createMembership` one hop down."
+@tags "authority" "rights" "identity"
+-- ⚠ THE FOUR DOORS ARE NOT THE UNIT; THE FILE IS (review round 3). An earlier
+-- spelling excluded only the `@ioAction`-bearing orchestrators, which left
+-- `auth:authChangeMemberRoleNow` and `auth:authRemoveMemberNow` INSIDE the
+-- privileged realm — and those two are exactly the orchestrators MINUS their
+-- last-owner guard, which is the file's whole reason for existing. Nothing
+-- reaches them today: `state:setMembershipRole` and `state:deleteMembership` are
+-- not in `identityRealmDescriptors`, so both bodies are refused one hop down
+-- (measured `Just false`). The trap is conditional and cheap to spring —
+-- `state:createMembership` is ALREADY in that list, so an admin or impersonation
+-- feature adding `state:setMembershipRole` beside it would turn
+-- `authChangeMemberRoleNow` into a privileged-door path that re-roles any
+-- membership in any account, with no axis and no last-owner check.
+--
+-- The rule is therefore "every bodied function this FILE declares", and the pin
+-- reads the file rather than this list. A private helper is not on the
+-- authentication chain in any sense: all five are called only from
+-- `membership.fenel`.
+membershipModuleDescriptors : (unit: Any) -> List String
+membershipModuleDescriptors unit = ["auth:inviteMember", "auth:changeMemberRole", "auth:authChangeMemberRoleNow", "auth:removeMember", "auth:authRemoveMemberNow", "auth:listMembers", "auth:authLastOwnerBlocksRole", "auth:authSoleOwnerIs", "auth:authFirstOwnerIs"]
+
+-- ONE SPELLING (rights R2b). Every bodied auth function is implementation-
+-- bearing at its colon id and aliased at its dotted `@ioAction`, and
+-- `listPerformDescriptors` publishes the implementation-bearing name only, so
+-- the dotted half of this rule now matches nothing. Keeping it would be a
+-- dotted literal inside the policy module, which the `descriptor-canonical`
+-- audit rule refuses.
+authorityIsAuthDescriptor : (d: String) -> Boolean
+authorityIsAuthDescriptor d = startsWith d "auth:"
+
+
+-- A system-created personal workspace grants ordinary value storage in its
+-- own partition only. It deliberately has no general descriptor row: creating
+-- preferences storage must not introduce HTTP/email/Telegram, membership,
+-- identity or integration acts to a reader. Existing source/field HTTP host
+-- facades are a separate residual documented in design/authority.md.
+personalDataDescriptors : Any -> List String
+personalDataDescriptors unit =
+  concat (personalValueDescriptors unit) (concat (personalCatalogDescriptors unit) (concat (personalSavedValueDescriptors unit) (concat (personalLocusDescriptors unit) (personalRepresentationDescriptors unit))))
+
+personalValueDescriptors : Any -> List String
+personalValueDescriptors unit = ["state:loadType", "state:schemaOf", "state:typeclassMethodsSchema", "state:validateEntityInstance", "state:createInstance", "state:tryCreateInstance", "state:tryCreateInstanceByName", "state:updateInstance", "state:deleteInstance", "state:getInstance", "state:getInstanceById", "state:listInstances", "state:listInstancesByName", "state:readLocusRoot", "dashboard:createEntityInstanceByType", "dashboard:replaceEntityInstance", "dashboard:patchEntityInstance", "dashboard:deleteEntityInstance", "crypto:uuidV4", "crypto:randomTokenHex", "dashboard:getLocusRootBody", "dashboard:editLocusRootBody"]
+
+personalCatalogDescriptors : Any -> List String
+personalCatalogDescriptors unit = ["dashboard:listTypesMerged", "dashboard:getTypeDetail", "state:listTypes", "state:getType", "state:getTypeById", "dispatch:listSystemEntities", "dispatch:listModuleEntities", "dashboard:listFunctionsMerged", "dashboard:getFunctionDetail", "state:listFunctions", "state:getFunction", "dispatch:listModuleFunctions", "state:catalogReadRevision", "state:listViews", "state:getView", "state:getAccountById"]
+
+personalSavedValueDescriptors : Any -> List String
+personalSavedValueDescriptors unit = ["dashboard:listSavedQueriesAggregated", "dashboard:pickSavedQueries", "dashboard:savedQueriesByCategory", "dashboard:savedQueriesBySearch", "dashboard:savedQueriesDefault", "dashboard:getSavedQueryById", "state:listSavedQueries", "state:listSavedQueriesByCategory", "state:searchSavedQueries", "state:getSavedQuery", "state:listQueryCategories", "state:listQueryCategoryMembers", "dashboard:createSavedQueryBody", "dashboard:updateSavedQueryBody", "dashboard:deleteSavedQueryBody", "state:createSavedQuery", "state:updateSavedQuery", "state:deleteSavedQuery"]
+
+personalLocusDescriptors : Any -> List String
+personalLocusDescriptors unit = ["dashboard:listLocusViewsAll", "dashboard:getActiveLocusViewBody", "dashboard:createLocusViewBody", "dashboard:updateLocusViewBody", "dashboard:activateLocusViewBody", "dashboard:deleteLocusViewWithPromote", "dashboard:clearOthersIfActive", "dashboard:promoteIfWasActive", "state:listLocusViews", "state:getActiveLocusView", "state:countLocusViews", "state:clearAllActiveLocusViews", "state:createLocusView", "state:updateLocusView", "state:deleteLocusViewById", "state:promoteOldestLocusView"]
+
+personalRepresentationDescriptors : Any -> List String
+personalRepresentationDescriptors unit = ["dashboard:listSpecInstancesAll", "dashboard:getSpecInstanceById", "dashboard:createAccountSpecInstance", "dashboard:updateAccountSpecInstance", "dashboard:deleteAccountSpecInstance", "state:listSpecInstances", "state:getSpecInstance", "state:createSpecInstance", "state:updateSpecInstance", "state:deleteSpecInstance", "dispatch:refreshAccountInstances", "dispatch:listAllInstances", "dispatch:lookupOne"]
+
+authorityPersonalRows : String -> List StorageDescriptor -> List ActRow
+authorityPersonalRows acct storage =
+  concat (authorityDescriptorRows (personalDataDescriptors 0)) (concat (authorityStoragePositionalRows acct (storagePositionalMethods 0) storage) (authorityLocusRootWriteRows acct))

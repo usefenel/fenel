@@ -1,0 +1,1048 @@
+module engine where
+
+-- type-traversal — walk a FenelType tree and discover usages.
+--
+-- Reverse-lookup primitive: given a target type name, find every entity
+-- type whose record fields reference it, and every function whose params
+-- or returns reference it. Powers the "what uses this type" sections on
+-- the dashboard.
+--
+-- Phase 7a port — second port in the type-algebra arc, mirrors the TS
+-- oracle at implementations/typescript/engine/src/type-traversal.ts
+-- (now a thin shim). The Fenel body walks a marshalled TraversalType
+-- ADT — same boundary-adapter pattern as type-normalize.fenel. Refinements
+-- carry the complete canonical SetExpr marker beside their raw set, so Fenel
+-- owns tagged-phantom enum-first and entity/string recognition.
+--
+-- Public surface ported here (via dispatched wrappers):
+--   typeReferences    (FenelType, String) -> Bool
+--   collectTypeNames  FenelType            -> List<String>
+--   fieldsReferencing (FenelType, String) -> List<FieldUsageSlot>
+--   functionValueTypes FenelFunction       -> List<String>
+--   functionUsages    (fns, String)        -> List<FunctionUsage>
+--
+-- `walkTypePlan` owns the visitor traversal order and structural recursion;
+-- the TS public adapter only invokes the host callback over that returned raw
+-- node list. `entityUsages` still owns the TS-side systemEntities roster walk,
+-- while each per-type semantic traversal dispatches here.
+--
+-- All internal helpers are prefixed `typeTraversal…` to avoid colliding
+-- with like-named helpers already registered by other engine bodies
+-- (notably normalise-to-core.fenel's `walk` family and
+-- type-normalize.fenel's `typeNorm…` family).
+
+-- TraversalType — typed ADT view of a FenelType. The marshalling layer
+-- in the dispatch wrapper converts each TS-side `{$record: …}` /
+-- `{$variant: …}` / etc. shape to its canonical variant. TtRefined.setView
+-- is the descriptor-safe canonical SetExpr boundary view; TtTagged carries no
+-- host-decided semantic metadata.
+--
+-- Every variant carries `raw: Any` (the original raw FenelType subtree at
+-- that position). Phase 7c added this so the peel helpers
+-- (peelMaybe / peelList / peelResult / peelToVariant / peelListVariant)
+-- can return raw FenelType subtrees without lossy round-trip. The 7a
+-- bodies (collectTypeNames / typeReferences / fieldsReferencing /
+-- functionValueTypes / functionUsages) ignore the `raw` field via
+-- named-field pattern matching; the schema extension is backward
+-- compatible.
+TraversalType =
+  TtNamed name: String origin: String raw: Any
+  | TtVar name: String raw: Any
+  | TtUnit raw: Any
+  | TtVoid raw: Any
+  | TtTypeUniverse raw: Any
+  | TtEl content: Any raw: Any
+  | TtRecord fields: List TtField raw: Any
+  | TtVariant cases: List TtVariantCase discriminator: Maybe String raw: Any
+  | TtTuple items: List TraversalType raw: Any
+  | TtMap keys: Any canonicalKeys: SetExpr values: TraversalType raw: Any
+  | TtApp head: String args: List TraversalType raw: Any
+  | TtRefined base: TraversalType set: Any setView: SetExpr raw: Any
+  | TtMu body: TraversalType raw: Any var: String
+  | TtTagged value: TraversalType phantom: TraversalType raw: Any
+  | TtOpaque pure: TraversalType name: String raw: Any repositoryRationalKeys: Undefinable ({ num: Maybe FieldKey, den: Maybe FieldKey }) repositoryIntegerKeys: Undefinable ({ natPred: Maybe FieldKey, intMagnitude: Maybe FieldKey, intNegative: Maybe FieldKey }) readerCanonicalOwner: Undefinable (Maybe ({ readerOwnerIdentity: String, expectedSystemIdentity: String, fields: List ({ wireName: String, key: FieldKey }) }))
+  | TtArrow params: List TtArrowParam returns: TraversalType raw: Any
+  -- containment-substrate Phase 2 Step 1b — the tier-2 cross-base FenelType
+  -- formers ($union / $intersect / $complement promoted to real ctors). TtUnion /
+  -- TtIntersect carry a list of branch TraversalTypes; TtComplement carries one
+  -- inner TraversalType. Marshalled by marshalTraversalType (engine-bodies-
+  -- dispatch.ts). Additive — existing exhaustive Tt* matches add an arm (the
+  -- two name walkers below + tsKind in type-subsumes.fenel + the trio in
+  -- containment.fenel); anything still falling through stays sound-but-coarse.
+  | TtUnion branches: List TraversalType raw: Any
+  | TtIntersect branches: List TraversalType raw: Any
+  | TtComplement inner: TraversalType raw: Any
+  -- `invalid` distinguishes a deliberate active-cycle back-edge (false), on
+  -- which conservative consumers may abstain, from a malformed host-boundary
+  -- envelope (true), which no semantic judgment may admit.
+  | TtUnknown raw: Any invalid: Boolean
+
+-- FieldKeyInput — the exact `$`-free B3 view of an optional FieldDef.key.
+-- This is classification only: the marshaller never infers positionality from
+-- `_n`, validates a handle, or resolves an identity.
+FieldKeyInput =
+  NoFieldKey
+  | NamedFieldInput handle: String
+  | PositionalFieldInput index: Nat
+
+-- TtField — one record/variant field entry. `key` remains the exact raw
+-- FieldKeyInput consumed by the Phase-2 authoring normalizer; it is never a
+-- semantic equality carrier. `semanticKey` is the identity-total FieldKey used
+-- by containment/reflection after `traversalSemanticSlotsError` validates the
+-- whole tree. `wireName` is only the current source/JSON projection and
+-- diagnostic spelling. `token` is an opaque host reattachment token. The raw
+-- FieldDef deliberately does not cross the boundary; `raw` carries only the
+-- raw FenelType of `type` for the Phase-7c peel-helper channel.
+TtField = TtField name: String key: FieldKeyInput semanticKey: FieldKey wireName: String token: String type: TraversalType raw: Any
+
+-- TtVariantCase — one variant case entry. `fields` is a list of TtField.
+TtVariantCase = TtVariantCase name: String fields: List TtField constructorFunction: Undefinable (Maybe String)
+
+-- TtArrowParam — the arrow-parameter sibling of TtField. It retains the same
+-- raw authoring input plus identity-total semantic key/current projection.
+-- Arrow variance still pairs this list strictly by position; semanticKey is
+-- retained for reflection and later named-call/compiler metadata, never used
+-- to reorder parameters.
+TtArrowParam = TtArrowParam name: String key: FieldKeyInput semanticKey: FieldKey wireName: String token: String type: TraversalType raw: Any
+
+-- FieldUsageSlot — identity-bearing reflection result. Consumers may project
+-- wireName for display, but the semantic/public carrier never collapses to a
+-- bare string.
+FieldUsageSlot = FieldUsageSlot key: FieldKey wireName: String
+
+-- FunctionUsageEntry — one entry in functionUsages' output. `id` is
+-- the function id; `asParam` is the list of identity-bearing param slots whose types
+-- reference the target; `asReturn` is true when the return type
+-- references the target; `triggered` is carried through from input.
+FunctionUsageEntry = FunctionUsageEntry id: String asParam: List FieldUsageSlot asReturn: Boolean triggered: Boolean
+
+-- FunctionUsageInput — one input record describing a function to scan.
+-- Mirrors the TS shape `{ id: String, params: List<TtArrowParam>,
+-- returns: TraversalType, triggered: Bool }`. The triggered flag is
+-- passed through verbatim.
+FunctionUsageInput = FunctionUsageInput id: String params: List TtArrowParam returns: TraversalType triggered: Boolean
+
+-- ============================================================================
+-- Phase 3 semantic-slot validation
+--
+-- The host marshaller is allowed to classify `$`-keyed input mechanically and
+-- attach an invalid sentinel for a missing/malformed key. Every semantic
+-- traversal/containment boundary calls this Fenel-owned validation before a
+-- judgment. The shared fieldSemanticSlotsError helper owns UUID/ordinal,
+-- duplicate-key, duplicate-wire, and positional-index policy; this file only
+-- recursively selects each field container and its child types.
+-- ============================================================================
+
+@label "Traversal semantic slots error"
+@description "Field-identity Phase 3 — recursively validate every record, variant-case, and arrow-param container in a TraversalType. Delegates each container's key/wire/ordinal policy to fieldSemanticSlotsError and returns the first diagnostic. Nothing means the tree is identity-total."
+@tags "engine" "type" "traversal" "field-identity" "semantic-slot" "phase-3"
+traversalSemanticSlotsError : (root: TraversalType) -> Maybe String
+traversalSemanticSlotsError root = typeTraversalSemanticNodeErrorForBoundary root false
+
+@label "Traversal semantic slots error with SourceHandles"
+@description "Source-aware recursive semantic-slot validation for compiler/source-registry boundaries. Embedded UUID rules remain strict; only rigorously validated lock-less SourceHandles are additionally admitted."
+@tags "engine" "type" "traversal" "field-identity" "semantic-slot" "source-handle" "phase-3"
+traversalSemanticSlotsErrorWithSourceHandles : (root: TraversalType) -> Maybe String
+traversalSemanticSlotsErrorWithSourceHandles root = typeTraversalSemanticNodeErrorForBoundary root true
+
+@label "Traversal semantic slots valid"
+@description "Boolean projection of traversalSemanticSlotsError for already-structured Fenel callers."
+@tags "engine" "type" "traversal" "field-identity" "semantic-slot" "phase-3"
+traversalSemanticSlotsValid : (root: TraversalType) -> Boolean
+traversalSemanticSlotsValid root = case traversalSemanticSlotsError root of
+  Nothing -> true
+  Just message -> false
+
+@label "type-traversal: semantic node error"
+@description "Recursive identity-total validation over one TraversalType node. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalSemanticNodeError : (node: TraversalType) -> Maybe String
+typeTraversalSemanticNodeError node = typeTraversalSemanticNodeErrorForBoundary node false
+
+@category "engine-internal"
+typeTraversalSemanticNodeErrorForBoundary : (node: TraversalType) -> (allowSourceHandles: Boolean) -> Maybe String
+typeTraversalSemanticNodeErrorForBoundary node allowSourceHandles = case node of
+  TtUnknown { invalid = invalid } -> if invalid then Just "invalid own-data type boundary" else Nothing
+  TtRecord { fields = fs } -> typeTraversalSemanticFieldsErrorForBoundary "record" fs allowSourceHandles
+  TtVariant { cases = cs } -> typeTraversalSemanticCasesErrorForBoundary cs allowSourceHandles
+  TtTuple { items = xs } -> typeTraversalSemanticTypeListErrorForBoundary xs allowSourceHandles
+  TtMap { values = v } -> typeTraversalSemanticNodeErrorForBoundary v allowSourceHandles
+  TtApp { args = xs } -> typeTraversalSemanticTypeListErrorForBoundary xs allowSourceHandles
+  TtRefined { base = b } -> typeTraversalSemanticNodeErrorForBoundary b allowSourceHandles
+  TtMu { body = b } -> typeTraversalSemanticNodeErrorForBoundary b allowSourceHandles
+  TtTagged { value = v, phantom = p } -> typeTraversalFirstError (typeTraversalSemanticNodeErrorForBoundary v allowSourceHandles) (typeTraversalSemanticNodeErrorForBoundary p allowSourceHandles)
+  TtOpaque { pure = p } -> typeTraversalSemanticNodeErrorForBoundary p allowSourceHandles
+  TtArrow { params = ps, returns = r } -> typeTraversalFirstError (typeTraversalSemanticParamsErrorForBoundary ps allowSourceHandles) (typeTraversalSemanticNodeErrorForBoundary r allowSourceHandles)
+  TtUnion { branches = bs } -> typeTraversalSemanticTypeListErrorForBoundary bs allowSourceHandles
+  TtIntersect { branches = bs } -> typeTraversalSemanticTypeListErrorForBoundary bs allowSourceHandles
+  TtComplement { inner = i } -> typeTraversalSemanticNodeErrorForBoundary i allowSourceHandles
+  _ -> Nothing
+
+@label "type-traversal: first semantic error"
+@description "Keep the first semantic-slot error, otherwise evaluate to the later result. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalFirstError : (first: Maybe String) -> (later: Maybe String) -> Maybe String
+typeTraversalFirstError first later = case first of
+  Just message -> Just message
+  Nothing -> later
+
+@label "type-traversal: prefix semantic error"
+@description "Add a readable container projection to a semantic-slot diagnostic. Names are diagnostic only. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalPrefixError : (prefix: String) -> (error: Maybe String) -> Maybe String
+typeTraversalPrefixError prefix error = case error of
+  Nothing -> Nothing
+  Just message -> Just (concat prefix (concat ": " message))
+
+@label "type-traversal: semantic field projections"
+@description "Project TtFields to the shared semantic-slot validator shape. Raw source key/name/token/type metadata is deliberately excluded. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalSemanticFieldProjections : (fields: List TtField) -> List ({ key: FieldKey, wireName: String })
+typeTraversalSemanticFieldProjections fields =
+  map (\field -> { key = field.semanticKey, wireName = field.wireName }) fields
+
+@label "type-traversal: semantic param projections"
+@description "Project TtArrowParams to the shared semantic-slot validator shape. Arrow list order is retained exactly. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalSemanticParamProjections : (params: List TtArrowParam) -> List ({ key: FieldKey, wireName: String })
+typeTraversalSemanticParamProjections params =
+  map (\param -> { key = param.semanticKey, wireName = param.wireName }) params
+
+@label "type-traversal: semantic fields error"
+@description "Validate one record/variant field container, then validate every nested occurrence type. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalSemanticFieldsError : (context: String) -> (fields: List TtField) -> Maybe String
+typeTraversalSemanticFieldsError context fields =
+  typeTraversalSemanticFieldsErrorForBoundary context fields false
+
+@category "engine-internal"
+typeTraversalSemanticFieldsErrorForBoundary : (context: String) -> (fields: List TtField) -> (allowSourceHandles: Boolean) -> Maybe String
+typeTraversalSemanticFieldsErrorForBoundary context fields allowSourceHandles =
+  let projections = typeTraversalSemanticFieldProjections fields
+  let slotError = if allowSourceHandles then fieldSemanticSlotsErrorWithSourceHandles projections else fieldSemanticSlotsError projections
+  typeTraversalFirstError (typeTraversalPrefixError context slotError) (typeTraversalSemanticFieldChildrenErrorForBoundary fields allowSourceHandles)
+
+@label "type-traversal: semantic params error"
+@description "Validate one arrow's local parameter container, then validate every parameter occurrence type. Arrow variance remains list-positional. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalSemanticParamsError : (params: List TtArrowParam) -> Maybe String
+typeTraversalSemanticParamsError params =
+  typeTraversalSemanticParamsErrorForBoundary params false
+
+@category "engine-internal"
+typeTraversalSemanticParamsErrorForBoundary : (params: List TtArrowParam) -> (allowSourceHandles: Boolean) -> Maybe String
+typeTraversalSemanticParamsErrorForBoundary params allowSourceHandles =
+  let projections = typeTraversalSemanticParamProjections params
+  let slotError = if allowSourceHandles then fieldSemanticSlotsErrorWithSourceHandles projections else fieldSemanticSlotsError projections
+  typeTraversalFirstError (typeTraversalPrefixError "arrow params" slotError) (typeTraversalSemanticParamChildrenErrorForBoundary params allowSourceHandles)
+
+@label "type-traversal: semantic field children error"
+@description "Stack-safe fold over nested TtField types, retaining the first error. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalSemanticFieldChildrenError : (fields: List TtField) -> Maybe String
+typeTraversalSemanticFieldChildrenError fields = typeTraversalSemanticFieldChildrenErrorForBoundary fields false
+
+@category "engine-internal"
+typeTraversalSemanticFieldChildrenErrorForBoundary : (fields: List TtField) -> (allowSourceHandles: Boolean) -> Maybe String
+typeTraversalSemanticFieldChildrenErrorForBoundary fields allowSourceHandles =
+  fold
+    (\acc field -> typeTraversalFirstError acc (typeTraversalPrefixError field.wireName (typeTraversalSemanticNodeErrorForBoundary field.type allowSourceHandles)))
+    Nothing
+    fields
+
+@category "engine-internal"
+typeTraversalSemanticFieldChildStep : (acc: Maybe String) -> (field: TtField) -> Maybe String
+typeTraversalSemanticFieldChildStep acc field = typeTraversalFirstError acc (typeTraversalPrefixError field.wireName (typeTraversalSemanticNodeError field.type))
+
+@label "type-traversal: semantic param children error"
+@description "Stack-safe fold over nested arrow-param types, retaining the first error. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalSemanticParamChildrenError : (params: List TtArrowParam) -> Maybe String
+typeTraversalSemanticParamChildrenError params = typeTraversalSemanticParamChildrenErrorForBoundary params false
+
+@category "engine-internal"
+typeTraversalSemanticParamChildrenErrorForBoundary : (params: List TtArrowParam) -> (allowSourceHandles: Boolean) -> Maybe String
+typeTraversalSemanticParamChildrenErrorForBoundary params allowSourceHandles =
+  fold
+    (\acc param -> typeTraversalFirstError acc (typeTraversalPrefixError param.wireName (typeTraversalSemanticNodeErrorForBoundary param.type allowSourceHandles)))
+    Nothing
+    params
+
+@category "engine-internal"
+typeTraversalSemanticParamChildStep : (acc: Maybe String) -> (param: TtArrowParam) -> Maybe String
+typeTraversalSemanticParamChildStep acc param = typeTraversalFirstError acc (typeTraversalPrefixError param.wireName (typeTraversalSemanticNodeError param.type))
+
+@label "type-traversal: semantic cases error"
+@description "Stack-safe fold over variant cases. Case tags remain names; only payload axes use FieldKey. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalSemanticCasesError : (cases: List TtVariantCase) -> Maybe String
+typeTraversalSemanticCasesError cases = typeTraversalSemanticCasesErrorForBoundary cases false
+
+@category "engine-internal"
+typeTraversalSemanticCasesErrorForBoundary : (cases: List TtVariantCase) -> (allowSourceHandles: Boolean) -> Maybe String
+typeTraversalSemanticCasesErrorForBoundary cases allowSourceHandles =
+  fold
+    (\acc variantCase -> typeTraversalFirstError acc (typeTraversalSemanticFieldsErrorForBoundary (concat "variant case " variantCase.name) variantCase.fields allowSourceHandles))
+    Nothing
+    cases
+
+@category "engine-internal"
+typeTraversalSemanticCaseStep : (acc: Maybe String) -> (variantCase: TtVariantCase) -> Maybe String
+typeTraversalSemanticCaseStep acc variantCase =
+  typeTraversalFirstError acc (typeTraversalSemanticFieldsError (concat "variant case " variantCase.name) variantCase.fields)
+
+@label "type-traversal: semantic type list error"
+@description "Stack-safe fold over a list of TraversalType children, retaining the first error. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalSemanticTypeListError : (items: List TraversalType) -> Maybe String
+typeTraversalSemanticTypeListError items = typeTraversalSemanticTypeListErrorForBoundary items false
+
+@category "engine-internal"
+typeTraversalSemanticTypeListErrorForBoundary : (items: List TraversalType) -> (allowSourceHandles: Boolean) -> Maybe String
+typeTraversalSemanticTypeListErrorForBoundary items allowSourceHandles =
+  fold (\acc item -> typeTraversalFirstError acc (typeTraversalSemanticNodeErrorForBoundary item allowSourceHandles)) Nothing items
+
+@category "engine-internal"
+typeTraversalSemanticTypeStep : (acc: Maybe String) -> (item: TraversalType) -> Maybe String
+typeTraversalSemanticTypeStep acc item = typeTraversalFirstError acc (typeTraversalSemanticNodeError item)
+
+-- ============================================================================
+-- walkTypePlan — pre-order raw-node plan for the public higher-order visitor.
+--
+-- Structural branch selection and recursion live here. The host adapter only
+-- invokes the caller-supplied callback over the returned raw FenelType nodes
+-- until it asks to stop. This retains the public callback API without keeping
+-- a second TypeScript structural walker.
+-- ============================================================================
+
+@label "Type traversal visitor plan"
+@description "Field-identity Phase 3 — return every raw FenelType node in pre-order. Fenel owns structural classification and recursion; the TS adapter only applies the host callback and short-circuits over this plan."
+@tags "engine" "type" "traversal" "field-identity" "boundary" "phase-3"
+walkTypePlan : (root: TraversalType) -> (emptyList: List Any) -> List Any
+walkTypePlan root emptyList = typeTraversalWalkRaw root emptyList
+
+@label "type-traversal: walk raw"
+@description "Pre-order structural traversal over TraversalType, appending each raw node before its children. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalWalkRaw : (node: TraversalType) -> (acc: List Any) -> List Any
+typeTraversalWalkRaw node acc = case node of
+  TtNamed { raw = r } -> appendItem r acc
+  TtVar { raw = r } -> appendItem r acc
+  TtUnit { raw = r } -> appendItem r acc
+  TtVoid { raw = r } -> appendItem r acc
+  TtTypeUniverse { raw = r } -> appendItem r acc
+  TtEl { raw = r } -> appendItem r acc
+  TtUnknown { raw = r } -> appendItem r acc
+  TtRecord { fields = fs, raw = r } ->
+    typeTraversalWalkRawFields fs (appendItem r acc)
+  TtVariant { cases = cs, raw = r } ->
+    typeTraversalWalkRawCases cs (appendItem r acc)
+  TtTuple { items = xs, raw = r } ->
+    typeTraversalWalkRawList xs (appendItem r acc)
+  TtMap { values = v, raw = r } ->
+    typeTraversalWalkRaw v (appendItem r acc)
+  TtApp { args = xs, raw = r } ->
+    typeTraversalWalkRawList xs (appendItem r acc)
+  TtRefined { base = b, raw = r } ->
+    typeTraversalWalkRaw b (appendItem r acc)
+  TtMu { body = b, raw = r } ->
+    typeTraversalWalkRaw b (appendItem r acc)
+  TtTagged { value = v, phantom = p, raw = r } ->
+    let next = typeTraversalWalkRaw v (appendItem r acc)
+    typeTraversalWalkRaw p next
+  TtOpaque { pure = p, raw = r } ->
+    typeTraversalWalkRaw p (appendItem r acc)
+  TtArrow { params = ps, returns = rtype, raw = r } ->
+    let next = typeTraversalWalkRawParams ps (appendItem r acc)
+    typeTraversalWalkRaw rtype next
+  TtUnion { branches = bs, raw = r } ->
+    typeTraversalWalkRawList bs (appendItem r acc)
+  TtIntersect { branches = bs, raw = r } ->
+    typeTraversalWalkRawList bs (appendItem r acc)
+  TtComplement { inner = i, raw = r } ->
+    typeTraversalWalkRaw i (appendItem r acc)
+
+@label "type-traversal: walk raw fields"
+@description "Walk record or variant field types in declaration order. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalWalkRawFields : (fields: List TtField) -> (acc: List Any) -> List Any
+typeTraversalWalkRawFields fields acc = case head fields of
+  Nothing -> acc
+  Just field ->
+    let next = typeTraversalWalkRaw field.type acc
+    case tail fields of
+      Nothing -> next
+      Just rest -> typeTraversalWalkRawFields rest next
+
+@label "type-traversal: walk raw cases"
+@description "Walk variant cases and their fields in declaration order. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalWalkRawCases : (cases: List TtVariantCase) -> (acc: List Any) -> List Any
+typeTraversalWalkRawCases cases acc = case head cases of
+  Nothing -> acc
+  Just variantCase ->
+    let next = typeTraversalWalkRawFields variantCase.fields acc
+    case tail cases of
+      Nothing -> next
+      Just rest -> typeTraversalWalkRawCases rest next
+
+@label "type-traversal: walk raw list"
+@description "Walk a TraversalType list in source order. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalWalkRawList : (items: List TraversalType) -> (acc: List Any) -> List Any
+typeTraversalWalkRawList items acc = case head items of
+  Nothing -> acc
+  Just item ->
+    let next = typeTraversalWalkRaw item acc
+    case tail items of
+      Nothing -> next
+      Just rest -> typeTraversalWalkRawList rest next
+
+@label "type-traversal: walk raw params"
+@description "Walk arrow parameter types in positional order. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalWalkRawParams : (params: List TtArrowParam) -> (acc: List Any) -> List Any
+typeTraversalWalkRawParams params acc = case head params of
+  Nothing -> acc
+  Just param ->
+    let next = typeTraversalWalkRaw param.type acc
+    case tail params of
+      Nothing -> next
+      Just rest -> typeTraversalWalkRawParams rest next
+
+-- ============================================================================
+-- Tagged phantom meaning over the complete TraversalType + SetExpr view.
+-- The host canonicalizes the `$`-key boundary only. Constructor selection,
+-- enum-first policy, and the entity-name string filter all live here.
+-- ============================================================================
+
+@label "type-traversal: refined enum first"
+@description "Field-identity Phase 3 — read the first value only when a TraversalType is a refined type whose complete canonical SetExpr is SeEnum. Internal helper; no host-side enum classifier."
+@tags "engine" "internal" "type" "traversal" "phantom" "phase-3"
+@category "engine-internal"
+typeTraversalRefinedEnumFirst : (node: TraversalType) -> Maybe Any
+typeTraversalRefinedEnumFirst node = case node of
+  TtRefined { setView = setView } -> case setView of
+    SeEnum { values = values } -> head values
+    _ -> Nothing
+  _ -> Nothing
+
+@label "type-traversal: phantom first"
+@description "Field-identity Phase 3 — select TtTagged.phantom and apply refined-enum-first policy in Fenel. Internal helper."
+@tags "engine" "internal" "type" "traversal" "phantom" "phase-3"
+@category "engine-internal"
+typeTraversalPhantomFirst : (node: TraversalType) -> Maybe Any
+typeTraversalPhantomFirst node = case node of
+  TtTagged { phantom = phantom } -> typeTraversalRefinedEnumFirst phantom
+  _ -> Nothing
+
+@label "type-traversal: phantom entity name"
+@description "Field-identity Phase 3 — recognize a tagged phantom's refined-enum first member as an entity name only when it is a string. Semantic policy is wholly Fenel-owned. Internal helper."
+@tags "engine" "internal" "type" "traversal" "phantom" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalPhantomEntityName : (node: TraversalType) -> Maybe String
+typeTraversalPhantomEntityName node = case typeTraversalPhantomFirst node of
+  Nothing -> Nothing
+  Just value -> if isString value then Just value else Nothing
+
+-- ============================================================================
+-- typeTraversalCollectTypeNames — collect every `$named` reference and
+-- every $tagged-phantom-derived entity name reachable in the type tree.
+-- Returns a deduplicated list (insertion order preserved, mirroring the
+-- TS oracle's `new Set` + `[...names]` shape).
+-- ============================================================================
+
+@label "Collect type names"
+@description "Phase 7a / field-identity Phase 3 — collect every named reference and Fenel-recognized tagged-phantom entity name reachable in an identity-total TraversalType. Returns a deduplicated insertion-ordered list."
+@tags "engine" "type" "traversal" "boundary" "phase-7a"
+collectTypeNames : (root: TraversalType) -> (emptyList: List String) -> List String
+collectTypeNames root emptyList =
+  typeTraversalWalkForNames root emptyList emptyList
+
+-- typeTraversalWalkForNames — main recursive walk. Threads the
+-- accumulator list through every visit; uses typeTraversalAddName to
+-- dedupe via membership check.
+@label "type-traversal: walkForNames"
+@description "Phase 7a — main recursive walk for collectTypeNames. Threads the accumulator list through every visit. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalWalkForNames : (node: TraversalType) -> (emptyList: List String) -> (acc: List String) -> List String
+typeTraversalWalkForNames node emptyList acc =
+  case node of
+    TtNamed { name = n } -> typeTraversalAddName n acc
+    TtVar -> acc
+    TtUnit -> acc
+    TtVoid -> acc
+    TtTypeUniverse -> acc
+    TtEl -> acc
+    TtUnknown -> acc
+    TtRecord { fields = fs } ->
+      typeTraversalWalkFieldsForNames fs emptyList acc
+    TtVariant { cases = cs } ->
+      typeTraversalWalkCasesForNames cs emptyList acc
+    TtTuple { items = xs } ->
+      typeTraversalWalkListForNames xs emptyList acc
+    TtMap { values = v } ->
+      typeTraversalWalkForNames v emptyList acc
+    TtApp { args = xs } ->
+      typeTraversalWalkListForNames xs emptyList acc
+    TtRefined { base = b } ->
+      typeTraversalWalkForNames b emptyList acc
+    TtMu { body = b } ->
+      typeTraversalWalkForNames b emptyList acc
+    TtTagged { value = v, phantom = ph } ->
+      -- Match the TS oracle's visit-before-recurse order: the $tagged
+      -- node itself contributes its phantom-entity name FIRST (the
+      -- walkType callback fires on entry), then we recurse into value
+      -- then phantom.
+      let acc0 = typeTraversalAddPhantomName (typeTraversalPhantomEntityName node) acc
+      let acc1 = typeTraversalWalkForNames v emptyList acc0
+      typeTraversalWalkForNames ph emptyList acc1
+    TtOpaque { pure = p } ->
+      typeTraversalWalkForNames p emptyList acc
+    TtArrow { params = ps, returns = r } ->
+      let acc1 = typeTraversalWalkArrowParamsForNames ps emptyList acc
+      typeTraversalWalkForNames r emptyList acc1
+    TtUnion { branches = bs } ->
+      typeTraversalWalkListForNames bs emptyList acc
+    TtIntersect { branches = bs } ->
+      typeTraversalWalkListForNames bs emptyList acc
+    TtComplement { inner = i } ->
+      typeTraversalWalkForNames i emptyList acc
+
+-- typeTraversalWalkFieldsForNames — walk every record-field's type.
+@label "type-traversal: walkFieldsForNames"
+@description "Phase 7a — walk every record-field's type, accumulating names. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalWalkFieldsForNames : (fields: List TtField) -> (emptyList: List String) -> (acc: List String) -> List String
+typeTraversalWalkFieldsForNames fields emptyList acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let next = typeTraversalWalkForNames f.type emptyList acc
+      case tail fields of
+        Nothing -> next
+        Just rest ->
+          typeTraversalWalkFieldsForNames rest emptyList next
+
+-- typeTraversalWalkCasesForNames — walk every variant case's fields.
+@label "type-traversal: walkCasesForNames"
+@description "Phase 7a — walk every variant case's fields. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalWalkCasesForNames : (cases: List TtVariantCase) -> (emptyList: List String) -> (acc: List String) -> List String
+typeTraversalWalkCasesForNames cases emptyList acc =
+  case head cases of
+    Nothing -> acc
+    Just c ->
+      let next = typeTraversalWalkFieldsForNames c.fields emptyList acc
+      case tail cases of
+        Nothing -> next
+        Just rest ->
+          typeTraversalWalkCasesForNames rest emptyList next
+
+-- typeTraversalWalkListForNames — walk every TraversalType in a list.
+-- Used by tuples + applications.
+@label "type-traversal: walkListForNames"
+@description "Phase 7a — walk every TraversalType in a list. Used by tuples + applications. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalWalkListForNames : (items: List TraversalType) -> (emptyList: List String) -> (acc: List String) -> List String
+typeTraversalWalkListForNames items emptyList acc =
+  case head items of
+    Nothing -> acc
+    Just first ->
+      let next = typeTraversalWalkForNames first emptyList acc
+      case tail items of
+        Nothing -> next
+        Just rest ->
+          typeTraversalWalkListForNames rest emptyList next
+
+-- typeTraversalWalkArrowParamsForNames — walk every arrow param's type.
+@label "type-traversal: walkArrowParamsForNames"
+@description "Phase 7a — walk every arrow param's type. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalWalkArrowParamsForNames : (params: List TtArrowParam) -> (emptyList: List String) -> (acc: List String) -> List String
+typeTraversalWalkArrowParamsForNames params emptyList acc =
+  case head params of
+    Nothing -> acc
+    Just p ->
+      let next = typeTraversalWalkForNames p.type emptyList acc
+      case tail params of
+        Nothing -> next
+        Just rest ->
+          typeTraversalWalkArrowParamsForNames rest emptyList next
+
+-- typeTraversalAddName — dedupe-then-append. Insertion order preserved.
+@label "type-traversal: addName"
+@description "Phase 7a — dedupe-then-append. Insertion order preserved. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalAddName : (name: String) -> (acc: List String) -> List String
+typeTraversalAddName name acc =
+  if elem name acc
+  then acc
+  else appendItem name acc
+
+-- typeTraversalAddPhantomName — dispatch on Maybe<String>; only append
+-- when the phantom resolved to Just.
+@label "type-traversal: addPhantomName"
+@description "Phase 7a — dispatch on Maybe<String>; only append when the phantom resolved to Just. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalAddPhantomName : (pe: Maybe String) -> (acc: List String) -> List String
+typeTraversalAddPhantomName pe acc =
+  case pe of
+    Nothing -> acc
+    Just n -> typeTraversalAddName n acc
+
+-- ============================================================================
+-- typeReferences — boolean shortcut: does the type tree reference
+-- `targetName` either as a `$named` atom or as a `$tagged`-phantom entity
+-- name? Short-circuits on first match; mirrors the TS oracle's walkType
+-- + visitor pattern but without higher-order callbacks.
+-- ============================================================================
+
+@label "Type references"
+@description "Phase 7a — boolean shortcut: does the FenelType tree reference `targetName` either as a `$named` atom or as a `$tagged`-phantom entity name? Short-circuits on first match. Boundary adapter; dispatched via `dispatchedTypeReferences` in engine-bodies-dispatch.ts. Mirrors implementations/typescript/engine/src/type-traversal.ts:typeReferences (now a thin shim)."
+@tags "engine" "type" "traversal" "boundary" "phase-7a"
+typeReferences : (root: TraversalType) -> (targetName: String) -> (emptyList: List Any) -> Boolean
+typeReferences root targetName emptyList =
+  typeTraversalCheckReferences root targetName
+
+@label "type-traversal: checkReferences"
+@description "Phase 7a — recursive check: does this TraversalType subtree reference `targetName`? Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalCheckReferences : (node: TraversalType) -> (targetName: String) -> Boolean
+typeTraversalCheckReferences node targetName =
+  case node of
+    TtNamed { name = n } -> eq n targetName
+    TtVar -> false
+    TtUnit -> false
+    TtVoid -> false
+    TtTypeUniverse -> false
+    TtEl -> false
+    TtUnknown -> false
+    TtRecord { fields = fs } ->
+      typeTraversalCheckFieldsForRef fs targetName
+    TtVariant { cases = cs } ->
+      typeTraversalCheckCasesForRef cs targetName
+    TtTuple { items = xs } ->
+      typeTraversalCheckListForRef xs targetName
+    TtMap { values = v } -> typeTraversalCheckReferences v targetName
+    TtApp { args = xs } -> typeTraversalCheckListForRef xs targetName
+    TtRefined { base = b } -> typeTraversalCheckReferences b targetName
+    TtMu { body = b } -> typeTraversalCheckReferences b targetName
+    TtTagged { value = v, phantom = ph } ->
+      if typeTraversalCheckPhantomForRef (typeTraversalPhantomEntityName node) targetName
+      then true
+      else if typeTraversalCheckReferences v targetName
+      then true
+      else typeTraversalCheckReferences ph targetName
+    TtOpaque { pure = p } -> typeTraversalCheckReferences p targetName
+    TtArrow { params = ps, returns = r } ->
+      if typeTraversalCheckArrowParamsForRef ps targetName
+      then true
+      else typeTraversalCheckReferences r targetName
+    TtUnion { branches = bs } -> typeTraversalCheckListForRef bs targetName
+    TtIntersect { branches = bs } -> typeTraversalCheckListForRef bs targetName
+    TtComplement { inner = i } -> typeTraversalCheckReferences i targetName
+
+@label "type-traversal: checkFieldsForRef"
+@description "Phase 7a — short-circuit check across a record-fields list. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalCheckFieldsForRef : (fields: List TtField) -> (targetName: String) -> Boolean
+typeTraversalCheckFieldsForRef fields targetName =
+  case head fields of
+    Nothing -> false
+    Just f ->
+      if typeTraversalCheckReferences f.type targetName
+      then true
+      else case tail fields of
+        Nothing -> false
+        Just rest ->
+          typeTraversalCheckFieldsForRef rest targetName
+
+@label "type-traversal: checkCasesForRef"
+@description "Phase 7a — short-circuit check across a variant-cases list. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalCheckCasesForRef : (cases: List TtVariantCase) -> (targetName: String) -> Boolean
+typeTraversalCheckCasesForRef cases targetName =
+  case head cases of
+    Nothing -> false
+    Just c ->
+      if typeTraversalCheckFieldsForRef c.fields targetName
+      then true
+      else case tail cases of
+        Nothing -> false
+        Just rest ->
+          typeTraversalCheckCasesForRef rest targetName
+
+@label "type-traversal: checkListForRef"
+@description "Phase 7a — short-circuit check across a TraversalType list. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalCheckListForRef : (items: List TraversalType) -> (targetName: String) -> Boolean
+typeTraversalCheckListForRef items targetName =
+  case head items of
+    Nothing -> false
+    Just first ->
+      if typeTraversalCheckReferences first targetName
+      then true
+      else case tail items of
+        Nothing -> false
+        Just rest ->
+          typeTraversalCheckListForRef rest targetName
+
+@label "type-traversal: checkArrowParamsForRef"
+@description "Phase 7a — short-circuit check across an arrow-params list. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalCheckArrowParamsForRef : (params: List TtArrowParam) -> (targetName: String) -> Boolean
+typeTraversalCheckArrowParamsForRef params targetName =
+  case head params of
+    Nothing -> false
+    Just p ->
+      if typeTraversalCheckReferences p.type targetName
+      then true
+      else case tail params of
+        Nothing -> false
+        Just rest ->
+          typeTraversalCheckArrowParamsForRef rest targetName
+
+@label "type-traversal: checkPhantomForRef"
+@description "Phase 7a — check whether the pre-extracted phantom-entity name equals the target. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalCheckPhantomForRef : (pe: Maybe String) -> (targetName: String) -> Boolean
+typeTraversalCheckPhantomForRef pe targetName =
+  case pe of
+    Nothing -> false
+    Just n -> eq n targetName
+
+-- ============================================================================
+-- fieldsReferencing — return the matching identity-bearing record-field slots
+-- whose type references targetName. This body owns record selection and the
+-- Refined / canonical-Maybe peeling policy over the complete TraversalType.
+-- ============================================================================
+
+@label "Fields referencing"
+@description "Phase 7a / field-identity Phase 3 — return identity-bearing FieldUsageSlots for record fields whose type references `targetName`. Fenel selects the record through Refined and canonical Maybe wrappers from the complete identity-total TraversalType; `wireName` is projection metadata only."
+@tags "engine" "type" "traversal" "boundary" "phase-7a"
+fieldsReferencing : (node: TraversalType) -> (targetName: String) -> (emptyList: List FieldUsageSlot) -> List FieldUsageSlot
+fieldsReferencing node targetName emptyList =
+  typeTraversalFieldsReferencingFromType node targetName emptyList
+
+@label "type-traversal: fields referencing from type"
+@description "Select an entity record through Refined and exact canonical Maybe wrappers, then filter its identity-bearing fields. Non-record shapes return the supplied empty list. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalFieldsReferencingFromType : (node: TraversalType) -> (targetName: String) -> (emptyList: List FieldUsageSlot) -> List FieldUsageSlot
+typeTraversalFieldsReferencingFromType node targetName emptyList = case node of
+  TtRecord { fields = fields } ->
+    typeTraversalFilterFieldsByRef fields targetName emptyList
+  TtRefined { base = base } ->
+    typeTraversalFieldsReferencingFromType base targetName emptyList
+  TtVariant { cases = cases } ->
+    case typeTraversalMaybeInner cases of
+      Nothing -> emptyList
+      Just inner -> typeTraversalFieldsReferencingFromType inner targetName emptyList
+  _ -> emptyList
+
+@label "type-traversal: exact Maybe inner"
+@description "Recognize exactly Nothing | Just<T>: two cases, nullary Nothing, and one ordinal-0 Just field. Returns that field's marshalled TraversalType, never its wire spelling. Internal helper."
+@tags "engine" "internal" "type" "traversal" "field-identity" "phase-3"
+@category "engine-internal"
+typeTraversalMaybeInner : (cases: List TtVariantCase) -> Maybe TraversalType
+typeTraversalMaybeInner cases =
+  if not (eq (length cases) 2)
+  then Nothing
+  else
+    case setAlgebraFindCaseByName cases "Nothing" of
+      Nothing -> Nothing
+      Just nothingCase ->
+        if gt (length nothingCase.fields) 0
+        then Nothing
+        else case setAlgebraFindCaseByName cases "Just" of
+          Nothing -> Nothing
+          Just justCase ->
+            if not (eq (length justCase.fields) 1)
+            then Nothing
+            else case head justCase.fields of
+              Nothing -> Nothing
+              Just field ->
+                if fieldKeyEq field.semanticKey (PositionalField { index = 0 })
+                then Just field.type
+                else Nothing
+
+@label "type-traversal: filterFieldsByRef"
+@description "Phase 7a / field-identity Phase 3 — accumulator-threaded filter: keep identity-bearing field slots whose type references targetName. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalFilterFieldsByRef : (fields: List TtField) -> (targetName: String) -> (acc: List FieldUsageSlot) -> List FieldUsageSlot
+typeTraversalFilterFieldsByRef fields targetName acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let nextAcc =
+            if typeTraversalCheckReferences f.type targetName
+            then appendItem (FieldUsageSlot { key = f.semanticKey, wireName = f.wireName }) acc
+            else acc
+      case tail fields of
+        Nothing -> nextAcc
+        Just rest ->
+          typeTraversalFilterFieldsByRef rest targetName nextAcc
+
+-- ============================================================================
+-- functionValueTypes — collect every `$named` + `$tagged`-phantom
+-- entity name reachable from the function's params + return. Returns
+-- a deduplicated list (insertion order preserved). The wrapper accepts
+-- the marshalled params (List<TtArrowParam>) + marshalled returns
+-- (TraversalType); both share the same walk machinery as collectTypeNames.
+-- ============================================================================
+
+@label "Function value types"
+@description "Phase 7a — union of names reachable from a function's params + returns. Boundary adapter; dispatched via `dispatchedFunctionValueTypes`. Mirrors implementations/typescript/engine/src/type-traversal.ts:functionValueTypes."
+@tags "engine" "type" "traversal" "boundary" "phase-7a"
+functionValueTypes : (params: List TtArrowParam) -> (returns: TraversalType) -> (emptyList: List String) -> List String
+functionValueTypes params returns emptyList =
+  let paramNames = typeTraversalWalkArrowParamsForNames params emptyList emptyList
+  typeTraversalWalkForNames returns emptyList paramNames
+
+-- ============================================================================
+-- functionUsages — scan a list of FunctionUsageInput entries; return
+-- FunctionUsageEntry records for the ones whose params or returns
+-- reference targetName. Each entry's `asParam` is the list of identity-bearing
+-- parameter slots whose types reference the target; `asReturn` is the boolean
+-- check on the return type; `triggered` is passed through.
+-- ============================================================================
+
+@label "Function usages"
+@description "Phase 7a — scan a list of functions for ones whose signature references `targetName`; return FunctionUsageEntry records. Boundary adapter; dispatched via `dispatchedFunctionUsages`. Mirrors implementations/typescript/engine/src/type-traversal.ts:functionUsages."
+@tags "engine" "type" "traversal" "boundary" "phase-7a"
+functionUsages : (fns: List FunctionUsageInput) -> (targetName: String) -> (emptyEntries: List FunctionUsageEntry) -> (emptySlots: List FieldUsageSlot) -> List FunctionUsageEntry
+functionUsages fns targetName emptyEntries emptySlots =
+  fold (typeTraversalScanFnsForUsages targetName emptySlots) emptyEntries fns
+
+@label "type-traversal: scanFnsForUsages"
+@description "Phase 7a / field-identity Phase 2b — stack-safe fold step over FunctionUsageInput entries. Emits one FunctionUsageEntry when a signature references the target. The former list-tail self recursion overflowed the browser evaluator on the repository's full function catalog."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalScanFnsForUsages : (targetName: String) -> (emptyList: List FieldUsageSlot) -> (acc: List FunctionUsageEntry) -> (fn: FunctionUsageInput) -> List FunctionUsageEntry
+typeTraversalScanFnsForUsages targetName emptyList acc fn =
+  let asParamNames =
+        typeTraversalCollectParamNamesByRef fn.params targetName emptyList
+  let asReturnBool =
+        typeTraversalCheckReferences fn.returns targetName
+  let hasAnyParam = gt (length asParamNames) 0
+  if hasAnyParam
+  then appendItem (FunctionUsageEntry {
+         id = fn.id,
+         asParam = asParamNames,
+         asReturn = asReturnBool,
+         triggered = fn.triggered
+       }) acc
+  else if asReturnBool
+  then appendItem (FunctionUsageEntry {
+         id = fn.id,
+         asParam = asParamNames,
+         asReturn = asReturnBool,
+         triggered = fn.triggered
+       }) acc
+  else acc
+
+-- typeTraversalCollectParamNamesByRef — collect identity-bearing slots of params whose
+-- type references targetName.
+@label "type-traversal: collectParamNamesByRef"
+@description "Phase 7a / field-identity Phase 3 — collect identity-bearing arrow-param slots whose type references targetName. Arrow order is retained; keys never reorder the list. Helper; tagged engine-internal."
+@tags "engine" "internal" "type" "phase-7a"
+@category "engine-internal"
+typeTraversalCollectParamNamesByRef : (params: List TtArrowParam) -> (targetName: String) -> (acc: List FieldUsageSlot) -> List FieldUsageSlot
+typeTraversalCollectParamNamesByRef params targetName acc =
+  case head params of
+    Nothing -> acc
+    Just p ->
+      let nextAcc =
+            if typeTraversalCheckReferences p.type targetName
+            then appendItem (FieldUsageSlot { key = p.semanticKey, wireName = p.wireName }) acc
+            else acc
+      case tail params of
+        Nothing -> nextAcc
+        Just rest ->
+          typeTraversalCollectParamNamesByRef rest targetName nextAcc
+
+-- Type-data previews describe the finite declared syntax. These counts are
+-- presentation facts, never containment, inhabitance or disjointness evidence.
+-- Canonical TtApp distinguishes type-only applications from genuine TtEl
+-- expressions; unresolved declaration bodies cannot establish independence.
+
+@label "Type data preview details"
+@description "Summarize a checked declared type's structural presentation and inspect its canonical type tree for dependent expressions. A genuine TtEl establishes dependence; unresolved names, applications and unknown syntax abstain unless another inspected branch contains TtEl. This is presentation only, never a type judgment."
+@tags "engine" "type" "presentation" "preview"
+typeDataPreviewDetails : (type: TraversalType) -> ({ summary: String, dependent: Maybe Bool })
+typeDataPreviewDetails type = { summary = typeDataPreviewSummary type, dependent = typeDataPreviewDependent type }
+
+@category "engine-internal"
+typeDataPreviewCount : (count: Number) -> (singular: String) -> (plural: String) -> String
+typeDataPreviewCount count singular plural = concat (toString count) (concat " " (if eq count 1 then singular else plural))
+
+@category "engine-internal"
+typeDataPreviewSummary : (type: TraversalType) -> String
+typeDataPreviewSummary type = case type of
+  TtNamed {} -> "Named type"
+  TtVar {} -> "Type parameter"
+  TtUnit {} -> "Unit type"
+  TtVoid {} -> "Empty type"
+  TtTypeUniverse {} -> "Type of types"
+  TtEl {} -> "Dependent type"
+  TtRecord { fields = fields } -> typeDataPreviewCount (length fields) "field" "fields"
+  TtVariant { cases = cases } ->
+    if eq (length cases) 1 then case head cases of
+      Just single -> typeDataPreviewCount (length single.fields) "field" "fields"
+      Nothing -> "0 variants"
+    else typeDataPreviewCount (length cases) "variant" "variants"
+  TtTuple { items = items } -> typeDataPreviewCount (length items) "item" "items"
+  TtMap {} -> "Map"
+  TtApp {} -> "Type application"
+  TtRefined { base = base } -> concat "Refined · " (typeDataPreviewSummary base)
+  TtMu { body = body } -> concat "Recursive · " (typeDataPreviewSummary body)
+  TtTagged { value = value } -> concat "Tagged · " (typeDataPreviewSummary value)
+  TtOpaque { pure = pure } -> typeDataPreviewSummary pure
+  TtArrow { params = params } -> typeDataPreviewCount (length params) "parameter" "parameters"
+  TtUnion { branches = branches } -> typeDataPreviewCount (length branches) "branch" "branches"
+  TtIntersect { branches = branches } -> typeDataPreviewCount (length branches) "branch" "branches"
+  TtComplement {} -> "Complement type"
+  _ -> "Unresolved type"
+
+@category "engine-internal"
+typeDataPreviewDependentMerge : (left: Maybe Bool) -> (right: Maybe Bool) -> Maybe Bool
+typeDataPreviewDependentMerge left right = case left of
+  Just true -> Just true
+  Just false -> right
+  Nothing -> case right of
+    Just true -> Just true
+    _ -> Nothing
+
+@category "engine-internal"
+typeDataPreviewDependentList : (types: List TraversalType) -> (initial: Maybe Bool) -> Maybe Bool
+typeDataPreviewDependentList types initial = fold (\current type -> typeDataPreviewDependentMerge current (typeDataPreviewDependent type)) initial types
+
+@category "engine-internal"
+typeDataPreviewDependentFields : (fields: List TtField) -> Maybe Bool
+typeDataPreviewDependentFields fields = fold (\current field -> typeDataPreviewDependentMerge current (typeDataPreviewDependent field.type)) (Just false) fields
+
+@category "engine-internal"
+typeDataPreviewDependent : (type: TraversalType) -> Maybe Bool
+typeDataPreviewDependent type = case type of
+  TtEl {} -> Just true
+  TtNamed {} -> Nothing
+  TtApp { args = args } -> typeDataPreviewDependentList args Nothing
+  TtUnknown {} -> Nothing
+  TtVar {} -> Just false
+  TtUnit {} -> Just false
+  TtVoid {} -> Just false
+  TtTypeUniverse {} -> Just false
+  TtRecord { fields = fields } -> typeDataPreviewDependentFields fields
+  TtVariant { cases = cases } -> fold (\current variantCase -> typeDataPreviewDependentMerge current (typeDataPreviewDependentFields variantCase.fields)) (Just false) cases
+  TtTuple { items = items } -> typeDataPreviewDependentList items (Just false)
+  TtMap { values = values } -> typeDataPreviewDependent values
+  TtRefined { base = base } -> typeDataPreviewDependent base
+  TtMu { body = body } -> typeDataPreviewDependent body
+  TtTagged { value = value, phantom = phantom } -> typeDataPreviewDependentMerge (typeDataPreviewDependent value) (typeDataPreviewDependent phantom)
+  TtOpaque { pure = pure } -> typeDataPreviewDependent pure
+  TtArrow { params = params, returns = returns } -> typeDataPreviewDependentMerge (fold (\current param -> typeDataPreviewDependentMerge current (typeDataPreviewDependent param.type)) (Just false) params) (typeDataPreviewDependent returns)
+  TtUnion { branches = branches } -> typeDataPreviewDependentList branches (Just false)
+  TtIntersect { branches = branches } -> typeDataPreviewDependentList branches (Just false)
+  TtComplement { inner = inner } -> typeDataPreviewDependent inner
+  _ -> Nothing
+
+-- Contextual authoring selects an existing child occurrence. This is a lens,
+-- not a type judgment: refs/apps without a captured declaration stay fenced,
+-- and the caller reattaches the selected subtree's existing scheme evidence.
+AuthoringChildTypeSlot = AuthoringChildTypeSlot kind: String name: String key: Maybe FieldKey
+AuthoringChildTypePlan = AuthoringChildTypePlan known: Boolean path: List String message: String
+
+@category "engine-internal"
+attChildUnavailable : (message: String) -> AuthoringChildTypePlan
+attChildUnavailable message = AuthoringChildTypePlan { known = false, path = [], message = message }
+
+@category "engine-internal"
+attChildKnown : (path: List String) -> AuthoringChildTypePlan
+attChildKnown path = AuthoringChildTypePlan { known = true, path = path, message = "" }
+
+@category "engine-internal"
+attChildFieldMatches : (slot: AuthoringChildTypeSlot) -> (field: TtField) -> Boolean
+attChildFieldMatches slot field = case slot.key of
+  Just key -> fieldKeyEqWithSourceHandles key field.semanticKey
+  Nothing -> eq slot.name field.wireName
+
+@category "engine-internal"
+attChildRecordPath : (node: TraversalType) -> (slot: AuthoringChildTypeSlot) -> (path: List String) -> (fuel: Number) -> AuthoringChildTypePlan
+attChildRecordPath node slot path fuel =
+  if lte fuel 0 then attChildUnavailable "The record expectation is too deep to project safely."
+  else case node of
+    TtRefined -> attChildUnavailable "The parent refinement needs whole-value checking before a field replacement can be guided."
+    TtOpaque { pure = pure } -> attChildRecordPath pure slot (concat path ["$opaque", "pure"]) (sub fuel 1)
+    TtRecord { fields = fields } ->
+      let matches = filter (\row -> attChildFieldMatches slot row.node) (asbIndexed fields)
+      if not (eq (length matches) 1) then attChildUnavailable "The expected record field is missing or ambiguous."
+      else case head matches of
+        Just row -> attChildKnown (concat path ["$record", "fields", toString row.index, "type"])
+        Nothing -> attChildUnavailable "The expected record field is unavailable."
+    TtNamed -> attChildUnavailable "A named record needs its captured declaration scheme before child expectations can be projected."
+    TtApp -> attChildUnavailable "An applied record needs its scoped application scheme before child expectations can be projected."
+    _ -> attChildUnavailable "The parent expectation does not expose a record field."
+
+@category "engine-internal"
+attChildListField : (field: TtField) -> (headKey: FieldKey) -> (unkeyedTokens: List String) -> Boolean
+attChildListField field headKey unkeyedTokens =
+  or (fieldKeyEq field.semanticKey headKey) (and (eq field.wireName "head") (elem field.token unkeyedTokens))
+
+@category "engine-internal"
+attChildListPath : (node: TraversalType) -> (headKey: FieldKey) -> (unkeyedTokens: List String) -> (path: List String) -> (fuel: Number) -> AuthoringChildTypePlan
+attChildListPath node headKey unkeyedTokens path fuel =
+  if lte fuel 0 then attChildUnavailable "The list expectation is too deep to project safely."
+  else case node of
+    TtRefined -> attChildUnavailable "The parent refinement needs whole-value checking before an element replacement can be guided."
+    TtOpaque { pure = pure } -> attChildListPath pure headKey unkeyedTokens (concat path ["$opaque", "pure"]) (sub fuel 1)
+    TtMu { body = body } -> attChildListPath body headKey unkeyedTokens (concat path ["$mu", "body"]) (sub fuel 1)
+    TtVariant { cases = cases } -> case find (\row -> eq row.node.name "Cons") (asbIndexed cases) of
+      Nothing -> attChildUnavailable "The expected list has no readable element slot."
+      Just cons ->
+        let matches = filter (\row -> attChildListField row.node headKey unkeyedTokens) (asbIndexed cons.node.fields)
+        if not (eq (length matches) 1) then attChildUnavailable "The expected list element slot is ambiguous."
+        else case head matches of
+          Just field -> attChildKnown (concat path ["$variant", "cases", toString cons.index, "fields", toString field.index, "type"])
+          Nothing -> attChildUnavailable "The expected list element slot is unavailable."
+    _ -> attChildUnavailable "The expected list has no readable element slot."
+
+@label "Child expectation type path"
+@description "Select an existing contextual record field or List element occurrence using the shared authoring List recognizer and FieldKey equality. Unsupported parent shapes stay unresolved; no inference or containment judgment is added."
+authoringChildTypePathPlan : (node: TraversalType) -> (slot: AuthoringChildTypeSlot) -> (headKey: FieldKey) -> (unkeyedTokens: List String) -> AuthoringChildTypePlan
+authoringChildTypePathPlan node slot headKey unkeyedTokens =
+  if eq slot.kind "record-field" then attChildRecordPath node slot [] 128
+  else if eq slot.kind "list-element" then case peelListForAuthoring node headKey unkeyedTokens of
+    Just element -> attChildListPath node headKey unkeyedTokens [] 128
+    Nothing -> attChildUnavailable "The parent list expectation needs its complete structural or scoped application scheme before its element can be projected."
+  else attChildUnavailable "This contextual child slot is unsupported."

@@ -1,0 +1,1831 @@
+module engine where
+
+-- =========================================================================
+-- totality.fenel — the totality checker, RUNG 1 (structural recursion) +
+-- RUNG 2 (guarded measure / well-founded descent) + RUNG 3 (slice A:
+-- lexicographic descent; slice B: SIZE-CHANGE graph closure, ONE function;
+-- slice C: MUTUAL recursion — the call-graph closure over a SET of functions).
+-- unified-static-analysis Phase 1 (rung 1) + Phase 3a (rung 2) + Phase 3c
+-- (rung 3a) + Phase 3d (rung 3b) + Phase 3e (rung 3c). Briefs:
+-- `workstreams/unified-static-analysis/briefs/phase-1-analyze-skeleton-and-totality-rung1.md`,
+-- `workstreams/unified-static-analysis/briefs/phase-3a-totality-rung2-measure.md`,
+-- `workstreams/unified-static-analysis/briefs/phase-3c-totality-rung3-lexicographic.md`,
+-- `workstreams/unified-static-analysis/briefs/phase-3d-totality-rung3-size-change-graph.md`,
+-- `workstreams/unified-static-analysis/briefs/phase-3e-totality-rung3c-mutual-recursion.md`.
+--
+-- THE SOUNDNESS PAYLOAD. Fenel's headline is dependent types + runtime
+-- proofs; a proof is a value inhabiting a proposition (Curry-Howard). Under
+-- general recursion a non-terminating term inhabits ANY proposition (`loop :
+-- P = loop`), so the kernel's reduction / `PropForall` rules are unsound
+-- until we can certify the backing definitions TERMINATE. This module is the
+-- first rung of that certificate.
+--
+-- RUNG 1 = STRUCTURAL RECURSION. A self-call is "decreasing" when one of its
+-- arguments is a variable that is a STRUCTURAL SUB-TERM of a parameter — i.e.
+-- a variable bound by destructuring (a `PatConstruct` field) of a parameter,
+-- or of an already-smaller variable. A definition is `Total` at rung 1 when
+-- EVERY self-call has at least one decreasing argument (and trivially when it
+-- has no self-call). When some self-call is NOT structurally decreasing, rung
+-- 1 returns `Unknown` (a measure / size-change argument may still prove it).
+-- Provable divergence + the `@partial` escape-hatch give `Partial`; the AST
+-- walk produces only `Total | Unknown`, the `@partial` flag is folded in by
+-- `totalityVerdict`.
+--
+-- RUNG 2 = GUARDED MEASURE / WELL-FOUNDED DESCENT (Phase 3a). The canonical
+-- NUMERIC recursion rung 1 misses: `f n = if n > 0 then f (n - 1) else 0`. A
+-- self-call is rung-2 decreasing when an argument is `sub v 1` (`v - 1`) with
+-- `v` proven `> 0` in the call's branch — the strict decrease `v-1 < v` is
+-- always true, and the `v > 0` GUARD supplies well-foundedness (`v-1 ≥ 0`, so
+-- the ℕ-descent is finite). The soundness crux is the guard: an UNGUARDED
+-- `f (v - 1)` may underflow (`0 → -1 → -2 → …` diverges), so rung 2 returns
+-- `Unknown` for it (a wrong `Total` there is the exact unsoundness totality
+-- exists to prevent). NUMERIC DOMAIN (2026-10-03): `v - 1 < v` is NOT always
+-- true of JS Numbers (`1e20 - 1 = 1e20`, `Infinity - 1 = Infinity`, and NaN or
+-- a non-number passes every NEGATED comparison), so `pos` now holds branch FACTS
+-- ({name, fact} records: "lower" v > 0, "upper" v ≤ 2^53, "number" v a non-NaN
+-- Number, the last proved only by a comparison that evaluated to true) and a unit
+-- decrement counts only under all three (totCanDecrement). An unbounded
+-- countdown (`if n > 0 then f (n - 1)`) is Unknown; `if n > 0 && n <= 1000000`
+-- proves it. The guard supplies a THIRD threaded set — `pos`, the
+-- branch facts (positivity, the exact-decrement bound, Number-ness of named
+-- variables) known in the current branch — established by the `if`
+-- guards the walk descends through (`totPosFromCond` / `totPosFromCondNeg`,
+-- narrowing re-expressed over core `Expr`). FENCE (rung-2b / rung-3): k≥2
+-- decrements (`v - 2` needs `v ≥ 2`), non-`sub` measures (`div v 2`) — each
+-- stays `Unknown`.
+--
+-- RUNG 3 (slice A) = LEXICOGRAPHIC DESCENT under a fixed (identity) parameter
+-- order (Phase 3c). THE SOUNDNESS REPAIR. Rungs 1+2 decided a self-call total
+-- when SOME argument decreases — a test that is POSITION-AGNOSTIC. For a
+-- multi-argument function that is UNSOUND: the decrease must be credited to the
+-- RIGHT position (each parameter's NEW value compared against ITS OWN old
+-- value). Two counterexamples were wrongly accepted as `Total` by rungs 1+2,
+-- both NON-TERMINATING:
+--   • structural cross-position: `f a b = case a of Cons h t -> f (Cons h t) t`
+--     (`t` lands in `b`'s slot; `a` is reconstructed — `a` never shrinks);
+--   • measure cross-position: `f a b = if a > 0 then f (b + 1) (a - 1) else 0`
+--     (`a-1` lands in `b`'s slot — `f 2 0 → f 1 1 → f 2 0` cycles).
+-- The position-agnostic "some arg decreases" fold credited the decrease to the
+-- WRONG parameter. Slice A replaces it with the POSITION-AWARE criterion: the
+-- parameter tuple `(p₀ … pₙ₋₁)` strictly DECREASES in LEXICOGRAPHIC order at
+-- every self-call —
+--     ∃k. (∀ i < k. argᵢ ≡ pᵢ)  ∧  (arg_k ≺ p_k)
+-- reading left-to-right, the FIRST position whose argument is not provably
+-- EQUAL to its own parameter must be provably STRICTLY LESS than its own
+-- parameter. Per position `i` (param `pᵢ`, argument `argᵢ`):
+--   • RelEq  ⟺ `argᵢ = EVar pᵢ` (the same parameter, unchanged, in its slot);
+--   • RelLt  ⟺ structural (`argᵢ = EVar v` with `origin(v) = pᵢ` — a strict
+--             sub-term of `pᵢ`, in `pᵢ`'s slot) OR guarded measure (`argᵢ =
+--             sub pᵢ 1` with `pᵢ ∈ pos`);
+--   • otherwise RelUnknown (a different param's sub-term, a construction, any
+--             unrecognized shape — cross-position lands HERE).
+-- SOUND because the measure is the parameter tuple under lexicographic order:
+-- each component's domain is well-founded (structural sizes ∈ ℕ; a guarded
+-- measure stays ≥ 0 within its descent), and lex order over finitely-many
+-- well-founded components is well-founded. A SINGLE fixed (identity) order must
+-- work for ALL self-calls; different calls may decrease at different `k`. This
+-- SUBSUMES rungs 1+2 (a single-arg, or any single fixed-position, descent is
+-- the k = the-fixed-position special case). It REPAIRS the hole: in the
+-- cross-position cases the first non-Eq position is RelUnknown ⇒ NOT
+-- lex-decreasing ⇒ `Unknown` (never wrongly `Total`).
+-- RUNG 3 (slice B) = THE SIZE-CHANGE GRAPH CLOSURE (Phase 3d) — see the full
+-- RUNG 3 (slice B) block below `totScrutDecreasable` for the principle, the LJB
+-- citation, and the soundness argument. Slice B replaces slice A's fixed-order
+-- lexicographic scan (`totCallLexDec`, RETIRED) with the COMPLETE-for-the-size-
+-- change-abstraction criterion: build a size-change graph per self-call site
+-- (the slice-A per-position relations `totPosIsEq`/`totPosIsLt` REUSED as the
+-- edge oracle, now over ALL source × target pairs), take the fuel-bounded
+-- transitive closure under composition, and accept iff every IDEMPOTENT graph in
+-- the closure has a strictly-descending self-edge. A strict superset of slice A:
+-- it proves PERMUTED / reordering / multi-step-rotation descents that no fixed
+-- order exposes (`f a b = if a > 0 then f b (a - 1) else 0` ⇒ Total) while
+-- KEEPING the cross-position soundness repairs `Unknown` (their `G = {a →↓ b}`
+-- has the empty idempotent `G ; G = {}`, no strict self-edge).
+-- RUNG 3 (slice C) = MUTUAL RECURSION (Phase 3e) — the LAST termination class.
+-- See the full RUNG 3 (slice C) block below the slice-B section for the principle,
+-- the LJB general-form citation, and the soundness argument. Slice C generalizes
+-- the per-function size-change closure to a CALL GRAPH over a SET of functions:
+-- graphs become `{from, to, edges}` morphisms `caller → callee`; composition is
+-- restricted to matching intermediate functions (`G.to == H.from`); the program
+-- terminates iff every IDEMPOTENT graph `f → f` in the closure has a
+-- strictly-descending self-edge. A strict SUPERSET of slice B (the single
+-- function is the one-object special case — `checkStructuralTotality` is now
+-- singleton sugar over `checkMutualTotality`, so the 40 slice-B verdicts are
+-- preserved by construction). The MUTUAL fence is REMOVED — slice C ships it
+-- (the structural `even`/`odd`-shaped mutual win, the measure mutual win, the
+-- 3-function cycle all prove `Total`; the canaries `f a = g a` / `g b = f b` and
+-- the permutation ping-pong stay `Unknown`). UNBLOCKS the kernel gate.
+-- FENCED (inherited): `≠ 0` / `== 0` equality guards (deriving `m > 0` from
+-- `m ≠ 0` needs a ℕ TYPE, not a name-set, so `== 0`-guarded mutual `even`/`odd`
+-- stays `Unknown`); k ≥ 2 / non-`sub` measures; and SCC DISCOVERY (the group is
+-- an explicit input — D-3e-4 — slice C does not find the mutually-recursive set
+-- itself). STILL ADVISORY (no kernel-gate wiring this slice — that is the next
+-- slice, now unblocked).
+--
+-- THE THREE-VALUED VERDICT (design/unified-static-analysis.md, D-B):
+--   Total            — termination proven (a rung found a decrease, or no recursion)
+--   Partial reason   — provably non-total, or declared `@partial`  ⇒ hard-reject
+--   Unknown reason   — no rung decided YET                          ⇒ warn (climb), reject on proof-paths
+--
+-- SOUNDNESS DISCIPLINE (totality must NEVER wrongly say `Total`): variable
+-- shadowing is handled — a binder (lambda param, match-arm pattern var) that
+-- re-uses a name REMOVES it from the smaller/scrutinizable/positivity sets
+-- before the body is walked, so a fresh same-named binding is never mistaken
+-- for the structurally-smaller one (or the `> 0` fact) it shadows. THREE sets
+-- are threaded, plus the constant `params` (the full parameter list, needed at
+-- each self-call site to pair positions): `scrut` (names whose destructuring
+-- yields smaller vars — the params plus any smaller var), `origins` (the
+-- ORIGIN-TRACKED smaller-var set — a `List {name, origin}` pairing each
+-- strictly-smaller variable with the ROOT PARAMETER it is a sub-term of; rung 3
+-- needs "smaller than WHICH param", which the rung-1/2 flat `decr` set could
+-- NOT answer — so `decr` BECAME `origins`), and `pos` (rung 2 — the facts an
+-- enclosing guard proves about named variables: `> 0`, `≤ 2^53`, a non-NaN
+-- Number; all three make a `std:sub p 1` arg count as a measure decrease at p's
+-- OWN position, 2026-10-03). every `origins` name ∈ `scrut`; params ∈
+-- `scrut` but NOT `origins` (a param is not smaller than itself); `pos` is
+-- seeded empty and grown only by guards (never by destructuring — a field is
+-- structurally smaller, not known `> 0`). The WALK now COLLECTS a `List Graph`
+-- (every self-call's size-change graph, with its local pos/origins context) —
+-- `totCollectGraphs`, NOT the boolean `totHasBadCall` — and the DECISION is the
+-- closure-based SCT criterion (`totSctTerminating`), not the fixed-order lex scan
+-- (`totCallLexDec`, RETIRED — subsumed by the closure). The position-agnostic
+-- "some arg decreases" fold (the rung-1/2 shortcut) was already RETIRED at slice
+-- A — it was unsound for multi-arg.
+--
+-- INPUT: the irreducible core `Expr` (7 cases, `fenel/std/expr.fenel`) — the
+-- surface `if`/`let`/`do` are already lowered (ECall "if" / applied-ELambda /
+-- sequence) so this walks 7 cases. Plain ADTs (no `$`-key barrier): the body
+-- pattern-matches `ELit`/`EVar`/`ECall`/`ELambda`/`EMatch`/`EConstruct`/
+-- `ERecord` and `PatLit`/`PatVar`/`PatWildcard`/`PatConstruct` directly. The
+-- idiom (named-field patterns, `head`/`tail`/`appendItem` list folds, arm
+-- `{pattern, body}` records) mirrors `desugar.fenel` + `match-structural.fenel`.
+--
+-- NOTE this checker is itself structurally recursive (decreasing on the Expr
+-- subtree / the list tail) — it would pass its own rung-1 check once mutual
+-- recursion across the tot* helpers is supported (Phase 2/3).
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- Totality — the three-valued verdict ADT.
+-- -------------------------------------------------------------------------
+
+@entity
+@label "Totality"
+@description "A totality verdict: Total (termination proven, or no recursion), Partial (provably non-total, or declared @partial — a hard-reject), or Unknown (no rung has decided yet — a warning during the rung climb, a reject on proof-carrying paths). The reason string carries the human-readable justification for Partial / Unknown."
+Totality =
+  Total
+  | Partial reason: String
+  | Unknown reason: String
+
+
+-- -------------------------------------------------------------------------
+-- totOr — eager boolean disjunction over the finite tree/list walk. (Not
+-- short-circuit; every recursion here is on a strictly smaller subtree or
+-- list tail, so eager evaluation terminates. Keeps the folds free of
+-- `if`-in-`else`-with-`case` shapes.)
+-- -------------------------------------------------------------------------
+
+@label "tot: or"
+@description "Eager boolean disjunction used by the totality tree/list folds. Returns True if either operand is True."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totOr : (x: Bool) -> (y: Bool) -> Bool
+totOr x y = if x then True else y
+
+
+-- -------------------------------------------------------------------------
+-- totNameElem — membership of a name in a name-list (List String).
+-- -------------------------------------------------------------------------
+
+@label "tot: name elem"
+@description "True when `name` occurs in the name-list. List iteration via the head/tail Maybe-returning natives (the engine-body idiom)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totNameElem : (name: String) -> (list: a) -> Bool
+totNameElem name list =
+  case head list of
+    Nothing -> False
+    Just x ->
+      case tail list of
+        Nothing -> eq x name
+        Just rest -> totOr (eq x name) (totNameElem name rest)
+
+
+-- -------------------------------------------------------------------------
+-- totRemoveOne / totRemoveAll — drop name(s) from a name-list (shadowing).
+-- -------------------------------------------------------------------------
+
+@label "tot: remove-one tail"
+@description "Recurse on the tail of a name-list for totRemoveOne. Internal split (keeps totRemoveOne free of case-in-let)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totRemoveOneTail : (n: String) -> (list: a) -> a
+totRemoveOneTail n list =
+  case tail list of
+    Nothing -> []
+    Just rest -> totRemoveOne n rest
+
+@label "tot: remove-one"
+@description "Remove every occurrence of name `n` from the name-list. Used for variable shadowing (a binder re-using a name drops the prior smaller/scrutinizable binding)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totRemoveOne : (n: String) -> (list: a) -> a
+totRemoveOne n list =
+  case head list of
+    Nothing -> []
+    Just x ->
+      let restRemoved = totRemoveOneTail n list
+      if eq x n then restRemoved else appendItem x restRemoved
+
+@label "tot: remove-all"
+@description "Remove every name in `names` from `list`. Applies the shadow-removal of a binder's whole bound-var set to a smaller/scrutinizable set."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totRemoveAll : (names: a) -> (list: a) -> a
+totRemoveAll names list =
+  case head names of
+    Nothing -> list
+    Just n ->
+      let list2 = totRemoveOne n list
+      case tail names of
+        Nothing -> list2
+        Just rest -> totRemoveAll rest list2
+
+
+-- -------------------------------------------------------------------------
+-- totAppendAll — append every name in `names` to `list`.
+-- -------------------------------------------------------------------------
+
+@label "tot: append-all"
+@description "Append every name in `names` to `list`. Adds a match-arm's constructor-bound (structurally-smaller) vars to the smaller/scrutinizable sets."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totAppendAll : (names: a) -> (list: a) -> a
+totAppendAll names list =
+  case head names of
+    Nothing -> list
+    Just n ->
+      let list2 = appendItem n list
+      case tail names of
+        Nothing -> list2
+        Just rest -> totAppendAll rest list2
+
+
+-- -------------------------------------------------------------------------
+-- Pattern variable collection — `totCollectAllVars` (every bound var, for
+-- shadow removal) and `totCollectCtorVars` (only vars UNDER a PatConstruct,
+-- the structurally-smaller ones).
+-- -------------------------------------------------------------------------
+
+@label "tot: collect all pattern vars"
+@description "Collect EVERY variable a pattern binds (top-level PatVar + all nested), for shadow removal. PatLit / PatWildcard bind nothing."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totCollectAllVars : (pattern: Pattern) -> (acc: a) -> a
+totCollectAllVars pattern acc =
+  case pattern of
+    PatVar { name = n } -> appendItem n acc
+    PatConstruct { args = subs } -> totCollectAllVarsList subs acc
+    _ -> acc
+
+@label "tot: collect all pattern vars (list)"
+@description "Fold totCollectAllVars over a list of sub-patterns (a PatConstruct's args)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totCollectAllVarsList : (subs: a) -> (acc: a) -> a
+totCollectAllVarsList subs acc =
+  case head subs of
+    Nothing -> acc
+    Just sp ->
+      let acc2 = totCollectAllVars sp acc
+      case tail subs of
+        Nothing -> acc2
+        Just rest -> totCollectAllVarsList rest acc2
+
+@label "tot: ctor-var step"
+@description "One sub-pattern's contribution to the structurally-smaller var set: a PatVar field is smaller; a nested PatConstruct's vars are smaller too; PatLit / PatWildcard contribute nothing."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totCtorVarStep : (sp: Pattern) -> (acc: a) -> a
+totCtorVarStep sp acc =
+  case sp of
+    PatVar { name = n } -> appendItem n acc
+    PatConstruct { args = nested } -> totCollectCtorVarsList nested acc
+    _ -> acc
+
+@label "tot: collect ctor vars (list)"
+@description "Fold totCtorVarStep over a PatConstruct's sub-patterns — the structurally-smaller variables introduced by destructuring."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totCollectCtorVarsList : (subs: a) -> (acc: a) -> a
+totCollectCtorVarsList subs acc =
+  case head subs of
+    Nothing -> acc
+    Just sp ->
+      let acc2 = totCtorVarStep sp acc
+      case tail subs of
+        Nothing -> acc2
+        Just rest -> totCollectCtorVarsList rest acc2
+
+@label "tot: collect ctor vars"
+@description "The structurally-smaller variables a pattern introduces: only the vars UNDER a PatConstruct (fields of a destructured value). A bare top-level PatVar binds a same-size alias, NOT a smaller term, so it contributes nothing."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totCollectCtorVars : (pattern: Pattern) -> (acc: a) -> a
+totCollectCtorVars pattern acc =
+  case pattern of
+    PatConstruct { args = subs } -> totCollectCtorVarsList subs acc
+    _ -> acc
+
+
+-- -------------------------------------------------------------------------
+-- ORIGIN TRACKING (rung 3, slice A) — the `decr` flat smaller-var set BECAME
+-- `origins : List {name, origin}`, pairing each strictly-smaller variable with
+-- the ROOT PARAMETER it is a structural sub-term of. The position-aware RelLt
+-- needs "smaller than WHICH param", which the flat set could not answer. The
+-- origin is ALWAYS a parameter name (the root of the destructuring chain). The
+-- entry field is `name` (NOT `var` — `var` is the JSON-Logic variable operator;
+-- `name` mirrors the existing `EVar {name}` / `{name, set}` assoc-list shape and
+-- side-steps any parse ambiguity).
+-- -------------------------------------------------------------------------
+
+@label "tot: lookup origin"
+@description "The origin param of a smaller var `v` in `origins`, or Nothing when `v` is not a tracked smaller var (a parameter, or an unrelated name). Maybe-returning (not a sentinel string) so callers pattern-match. Folds over `origins` comparing entry.name == v."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totLookupOrigin : (v: String) -> (origins: a) -> Maybe String
+totLookupOrigin v origins =
+  case head origins of
+    Nothing -> Nothing
+    Just entry ->
+      if eq entry.name v
+        then Just entry.origin
+        else
+          case tail origins of
+            Nothing -> Nothing
+            Just rest -> totLookupOrigin v rest
+
+@label "tot: origin is param"
+@description "True when `v`'s origin is EXACTLY `p` — i.e. `v` is a strict structural sub-term of parameter `p`. Drives RelLt-structural at p's OWN position. Folds over `origins` comparing entry.name == v AND entry.origin == p."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totOriginIs : (v: String) -> (p: String) -> (origins: a) -> Bool
+totOriginIs v p origins =
+  case head origins of
+    Nothing -> False
+    Just entry ->
+      let thisMatch = if eq entry.name v then eq entry.origin p else False
+      case tail origins of
+        Nothing -> thisMatch
+        Just rest -> totOr thisMatch (totOriginIs v p rest)
+
+@label "tot: root origin of scrutinee"
+@description "The ROOT param of a destructurable scrutinee expression: when `s` is `EVar v`, `v`'s origin if it is itself a smaller var (transitively a param), else `v` (a param is its own root). Non-EVar ⇒ \"\" (unused — only called when canDestr already gated `s ∈ scrut`, so `s` is an EVar). Threads the \"sub-term of WHICH param\" fact through nested destructuring."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totRootOrigin : (s: Expr) -> (origins: a) -> String
+totRootOrigin s origins =
+  case s of
+    EVar { name = v } ->
+      case totLookupOrigin v origins of
+        Nothing -> v
+        Just o -> o
+    _ -> ""
+
+@label "tot: origins remove-one tail"
+@description "Recurse on the tail of `origins` for totOriginsRemoveOne. Internal split (keeps totOriginsRemoveOne free of case-in-let)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totOriginsRemoveOneTail : (n: String) -> (origins: a) -> a
+totOriginsRemoveOneTail n origins =
+  case tail origins of
+    Nothing -> []
+    Just rest -> totOriginsRemoveOne n rest
+
+@label "tot: origins remove-one"
+@description "Remove every origins entry whose name is `n` (variable shadowing over the origin-tracked set — a binder re-using a name drops the prior smaller binding). Mirrors totRemoveOne but over the {name, origin} records."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totOriginsRemoveOne : (n: String) -> (origins: a) -> a
+totOriginsRemoveOne n origins =
+  case head origins of
+    Nothing -> []
+    Just entry ->
+      let restRemoved = totOriginsRemoveOneTail n origins
+      if eq entry.name n then restRemoved else appendItem entry restRemoved
+
+@label "tot: origins remove-all"
+@description "Remove every entry whose name is in `names` from `origins`. Applies a binder's whole bound-var set's shadow-removal to the origin-tracked smaller set (mirrors totRemoveAll)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totOriginsRemoveAll : (names: a) -> (origins: a) -> a
+totOriginsRemoveAll names origins =
+  case head names of
+    Nothing -> origins
+    Just n ->
+      let origins2 = totOriginsRemoveOne n origins
+      case tail names of
+        Nothing -> origins2
+        Just rest -> totOriginsRemoveAll rest origins2
+
+@label "tot: origins add ctor-vars"
+@description "Add `{name = ctorVar, origin = root}` for each destructured ctor-var — they all share the scrutinee's root param. Mirrors totAppendAll, attaching the origin (rung 3's per-var root-param tracking)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totOriginsAddCtor : (ctorVars: a) -> (root: String) -> (origins: a) -> a
+totOriginsAddCtor ctorVars root origins =
+  case head ctorVars of
+    Nothing -> origins
+    Just cv ->
+      let entry = { name = cv, origin = root }
+      let origins2 = appendItem entry origins
+      case tail ctorVars of
+        Nothing -> origins2
+        Just rest -> totOriginsAddCtor rest root origins2
+
+
+-- -------------------------------------------------------------------------
+-- THE PER-POSITION RELATIONS + the lexicographic scan (rung 3, slice A). Per
+-- position `i` (param `pᵢ`, argument `argᵢ`): RelEq (argᵢ = EVar pᵢ), RelLt
+-- (structural `EVar v` with origin pᵢ, OR guarded `sub pᵢ 1` with pᵢ ∈ pos),
+-- else RelUnknown. The scan reads left-to-right: the first non-Eq position must
+-- be Lt (lex-decreasing) — any other shape there FAILS (cross-position lands in
+-- RelUnknown, so the hole is repaired).
+-- -------------------------------------------------------------------------
+
+@label "tot: position RelEq"
+@description "True when `arg` is `EVar p` — the position's OWN parameter, unchanged, in its own slot (RelEq). Any other shape ⇒ False."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totPosIsEq : (p: String) -> (arg: Expr) -> Bool
+totPosIsEq p arg =
+  case arg of
+    EVar { name = v } -> eq v p
+    _ -> False
+
+@label "tot: sub is p-minus-one guarded"
+@description "True when the `sub` sub-args `s` are exactly `[EVar p, ELit 1]` (the operand is the position's OWN param `p`) AND the branch facts make the decrement strict and well-founded (totCanDecrement). The k=1 fence (inherited rung-2b): only a unit decrement of p itself. Specialized from the retired rung-2 `totSubVarOne` — the var MUST be `p`, not any var in pos."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totSubIsPMinusOne : (p: String) -> (s: a) -> (pos: a) -> Bool
+totSubIsPMinusOne p s pos =
+  case head s of
+    Nothing -> False
+    Just a0 ->
+      case tail s of
+        Nothing -> False
+        Just rest ->
+          case head rest of
+            Nothing -> False
+            Just a1 -> totSubPOne p pos a0 a1
+
+@label "tot: sub operands = (p, 1)"
+@description "Helper for totSubIsPMinusOne: True when `a0` is `EVar p` (the position's own param) and `a1` is `ELit 1`, AND the branch facts make `p - 1` a strict, well-founded descent in the runtime number representation (totCanDecrement: p > 0, p ≤ 2^53, p a non-NaN number). Any other shape ⇒ False (sound under-approximation — cross-position `sub q 1` at p's slot, q ≠ p, is RelUnknown here)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totSubPOne : (p: String) -> (pos: a) -> (a0: Expr) -> (a1: Expr) -> Bool
+totSubPOne p pos a0 a1 =
+  case a0 of
+    EVar { name = v } ->
+      case a1 of
+        ELit { value = k } ->
+          if eq v p
+            then (if eq k 1 then totCanDecrement p pos else False)
+            else False
+        _ -> False
+    _ -> False
+
+@label "tot: position RelLt"
+@description "True when `arg` is strictly LESS than the position's OWN param `p` (RelLt): structural (`EVar v` with origin(v) = p — a strict sub-term of p in p's slot) OR guarded measure (`std:sub p 1` — the canonical trusted id — under totCanDecrement). A var whose origin is a DIFFERENT param, a construction, or any unrecognized shape ⇒ False (RelUnknown — the cross-position repair)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totPosIsLt : (p: String) -> (arg: Expr) -> (pos: a) -> (origins: a) -> Bool
+totPosIsLt p arg pos origins =
+  case arg of
+    EVar { name = v } -> totOriginIs v p origins
+    ECall { fnId = f, args = s } -> if eq f "std:sub" then totSubIsPMinusOne p s pos else False
+    _ -> False
+
+@label "tot: small list tail"
+@description "The tail of a list, or [] when empty — a total `tail` for the parallel param/arg scan (decreasing on the list, no indexing)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totTail : (xs: a) -> a
+totTail xs =
+  case tail xs of
+    Nothing -> []
+    Just r -> r
+
+-- (`totCallLexDec` — slice A's fixed-order lexicographic scan — is RETIRED:
+-- the size-change graph closure (RUNG 3 slice B, below) proves everything the
+-- lex-identity scan did and more, so keeping the dead fixed-order shortcut
+-- alongside would only invite regression. Its inputs — `params` / `args` /
+-- `pos` / `origins` — now feed the `totCallSiteGraphCross` edge builder. The
+-- per-position relations `totPosIsEq` / `totPosIsLt` are REUSED verbatim as the
+-- edge oracle: slice A applied them on the DIAGONAL only; slice B applies them
+-- to ALL source-param × target-position pairs.)
+
+
+-- -------------------------------------------------------------------------
+-- totScrutDecreasable — is a match scrutinee a variable we can destructure
+-- into smaller vars? (a parameter, or an already-smaller var ⇒ in `scrut`.)
+-- -------------------------------------------------------------------------
+
+@label "tot: scrutinee destructurable"
+@description "True when the match scrutinee is a bare variable in the `scrut` set (a parameter or an already-smaller var), so destructuring it yields structurally-smaller bindings."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-1"
+@category "engine-internal"
+totScrutDecreasable : (scrut: a) -> (s: Expr) -> Bool
+totScrutDecreasable scrut s =
+  case s of
+    EVar { name = v } -> totNameElem v scrut
+    _ -> False
+
+
+-- =========================================================================
+-- RUNG 2 — the guard recognizer (`totPosFromCond` / `totPosFromCondNeg`).
+--
+-- The narrowing that backs rung-2's soundness obligation, RE-EXPRESSED over
+-- the core `Expr` + a `pos` NAME-set (NOT a call into `narrowFromCondition`:
+-- that operates on ExprMarker + a SetMarker env — a DIFFERENT representation;
+-- the inputs are genuinely different ADTs, so this is narrowing specialized to
+-- the `v > 0` predicate, not duplicated decision logic — D-3a-3). `pos` is the
+-- list of branch facts ({name, fact} records: "lower" v > 0, "upper" v ≤ 2^53,
+-- "number" v a non-NaN Number — see totFactsFromCompare) known in the current
+-- branch (a set of names known `> 0` until 2026-10-03).
+--
+-- `totPosFromCond cond pos` extends `pos` with every var the condition PROVES
+-- `> 0` in the TRUE branch; `totPosFromCondNeg cond pos` does the same for the
+-- FALSE (else) branch (the negation). The and/or asymmetry is mirrored EXACTLY:
+-- the true-branch can narrow an `and` (every conjunct holds) but NOT an `or`;
+-- the false-branch can narrow an `or` (every disjunct is false) but NOT an
+-- `and`. Any shape not recognized adds NOTHING (sound under-approximation — a
+-- wrong `> 0` is the unsoundness this rung exists to refuse).
+--
+-- TRUSTED IDENTITIES ONLY (2026-10-03). A fact is read off a comparison,
+-- a conjunction/disjunction or a subtraction only when its head is the
+-- CANONICAL id of the std primitive (`std:gt`, `std:gte`, `std:lt`, `std:lte`,
+-- `std:and`, `std:or`, `std:sub` — totIsTrustedPrimitive), never off the
+-- spelling: a user function named `gt` or `sub` means whatever its body says,
+-- and before this repair `gt a b = True; sub a b = a; loop n = if gt n 0 then
+-- loop (sub n 1) else 0` read Total. Stored bodies keep source spellings (the
+-- desugar codenames `gt` / `sub` … of fixity-resolve.fenel), so each caller
+-- resolves them first: the kernel projection rewrites a head whose spelling
+-- denotes exactly one registry id, that id being a trusted primitive
+-- (analyze.fenel anaCanonicalizeTrusted), and inference rewrites a head its
+-- exact routing row resolves to one (inferenceTotalityCallHead). A head that is
+-- ambiguous, unresolved or user-defined stays a spelling and yields no fact.
+-- =========================================================================
+
+@label "tot: trusted primitive id"
+@description "True when `id` is the canonical registry id of a std primitive whose meaning the size-change oracle relies on: the comparisons std:gt / std:gte / std:lt / std:lte, the connectives std:and / std:or, and the decrement std:sub. Only heads already resolved to one of these ids yield a positivity, bound or descent fact; a bare spelling never does (a user function may share the name)."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totIsTrustedPrimitive : (id: String) -> Bool
+totIsTrustedPrimitive id = elem id ["std:sub", "std:gt", "std:gte", "std:lt", "std:lte", "std:and", "std:or"]
+
+@label "tot: add a branch fact"
+@description "Record that the branch proves fact `kind` about variable `v`: \"lower\" (v > 0), \"upper\" (v ≤ 2^53, where subtracting 1 from a JS Number is exact) or \"number\" (v is a Number and not NaN — only a comparison that evaluated to TRUE proves it: std:gt and friends answer false for NaN and for mixed operand types). Facts are records {name, fact} in the `pos` list."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totAddFact : (v: String) -> (kind: String) -> (pos: a) -> a
+totAddFact v kind pos =
+  let entry = { name = v, fact = kind }
+  appendItem entry pos
+
+@label "tot: has a branch fact"
+@description "True when the branch facts `pos` hold fact `kind` (\"lower\" / \"upper\" / \"number\") about variable `v`."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totHasFact : (v: String) -> (kind: String) -> (pos: a) -> Bool
+totHasFact v kind pos =
+  fold (\found x -> if found then True else if eq x.name v then eq x.fact kind else False) False pos
+
+@label "tot: forget facts about shadowed names"
+@description "Drop every branch fact about a name in `names` (a binder that re-uses the name hides the variable the fact was about)."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totFactsForget : (names: a) -> (pos: b) -> b
+totFactsForget names pos = filter (\x -> not (elem x.name names)) pos
+
+@label "tot: unit decrement is a strict well-founded descent"
+@description "True when `p - 1` strictly decreases `p` in a well-founded order AS JS NUMBERS COMPUTE IT: p > 0 (\"lower\"), p ≤ 2^53 (\"upper\": below it subtracting 1 is exact, above it `1e20 - 1 = 1e20` and `Infinity - 1 = Infinity`), and p a non-NaN Number (\"number\": a NaN or a non-number satisfies every NEGATED comparison, so `if n <= 0 then 0 else f (n - 1)` loops on NaN). Under all three, ⌈p⌉ is a natural number that drops by one per call. 2026-10-03: before, `p > 0` alone (or the else branch of `p <= 0`) was accepted."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totCanDecrement : (p: String) -> (pos: a) -> Bool
+totCanDecrement p pos =
+  and (totHasFact p "lower" pos) (and (totHasFact p "upper" pos) (totHasFact p "number" pos))
+
+@label "tot: flip a comparison"
+@description "The relation read from the other side: `k > v` is `v < k`. gt ↔ lt, gte ↔ lte."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totRelFlip : (rel: String) -> String
+totRelFlip rel =
+  if eq rel "gt" then "lt" else if eq rel "lt" then "gt" else if eq rel "gte" then "lte" else if eq rel "lte" then "gte" else ""
+
+@label "tot: relation holding in a branch"
+@description "The relation `v rel k` holding in the TRUE branch (`truth`), or its negation in the FALSE branch: not (v > k) is v ≤ k, and so on. The negation is exact only for non-NaN numbers, which is why a false-branch relation never contributes the \"number\" fact."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totRelUnder : (rel: String) -> (truth: Bool) -> String
+totRelUnder rel truth =
+  if truth then rel
+  else if eq rel "gt" then "lte" else if eq rel "gte" then "lt" else if eq rel "lt" then "gte" else if eq rel "lte" then "gt" else ""
+
+@label "tot: facts from a variable-literal relation"
+@description "Extend the branch facts with what `v rel k` proves for a NUMERIC literal k (a non-number literal proves nothing): v > k with k ≥ 0, or v ≥ k with k > 0, gives \"lower\"; v < k or v ≤ k with k ≤ 2^53 gives \"upper\"; and when the comparison itself evaluated to TRUE (`direct`), \"number\"."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totFactsFromRel : (v: String) -> (rel: String) -> (k: b) -> (direct: Bool) -> (pos: a) -> a
+totFactsFromRel v rel k direct pos =
+  if not (isNumber k) then pos
+  else
+    let withNumber = if direct then totAddFact v "number" pos else pos
+    let lower = if eq rel "gt" then gte k 0 else if eq rel "gte" then gt k 0 else False
+    let upper = if eq rel "lt" then lte k 9007199254740992 else if eq rel "lte" then lte k 9007199254740992 else False
+    let withLower = if lower then totAddFact v "lower" withNumber else withNumber
+    if upper then totAddFact v "upper" withLower else withLower
+
+@label "tot: facts from a comparison"
+@description "The facts a trusted comparison `f a0 a1` (std:gt / std:gte / std:lt / std:lte only — totIsTrustedPrimitive) proves about a variable compared with a literal, in its TRUE branch (`truth`) or its FALSE branch. Either orientation (`v > 0`, `0 < v`); any other shape or head proves nothing."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totFactsFromCompare : (f: String) -> (a0: Expr) -> (a1: Expr) -> (truth: Bool) -> (pos: a) -> a
+totFactsFromCompare f a0 a1 truth pos =
+  let rel = if eq f "std:gt" then "gt" else if eq f "std:gte" then "gte" else if eq f "std:lt" then "lt" else if eq f "std:lte" then "lte" else ""
+  if eq rel "" then pos
+  else
+    case a0 of
+      EVar { name = v } ->
+        case a1 of
+          ELit { value = k } -> totFactsFromRel v (totRelUnder rel truth) k truth pos
+          _ -> pos
+      ELit { value = k } ->
+        case a1 of
+          EVar { name = v } -> totFactsFromRel v (totRelUnder (totRelFlip rel) truth) k truth pos
+          _ -> pos
+      _ -> pos
+
+@label "tot: positivity from comparison (true-branch)"
+@description "The facts a binary comparison proves in its TRUE branch, given its fnId and two operands (totFactsFromCompare with truth = True): positivity, the exact-decrement bound and Number-ness of the compared variable. Unrecognized fnId or shape ⇒ pos unchanged."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3a"
+@category "engine-internal"
+totPosFromCompare : (f: String) -> (a0: Expr) -> (a1: Expr) -> (pos: a) -> a
+totPosFromCompare f a0 a1 pos = totFactsFromCompare f a0 a1 True pos
+
+@label "tot: positivity from comparison (false-branch)"
+@description "The facts the negated comparison proves (what the FALSE/else branch knows; totFactsFromCompare with truth = False): positivity or the exact-decrement bound of the compared variable, never its Number-ness (NaN and non-numbers fail every comparison). Unrecognized fnId or shape ⇒ pos unchanged."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3a"
+@category "engine-internal"
+totPosFromCompareNeg : (f: String) -> (a0: Expr) -> (a1: Expr) -> (pos: a) -> a
+totPosFromCompareNeg f a0 a1 pos = totFactsFromCompare f a0 a1 False pos
+
+@label "tot: binary operands → positivity (true)"
+@description "Extract the two operands of a binary comparison `ECall f args` and apply totPosFromCompare. Fewer than two operands ⇒ pos unchanged."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3a"
+@category "engine-internal"
+totPosFromBinary : (f: String) -> (args: a) -> (pos: b) -> b
+totPosFromBinary f args pos =
+  case head args of
+    Nothing -> pos
+    Just a0 ->
+      case tail args of
+        Nothing -> pos
+        Just rest ->
+          case head rest of
+            Nothing -> pos
+            Just a1 -> totPosFromCompare f a0 a1 pos
+
+@label "tot: binary operands → positivity (false)"
+@description "Extract the two operands of a binary comparison `ECall f args` and apply totPosFromCompareNeg (the else-branch positivity). Fewer than two operands ⇒ pos unchanged."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3a"
+@category "engine-internal"
+totPosFromBinaryNeg : (f: String) -> (args: a) -> (pos: b) -> b
+totPosFromBinaryNeg f args pos =
+  case head args of
+    Nothing -> pos
+    Just a0 ->
+      case tail args of
+        Nothing -> pos
+        Just rest ->
+          case head rest of
+            Nothing -> pos
+            Just a1 -> totPosFromCompareNeg f a0 a1 pos
+
+@label "tot: fold positivity over and-conjuncts"
+@description "Fold totPosFromCond over the conjuncts of an `and` (true-branch): every conjunct holds, so each narrowing applies in sequence."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3a"
+@category "engine-internal"
+totPosFoldAnd : (args: a) -> (pos: b) -> b
+totPosFoldAnd args pos =
+  case head args of
+    Nothing -> pos
+    Just c ->
+      let pos2 = totPosFromCond c pos
+      case tail args of
+        Nothing -> pos2
+        Just rest -> totPosFoldAnd rest pos2
+
+@label "tot: fold neg-positivity over or-disjuncts"
+@description "Fold totPosFromCondNeg over the disjuncts of an `or` (false-branch): the else branch of `if (or [..])` holds only when EVERY disjunct is false, so each negated narrowing applies in sequence."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3a"
+@category "engine-internal"
+totPosFoldOrNeg : (args: a) -> (pos: b) -> b
+totPosFoldOrNeg args pos =
+  case head args of
+    Nothing -> pos
+    Just c ->
+      let pos2 = totPosFromCondNeg c pos
+      case tail args of
+        Nothing -> pos2
+        Just rest -> totPosFoldOrNeg rest pos2
+
+@label "tot: positivity from guard (true-branch)"
+@description "Extend `pos` with every variable the condition PROVES `> 0` in its TRUE branch. Handles `and` (fold over conjuncts) and the four binary comparisons; the true-branch CANNOT narrow an `or` (the and/or asymmetry), so an `or` and any unrecognized shape leave `pos` unchanged (sound under-approximation)."
+@tags "engine" "totality" "unified-static-analysis" "phase-3a"
+totPosFromCond : (cond: Expr) -> (pos: a) -> a
+totPosFromCond cond pos =
+  case cond of
+    ECall { fnId = f, args = args } ->
+      if eq f "std:and" then totPosFoldAnd args pos
+      else totPosFromBinary f args pos
+    _ -> pos
+
+@label "tot: positivity from guard (false-branch)"
+@description "Extend `pos` with every variable the condition's NEGATION proves `> 0` (the else branch). Handles `or` (fold the negated narrowing over disjuncts) and the four negated binary comparisons; the false-branch CANNOT narrow an `and` (the and/or asymmetry), so an `and` and any unrecognized shape leave `pos` unchanged (sound under-approximation)."
+@tags "engine" "totality" "unified-static-analysis" "phase-3a"
+totPosFromCondNeg : (cond: Expr) -> (pos: a) -> a
+totPosFromCondNeg cond pos =
+  case cond of
+    ECall { fnId = f, args = args } ->
+      if eq f "std:or" then totPosFoldOrNeg args pos
+      else totPosFromBinaryNeg f args pos
+    _ -> pos
+
+
+-- =========================================================================
+-- RUNG 3 (slice B) — THE SIZE-CHANGE GRAPH CLOSURE (Lee–Jones–Ben-Amram, "The
+-- Size-Change Principle for Program Termination", POPL 2001). The complete
+-- (for the size-change abstraction) single-function termination criterion;
+-- subsumes rungs 1+2+3a and proves PERMUTED / reordering descents for which NO
+-- fixed parameter order works (`f a b = if a > 0 then f b (a - 1) else 0` —
+-- terminating, but slice A fences it `Unknown` because position 0 gets `b`).
+--
+-- THE SIZE-CHANGE GRAPH of a self-call `f(arg₀ … argₙ₋₁)` (caller params
+-- `p₀ … pₙ₋₁`) is a `List Edge`; an edge `{ src, tgt, strict }` records a size
+-- relation from a SOURCE param to a callee TARGET param-slot. For every source
+-- `pⱼ` and target position `i` (arg `argᵢ` binds the callee's `pᵢ`):
+--   • strict edge `pⱼ →↓ pᵢ`  (`strict = true`)  ⟺ `totPosIsLt pⱼ argᵢ pos
+--     origins` (argᵢ is a structural sub-term of pⱼ, OR argᵢ = sub pⱼ 1 with
+--     pⱼ ∈ pos — the callee's pᵢ is STRICTLY less than the caller's pⱼ);
+--   • non-strict edge `pⱼ →↓= pᵢ` (`strict = false`) ⟺ `totPosIsEq pⱼ argᵢ`
+--     (argᵢ = EVar pⱼ — the callee's pᵢ is EQUAL/≤ the caller's pⱼ);
+--   • no edge otherwise (a construction, an unrelated var, any unrecognized
+--     shape). At most one edge per (src, tgt) slot — RelLt and RelEq are
+--     mutually exclusive. The per-position relations `totPosIsEq`/`totPosIsLt`
+--     are slice A's, REUSED verbatim — slice A read them on the DIAGONAL only;
+--     slice B reads them over ALL source × target pairs (the generalization).
+--
+-- COMPOSITION `G ; H` (G then H, both over the same param set): an edge
+-- `x →ʳ z` exists iff some intermediate `y` has `x →ʳ¹ y ∈ G` and `y →ʳ² z ∈ H`;
+-- the label is STRICT if r1 OR r2 is strict, else non-strict (`totOr` on the
+-- flags). When several intermediates yield `x → z`, the STRONGEST wins
+-- (`totAddStrongEdge` — strict dominates). Composition models the size relation
+-- after two consecutive calls.
+--
+-- CLOSURE `S*`. Start with S₀ = the call-site graphs (one per self-call,
+-- deduped). Iterate `S_{k+1} = S_k ∪ { normalize(G ; H) : G, H ∈ S_k }` until
+-- `S_{k+1} = S_k`. The set of distinct graphs over n params is finite (each of
+-- n² slots ∈ {none, ↓=, ↓} ⇒ ≤ 3^(n²) graphs), so the closure TERMINATES — the
+-- fuel is the structural-decreasing measure (`totClose`, seeded 256, early-exit
+-- on no-change) AND a pathological backstop; fuel exhaustion ⇒ `Unknown` (a
+-- SOUND under-approximation — we NEVER check a PARTIAL closure for `Total`).
+--
+-- THE SCT CRITERION. The recursion is size-change terminating iff EVERY
+-- IDEMPOTENT graph `G` in the closure (`G ; G = G`) has a strictly-descending
+-- SELF-edge (∃x. x →↓ x ∈ G). An idempotent graph describes a "stable" infinite
+-- call path; if every such path strictly decreases SOME parameter forever, no
+-- infinite computation exists (well-foundedness — structural sizes ∈ ℕ, guarded
+-- measures ≥ 0 within descent — forbids it).
+--
+-- WHY SOUND (never a wrong `Total`). Every edge asserts a relation the sound
+-- per-position oracle already proved (slice A's soundness, unchanged);
+-- composition only DERIVES relations that hold along two-call paths; the SCT
+-- theorem is sound. A MISSING edge (under-approximation) only makes the
+-- criterion HARDER to satisfy ⇒ `Unknown`, never a wrong `Total`.
+-- WHY REPAIR-PRESERVING (the slice-A holes stay `Unknown`). `f a b = case a of
+-- Cons h t -> f (Cons h t) t`: arg₀ = Cons h t (construction ⇒ no edge), arg₁ =
+-- t (origin a ⇒ strict a →↓ b). G = {a →↓ b}; G ; G = {} (G's only edge target
+-- b ≠ its source a, no composition) — the EMPTY idempotent has no strict
+-- self-edge ⇒ `Unknown` (✓ `a` never shrinks). Same for the measure
+-- cross-position `f (b+1) (a-1)` (same G = {a →↓ b}).
+-- WHY SUBSUMES slice A. A lex-identity descent is a special case of SCT (LJB
+-- theorem) — every slice-A `Total` keeps its diagonal strict edge into a
+-- strict-self-edge idempotent.
+-- WHY WINS. Permuted `f a b = if a>0 then f b (a-1) else 0`: arg₀ = b (RelEq vs
+-- b ⇒ b →↓= a), arg₁ = a-1 (a ∈ pos ⇒ a →↓ b). G = {b →↓= a, a →↓ b}; G ; G =
+-- {a →↓ a, b →↓ b} (idempotent, strict self-edges) ⇒ `Total` (slice A said
+-- `Unknown`).
+-- SLICE C (rung-3c, Phase 3e) LIFTED this: the bare `List Edge` graph became a
+-- `{from, to, edges}` morphism, the walk threads `group` + `fromId` + `fromParams`
+-- (not one `selfId`), and composition is guarded by `G.to == H.from` — so MUTUAL
+-- recursion (a SET of functions, inter-function edges between DIFFERENT param
+-- sets) is now decided. This slice-B section's machinery (the edge ops, the edge
+-- composition fold, the closure shape) is REUSED verbatim by slice C below.
+-- Inherited fences (slice A): the size-change abstraction tracks only ≤ / < from
+-- the name-set oracle, so `≠ 0`/ℕ-typed guards still need a TYPE (`== 0`-guarded
+-- Ackermann/even-odd stays `Unknown`), and the k=1 / non-`sub` measure fence is
+-- unchanged. STILL ADVISORY (no kernel-gate wiring — slice C's successor).
+-- =========================================================================
+
+
+-- =========================================================================
+-- RUNG 3 (slice C) — MUTUAL RECURSION: THE CALL-GRAPH SIZE-CHANGE CLOSURE
+-- (Lee–Jones–Ben-Amram general form). The LAST termination class; UNBLOCKS the
+-- kernel gate. Generalizes slice B's per-function self-composition to a CALL
+-- GRAPH over a SET of functions `{f₀, f₁, …}`, each with its own param list.
+--
+-- THE CALL GRAPH. A call site `fₐ(…) → fᵦ(arg₀ … argₘ₋₁)` (the call is in fₐ's
+-- body; fᵦ's params are q₀ … qₘ₋₁) yields a size-change graph `G : fₐ → fᵦ` — a
+-- record `{from = fₐ, to = fᵦ, edges}`. Edges run from the CALLER's params
+-- (source) to the CALLEE's param-slots (target), via the SAME per-position oracle
+-- slice A/B use (totPosIsLt / totPosIsEq, REUSED verbatim) — only the source set
+-- (caller) and target set (callee) now DIFFER (slice B had them equal). The walk
+-- totCallSiteGraphGo already separates source `allParams` from target `tgtParams`,
+-- so the cross-function build is the SAME walk seeded with caller ≠ callee params.
+--
+-- COMPOSITION `G ; H` (category structure, PARTIAL). Defined ONLY when
+-- `G.to == H.from` (the intermediate function matches): `G : fₐ → fᵦ` and
+-- `H : fᵦ → f𝚌` compose to `G ; H : fₐ → f𝚌` (from = G.from, to = H.to, edges =
+-- the SAME meet-at-intermediate edge composition slice B uses). When G.to ≠ H.from
+-- there is NO composed graph (the pair is SKIPPED — NOT an empty graph, which
+-- would pollute the closure with a spurious idempotent). Name collisions across
+-- functions are harmless — composition only matches G.edge.tgt to H.edge.src when
+-- G.to == H.from, so both names live in the SAME intermediate's param namespace.
+--
+-- CLOSURE `S*`. S₀ = every call-site graph from EVERY group member's body
+-- (totCollectAllMembers, deduped). Iterate S_{k+1} = S_k ∪ { normalize(G ; H) :
+-- G,H ∈ S_k, G.to == H.from } until fixpoint. The distinct-graph set is finite
+-- (≤ 3^(|from|×|to|) edge-sets per ordered (from,to) pair, finitely many pairs),
+-- so the closure TERMINATES — fuel-bounded (256), exhaustion ⇒ `Unknown`.
+--
+-- THE SCT CRITERION (LJB, general). Size-change terminating iff every IDEMPOTENT
+-- graph `G` in the closure (`G.from == G.to` AND `G ; G = G`) has a
+-- strictly-descending SELF-edge (∃x. x →↓ x ∈ G.edges). Idempotent graphs are
+-- necessarily `f → f` cycles. Intuition: an idempotent `f → f` graph is a stable
+-- infinite call path returning to `f`; if every such cycle strictly decreases
+-- SOME parameter forever, no infinite computation exists (well-foundedness of the
+-- per-parameter domains forbids it).
+--
+-- WHY SOUND (never a wrong `Total`). Every edge asserts a relation the sound
+-- per-position oracle proved (slice A's soundness, unchanged); composition only
+-- derives relations holding along multi-call call-graph paths; the LJB theorem is
+-- sound for the general multi-function case. A MISSING edge (a call outside the
+-- group, an unrecognized shape, fuel exhaustion) only weakens the criterion ⇒
+-- `Unknown`, never a wrong `Total`. A partial closure is NEVER checked for `Total`.
+-- WHY SUBSUMES slice B. The single function is the one-object special case: every
+-- graph is `f → f`, the `from == to` guard is always true, composition is always
+-- defined ⇒ the closure + criterion reduce EXACTLY to slice B's.
+-- checkStructuralTotality is now SUGAR for checkMutualTotality of a singleton
+-- group — the 40 slice-B test verdicts are preserved BY CONSTRUCTION.
+-- WHY WINS. Structural mutual `f x = case x of Cons h t -> g t` / `g y = case y
+-- of Cons h t -> f t`: G1 = f→g {x →↓ y}, G2 = g→f {y →↓ x}; G1;G2 = f→f {x →↓ x},
+-- G2;G1 = g→g {y →↓ y}, both idempotent with a strict self-edge ⇒ `Total`. The
+-- measure mutual `f a = if a>0 then g (a-1)` / `g b = if b>0 then f (b-1)` ⇒
+-- `Total` likewise. A 3-function cycle `f → g → h → f` surfaces its `f → f`
+-- idempotent only after composing THREE graphs — the closure fixpoint catches it.
+-- WHY STAYS SOUND on the canaries (MUST be `Unknown`). Mutual non-termination
+-- `f a = g a` / `g b = f b`: G1 = f→g {a →↓= b}, G2 = g→f {b →↓= a}; G1;G2 = f→f
+-- {a →↓= a} — idempotent with NO strict self-edge ⇒ `Unknown` (f 5 → g 5 → f 5 …
+-- diverges). Permutation ping-pong `f a b = g b a` / `g x y = f y x` — the f→f
+-- cycle is {a →↓= a, b →↓= b}, no strict self-edge ⇒ `Unknown`.
+-- FENCED (inherited): `≠ 0` / `== 0` equality guards need a ℕ TYPE (`== 0`-guarded
+-- mutual `even`/`odd` stays `Unknown`); k ≥ 2 / non-`sub` measures; and SCC
+-- DISCOVERY — the group is an explicit input (D-3e-4); slice C does not find the
+-- mutually-recursive set itself (the gate wiring or a follow-up owns it). STILL
+-- ADVISORY (no kernel-gate wiring — the NEXT slice, now unblocked).
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- A. The size-change graph representation. A graph is a `List Edge`; an edge is
+-- the anonymous record `{ src, tgt, strict }` (src/tgt param-name Strings; the
+-- `strict` Bool field VALUE uses lowercase true/false per the solve.fenel idiom
+-- — no bare True/False in arg position). A graph SET (the closure) is a
+-- `List Graph` = `List (List Edge)`. 0 entity decls (plain List-of-records, the
+-- propagate.fenel/totality.fenel plain-record discipline). The canonical graph
+-- form has at most one edge per (src, tgt) slot, strict dominating.
+-- -------------------------------------------------------------------------
+
+@label "tot: and"
+@description "Eager boolean conjunction used by the size-change set/closure folds. Returns y when x is True, else False."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totAnd : (x: Bool) -> (y: Bool) -> Bool
+totAnd x y = if x then y else False
+
+@label "tot: bool eq"
+@description "Boolean equality (the `strict` flag comparison for edge equality). True when both flags agree. Avoids relying on the scalar `eq` native over JS booleans."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totBoolEq : (x: Bool) -> (y: Bool) -> Bool
+totBoolEq x y = if x then y else not y
+
+@label "tot: edge same slot"
+@description "True when two edges occupy the SAME (src, tgt) slot — same source param AND same target param — regardless of strictness. Used for canonical-form merge + strict-dominance."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totEdgeSameSlot : (e1: a) -> (e2: a) -> Bool
+totEdgeSameSlot e1 e2 = if eq e1.src e2.src then eq e1.tgt e2.tgt else False
+
+@label "tot: edge eq"
+@description "Full edge equality: same (src, tgt) slot AND same strict flag. Needed for set-equality of graphs (idempotency + closure dedup)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totEdgeEq : (e1: a) -> (e2: a) -> Bool
+totEdgeEq e1 e2 = if totEdgeSameSlot e1 e2 then totBoolEq e1.strict e2.strict else False
+
+@label "tot: edge member"
+@description "True when edge `e` (exact src/tgt/strict) occurs in graph `g`. Fold totEdgeEq over g."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totEdgeMember : (e: a) -> (g: b) -> Bool
+totEdgeMember e g =
+  case head g of
+    Nothing -> False
+    Just e2 ->
+      if totEdgeEq e e2 then True
+      else
+        case tail g of
+          Nothing -> False
+          Just rest -> totEdgeMember e rest
+
+@label "tot: edges subset"
+@description "True when every edge of edge-list `g` occurs (exactly) in edge-list `h`. The order-independent half of edge-set-equality. (Slice C rename: was totGraphSubset — graphs are now {from,to,edges} records, so the set ops over the EDGE lists are named tot Edges* and the graph-level eq compares from/to too.)"
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totEdgesSubset : (g: a) -> (h: b) -> Bool
+totEdgesSubset g h =
+  case head g of
+    Nothing -> True
+    Just e ->
+      let thisIn = totEdgeMember e h
+      case tail g of
+        Nothing -> thisIn
+        Just rest -> totAnd thisIn (totEdgesSubset rest h)
+
+@label "tot: edges eq"
+@description "Set-equality of two edge-lists (order-independent): mutual edge-subset. Both are kept in canonical form (one edge per slot, strict-dominant), so set-equality is the right notion for idempotency + closure dedup. (Slice C rename: was totGraphEq, edge-level.)"
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3c"
+@category "engine-internal"
+totEdgesEq : (g: a) -> (h: b) -> Bool
+totEdgesEq g h = totAnd (totEdgesSubset g h) (totEdgesSubset h g)
+
+@label "tot: graph eq"
+@description "Set-equality of two GRAPHS (slice C): same `from` function, same `to` function, AND set-equal edge lists. A graph is a {from, to, edges} morphism caller→callee; two graphs are equal only when they label the SAME function pair and carry the same canonical edge set. Drives idempotency + closure dedup over the call graph."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totGraphEq : (g: a) -> (h: b) -> Bool
+totGraphEq g h = totAnd (eq g.from h.from) (totAnd (eq g.to h.to) (totEdgesEq g.edges h.edges))
+
+@label "tot: graph member"
+@description "True when graph `g` (by graph set-equality — from/to/edges) occurs in the graph-set `set`. Fold totGraphEq over set."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totGraphMember : (g: a) -> (set: b) -> Bool
+totGraphMember g set =
+  case head set of
+    Nothing -> False
+    Just g2 ->
+      if totGraphEq g g2 then True
+      else
+        case tail set of
+          Nothing -> False
+          Just rest -> totGraphMember g rest
+
+@label "tot: graph-set subset"
+@description "True when every graph of set `s1` occurs (by set-equality) in set `s2`. Half of the closure fixpoint stop-test."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totGraphSetSubset : (s1: a) -> (s2: b) -> Bool
+totGraphSetSubset s1 s2 =
+  case head s1 of
+    Nothing -> True
+    Just g ->
+      let thisIn = totGraphMember g s2
+      case tail s1 of
+        Nothing -> thisIn
+        Just rest -> totAnd thisIn (totGraphSetSubset rest s2)
+
+@label "tot: graph-set eq"
+@description "Set-equality of two graph-sets (mutual graph-subset) — the closure fixpoint stop-test (the round added no new graph)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totGraphSetEq : (s1: a) -> (s2: b) -> Bool
+totGraphSetEq s1 s2 = totAnd (totGraphSetSubset s1 s2) (totGraphSetSubset s2 s1)
+
+@label "tot: keep merged edge"
+@description "The strict-dominance merge step: build a single edge in `x`'s slot with strict = (x OR e strict), prepended onto the already-rebuilt rest. Helper for totMergeEdge (keeps it free of inline-record-in-then)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totMergeEdgeKeep : (x: a) -> (e: a) -> (rest: b) -> b
+totMergeEdgeKeep x e rest =
+  let merged = { src = x.src, tgt = x.tgt, strict = totOr x.strict e.strict }
+  appendItem merged rest
+
+@label "tot: merge-edge tail"
+@description "Recurse on the tail of graph `g` for totMergeEdge (keeps it free of case-in-let)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totMergeEdgeTail : (e: a) -> (g: b) -> b
+totMergeEdgeTail e g =
+  case tail g of
+    Nothing -> []
+    Just rest -> totMergeEdge e rest
+
+@label "tot: merge edge (strict-dominant)"
+@description "Rebuild graph `g`, OR-ing `e`'s strict flag into the existing edge in the SAME (src, tgt) slot (canonical-form strict-dominance). Non-matching edges pass through. Used only when a slot is already present (else totAddStrongEdge appends)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totMergeEdge : (e: a) -> (g: b) -> b
+totMergeEdge e g =
+  case head g of
+    Nothing -> []
+    Just x ->
+      let rest2 = totMergeEdgeTail e g
+      if totEdgeSameSlot e x then totMergeEdgeKeep x e rest2 else appendItem x rest2
+
+@label "tot: slot present"
+@description "True when graph `g` already has an edge in `e`'s (src, tgt) slot. Decides whether totAddStrongEdge merges (strict-dominance) or appends."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totSlotPresent : (e: a) -> (g: b) -> Bool
+totSlotPresent e g =
+  case head g of
+    Nothing -> False
+    Just x ->
+      if totEdgeSameSlot e x then True
+      else
+        case tail g of
+          Nothing -> False
+          Just rest -> totSlotPresent e rest
+
+@label "tot: add strong edge"
+@description "Insert edge `e` into graph `g` preserving canonical form: if an edge with the same (src, tgt) slot already exists, OR the strict flags (strict wins); else append. The graph builder AND composition both route through this."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totAddStrongEdge : (e: a) -> (g: b) -> b
+totAddStrongEdge e g =
+  if totSlotPresent e g then totMergeEdge e g else appendItem e g
+
+
+-- -------------------------------------------------------------------------
+-- B. The per-call-site graph builder. Reuse the slice-A per-position relations
+-- (`totPosIsLt` / `totPosIsEq`) as the edge oracle, now over ALL source-param ×
+-- target-position pairs (slice A read them on the diagonal only). For each
+-- target arg, fold over the FULL source param list; for each source, a strict /
+-- non-strict / no edge per the oracle.
+-- -------------------------------------------------------------------------
+
+@label "tot: strict edge"
+@description "Append a strict edge {src, tgt, strict = true} onto the accumulator (the source param strictly dominates the target slot)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totStrictEdge : (src: String) -> (tgt: String) -> (acc: a) -> a
+totStrictEdge src tgt acc =
+  let e = { src = src, tgt = tgt, strict = true }
+  appendItem e acc
+
+@label "tot: non-strict edge"
+@description "Append a non-strict edge {src, tgt, strict = false} onto the accumulator (the source param is equal-to/≤ the target slot)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totNonStrictEdge : (src: String) -> (tgt: String) -> (acc: a) -> a
+totNonStrictEdge src tgt acc =
+  let e = { src = src, tgt = tgt, strict = false }
+  appendItem e acc
+
+@label "tot: edge for one source param"
+@description "One source param `src`'s contribution to the edges INTO target slot `tgt` (arg `arg`): a strict edge when totPosIsLt (arg ≺ src — structural sub-term or guarded `sub src 1`), a non-strict edge when totPosIsEq (arg = EVar src), else nothing. At most one edge per source."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totEdgeForSrc : (src: String) -> (tgt: String) -> (arg: Expr) -> (pos: a) -> (origins: a) -> (acc: b) -> b
+totEdgeForSrc src tgt arg pos origins acc =
+  if totPosIsLt src arg pos origins then totStrictEdge src tgt acc
+  else if totPosIsEq src arg then totNonStrictEdge src tgt acc
+  else acc
+
+@label "tot: edges for one target arg (tail)"
+@description "Recurse on the tail of the source-param list for totEdgesForArg (keeps it free of case-in-let)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totEdgesForArgTail : (srcParams: a) -> (tgt: String) -> (arg: Expr) -> (pos: b) -> (origins: c) -> d
+totEdgesForArgTail srcParams tgt arg pos origins =
+  case tail srcParams of
+    Nothing -> []
+    Just rest -> totEdgesForArg rest tgt arg pos origins
+
+@label "tot: edges for one target arg"
+@description "Fold over the FULL source param list, accumulating each source's edge (strict / non-strict / none) into target slot `tgt` for argument `arg`. Returns the edges into this one slot."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totEdgesForArg : (srcParams: a) -> (tgt: String) -> (arg: Expr) -> (pos: b) -> (origins: c) -> d
+totEdgesForArg srcParams tgt arg pos origins =
+  case head srcParams of
+    Nothing -> []
+    Just src ->
+      let rest = totEdgesForArgTail srcParams tgt arg pos origins
+      totEdgeForSrc src tgt arg pos origins rest
+
+@label "tot: merge edges into a graph"
+@description "Fold totAddStrongEdge over a list of edges into the running graph (canonical-form insert, strict-dominant). Used to accumulate one target slot's edges into the call-site graph."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totMergeEdges : (edges: a) -> (acc: b) -> b
+totMergeEdges edges acc =
+  case head edges of
+    Nothing -> acc
+    Just e ->
+      let acc2 = totAddStrongEdge e acc
+      case tail edges of
+        Nothing -> acc2
+        Just rest -> totMergeEdges rest acc2
+
+@label "tot: call-site graph walk"
+@description "The parallel walk of target params / arguments (decreasing on the tails via totTail, no indexing): for each (tgtName, arg), accumulate totEdgesForArg over the FULL source param list into the running graph. Ran out of either list ⇒ the accumulated graph (an arity mismatch yields fewer edges — sound: a missing edge only weakens the criterion)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totCallSiteGraphGo : (allParams: a) -> (tgtParams: b) -> (args: c) -> (pos: d) -> (origins: e) -> (acc: f) -> f
+totCallSiteGraphGo allParams tgtParams args pos origins acc =
+  case head tgtParams of
+    Nothing -> acc
+    Just tgtName ->
+      case head args of
+        Nothing -> acc
+        Just arg ->
+          let edges = totEdgesForArg allParams tgtName arg pos origins
+          let acc2 = totMergeEdges edges acc
+          totCallSiteGraphGo allParams (totTail tgtParams) (totTail args) pos origins acc2
+
+@label "tot: cross-function call-site graph"
+@description "The size-change graph `G : fromId → toId` of ONE call site `toId(args)` in `fromId`'s body (slice C, generalizing slice B's single-function totCallSiteGraph): seeds the parallel param/arg walk with SOURCE = the caller's param list (callerParams) and TARGET = the callee's param list (calleeParams) — DIFFERENT sets for a mutual call, EQUAL for a self-call — then wraps the edge list in a {from, to, edges} morphism record. totCallSiteGraphGo is REUSED verbatim (it already separates source `allParams` from target `tgtParams`). The edges are built via a `let` then the literal (the inline-record-in-arg surprise)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totCallSiteGraphCross : (fromId: String) -> (toId: String) -> (callerParams: a) -> (calleeParams: b) -> (args: c) -> (pos: d) -> (origins: e) -> f
+totCallSiteGraphCross fromId toId callerParams calleeParams args pos origins =
+  let edges = totCallSiteGraphGo callerParams calleeParams args pos origins []
+  { from = fromId, to = toId, edges = edges }
+
+
+-- -------------------------------------------------------------------------
+-- C. The walk — COLLECT every self-call's size-change graph (a `List Graph`),
+-- threading the same (scrut, origins, pos) context slice A's walk threaded. The
+-- monoid is list concatenation (`totConcat`), not boolean disjunction; the tree
+-- walk, shadowing, guard-narrowing, and origin-tracking are otherwise the SAME.
+-- -------------------------------------------------------------------------
+
+@label "tot: concat (graph lists)"
+@description "Append every element of `xs` to `ys`. Order is irrelevant (the result feeds a deduped graph-SET closure), so a fold of appendItem suffices. Used to combine the self-call graphs collected from sub-expressions."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totConcat : (xs: a) -> (ys: b) -> b
+totConcat xs ys =
+  case head xs of
+    Nothing -> ys
+    Just x ->
+      let ys2 = appendItem x ys
+      case tail xs of
+        Nothing -> ys2
+        Just rest -> totConcat rest ys2
+
+@label "tot: group lookup"
+@description "The callee param-list of function `id` within the group (a `List {id, params, body}`), or Nothing when `id` is not a group member (a call OUTSIDE the mutually-recursive set — contributes no graph, sound: a missing edge only weakens the criterion). Maybe-returning (the totLookupOrigin shape) so callers pattern-match. Folds over the group comparing member.id == id."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totGroupLookup : (id: String) -> (group: a) -> Maybe b
+totGroupLookup id group =
+  case head group of
+    Nothing -> Nothing
+    Just member ->
+      if eq member.id id
+        then Just member.params
+        else
+          case tail group of
+            Nothing -> Nothing
+            Just rest -> totGroupLookup id rest
+
+@label "tot: head may name a member"
+@description "True when a call head or variable spelling may denote the function `id` (a canonical `module:name` id, or a bare id in hand-built groups). Stored bodies keep their source spellings while ids are canonical, so the match is spelling-normalized: a var-head call's `$dyn:` marker is stripped; the exact id matches; a dotted `Module.name` matches the id whose colons read as dots; a bare name matches every id whose code name it is (an over-approximation across modules: an extra match only adds a size-change graph or an escape, never removes one, so it can turn Total into Unknown but never the reverse). A colon spelling other than the exact id names something else."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totHeadMayName : (head: String) -> (id: String) -> Bool
+totHeadMayName head id =
+  let name = if startsWith head "$dyn:" then slice head 5 (length head) else head
+  if eq name id then True
+  else if contains name ":" then False
+  else if contains name "." then eq name (join (split id ":") ".")
+  else endsWith id (concat ":" name)
+
+@label "tot: head names some member"
+@description "True when the spelling may denote at least one member of the group (totHeadMayName)."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totHeadNamesMember : (group: a) -> (head: String) -> Bool
+totHeadNamesMember group head =
+  fold (\found member -> if found then True else totHeadMayName head member.id) False group
+
+@label "tot: here graph (cross-function call)"
+@description "The size-change graph(s) contributed by a call `f(args)` in `fromId`'s body (slice C): ONE cross-function graph `fromId → m` for EVERY group member `m` the head may denote (totHeadMayName — canonical, dotted, bare and var-head spellings of the same function all count; built by totCallSiteGraphCross pairing the caller's params against m's params via the per-position oracle); a head naming no member contributes no graph. The graph's `to` is the member's canonical id, so composition meets at member ids whatever the call spelling. Generalizes slice B's `if eq f selfId` self-call check to a call to ANY member of the mutually-recursive set."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totHereGraph : (group: a) -> (fromId: String) -> (fromParams: b) -> (f: String) -> (args: c) -> (pos: d) -> (origins: e) -> g
+totHereGraph group fromId fromParams f args pos origins =
+  fold
+    (\graphs member ->
+      if totHeadMayName f member.id
+        then appendItem (totCallSiteGraphCross fromId member.id fromParams member.params args pos origins) graphs
+        else graphs)
+    []
+    group
+
+@label "tot: collect graphs in arg list"
+@description "Fold totCollectGraphs over a list of argument/child expressions, concatenating the call-site graphs found in each."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totGraphsInList : (group: g) -> (fromId: String) -> (fromParams: a) -> (scrut: a) -> (origins: a) -> (pos: a) -> (args: a) -> b
+totGraphsInList group fromId fromParams scrut origins pos args =
+  case head args of
+    Nothing -> []
+    Just a ->
+      let these = totCollectGraphs group fromId fromParams scrut origins pos a
+      case tail args of
+        Nothing -> these
+        Just rest -> totConcat these (totGraphsInList group fromId fromParams scrut origins pos rest)
+
+@label "tot: collect graphs in record fields"
+@description "Fold totCollectGraphs over a record's field values ({name, value} records), concatenating the call-site graphs found in each field value."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totGraphsInFields : (group: g) -> (fromId: String) -> (fromParams: a) -> (scrut: a) -> (origins: a) -> (pos: a) -> (fields: a) -> b
+totGraphsInFields group fromId fromParams scrut origins pos fields =
+  case head fields of
+    Nothing -> []
+    Just f ->
+      let these = totCollectGraphs group fromId fromParams scrut origins pos f.value
+      case tail fields of
+        Nothing -> these
+        Just rest -> totConcat these (totGraphsInFields group fromId fromParams scrut origins pos rest)
+
+@label "tot: shadow source params"
+@description "The caller's source-param list with every name in `binders` replaced by a `$shadowed:` spelling no variable can have. A binder (lambda param, arm pattern variable) that re-uses a source param's name hides that param for the binder's scope: an argument `EVar n` or `sub n 1` there denotes the BINDER, so the size-change oracle must not read it as the source param `n` (2026-10-03: `loop n` whose body applies a lambda that rebinds `n` and recurses on `n - 1` read Total). Renaming the hidden source slot removes every edge out of it in that scope (RelEq and measure edges compare names; a structural edge whose smaller variable was bound outside the scope is lost too — an under-approximation, never a false edge)."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totShadowParams : (binders: a) -> (fromParams: b) -> b
+totShadowParams binders fromParams =
+  map (\p -> if elem p binders then concat "$shadowed:" p else p) fromParams
+
+@label "tot: collect graphs in match arms"
+@description "Per match arm, extend the (scrut, origins, pos) sets exactly as slice A/B's walk did — remove the arm pattern's bound vars from all three (shadowing), then add its constructor-bound (smaller) vars to scrut and to origins WITH their root param (= totRootOrigin of the scrutinee) IF the scrutinee is destructurable (NOT to pos) — and collect the call-site graphs of the arm guard (when present: a guard runs before the body, so a call in it is an executable edge too) and of the arm body. Concatenate across arms."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totGraphsInArms : (group: g) -> (fromId: String) -> (fromParams: a) -> (scrut: a) -> (origins: a) -> (pos: a) -> (s: Expr) -> (arms: a) -> b
+totGraphsInArms group fromId fromParams scrut origins pos s arms =
+  case head arms of
+    Nothing -> []
+    Just arm ->
+      let canDestr = totScrutDecreasable scrut s
+      let allVars = totCollectAllVars arm.pattern []
+      let ctorVars = if canDestr then totCollectCtorVars arm.pattern [] else []
+      let root = totRootOrigin s origins
+      let scrut1 = totAppendAll ctorVars (totRemoveAll allVars scrut)
+      let origins1 = totOriginsAddCtor ctorVars root (totOriginsRemoveAll allVars origins)
+      let pos1 = totFactsForget allVars pos
+      let fromParams1 = totShadowParams allVars fromParams
+      let guardGraphs = case lookup arm "guard" of
+        Nothing -> []
+        Just guard -> totCollectGraphs group fromId fromParams1 scrut1 origins1 pos1 guard
+      let these = totConcat guardGraphs (totCollectGraphs group fromId fromParams1 scrut1 origins1 pos1 arm.body)
+      case tail arms of
+        Nothing -> these
+        Just rest -> totConcat these (totGraphsInArms group fromId fromParams scrut origins pos s rest)
+
+@label "tot: collect graphs at a uniform call"
+@description "The non-`if` ECall arm (slice C): when `f` is a group member the call contributes ITS cross-function call-site size-change graph (totHereGraph → totCallSiteGraphCross pairs the caller's params against the callee's via the per-position oracle); then recurse into every argument (a call nested in an argument is still collected). Replaces slice B's `eq f selfId` self-call test with the group lookup — a call to ANY member contributes its cross graph; non-members contribute nothing. Factored so the `if` guard-entry falls back here for short-arg `if`s."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totGraphsUniform : (group: g) -> (fromId: String) -> (fromParams: a) -> (scrut: a) -> (origins: a) -> (pos: a) -> (f: String) -> (args: a) -> b
+totGraphsUniform group fromId fromParams scrut origins pos f args =
+  let here = totHereGraph group fromId fromParams f args pos origins
+  totConcat here (totGraphsInList group fromId fromParams scrut origins pos args)
+
+@label "tot: collect graphs in if guard-entry"
+@description "The `ECall \"if\"` guard entry (rung-2 narrowing, unchanged in shape): split the three args — collect from `cond` with the current `pos`, from `then` with `pos` extended by totPosFromCond cond (true-branch positivity), from `else` with totPosFromCondNeg cond (false-branch positivity) — and concatenate. An `if` with fewer than three args falls back to the uniform collection."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totGraphsInIf : (group: g) -> (fromId: String) -> (fromParams: a) -> (scrut: a) -> (origins: a) -> (pos: a) -> (f: String) -> (args: a) -> b
+totGraphsInIf group fromId fromParams scrut origins pos f args =
+  case head args of
+    Nothing -> totGraphsUniform group fromId fromParams scrut origins pos f args
+    Just cond ->
+      case tail args of
+        Nothing -> totGraphsUniform group fromId fromParams scrut origins pos f args
+        Just rest1 ->
+          case head rest1 of
+            Nothing -> totGraphsUniform group fromId fromParams scrut origins pos f args
+            Just thenE ->
+              case tail rest1 of
+                Nothing -> totGraphsUniform group fromId fromParams scrut origins pos f args
+                Just rest2 ->
+                  case head rest2 of
+                    Nothing -> totGraphsUniform group fromId fromParams scrut origins pos f args
+                    Just elseE ->
+                      let gCond = totCollectGraphs group fromId fromParams scrut origins pos cond
+                      let posT = totPosFromCond cond pos
+                      let posE = totPosFromCondNeg cond pos
+                      let gThen = totCollectGraphs group fromId fromParams scrut origins posT thenE
+                      let gElse = totCollectGraphs group fromId fromParams scrut origins posE elseE
+                      totConcat gCond (totConcat gThen gElse)
+
+@label "tot: list literal call"
+@description "True when a core ECall is the synthetic `appendItem` of a list literal (`[a, b]` lowers to an `appendItem` chain marked `lit = true`, the mark desugar keeps). The evaluator builds a literal natively; it never calls std:appendItem, so the walk treats it as a construction: its elements are walked, its head is no call."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totIsListLiteral : (e: Expr) -> Bool
+totIsListLiteral e =
+  case lookup e "lit" of
+    Nothing -> False
+    Just mark -> eq mark True
+
+@label "tot: collect call-site graphs"
+@description "The core totality walk over the 7-case core Expr, COLLECTING the size-change graph of every call to a GROUP member (slice C) in the subtree as a `List Graph`, given the current scrut/origins/pos sets and the caller (fromId, fromParams). ELit/EVar ⇒ no graphs; ECall `if` ⇒ the guard-entry (per-branch pos narrowing), other ECall ⇒ uniform (a call to a group member contributes its cross-function graph, then recurse args); ELambda removes its params from all three sets (shadowing); EMatch threads per-arm via totGraphsInArms (ctor-vars get their scrutinee's root origin); EConstruct/ERecord recurse into args/field-values. The SCT criterion is a GLOBAL decision over the closure of ALL call-graph graphs, so the walk collects, then checkMutualTotality decides once. Generalizes slice B's single-`selfId` walk (the one-object special case)."
+@tags "engine" "totality" "unified-static-analysis" "phase-3e"
+totCollectGraphs : (group: g) -> (fromId: String) -> (fromParams: a) -> (scrut: a) -> (origins: a) -> (pos: a) -> (e: Expr) -> b
+totCollectGraphs group fromId fromParams scrut origins pos e =
+  case e of
+    ELit { value = _ } -> []
+    EVar { name = _ } -> []
+    ECall { fnId = f, args = args } ->
+      if and (eq f "if") (not (eq (lookup e "structural") (Just false)))
+        then totGraphsInIf group fromId fromParams scrut origins pos f args
+        else if totIsListLiteral e
+          then totGraphsInList group fromId fromParams scrut origins pos args
+          else totGraphsUniform group fromId fromParams scrut origins pos f args
+    ELambda { params = ps, body = bd } ->
+      let scrut2 = totRemoveAll ps scrut
+      let origins2 = totOriginsRemoveAll ps origins
+      let pos2 = totFactsForget ps pos
+      totCollectGraphs group fromId (totShadowParams ps fromParams) scrut2 origins2 pos2 bd
+    EMatch { scrutinee = s, arms = arms } ->
+      totConcat (totCollectGraphs group fromId fromParams scrut origins pos s) (totGraphsInArms group fromId fromParams scrut origins pos s arms)
+    EConstruct { args = args } -> totGraphsInList group fromId fromParams scrut origins pos args
+    ERecord { fields = fields } -> totGraphsInFields group fromId fromParams scrut origins pos fields
+
+@label "tot: collect graphs from all group members"
+@description "Seed S₀ of the call-graph closure: fold over every group member, collecting that member's call-site graphs with THAT member as the caller (fromId = m.id, fromParams = m.params, scrut seeded = its params, origins/pos empty). Concatenate across members. The result is every cross-function (and self) size-change graph in the whole mutually-recursive group's bodies."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totCollectAllMembers : (group: a) -> (members: b) -> c
+totCollectAllMembers group members =
+  case head members of
+    Nothing -> []
+    Just m ->
+      let these = totCollectGraphs group m.id m.params m.params [] [] m.body
+      case tail members of
+        Nothing -> these
+        Just rest -> totConcat these (totCollectAllMembers group rest)
+
+
+-- -------------------------------------------------------------------------
+-- D. The SCT decision — composition, the fuel-bounded closure fixpoint, and the
+-- idempotent-strict-self-edge criterion.
+-- -------------------------------------------------------------------------
+
+@label "tot: add composed edge"
+@description "Compose two edges that meet at an intermediate (e1.tgt == e2.src): the composed edge runs src e1 → tgt e2, strict iff EITHER is strict (totOr), inserted strict-dominantly. Helper for totComposeMatch."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totAddComposedEdge : (e1: a) -> (e2: a) -> (acc: b) -> b
+totAddComposedEdge e1 e2 acc =
+  let e = { src = e1.src, tgt = e2.tgt, strict = totOr e1.strict e2.strict }
+  totAddStrongEdge e acc
+
+@label "tot: compose-match"
+@description "Add the composition of e1 and e2 to the accumulator IFF they meet (e1.tgt == e2.src); else leave the accumulator unchanged."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totComposeMatch : (e1: a) -> (e2: a) -> (acc: b) -> b
+totComposeMatch e1 e2 acc =
+  if eq e1.tgt e2.src then totAddComposedEdge e1 e2 acc else acc
+
+@label "tot: compose inner (one e1 over h)"
+@description "Fold one edge e1 of G against every edge of H, adding each meeting composition. Inner loop of graph composition."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totComposeInner : (e1: a) -> (h: b) -> (acc: c) -> c
+totComposeInner e1 h acc =
+  case head h of
+    Nothing -> acc
+    Just e2 ->
+      let acc2 = totComposeMatch e1 e2 acc
+      case tail h of
+        Nothing -> acc2
+        Just rest -> totComposeInner e1 rest acc2
+
+@label "tot: compose outer (G over H)"
+@description "Fold every edge of G as e1 against H (via totComposeInner), accumulating the composed graph. Outer loop of graph composition."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totComposeOuter : (g: a) -> (h: b) -> (acc: c) -> c
+totComposeOuter g h acc =
+  case head g of
+    Nothing -> acc
+    Just e1 ->
+      let acc2 = totComposeInner e1 h acc
+      case tail g of
+        Nothing -> acc2
+        Just rest -> totComposeOuter rest h acc2
+
+@label "tot: compose graphs"
+@description "Graph composition `G ; H` (slice C, PARTIAL — the caller guards G.to == H.from): the morphism `from = G.from, to = H.to`, with edges = for every pair (x → y ∈ G.edges, y → z ∈ H.edges) that meet, the edge x → z, strict iff either step is strict (strict-dominance on collisions). Models the size relation after two consecutive calls through the matching intermediate function. The edge fold (totComposeOuter/Inner/Match/totAddComposedEdge) is REUSED verbatim over the edge lists. Edges built via `let` then the literal (the inline-record-in-arg surprise)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totCompose : (g: a) -> (h: b) -> c
+totCompose g h =
+  let edges = totComposeOuter g.edges h.edges []
+  { from = g.from, to = h.to, edges = edges }
+
+@label "tot: maybe-add a composition (composable)"
+@description "Compose graphs g and h (precondition g.to == h.from already checked); append the result to the accumulator set only if not already present (by graph set-equality). The deduped one-round expansion step for a composable pair."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totCompMaybeAdd2 : (g: a) -> (h: b) -> (acc: c) -> c
+totCompMaybeAdd2 g h acc =
+  let c = totCompose g h
+  if totGraphMember c acc then acc else appendItem c acc
+
+@label "tot: maybe-add a composition"
+@description "Slice C: composition is a PARTIAL operation — defined only when the intermediate function matches (g.to == h.from). When they match, compose + dedup-add (totCompMaybeAdd2); when they don't, SKIP the pair entirely (NO graph added — NOT an empty graph, which would pollute the closure with a spurious idempotent). This guard is what keeps the call graph's composition a category morphism restricted to matching intermediates."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totCompMaybeAdd : (g: a) -> (h: b) -> (acc: c) -> c
+totCompMaybeAdd g h acc =
+  if eq g.to h.from then totCompMaybeAdd2 g h acc else acc
+
+@label "tot: compositions inner (g over all)"
+@description "Fold graph g against every graph in `hs`, maybe-adding each composition g ; h to the accumulator set. Inner loop of one closure round."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totCompInner : (g: a) -> (hs: b) -> (acc: c) -> c
+totCompInner g hs acc =
+  case head hs of
+    Nothing -> acc
+    Just h ->
+      let acc2 = totCompMaybeAdd g h acc
+      case tail hs of
+        Nothing -> acc2
+        Just rest -> totCompInner g rest acc2
+
+@label "tot: compositions outer"
+@description "Fold every graph of `gs` as the left operand against the full graph list `allG` (via totCompInner), accumulating into the set. Outer loop of one closure round."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totCompOuter : (allG: a) -> (gs: b) -> (acc: c) -> c
+totCompOuter allG gs acc =
+  case head gs of
+    Nothing -> acc
+    Just g ->
+      let acc2 = totCompInner g allG acc
+      case tail gs of
+        Nothing -> acc2
+        Just rest -> totCompOuter allG rest acc2
+
+@label "tot: one closure round"
+@description "One round of the closure: `graphs` plus normalize(G ; H) for every ordered pair (G, H) of graphs, each inserted only if not already present (deduped by set-equality). Seeds the accumulator with `graphs` itself, so the round is non-shrinking (next ⊇ graphs)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totAddCompositions : (graphs: a) -> b
+totAddCompositions graphs = totCompOuter graphs graphs graphs
+
+@label "tot: closure step"
+@description "One fuel-bounded fixpoint step: compute the next round; if it added nothing (set-equal to the current graphs) return Just graphs (fixpoint reached), else recurse with one less fuel on the expanded set. Helper for totClose (keeps the fuel guard a single-line if)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totCloseStep : (fuel: a) -> (graphs: b) -> Maybe b
+totCloseStep fuel graphs =
+  let next = totAddCompositions graphs
+  if totGraphSetEq next graphs then Just graphs else totClose (sub fuel 1) next
+
+@label "tot: closure (fuel-bounded fixpoint)"
+@description "The transitive closure of the graph set under composition, fuel-bounded: Nothing when fuel is exhausted (a SOUND under-approximation — the caller maps Nothing → Unknown; we NEVER check a partial closure for Total), else the fixpoint (totCloseStep) reached when a round adds no new graph. Structurally recursive on `fuel` (the structural-decreasing measure). The closure is finite (≤ 3^(n²) graphs over n params); fuel 256 is a generous pathological backstop — real code saturates in a handful of rounds via the early no-change exit. Tunable."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totClose : (fuel: a) -> (graphs: b) -> Maybe b
+totClose fuel graphs =
+  if eq fuel 0 then Nothing else totCloseStep fuel graphs
+
+@label "tot: idempotent edge-set check"
+@description "Helper for totIsIdempotent (slice C): given a graph g whose from == to is already established, True when composing g with itself leaves its edge set unchanged ((g ; g).edges == g.edges, by edge set-equality). Kept separate to avoid a let-in-then-branch."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totIsIdempotentEdges : (g: a) -> Bool
+totIsIdempotentEdges g =
+  let c = totCompose g g
+  totEdgesEq c.edges g.edges
+
+@label "tot: graph is idempotent"
+@description "True when graph `g` is idempotent under composition (`g ; g = g`). Slice C: an idempotent graph is NECESSARILY a same-function cycle, so the from == to precondition is checked FIRST (a g with from ≠ to could not equal g ; g, whose from = g.from but whose composition only meets if g.to == g.from); then the edge set must be fixed. An idempotent graph describes a stable infinite call path returning to its function — the graphs the SCT criterion imposes a descent obligation on."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totIsIdempotent : (g: a) -> Bool
+totIsIdempotent g = if eq g.from g.to then totIsIdempotentEdges g else False
+
+@label "tot: graph has strict self-edge"
+@description "True when the edge-list `edges` has a strictly-descending SELF-edge (∃ edge with src == tgt AND strict). The descent witness an idempotent graph must carry for SCT. Called on `g.edges` of an idempotent graph (whose from == to, so a src==tgt edge is a true self-loop on a single parameter)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totHasStrictDiagonal : (edges: a) -> Bool
+totHasStrictDiagonal edges =
+  case head edges of
+    Nothing -> False
+    Just e ->
+      let thisDiag = if eq e.src e.tgt then e.strict else False
+      case tail edges of
+        Nothing -> thisDiag
+        Just rest -> totOr thisDiag (totHasStrictDiagonal rest)
+
+@label "tot: all idempotents descend"
+@description "Fold the closure: every IDEMPOTENT graph must have a strictly-descending self-edge; a non-idempotent graph imposes no obligation (True). All obligations must hold (the SCT criterion). Slice C: the idempotent graphs are the `f → f` cycles of the call graph; each must strictly descend some parameter."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totAllIdempotentsDescend : (graphs: a) -> Bool
+totAllIdempotentsDescend graphs =
+  case head graphs of
+    Nothing -> True
+    Just g ->
+      let thisOk = if totIsIdempotent g then totHasStrictDiagonal g.edges else True
+      case tail graphs of
+        Nothing -> thisOk
+        Just rest -> totAnd thisOk (totAllIdempotentsDescend rest)
+
+@label "tot: SCT decide (over a non-empty graph set)"
+@description "Run the closure and apply the SCT criterion: fuel exhaustion (Nothing) ⇒ False (a sound Unknown), else every idempotent in the closure must strictly descend."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totSctDecide : (graphs: a) -> Bool
+totSctDecide graphs =
+  case totClose 256 graphs of
+    Nothing -> False
+    Just closure -> totAllIdempotentsDescend closure
+
+@label "tot: is empty list"
+@description "True when the list is empty (no head). Drives the no-self-call ⇒ vacuously total fast path."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3d"
+@category "engine-internal"
+totIsEmptyList : (xs: a) -> Bool
+totIsEmptyList xs =
+  case head xs of
+    Nothing -> True
+    Just _ -> False
+
+@label "tot: SCT terminating"
+@description "The size-change termination decision for a function GROUP (slice C): no call-graph graph at all (empty set) ⇒ vacuously total; else the closure-based SCT criterion (every idempotent `f → f` graph in the transitive closure under restricted composition has a strictly-descending self-edge; fuel exhaustion ⇒ False/Unknown). The single-function case is the one-object special case (every graph is `f → f`)."
+@tags "engine" "internal" "totality" "unified-static-analysis" "phase-3e"
+@category "engine-internal"
+totSctTerminating : (graphs: a) -> Bool
+totSctTerminating graphs =
+  if totIsEmptyList graphs then True else totSctDecide graphs
+
+
+-- -------------------------------------------------------------------------
+-- E. The unchecked-reference audit (2026-10-02). The size-change walk above
+-- sees only CALLS to group members. Two other executable routes back into a
+-- group are invisible to it, and either one beside a visibly decreasing call
+-- would yield a false Total: a member taken as a VALUE (`map f xs` — whoever
+-- receives it can call it with any argument), and a var-head call to a name no
+-- enclosing binder binds and no member is (a local recursive `where` binding
+-- lowers to exactly that: `$ (\go -> go n) (\k -> go k)` — the inner `go` is
+-- free). The audit walks every member body with its lexical binders (the
+-- member's params, lambda params, arm pattern vars) and refuses both.
+--
+-- A THIRD route (2026-10-03): INVOKING a callable the walk cannot see the body
+-- of. A var-head call `$dyn:k` or an apply `k $ x` whose callee is a function
+-- parameter, an arm pattern variable, a lambda parameter, or a field of one
+-- (`r.f`), or an apply whose callee is any other computed expression, runs code
+-- the size-change graphs never saw: a callback that re-enters the group
+-- (`unroll r = case r of Roll k -> k r` with `start = unroll (Roll unroll)`), a
+-- self-application, a stored function. Such an invocation is refused. The one
+-- precise acceptance is a CHECKED LOCAL CLOSURE: a name bound by an immediately
+-- applied lambda (the `let` / `where` lowering `$ (\g -> body) (\k -> …)`) to a
+-- lambda literal, invoked by its own name in the scope of that binding. Its body
+-- is the literal argument, which this audit and the size-change walk both walk
+-- in place, and a non-recursive `let` cannot make it refer to itself.
+--
+-- A FOURTH route (2026-10-03): OVER-APPLICATION. The evaluator binds a callee's
+-- params, evaluates its body and, when arguments are left over and the result
+-- is callable, applies the leftovers to that result (json-logic.ts, the
+-- eta-reduction spill). So `idf p r` with `idf y = y` invokes p, and `g f x` with
+-- `g = \k -> k` invokes f: an invocation of a value the walk never checked.
+-- Refused here: a call to a group member, a lambda literal, or a checked local
+-- closure with more arguments than its params (a closure remembers the arity
+-- of its literal). Over-application of a registry function outside the group
+-- is refused by the kernel-gate entry (verdictTagForIn), which knows its params.
+-- -------------------------------------------------------------------------
+
+@label "tot: spelling root"
+@description "The lexical root of a variable or var-head spelling: the text before the first dot (`row` for `row.args`), with a var-head call's `$dyn:` marker stripped. A spelling whose root a binder binds is a local value or a field of one."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totSpellingRoot : (name: String) -> String
+totSpellingRoot name =
+  let local = if startsWith name "$dyn:" then slice name 5 (length name) else name
+  fromMaybe local (head (split local "."))
+
+@label "tot: closure over-applied"
+@description "For a local callee spelled exactly `name`: True unless `closures` (checked local closures, {name, arity} records, the innermost first) holds `name` with an arity of at least `argc`. A bound name that is no checked closure is a callback (True); a checked closure applied to more arguments than its lambda literal has params spills the rest onto its result (True)."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totClosureOverApplied : (closures: a) -> (name: String) -> (argc: Number) -> Bool
+totClosureOverApplied closures name argc =
+  let found = fold (\state c -> if state.seen then state else if eq c.name name then { seen = True, unchecked = gt argc c.arity } else state) { seen = False, unchecked = True } closures
+  found.unchecked
+
+@label "tot: member over-applied"
+@description "True when the spelling may denote a group member (totHeadMayName) whose params are fewer than `argc`: the call spills the extra arguments onto the member's result, an invocation the size-change graphs do not see."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totMemberOverApplied : (group: a) -> (name: String) -> (argc: Number) -> Bool
+totMemberOverApplied group name argc =
+  fold (\found member -> if found then True else and (totHeadMayName name member.id) (gt argc (length member.params))) False group
+
+@label "tot: remove closures"
+@description "Drop every checked local closure whose name is in `names` (a binder that shadows it)."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totRemoveClosures : (names: a) -> (closures: b) -> b
+totRemoveClosures names closures =
+  filter (\c -> not (elem c.name names)) closures
+
+@label "tot: unchecked invocation of a named callable"
+@description "True when invoking the callable spelled `name` with `argc` arguments (a var-head call's name with `$dyn:` stripped, or the variable an apply `$` calls) is a route the size-change walk cannot check. A name whose root an enclosing binder binds is a local: accepted only when it is exactly a checked local closure applied to at most its arity (totClosureOverApplied; not a field read of one); any other local (a parameter, a pattern variable, a field of either) is a callback whose body is never seen. An unbound name is accepted when `memberCallOk` and it may denote a group member applied to at most its params (a var-head call to a member has its size-change graph; totMemberOverApplied); when not `memberCallOk` (an apply `$`, which builds no graph), naming a member is refused and naming anything else is taken as a call outside the group: that such a name denotes a gathered registry function is checked by the kernel-gate entry (verdictTagForIn, anaAppliesUnresolved), not here — a group-only caller (the census, inference trust) must discharge it itself. An unbound var-head name that names no member is an unresolvable dynamic call (a local recursive binding lowers to one)."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totUncheckedInvoke : (group: a) -> (bound: b) -> (closures: c) -> (name: String) -> (argc: Number) -> (memberCallOk: Bool) -> Bool
+totUncheckedInvoke group bound closures name argc memberCallOk =
+  let root = totSpellingRoot name
+  if elem root bound then (if eq name root then totClosureOverApplied closures name argc else True)
+  else if memberCallOk then (if totHeadNamesMember group name then totMemberOverApplied group name argc else True)
+  else totHeadNamesMember group name
+
+@label "tot: lambda-literal argument closures"
+@description "The checked local closures an immediately applied lambda binds: for each param whose positional argument is itself a lambda literal, the record {name, arity} (the param, and the literal's param count). The applied body sees that name bound to a closure whose body is the literal (the `let` / `where` lowering binds one name per application)."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totLambdaArgClosures : (params: a) -> (args: b) -> c
+totLambdaArgClosures params args =
+  case head params of
+    Nothing -> []
+    Just p ->
+      case head args of
+        Nothing -> []
+        Just arg ->
+          let rest = totLambdaArgClosures (totTail params) (totTail args)
+          case arg of
+            ELambda { params = lps } -> appendItem { name = p, arity = length lps } rest
+            _ -> rest
+
+@label "tot: unchecked reference in a list"
+@description "True when any expression of the list holds an unchecked route (totUncheckedReference) under the same binders and closures."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totUncheckedInList : (group: a) -> (bound: b) -> (closures: c) -> (es: d) -> Bool
+totUncheckedInList group bound closures es =
+  fold (\found a -> if found then True else totUncheckedReference group bound closures a) False es
+
+@label "tot: unchecked apply"
+@description "The apply form `$ callee args…`. An immediately applied lambda (the `let` / `where` / `do` lowering) walks its arguments in the current scope, then its body with the lambda params bound, each param whose argument is a lambda literal becoming a checked local closure (with the literal's arity) and every other param shadowing any closure of that name; applied to more arguments than it has params, it spills the rest onto its result and is refused. A variable callee is an invocation judged by totUncheckedInvoke with the argument count (no member graph: `$` builds none). Any other callee (a call result, a match, a construction) is a computed callable and is refused."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totUncheckedApply : (group: a) -> (bound: b) -> (closures: c) -> (args: d) -> Bool
+totUncheckedApply group bound closures args =
+  case head args of
+    Nothing -> False
+    Just callee ->
+      let rest = totTail args
+      case callee of
+        ELambda { params = ps, body = bd } ->
+          if gt (length rest) (length ps) then True
+          else if totUncheckedInList group bound closures rest then True
+          else totUncheckedReference group (totAppendAll ps bound) (totConcat (totLambdaArgClosures ps rest) (totRemoveClosures ps closures)) bd
+        EVar { name = n } ->
+          if totUncheckedInvoke group bound closures n (length rest) False then True
+          else totUncheckedInList group bound closures rest
+        _ -> True
+
+@label "tot: unchecked reference"
+@description "True when the core Expr `e`, under the lexical binders `bound` and the checked local closures `closures`, holds an executable route into the group that the size-change walk cannot check: an EVar whose root is unbound and which may denote a member (totHeadNamesMember — the member escapes as a value); a `$dyn:` var-head call the walk cannot check (totUncheckedInvoke: a callable parameter, pattern variable or field invoked, an unbound name that is no member — e.g. a local recursive binding — or a closure or member over-applied); an apply `$` whose callee is not a checked closure or a lambda literal, or that over-applies one (totUncheckedApply); a string-head call that over-applies a group member (totMemberOverApplied; a list literal's synthetic appendItem excepted). Lambda params and arm pattern vars extend `bound` and shadow `closures` for their bodies; arm guards are walked like bodies. Any extra binder only removes a refusal for a genuinely local name, and the member match over-approximates, so the audit can only turn Total into Unknown."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totUncheckedReference : (group: a) -> (bound: b) -> (closures: c) -> (e: Expr) -> Bool
+totUncheckedReference group bound closures e =
+  case e of
+    ELit { value = _ } -> False
+    EVar { name = n } -> if elem (totSpellingRoot n) bound then False else totHeadNamesMember group n
+    ECall { fnId = f, args = args } ->
+      if startsWith f "$dyn:" then
+        (if totUncheckedInvoke group bound closures (slice f 5 (length f)) (length args) True then True
+         else totUncheckedInList group bound closures args)
+      else if eq f "$" then totUncheckedApply group bound closures args
+      else if totIsListLiteral e then totUncheckedInList group bound closures args
+      else if totMemberOverApplied group f (length args) then True
+      else totUncheckedInList group bound closures args
+    ELambda { params = ps, body = bd } -> totUncheckedReference group (totAppendAll ps bound) (totRemoveClosures ps closures) bd
+    EMatch { scrutinee = s, arms = arms } ->
+      if totUncheckedReference group bound closures s then True
+      else
+        fold
+          (\found arm ->
+            if found then True
+            else
+              let armVars = totCollectAllVars arm.pattern []
+              let armBound = totAppendAll armVars bound
+              let armClosures = totRemoveClosures armVars closures
+              case lookup arm "guard" of
+                Nothing -> totUncheckedReference group armBound armClosures arm.body
+                Just guard ->
+                  if totUncheckedReference group armBound armClosures guard then True
+                  else totUncheckedReference group armBound armClosures arm.body)
+          False
+          arms
+    EConstruct { args = args } -> totUncheckedInList group bound closures args
+    ERecord { fields = fields } -> fold (\found field -> if found then True else totUncheckedReference group bound closures field.value) False fields
+
+@label "tot: group has an unchecked reference"
+@description "True when any member body, under its own params (and no closures), holds an unchecked route into the group (totUncheckedReference)."
+@tags "engine" "internal" "totality" "unified-static-analysis"
+@category "engine-internal"
+totGroupUnchecked : (group: a) -> Bool
+totGroupUnchecked group =
+  fold (\found member -> if found then True else totUncheckedReference group member.params [] member.body) False group
+
+
+-- -------------------------------------------------------------------------
+-- checkMutualTotality — the rung-3c entry (slice C): the MUTUAL-recursion
+-- size-change decision over a SET of functions. `group` is a `List {id, params,
+-- body}` — the mutually-recursive set the caller supplies (the SCC; slice C does
+-- NOT discover the SCCs itself — D-3e-4). Seed S₀ = every call-site graph from
+-- EVERY member's body (totCollectAllMembers), then apply the call-graph SCT
+-- criterion (totSctTerminating): `Total` when every IDEMPOTENT `f → f` graph in
+-- the closure under restricted composition strictly descends (or no call-graph
+-- graph exists at all); else `Unknown`. A singleton group = the single-function
+-- case (slice B), so checkStructuralTotality below is sugar over this.
+-- -------------------------------------------------------------------------
+
+@label "Check mutual-recursion totality (rung 3c)"
+@description "Rung-3c MUTUAL-recursion totality check over a function GROUP (a `List {id, params, body}` of the mutually-recursive set). Generalizes the single-function size-change closure (slice B) to a CALL GRAPH over a set of functions (Lee–Jones–Ben-Amram general form): each call site `fₐ → fᵦ` yields a size-change graph `{from = fₐ, to = fᵦ, edges}` whose edges run from the caller's params to the callee's param-slots (the per-position oracle totPosIsLt/totPosIsEq reused verbatim); composition `G ; H` is defined ONLY when G.to == H.from (matching intermediate function); the fuel-bounded transitive closure is taken; the program is size-change terminating iff every IDEMPOTENT graph (`from == to` AND `g ; g = g`, necessarily an `f → f` cycle) has a strictly-descending self-edge. Returns Total when the group is size-change terminating (incl. the structural mutual win `f x = …g t…` / `g y = …f t…`, the measure mutual win, the 3-function cycle whose `f → f` idempotent surfaces only at closure depth 3), or there is no call-graph graph at all; Unknown when some idempotent `f → f` graph has no strict self-edge (the mutual non-termination canaries `f a = g a` / `g b = f b`, the permutation ping-pong), or the closure exceeded the fuel bound, or for the inherited fences (`≠ 0`/ℕ-typed equality guards need a type — `== 0`-guarded even/odd stays Unknown; k ≥ 2 / non-`sub` measures). SOUND: every edge asserts a relation the per-position oracle proved; composition only derives relations holding along call-graph paths; a missing edge (a call outside the group, an unrecognized shape) only weakens the criterion ⇒ Unknown, never a wrong Total. A passed group that is not mutually closed loses edges (sound). A missing GRAPH is different from a missing edge: a call site the walk fails to recognise removes an obligation and could fake Total, so call heads match members by spelling (totHeadMayName: canonical, dotted, bare and var-head spellings), and a member taken as a value or a var-head call to an unbound non-member name refuses first (totGroupUnchecked ⇒ Unknown; 2026-10-02). Never returns Partial — the @partial escape-hatch is folded by totalityVerdict."
+@tags "engine" "totality" "unified-static-analysis" "phase-3e"
+checkMutualTotality : (group: a) -> Totality
+checkMutualTotality group =
+  if totGroupUnchecked group
+    then Unknown { reason = "a group member is taken as a value, or a var-head call names nothing a binder or the group provides (e.g. a local recursive binding): the size-change graphs cannot check that route" }
+    else
+      let graphs = totCollectAllMembers group group
+      if totSctTerminating graphs
+        then Total
+        else Unknown { reason = "rung-3c: the mutual-recursion call graph is not size-change terminating — some idempotent f→f graph in the closure has no strictly-descending self-edge (or the closure exceeded the fuel bound); a type-guarded (≠0 on ℕ) or outside-the-abstraction argument may still hold" }
+
+
+-- -------------------------------------------------------------------------
+-- checkStructuralTotality — the rung-1/2/3a/3b SINGLE-FUNCTION entry, now
+-- SINGLETON SUGAR over checkMutualTotality (slice C, D-3e-2): a single function
+-- is the one-object special case of the call graph (every graph is `f → f`, every
+-- composition is defined, the from == to guard is always true), so the closure +
+-- criterion reduce EXACTLY to slice B's. The signature is unchanged (preserves the
+-- 40 single-function tests + any consumer) — the regression guard.
+-- -------------------------------------------------------------------------
+
+@label "Check structural + measure + lexicographic + size-change totality (rung 1 + 2 + 3a + 3b)"
+@description "Single-function totality check (rung 1 structural-recursion + rung 2 guarded measure + rung 3a lexicographic + rung 3b size-change graph closure) over a function's core Expr body. As of slice C (rung 3c) this is SINGLETON SUGAR over checkMutualTotality — the function becomes a one-member group `[{id = selfId, params, body}]`, so the mutual call-graph closure reduces to the single-function self-call closure (the one-object special case): Total iff the recursion is size-change terminating (every IDEMPOTENT graph in the transitive closure under composition has a strictly-descending self-edge), or there is no self-call. COMPLETE for the size-change abstraction: subsumes rungs 1+2+3a (structural / measure / lexicographic-identity descents) AND proves PERMUTED / reordering / multi-step-rotation descents for which no fixed parameter order works (`f a b = if a>0 then f b (a-1) else 0` ⇒ Total). SOUND throughout: every edge asserts a relation the per-position oracle proved, composition only derives two-call relations, a missing edge only makes the criterion harder (⇒ Unknown, never a wrong Total); the cross-position soundness repairs (`f (Cons h t) t`, `f (b+1) (a-1)`) stay Unknown (G = {a →↓ b}; G ; G = {} empty idempotent, no strict self-edge). Returns Unknown when the closure has a non-descending idempotent, or the fuel-bounded fixpoint is exhausted, or for the inherited fences (`≠ 0`/ℕ-typed guards need a type; k ≥ 2 / non-`sub` measures). Never returns Partial — folded by totalityVerdict. Sound: variable shadowing removes re-bound names from ALL of scrut/origins/pos."
+@tags "engine" "totality" "unified-static-analysis" "phase-3e"
+checkStructuralTotality : (selfId: String) -> (params: a) -> (body: Expr) -> Totality
+checkStructuralTotality selfId params body =
+  let member = { id = selfId, params = params, body = body }
+  checkMutualTotality (appendItem member [])
+
+
+-- -------------------------------------------------------------------------
+-- totalityVerdict — the three-valued producer: fold the `@partial` escape-
+-- hatch in front of the rung-1 check. A declared-partial definition is
+-- `Partial` (accepted-with-acknowledgement, excluded from proof paths);
+-- otherwise the rung-1 verdict (`Total | Unknown`).
+-- -------------------------------------------------------------------------
+
+@label "Totality verdict"
+@description "The three-valued totality verdict for a definition: Partial when declared @partial (an acknowledged escape-hatch — hard-rejected on proof-carrying paths, accepted elsewhere), otherwise the rung-1 structural-recursion verdict (Total | Unknown). The gate consumer reads this: Partial is a hard-reject, Unknown a warning (a reject on proof-carrying paths), Total an accept."
+@tags "engine" "totality" "unified-static-analysis" "phase-1"
+totalityVerdict : (declaredPartial: Bool) -> (selfId: String) -> (params: a) -> (body: Expr) -> Totality
+totalityVerdict declaredPartial selfId params body =
+  if declaredPartial
+    then Partial { reason = "declared partial (@partial escape-hatch)" }
+    else checkStructuralTotality selfId params body

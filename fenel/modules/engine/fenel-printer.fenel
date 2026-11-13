@@ -1,0 +1,1973 @@
+module engine where
+
+-- fenel-printer — the Fenel EXPRESSION pretty-printer (`px`'s expression arms)
+-- + `printSetExpr` (the harvest's LAST structural SetExpr reader). The inverse
+-- of the parser: JSON-Logic Expression → `.fenel` text syntax. The Fenel port
+-- of `fenel-printer.ts`'s `px` (expression arms only) + `printSetExpr` (the TS
+-- functions become a thin router + a thin `dispatchEngineBody` wrapper).
+--
+-- set-algebra-to-fenel Phase 3b-3f — the keystone the rest of the harvest's
+-- `$where`-blocked surface was waiting on: rendering a `$where` JSON-Logic
+-- Expression to a string. `setExprToSQL` (3b-3e) dodged it by carrying the raw
+-- pred THROUGH to a TS leaf; `printSetExpr` CANNOT — its `$where` arm must emit
+-- an inline string (`px(pred)`), so it needs the renderer itself. This file
+-- BUILDS that renderer (`engine:printExpr`), then rides it for `printSetExpr`
+-- (`engine:printSetExpr`) — two birds: the harvest's last reader + the reusable
+-- Fenel expression printer (the editor's ExpressionDisplay / `print()` / every
+-- future Expression→text reader rides it; the parser's inverse).
+--
+-- §A SCOPE — the printer is now FULLY Fenel-RENDERED (printer-substrate, CLOSED
+-- 2026-06-27). Every rendering arm is a Fenel body in THIS file: the EXPRESSION
+-- arms here (3b-3f), the TYPE printer (`printType` / `printTypeDef` /
+-- `printLegacyTypeExpr`, Phase 1), the DECLARATION/PROGRAM arms (`printDecl` =
+-- `def`/`type_sig`/`fixity`/`where`; `printProgram` = the top-level item fold,
+-- Phase 2), and the last rendering line — the `read(T)` wrapper
+-- (`printReadItem`, Phase 3). Each folds a `$`-free marker tree the TS marshal
+-- arm (`printerTypeToMarker` / `printerTypeDefToMarker` / `declToMarker` /
+-- `programItemsToMarkers` / `printerReadCallToMarker`, engine-bodies-dispatch.ts)
+-- precomputes (it READS the `$`-keys + the hard recognitions refHandle/peel*; it
+-- AUTHORS none — the bodies emit a STRING).
+--
+-- The TS seam that STAYS (fenel-printer.ts) is the irreducible classifier +
+-- locale boundary — NO rendering: `px` (the top-level `$`-key CLASSIFIER —
+-- decl/read/type/expr — a read a `.fenel` body can't do; invoked once per
+-- `print()`), `buildPrintKw` (§D locale boundary — LOCALE_KW + the
+-- registry-resolved getLocalizedOperators), the `print` entry, and the thin
+-- `printType` marshal shim. Sound because a `$where` predicate (and any
+-- expression) NEVER contains a declaration form; declarations appear only at
+-- `print()`'s top level. The classifier dispatches: single-key DECL_KEYS →
+-- `engine:printDecl` / `printProgram` / `printTypeDef`; `read(T)`-with-schema →
+-- `engine:printReadItem`; `looksLikeType` → `engine:printType`; else →
+-- `dispatchEngineBody("engine:printExpr", [e, ctx, kw])`. Once an expression node
+-- is reached the whole subtree renders in Fenel (printExpr self-recurses). This
+-- residual is a sanctioned B3 marshal + boundary permanent (ledger D5, the
+-- regex-shim.ts precedent) — not a TS reimplementation kept for speed.
+--
+-- THE ANNOTATION (modules-as-values Phase 2d, amending D-C): `{ann:[e, T]}`
+-- prints as the one surface `(e : T)` — the parenthesised single-colon form both
+-- parsers read (`::` is gone). T is a `$`-keyed FenelType; the px router's
+-- pre-pass (`printerAnnTypesToMarkers`, engine-bodies-dispatch.ts) replaces every
+-- annotation type in the input with its `printerTypeToMarker` marker, so ppAnn
+-- renders it with the real type printer (`printType`). A type with no type-
+-- expression surface (an inline `$variant`, a `$literal`, an unrecognised shape)
+-- prints a readable `<no surface syntax: …>` diagnostic — never a JSON dump. A
+-- legacy bare-string type still prints verbatim. (The other two former
+-- boundaries — type-shaped node in expression position + `read(T)`-with-schema
+-- — are Fenel-bodied: `engine:printType` / `engine:printLegacyTypeExpr`.)
+--
+-- §B THE FIXITY ACCESSOR (the load-bearing dependency): pCall's infix/prefix
+-- rendering needs, for a codeName, its notation/precedence/associativity — the
+-- INVERSE of the parser's notation→codeName map. The infix side REUSES the
+-- already-Fenel `defaultFixityTable` (fixity-resolve.fenel, engine union): a
+-- linear scan by `fnId`, skipping the printer-excluded notations
+-- (`&&`/`||`/`>>=`/`<>` — the parse/print asymmetry) so the canonical `and`/`or`
+-- print. defaultFixityTable's assoc vocab is `l`/`r`/`n` (the parser's) ↔ the
+-- printer's `left`/`right`/`none`; ppCall translates inline (`l`→tight-left,
+-- `r`→tight-right, else both+1) yielding byte-identical leftCtx/rightCtx. The
+-- prefix side is a 2-row local table (`not`/`negate` — the only Prefixables;
+-- mirrors the defaultFixityTable projection precedent, authored `.fenel`, NOT a
+-- new TS surface).
+--
+-- §D LOCALE: `engine:printExpr` / `engine:printSetExpr` take the keyword table
+-- `kw` as a PARAM the TS router threads in (the router owns `buildPrintKw` +
+-- `getLocalizedOperators` — registry/Codeable reads, a legitimate boundary). The
+-- body renders structural keywords from `kw` (`kw.let`/`kw.if`/…/`kw.and`); the
+-- operator-key arms (`{and:…}`/`{or:…}`/`{!:…}`) use `kw.and`/`kw.or`/`kw.not`
+-- (localized); pCall's infix notation comes from §B's table (the SAME asymmetry
+-- as px — pCall is locale-independent there). `where` is TS-handled so `kw.where`
+-- is never read here.
+--
+-- INPUT READ ($-key-FREE, the json-logic-to-syntax precedent): the Expression is
+-- passed RAW; the body discriminates JS shapes via `isNull`/`isNumber`/
+-- `isBoolean`/`isString`/`isArray` (mirroring px's `typeof` cascade) and reads
+-- single-key op objects via `entries` + an op-name cascade. Leaf stringification
+-- mirrors px EXACTLY: number/boolean → `toString` (= `String(e)`); string →
+-- `jsLit` (= `JSON.stringify(e)`); null → "null".
+--
+-- OUTPUT is a plain STRING — NO marker ADT, NO `$`-key barrier (unlike 3b-3e's
+-- SqlFrag): the rendered string returns straight through `dispatchEngineBody`.
+--
+-- This file is FENCE_FALLBACK'd in the parse-cache (TS-parsed, byte-identical) —
+-- the SAME class as its set-algebra siblings: the faithful precedence cascades +
+-- the pCall infix/prefix dispatch exceed the Fenel-bodied parser's layout caps.
+-- List members build in-order via accumulator + `appendItem` (appends to END).
+-- Closing the fence is parser-substrate's job.
+--
+-- PRECEDENCE LADDER (px's `P`, mirrored as bare numerals):
+--   None=0  Or=1  And=2  Not=3  Comp=4  Add=5  Mul=6  Unary=7  App=8
+
+-- ---------------------------------------------------------------------------
+-- EXPR_KEYS — the single-key set px dispatches on (verbatim from
+-- `fenel-printer.ts:81`; the declaration keys are included so ppIsExprNode
+-- matches px, but the body's dispatch only covers the expression forms — a
+-- declaration key reaching printExpr falls to the record fallback, which never
+-- happens since the router keeps declarations in TS).
+-- ---------------------------------------------------------------------------
+
+-- ppIsExprKey k — is `k` one of px's dispatched single keys (verbatim from
+-- `fenel-printer.ts:81`)? A 1-arg helper with the list INLINED: a bare nullary
+-- reference does NOT auto-evaluate inside a Fenel body (the registry resolves it
+-- as a `{var}` lookup that misses), so every constant the body reads is either a
+-- 1-arg accessor (this) or an inline list literal passed as an argument. The
+-- declaration keys are included so ppIsExprNode matches px, but printExpr's
+-- dispatch only covers the expression forms — a declaration key reaching
+-- printExpr falls to ppRec, which never happens (the router keeps decls in TS).
+@category "engine-internal"
+ppIsExprKey : (k: String) -> Bool
+ppIsExprKey k =
+  elem k
+    [ "var", "let", "if", "match", "do", "fn", "call", "apply"
+    , "or", "and", "!", "==", "!=", "<", "<=", ">", ">=", "in"
+    , "+", "-", "*", "/", "%", "ann", "where", "cat"
+    , "construct", "type_def", "type_sig", "def", "fixity", "program"
+    , "tuple", "|>", "pipe", "method"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Small structural helpers.
+-- ---------------------------------------------------------------------------
+
+-- ppWrap s need — `(s)` when need, else `s` (px's `w`).
+@category "engine-internal"
+ppWrap : (s: String) -> (need: a) -> String
+ppWrap s need = if need then concat "(" (concat s ")") else s
+
+-- ppIsObject e — a non-null, non-array, non-scalar value (px's
+-- `typeof === "object" && !Array.isArray`).
+@category "engine-internal"
+ppIsObject : (e: a) -> Bool
+ppIsObject e =
+  if isNull e then false
+  else if isString e then false
+  else if isNumber e then false
+  else if isBoolean e then false
+  else if isArray e then false
+  else true
+
+-- ppIsExprNode e — single-key object whose key is in printExprKeys (px's
+-- `isExprNode`). Used by ppCall / ppConstruct to tell a record arg from an
+-- expression arg.
+@category "engine-internal"
+ppIsExprNode : (e: a) -> Bool
+ppIsExprNode e =
+  if ppIsObject e
+  then
+    let es = entries e
+    if eq (length es) 1
+    then ppIsExprKey (ppFirstKey es)
+    else false
+  else false
+
+-- ppFirstKey es — the `.key` of the first entry (assumes non-empty).
+@category "engine-internal"
+ppFirstKey : (es: a) -> String
+ppFirstKey es = case head es of
+  Nothing -> ""
+  Just e0 -> e0.key
+
+-- ppCodeName name — strip a `module:` prefix to the bare codeName (`std:add` →
+-- `add`; `add` → `add`). The fixity table keys by bare codeName.
+@category "engine-internal"
+ppCodeName : (name: String) -> String
+ppCodeName name = fromMaybe name (last (split name ":"))
+
+@category "engine-internal"
+ppIdentitySource : (handle: String) -> String
+ppIdentitySource handle =
+  if eq handle "" then "<no surface syntax: empty identity>"
+  else if isUuid handle then concat "@{" (concat handle "}")
+  else "<no surface syntax: reference has no admitted name or UUID>"
+
+@category "engine-internal"
+ppReferenceRouteMatches : (handle: String) -> (route: a) -> Bool
+ppReferenceRouteMatches handle route =
+  (eq route.targetId handle) || (eq route.sourceName handle) || (elem handle (fromMaybe [] (lookup route "handles")))
+
+@category "engine-internal"
+ppReferenceRouteReadable : (route: a) -> (routes: a) -> (kw: a) -> Bool
+ppReferenceRouteReadable route routes kw =
+  (eq route.status "resolved") && (ppNameIsIdent route.sourceName) && ((fromMaybe false (lookup kw "typeReference")) || (not (isCtorName route.sourceName))) && (ppReferenceRouteUnshadowed route kw) && (ppReferenceRouteUnambiguous route routes)
+
+@category "engine-internal"
+ppReferenceRouteUnshadowed : (route: a) -> (kw: a) -> Bool
+ppReferenceRouteUnshadowed route kw =
+  not (ppNameRootBound route.sourceName kw)
+
+@category "engine-internal"
+ppNameRootBound : (name: String) -> (kw: a) -> Bool
+ppNameRootBound name kw =
+  elem (fromMaybe "" (head (split name "."))) (fromMaybe [] (lookup kw "boundNames"))
+
+@category "engine-internal"
+ppReferenceRouteUnambiguous : (route: a) -> (routes: a) -> Bool
+ppReferenceRouteUnambiguous route routes =
+  let meanings = unique (map (\r -> r.targetId) (filter (\r -> (eq r.sourceName route.sourceName) && (eq r.status "resolved")) routes))
+  eq (length meanings) 1
+
+@category "engine-internal"
+ppReferenceIdentity : (handle: String) -> (kw: a) -> String
+ppReferenceIdentity handle kw =
+  if isUuid handle then handle
+  else
+    let routes = fromMaybe [] (lookup kw "referenceRoutes")
+    let meanings = unique (map (\r -> r.targetId) (filter (\r -> if ppReferenceRouteMatches handle r then (not (eq r.status "missing")) && (isUuid r.targetId) else false) routes))
+    if eq (length meanings) 1 then ppA0 meanings else handle
+
+@category "engine-internal"
+ppReferenceSource : (handle: String) -> (kw: a) -> String
+ppReferenceSource handle kw =
+  let routes = fromMaybe [] (lookup kw "referenceRoutes")
+  let candidates = filter (\r -> if ppReferenceRouteMatches handle r then ppReferenceRouteReadable r routes kw else false) routes
+  case head candidates of
+    Just route -> route.sourceName
+    Nothing -> ppIdentitySource (ppReferenceIdentity handle kw)
+
+@category "engine-internal"
+ppWithBoundNames : (kw: a) -> (names: a) -> a
+ppWithBoundNames kw names = mapSet kw "boundNames" (concat (fromMaybe [] (lookup kw "boundNames")) names)
+
+@category "engine-internal"
+ppReferenceHandle : (value: a) -> Maybe String
+ppReferenceHandle value =
+  if not (ppIsObject value) then Nothing
+  else case lookup value "$ref" of
+    Just handle ->
+      if (isString handle) && (not (eq handle "")) && (eq (length (entries value)) 1)
+      then Just handle else Nothing
+    Nothing ->
+      case lookup value "$pin" of
+        Nothing -> Nothing
+        Just kind ->
+          if not (elem kind ["entity", "function"]) then Nothing
+          else case lookup value "id" of
+            Nothing -> Nothing
+            Just handle -> if (isString handle) && (not (eq handle "")) then Just handle else Nothing
+
+-- nth-element access via head/tailOr/fromMaybe (px's `a[0]`/`a[1]`/`a[2]`).
+-- Well-formed expression arrays always carry the needed arity; the `{ ppNull }`
+-- default is inline (a bare nullary ref would not auto-evaluate) and is never
+-- reached for well-formed input.
+@category "engine-internal"
+ppA0 : (a: a) -> b
+ppA0 a = fromMaybe { ppNull = true } (head a)
+
+@category "engine-internal"
+ppA1 : (a: a) -> b
+ppA1 a = fromMaybe { ppNull = true } (head (tailOr a))
+
+@category "engine-internal"
+ppA2 : (a: a) -> b
+ppA2 a = fromMaybe { ppNull = true } (head (tailOr (tailOr a)))
+
+-- ---------------------------------------------------------------------------
+-- printExpr — the recursive expression renderer (px's expression arms). `ctx` is
+-- the enclosing precedence; `kw` the keyword table threaded by the TS router.
+-- Tagged data uses constructor syntax. Exact targets use only the source-frame
+-- routes passed by authoring; an unavailable spelling has no editable text form.
+-- ---------------------------------------------------------------------------
+
+@label "fenel-printer: printExpr"
+@description "Phase 3b-3f — the Fenel EXPRESSION pretty-printer (px's expression arms): JSON-Logic Expression → .fenel text syntax. Discriminates JS shapes via isNull/isNumber/isBoolean/isString/isArray (number/bool → toString, string → jsLit, null → \"null\", array → `[a, …]`), dispatches single-key op objects on the key (var/let/if/match/do/cat/fn/call/apply/tuple/construct/method + operators or/and/!/==/…/in/|>/+/-/*/%/ann). Infix/prefix rendering sources notation/prec/assoc from defaultFixityTable (§B). Precedence-threaded; `ctx`-driven parenthesisation. Keyword table `kw` threaded by the TS router (§D). Declaration/program/type arms + the type-printer stay TS (router); the three type-printer boundaries (object-type ann / type-shaped-in-expr / read+schema) are router-intercepted or deferred. Self-recursive: one dispatch renders a whole expression subtree. Mirrors fenel-printer.ts:px; the TS px is now a thin router."
+@tags "engine" "fenel-printer" "printer" "expr" "reader" "phase-3b-3f"
+printExpr : (e: a) -> (ctx: a) -> (kw: a) -> String
+printExpr e ctx kw =
+  if isNull e then "()"
+  else if isNumber e then ppNumber e ctx
+  else if isBoolean e then toString e
+  else if isString e then jsLit e
+  else if isArray e then ppList e kw
+  else case ppReferenceHandle e of
+    Just handle -> ppReferenceSource handle kw
+    Nothing -> case lookup e "$tag" of
+      Just tag ->
+        if isString tag
+        then
+          let gap = ppLiteralDataGap e
+          if not (eq gap "") then concat "<no surface syntax: " (concat gap ">")
+          else
+            let representations = filter (\representation -> elem tag representation.constructorTags) (fromMaybe [] (lookup kw "representationSources"))
+            if gt (length representations) 0 then ppRepresentationValueSource e representations ctx kw
+            else
+              let fields = ppNonTagEntries (entries e) []
+              if eq (length fields) 0
+              then ppConstruct [tag] 0 kw
+              else ppConstructRecordArg (ppConstructorSourceName tag kw) (fromEntries fields) ctx kw
+        else ppRec e kw
+      Nothing ->
+        let es = entries e
+        if eq (length es) 1
+        then
+          let e0 = ppFirstEntry es
+          if ppIsExprKey e0.key
+          then ppDispatch e0.key e0.value e ctx kw
+          else ppRec e kw
+        else ppRec e kw
+
+-- The source frame supplies registered representation methods as data. The
+-- printer reuses their admission and mathematical equality judgments, then
+-- the fixed singleton/data equality face verifies that observable fields stay
+-- unchanged. Neither a native carrier recognizer nor a numeric normalizer lives
+-- in this formatting policy.
+@native
+@category "engine-internal"
+presentationSourceCall : (callable: a) -> (args: List b) -> Maybe c
+
+@category "engine-internal"
+ppRepresentationValueSource : (value: a) -> (representations: a) -> (ctx: a) -> (kw: a) -> String
+ppRepresentationValueSource value representations ctx kw =
+  if not (eq (length representations) 1) then "<no surface syntax: ambiguous representation projection>"
+  else
+    let representation = ppA0 representations
+    case lookup representation "gap" of
+      Just gap -> concat "<no surface syntax: " (concat gap ">")
+      Nothing -> case lookup representation "encodeText" of
+        Nothing -> ppRepresentationSourceAdmitted value representation ctx kw
+        Just _ -> ppTextRepresentationSource value representation ctx kw
+
+@category "engine-internal"
+ppTextRepresentationSource : (value: a) -> (representation: a) -> (ctx: a) -> (kw: a) -> String
+ppTextRepresentationSource value representation ctx kw =
+  let admitted = presentationSourceCall representation.membership [value]
+  if not (ppSourceMembershipAdmitted admitted) then "<no surface syntax: representation admission refused or abstained>"
+  else case presentationSourceCall representation.encodeText [value] of
+    Just (Ok text) ->
+      if not (isString text) then "<no surface syntax: representation encoder did not produce text>"
+      else case presentationSourceCall representation.decodeText [text] of
+        Just (Ok restored) ->
+          let readmitted = presentationSourceCall representation.membership [restored]
+          if not (ppSourceMembershipAdmitted readmitted) then "<no surface syntax: decoded representation admission refused or abstained>"
+          else if not (ppSourceEqualityTrue (presentationSourceCall representation.equals [value, restored])) then "<no surface syntax: representation round trip failed>"
+          else if not (ppSourceEqualityTrue (exactEqualitySourceCall engine.deepEqValueTri [value, restored]))
+          then ppRepresentationSourceAdmitted value representation ctx kw
+          else case ppReferenceHandle representation.decodeText of
+            Nothing -> "<no surface syntax: representation decoder has no reference>"
+            Just decoder ->
+              let call = concat (ppGeneratedCallSource decoder kw) (concat " " (jsLit text))
+              ppWrap (concat kw.case (concat " " (concat call (concat " " (concat kw.of " Ok sourceValue -> sourceValue"))))) true
+        _ -> "<no surface syntax: representation decoder refused or produced no readable result>"
+    _ -> "<no surface syntax: representation encoder refused or produced no readable result>"
+
+@category "engine-internal"
+ppRepresentationSourceAdmitted : (value: a) -> (representation: a) -> (ctx: a) -> (kw: a) -> String
+ppRepresentationSourceAdmitted value representation ctx kw =
+    case ppReferenceHandle representation.lower of
+      Nothing -> "<no surface syntax: representation construction has no reference>"
+      Just lower ->
+        if not (ppSourceMembershipAdmitted (presentationSourceCall representation.membership [value])) then "<no surface syntax: representation admission refused or abstained>"
+        else case presentationSourceCall representation.lift [value] of
+          Nothing -> "<no surface syntax: representation projection did not produce a readable value>"
+          Just native -> case presentationSourceCall representation.lower [native] of
+            Nothing -> "<no surface syntax: representation construction did not produce a readable value>"
+            Just restored ->
+              if not (ppSourceEqualityTrue (presentationSourceCall representation.equals [value, restored])) then "<no surface syntax: representation round trip failed>"
+              else if not (ppSourceEqualityTrue (exactEqualitySourceCall engine.deepEqValueTri [value, restored]))
+              then "<no surface syntax: representation round trip changed data fields or abstained>"
+              else
+                let nativeKw = mapSet kw "representationSources" (filter (\row -> not (eq row.typeName representation.typeName)) (fromMaybe [] (lookup kw "representationSources")))
+                let lowerSource = ppGeneratedCallSource lower kw
+                ppWrap (concat lowerSource (concat " " (printExpr native 9 nativeKw))) (gt ctx 8)
+
+@category "engine-internal"
+ppSourceEqualityTrue : (answer: a) -> Bool
+ppSourceEqualityTrue answer = case answer of
+  Just (Just value) -> if isBoolean value then value else false
+  _ -> false
+
+@category "engine-internal"
+ppSourceMembershipAdmitted : (answer: a) -> Bool
+ppSourceMembershipAdmitted answer = case answer of
+  Just value -> ppRepresentationAdmitted value
+  _ -> false
+
+@category "engine-internal"
+ppRepresentationAdmitted : (answer: a) -> Bool
+ppRepresentationAdmitted answer =
+  if isBoolean answer then answer
+  else case answer of
+    Just admitted -> if isBoolean admitted then admitted else false
+    _ -> false
+
+@category "engine-internal"
+ppSourceProjectionFailure : (message: String) -> String
+ppSourceProjectionFailure message = concat "<no surface syntax: representation projection refused: " (concat message ">")
+
+@category "engine-internal"
+ppLiteralDataGap : (value: a) -> String
+ppLiteralDataGap value =
+  if isArray value then ppLiteralDataGaps value
+  else if not (ppIsObject value) then ""
+  else case ppReferenceHandle value of
+    Just _ -> ""
+    Nothing ->
+      let fields = entries value
+      case lookup value "$tag" of
+        Just tag ->
+          if isString tag then ppLiteralDataGaps (map (\field -> field.value) (ppNonTagEntries fields []))
+          else "inert expression-shaped data"
+        Nothing ->
+          let first = ppFirstEntry fields
+          if (eq (length fields) 1) && ((ppIsExprKey first.key) || ((isArray first.value) && (gt (length first.value) 0)))
+          then "inert expression-shaped data"
+          else ppLiteralDataGaps (map (\field -> field.value) fields)
+
+@category "engine-internal"
+ppLiteralDataGaps : (values: a) -> String
+ppLiteralDataGaps values =
+  case head values of
+    Nothing -> ""
+    Just value ->
+      let gap = ppLiteralDataGap value
+      if eq gap "" then ppLiteralDataGaps (tailOr values) else gap
+
+-- ppNumber n ctx — a number literal. A negative literal has no literal
+-- spelling: both parsers read `-1` as `negate 1`. It prints as that prefix call
+-- and takes its parentheses: `f -1` would read back as a subtraction and
+-- `--1` lexes as a comment, so `f (-1)` and `-(-1)`.
+@category "engine-internal"
+ppNumber : (n: a) -> (ctx: a) -> String
+ppNumber n ctx =
+  if lt n 0
+  then case ppPrefixOf "negate" of
+    Just pfx ->
+      let sym = pfx.notation
+      ppWrap (concat sym (toString (sub 0 n))) (gte ctx pfx.prec)
+    Nothing -> toString n
+  else toString n
+
+-- ppFirstEntry — the first `{key, value}` (assumes non-empty).
+@category "engine-internal"
+ppFirstEntry : (es: a) -> a
+ppFirstEntry es = fromMaybe { key = "", value = { ppNull = true } } (head es)
+
+-- ppDispatch op v e ctx kw — the per-op cascade (px's `switch (op)`). `v` is
+-- the single key's value (the arg array for most ops; a string for `var`; the
+-- bindings object for `let`).
+@category "engine-internal"
+ppDispatch : (op: String) -> (v: a) -> (e: a) -> (ctx: a) -> (kw: a) -> String
+ppDispatch op v e ctx kw =
+  if eq op "var" then v
+  else if eq op "let" then ppLet v ctx kw
+  else if eq op "if" then ppIf v ctx kw
+  else if eq op "match" then ppMatch v kw
+  else if eq op "do" then ppDo v kw
+  else if eq op "ann" then ppAnn v kw
+  else if eq op "cat" then ppCat v kw
+  else if eq op "fn" then ppFn v ctx kw
+  else if eq op "call" then ppCall v ctx kw
+  else if eq op "apply" then ppApply v ctx kw
+  else if eq op "tuple" then ppTuple v kw
+  else if eq op "construct" then ppConstruct v ctx kw
+  else if eq op "method" then ppMethod v ctx kw
+  -- Word `or` is an eager call; no existing text spelling preserves this
+  -- lazy form's exact tree and skipped arguments.
+  else if eq op "or" then "<no surface syntax: structural disjunctions>"
+  -- Only the flat refinement printer has a faithful comma spelling for this
+  -- lazy form. Word `and` would turn any nested expression into an eager call.
+  else if eq op "and" then "<no surface syntax: structural conjunctions outside flat refinement predicates>"
+  else if eq op "!" then ppWrap (concat kw.not (concat " " (printExpr (ppA0 v) 3 kw))) (gt ctx 3)
+  else if eq op "==" then ppBin op v 4 ctx kw
+  else if eq op "!=" then ppBin op v 4 ctx kw
+  else if eq op "<" then ppBin op v 4 ctx kw
+  else if eq op "<=" then ppBin op v 4 ctx kw
+  else if eq op ">" then ppBin op v 4 ctx kw
+  else if eq op ">=" then ppBin op v 4 ctx kw
+  else if eq op "in" then ppBin "in" v 4 ctx kw
+  else if eq op "|>" then ppBin "|>" v 1 ctx kw
+  else if eq op "+" then ppPlusMinus op v ctx kw
+  else if eq op "-" then ppPlusMinus op v ctx kw
+  else if eq op "*" then ppBin op v 6 ctx kw
+  else if eq op "/" then ppBin op v 6 ctx kw
+  else if eq op "%" then ppBin op v 6 ctx kw
+  else ppRec e kw
+
+-- ppPlusMinus — `+`/`-`: unary (1 arg) → `-x` (px negates ONLY — both `+`/`-`
+-- unary print `-`, matching px:261); binary → additive infix (prec 5).
+@category "engine-internal"
+ppPlusMinus : (op: String) -> (v: a) -> (ctx: a) -> (kw: a) -> String
+ppPlusMinus op v ctx kw =
+  if eq (length v) 1
+  then ppWrap (concat "-" (printExpr (ppA0 v) 7 kw)) (gt ctx 7)
+  else ppBin op v 5 ctx kw
+
+-- ppBin op a prec ctx kw — `lhs OP rhs` (px's `pBin`): lhs at prec, rhs at
+-- prec+1; wrap when ctx > prec.
+@category "engine-internal"
+ppBin : (op: String) -> (a: a) -> (prec: a) -> (ctx: a) -> (kw: a) -> String
+ppBin op a prec ctx kw =
+  let l = printExpr (ppA0 a) prec kw
+  let r = printExpr (ppA1 a) (add prec 1) kw
+  ppWrap (concat l (concat " " (concat op (concat " " r)))) (gt ctx prec)
+
+-- ppLet — `let name = val` (px:171). `v` is the single-binding object.
+@category "engine-internal"
+ppLet : (v: a) -> (ctx: a) -> (kw: a) -> String
+ppLet v ctx kw =
+  let b = ppFirstEntry (entries v)
+  ppWrap (concat kw.let (concat " " (concat b.key (concat " = " (printExpr b.value 0 kw))))) (gt ctx 0)
+
+-- ppIf — `if c then t [else e]` (px:176). The else branch is present only when
+-- the arg array has 3 elements.
+@category "engine-internal"
+ppIf : (a: a) -> (ctx: a) -> (kw: a) -> String
+ppIf a ctx kw =
+  let condS = printExpr (ppA0 a) 0 kw
+  let thenS = printExpr (ppA1 a) 0 kw
+  let base = concat kw.if (concat " " (concat condS (concat " " (concat kw.then (concat " " thenS)))))
+  let full =
+    if gt (length a) 2
+    then concat base (concat " " (concat kw.else (concat " " (printExpr (ppA2 a) 0 kw))))
+    else base
+  ppWrap full (gt ctx 0)
+
+-- ppDo — `do\n  s1\n  s2\nend` (px:185). Empty → `do\nend`.
+@category "engine-internal"
+ppDo : (a: a) -> (kw: a) -> String
+ppDo a kw =
+  if eq (length a) 0
+  then concat kw.do (concat "\n" kw.end)
+  else
+    let body = join (ppDoItems a kw []) "\n"
+    concat kw.do (concat "\n" (concat body (concat "\n" kw.end)))
+
+@category "engine-internal"
+ppDoItems : (a: a) -> (kw: a) -> (acc: a) -> a
+ppDoItems a kw acc =
+  case head a of
+    Nothing -> acc
+    Just x ->
+      let line = concat "  " (printExpr x 0 kw)
+      let acc2 = appendItem line acc
+      case tail a of
+        Nothing -> acc2
+        Just rest -> ppDoItems rest (ppWithBoundNames kw (ppStatementBoundNames x)) acc2
+
+@category "engine-internal"
+ppStatementBoundNames : (statement: a) -> List String
+ppStatementBoundNames statement =
+  if not (ppIsObject statement) then []
+  else case lookup statement "let" of
+    Just bindings -> if ppIsObject bindings then map (\binding -> binding.key) (entries bindings) else []
+    Nothing -> []
+
+-- ppAnn — the type annotation `(e : T)` (modules-as-values Phase 2d): one colon,
+-- always parenthesised (the annotation is a primary, so no outer context ever
+-- needs more). The type arrives as a printer marker (the px router's pre-pass)
+-- and prints through printType; a type with no surface syntax prints the
+-- readable diagnostic from ppTypeSurfaceGap instead of a JSON dump; a legacy
+-- bare-string type prints verbatim.
+@category "engine-internal"
+ppAnn : (a: a) -> (kw: a) -> String
+ppAnn a kw =
+  let exprS = printExpr (ppA0 a) 0 kw
+  let ty = ppA1 a
+  let gap = if isString ty then "" else ppTypeSurfaceGap ty
+  let tyS =
+        if isString ty then ty
+        else if eq gap "" then printType ty kw
+        else concat "<no surface syntax: " (concat gap ">")
+  concat "(" (concat exprS (concat " : " (concat tyS ")")))
+
+-- ppTypeSurfaceGap — "" when every node of a printer type marker has a
+-- type-expression surface, else what lacks one (the first found). An inline
+-- `$variant` (only a type DECLARATION spells one), a `$literal` and an
+-- unrecognised shape have none; so has a value that is not a marker at all.
+@category "engine-internal"
+ppTypeSurfaceGap : (m: a) -> String
+ppTypeSurfaceGap m =
+  case lookup m "tag" of
+    Nothing -> "a type value the printer was not given as a marker"
+    Just t ->
+      if eq t "TtVariant" then "an inline variant type"
+      else if eq t "TtLiteral" then "a literal type"
+      else if eq t "TtOther" then "an unrecognised type shape"
+      else if eq t "TtList" then ppTypeSurfaceGap m.elem
+      else if eq t "TtMaybe" then ppTypeSurfaceGap m.value
+      else if eq t "TtResult" then ppTypeSurfaceGapList [m.err, m.ok]
+      else if eq t "TtTagged" then ppTypeSurfaceGapList [m.value, m.phantom]
+      else if eq t "TtTaggedSingleton" then ppTypeSurfaceGapList [m.value, m.phantomBase]
+      else if eq t "TtMap" then ppTypeSurfaceGapList [m.keys, m.values]
+      else if eq t "TtTuple" then
+        if lt (length m.items) 2 then "a tuple of fewer than two types"
+        else ppTypeSurfaceGapList m.items
+      else if eq t "TtRecord" then
+        let nameGap = ppNameGap (map (\f -> f.name) m.fields) "a record field name"
+        if eq nameGap "" then ppTypeSurfaceGapList (map (\f -> f.type) m.fields) else nameGap
+      else if eq t "TtArrow" then
+        if eq (length m.params) 0 then "an arrow with no parameter"
+        else
+          let nameGap = ppNameGap (map (\p -> p.name) (filter (\p -> p.named) m.params)) "a parameter name"
+          if eq nameGap "" then ppTypeSurfaceGapList (appendItem m.returns (map (\p -> p.type) m.params)) else nameGap
+      else if eq t "TtRefined" then "a refinement (`T where p`)"
+      else if eq t "TtEl" then ppTypeSurfaceGapList (map (\ja -> ja.type) (filter (\ja -> (eq ja.tag "JaTypeBare") || (eq ja.tag "JaTypeParen")) m.args))
+      else ""
+
+-- ppNameGap — "" when every printed field or parameter name is an identifier,
+-- else what is not (the first found). Both parsers read a record field or an
+-- arrow parameter name only as ONE identifier token (TyFields / TyParams), so a
+-- reserved word (`where`, `in`, `end`, `true`, …) or any other text that does
+-- not lex as a single identifier would print as a type neither parser reads.
+@category "engine-internal"
+ppNameGap : (names: a) -> (what: String) -> String
+ppNameGap names what =
+  case head (filter (\n -> not (ppNameIsIdent n)) names) of
+    Nothing -> ""
+    Just n -> concat what (concat " that is not an identifier: " (jsLit n))
+
+-- ppNameIsIdent — does the name lex (the Fenel lexer, `lexAll`) as exactly one
+-- identifier token spelling the whole name? The lexer's keyword classification
+-- (`classifyTT`) is the reserved-word set, so no second word list is kept here.
+@category "engine-internal"
+ppNameIsIdent : (name: String) -> Boolean
+ppNameIsIdent name =
+  let toks = lexAll name
+  let t0 = ppA0 toks
+  (eq (length toks) 2) && (eq t0.t "ident") && (eq t0.v name)
+
+@category "engine-internal"
+ppCtorFieldNameGap : (names: a) -> String
+ppCtorFieldNameGap names =
+  case head (filter (\name -> not (ppCtorFieldNameReadable name)) names) of
+    Nothing -> ""
+    Just name -> concat "a constructor field name that is not readable: " (jsLit name)
+
+@category "engine-internal"
+ppCtorFieldNameReadable : (name: String) -> Bool
+ppCtorFieldNameReadable name =
+  let toks = lexAll name
+  let token = ppA0 toks
+  let fieldNames = parserFieldNameClass { tag = "WsPrefix", prefix = encVirt "ident" }
+  (eq (length toks) 2) && (eq token.v name) && (wsMember fieldNames (concat (encVirt token.t) token.v))
+
+@category "engine-internal"
+ppTypeDeclNameReadable : (name: String) -> Bool
+ppTypeDeclNameReadable name = (ppNameIsIdent name) && (eq (length (split name ".")) 1) && (isCtorName name)
+
+-- ppTypeSurfaceGapList — ppTypeSurfaceGap over a list: the first non-empty gap.
+@category "engine-internal"
+ppTypeSurfaceGapList : (ms: a) -> String
+ppTypeSurfaceGapList ms =
+  case head ms of
+    Nothing -> ""
+    Just m ->
+      let g = ppTypeSurfaceGap m
+      if eq g "" then
+        case tail ms of
+          Nothing -> ""
+          Just rest -> ppTypeSurfaceGapList rest
+      else g
+
+-- ppCat — `` `seg0${e1}seg2…` `` (px:201). String segments escape via ppEscTpl;
+-- expression segments render as `${…}`.
+@category "engine-internal"
+ppCat : (a: a) -> (kw: a) -> String
+ppCat a kw =
+  let bt = charFromCode 96
+  concat bt (concat (ppCatSegs a kw "") bt)
+
+@category "engine-internal"
+ppCatSegs : (segs: a) -> (kw: a) -> (acc: String) -> String
+ppCatSegs segs kw acc =
+  case head segs of
+    Nothing -> acc
+    Just seg ->
+      let piece = if isString seg then ppEscTpl seg else concat "${" (concat (printExpr seg 0 kw) "}")
+      let acc2 = concat acc piece
+      case tail segs of
+        Nothing -> acc2
+        Just rest -> ppCatSegs rest kw acc2
+
+-- ppEscTpl — escape `\`, CR, backtick, `${` for a template segment.
+-- Backslash FIRST so the escapes we add aren't re-escaped.
+@category "engine-internal"
+ppEscTpl : (s: String) -> String
+ppEscTpl s =
+  let bt = charFromCode 96
+  let s1 = replaceAll s "\\" "\\\\"
+  let s2 = replaceAll (replaceAll s1 (charFromCode 13) "\\r") bt (concat "\\" bt)
+  replaceAll s2 "${" "\\${"
+
+-- ppFn — `\p1 p2 -> body` (px:206). Params are all but the last arg; body is
+-- the last.
+@category "engine-internal"
+ppFn : (a: a) -> (ctx: a) -> (kw: a) -> String
+ppFn a ctx kw =
+  let params = take (sub (length a) 1) a
+  let body = fromMaybe { ppNull = true } (last a)
+  ppWrap (concat "\\" (concat (join params " ") (concat " -> " (printExpr body 0 (ppWithBoundNames kw params))))) (gt ctx 0)
+
+-- ppTuple — `(a, b, …)` (px:215).
+@category "engine-internal"
+ppTuple : (a: a) -> (kw: a) -> String
+ppTuple a kw = concat "(" (concat (join (ppRenderList a 0 kw []) ", ") ")")
+
+-- ppList — `[a, b, …]` (px:125), elements at prec None.
+@category "engine-internal"
+ppList : (a: a) -> (kw: a) -> String
+ppList a kw = concat "[" (concat (join (ppRenderList a 0 kw []) ", ") "]")
+
+-- ppRenderList xs prec kw acc — render each element at `prec`, accumulating a
+-- List String (the closure-free `map (printExpr · prec)`; the set-syntax idiom).
+@category "engine-internal"
+ppRenderList : (xs: a) -> (prec: a) -> (kw: a) -> (acc: a) -> a
+ppRenderList xs prec kw acc =
+  case head xs of
+    Nothing -> acc
+    Just x ->
+      let acc2 = appendItem (printExpr x prec kw) acc
+      case tail xs of
+        Nothing -> acc2
+        Just rest -> ppRenderList rest prec kw acc2
+
+-- ---------------------------------------------------------------------------
+-- ppCall — juxtaposition / infix / prefix / operator-name / record-call call
+-- rendering (px's `pCall`). The `read(T)`-with-schema legacy arm is
+-- router-intercepted (type-printer boundary §A); here `read` is a plain call.
+-- ---------------------------------------------------------------------------
+
+@category "engine-internal"
+ppCall : (a: a) -> (ctx: a) -> (kw: a) -> String
+ppCall a ctx kw =
+  let name = ppA0 a
+  let n = length a
+  if not (isString name)
+  then
+    if not (ppIsObject name) then "<no surface syntax: expression-headed application>"
+    else if not (eq (length (entries name)) 1) then "<no surface syntax: expression-headed application>"
+    else
+      case lookup name "method" of
+        Just operands ->
+          if not (isArray operands) then "<no surface syntax: expression-headed application>"
+          else if and (eq n 1) (eq (length operands) 2)
+          then
+            if and (isString (ppA0 operands)) (isString (ppA1 operands))
+            then concat (printExpr name 9 kw) " ()"
+            else "<no surface syntax: expression-headed application>"
+          else "<no surface syntax: expression-headed application>"
+        Nothing -> "<no surface syntax: expression-headed application>"
+  else if ppCallUsesIdentity name kw then ppCallNonOp name a n ctx kw
+  else if eq n 3
+  then
+    case ppInfixOf name of
+      Just infx -> ppInfixRender infx a ctx kw
+      Nothing -> ppCallRest name a n ctx kw
+  else if eq n 2
+  then
+    case ppPrefixOf name of
+      Just pfx -> ppPrefixRender pfx a ctx kw
+      Nothing -> ppCallRest name a n ctx kw
+  else ppCallRest name a n ctx kw
+
+@category "engine-internal"
+ppCallUsesIdentity : (name: String) -> (kw: a) -> Bool
+ppCallUsesIdentity name kw =
+  if (isUuid name) || (ppNameRootBound name kw) then true
+  else
+    let routes = fromMaybe [] (lookup kw "referenceRoutes")
+    gt (length (filter (ppReferenceRouteMatches name) routes)) 0
+
+-- ppInfixRender — `lhs <notation> rhs` (px:294). assoc `left`/`right`/`none`
+-- (the parser-fixities.fenel Infixable vocab, matching px's getInfixableByName):
+-- left re-enters at prec, right re-enters at prec, none re-enters at prec+1 both
+-- sides (the px `assoc === "left" ? prec : prec+1` rule).
+@category "engine-internal"
+ppInfixRender : (infx: a) -> (a: a) -> (ctx: a) -> (kw: a) -> String
+ppInfixRender infx a ctx kw =
+  let prec = infx.prec
+  let leftCtx = if eq infx.assoc "left" then prec else add prec 1
+  let rightCtx = if eq infx.assoc "right" then prec else add prec 1
+  let l = printExpr (ppA1 a) leftCtx kw
+  let r = printExpr (ppA2 a) rightCtx kw
+  ppWrap (concat l (concat " " (concat infx.notation (concat " " r)))) (gt ctx prec)
+
+-- ppPrefixRender — `<notation> arg` / `<notation>arg` (px:307). Word notations
+-- (`not`) emit a space; symbolic (`-`) do not. Wrapped when ctx reaches the
+-- prefix precedence: an application argument renders at 9, and both parsers
+-- read `f not a` as three arguments and `f -a` as a subtraction, so an
+-- argument position needs `f (not a)` / `f (-a)`.
+@category "engine-internal"
+ppPrefixRender : (pfx: a) -> (a: a) -> (ctx: a) -> (kw: a) -> String
+ppPrefixRender pfx a ctx kw =
+  let sym = pfx.notation
+  let sep = if ppHeadAlpha sym then " " else ""
+  ppWrap (concat sym (concat sep (printExpr (ppA1 a) (add pfx.prec 1) kw))) (gte ctx pfx.prec)
+
+-- ppCallRest — the operator-name / arity-1 / record-call / juxtaposition arms
+-- (px:316-337), reached when no Infixable (arity 3) / Prefixable (arity 2) hit.
+@category "engine-internal"
+ppCallRest : (name: String) -> (a: a) -> (n: a) -> (ctx: a) -> (kw: a) -> String
+ppCallRest name a n ctx kw =
+  if (eq n 3) then
+    if ppIsOperatorName name
+    then
+      let l = printExpr (ppA1 a) 9 kw
+      let r = printExpr (ppA2 a) 9 kw
+      ppWrap (concat l (concat " " (concat name (concat " " r)))) (gt ctx 8)
+    else ppCallNonOp name a n ctx kw
+  else ppCallNonOp name a n ctx kw
+
+-- ppCallNonOp — operator-name `(op) args` (px:321), arity-1 `name ()` (px:327),
+-- single-record-arg `name { … }` (px:330), and juxtaposition `name args…`
+-- (px:336).
+@category "engine-internal"
+ppCallNonOp : (name: String) -> (a: a) -> (n: a) -> (ctx: a) -> (kw: a) -> String
+ppCallNonOp name a n ctx kw =
+  if ppIsOperatorName name
+  then
+    if eq n 1
+    then concat "(" (concat name ") ()")
+    else ppWrap (concat "(" (concat name (concat ") " (join (ppRenderList (tailOr a) 9 kw []) " ")))) (gt ctx 8)
+  else if eq n 1
+  then concat (ppCallSourceName name kw) " ()"
+  else if (eq n 2) && (ppIsRecordArg (ppA1 a))
+  then ppCallRecord (ppCallSourceName name kw) (ppA1 a) kw
+  else ppWrap (concat (ppCallSourceName name kw) (concat " " (join (ppRenderList (tailOr a) 9 kw []) " "))) (gt ctx 8)
+
+@category "engine-internal"
+ppCallSourceName : (name: String) -> (kw: a) -> String
+ppCallSourceName name kw =
+  let routes = fromMaybe [] (lookup kw "referenceRoutes")
+  if (ppNameIsIdent name) && (ppNameRootBound name kw) then name
+  else if isUuid name then ppReferenceSource name kw
+  else if gt (length (filter (ppReferenceRouteMatches name) routes)) 0 then ppReferenceSource name kw
+  else if (ppNameIsIdent name) && (not (isCtorName name)) then name else ppIdentitySource name
+
+-- ppIsRecordArg x — an object that is NOT an expression node (px's record-call
+-- guard: `typeof === object && !Array.isArray && !isExprNode`). A tagged value
+-- is a constructor argument; printExpr owns its syntax and parentheses.
+@category "engine-internal"
+ppIsRecordArg : (x: a) -> Bool
+ppIsRecordArg x =
+  if ppIsObject x
+  then
+    case ppReferenceHandle x of
+      Just _ -> false
+      Nothing -> case lookup x "$tag" of
+        Just tag -> if isString tag then false else not (ppIsExprNode x)
+        Nothing -> not (ppIsExprNode x)
+  else false
+
+-- ppCallRecord — `name { k = v, … }` / `name {}` (px:330).
+@category "engine-internal"
+ppCallRecord : (name: String) -> (obj: a) -> (kw: a) -> String
+ppCallRecord name obj kw =
+  let es = entries obj
+  let gap = ppNameGap (map (\field -> field.key) es) "a record field name"
+  if not (eq gap "") then concat "<no surface syntax: " (concat gap ">")
+  else if eq (length es) 0
+  then concat name " {}"
+  else concat name (concat " { " (concat (join (ppRenderFields es kw []) ", ") " }"))
+
+-- ppRenderFields — `k = <px(v, None)>` per entry (record / record-call fields).
+@category "engine-internal"
+ppRenderFields : (es: a) -> (kw: a) -> (acc: a) -> a
+ppRenderFields es kw acc =
+  case head es of
+    Nothing -> acc
+    Just f ->
+      let acc2 = appendItem (concat f.key (concat " = " (printExpr f.value 0 kw))) acc
+      case tail es of
+        Nothing -> acc2
+        Just rest -> ppRenderFields rest kw acc2
+
+-- ppIsOperatorName name — all chars in the operator-char set, length > 0
+-- (px's `isOperatorName`). Empty-string guarded (`elem "" s` is true in JS).
+@category "engine-internal"
+ppIsOperatorName : (name: String) -> Bool
+ppIsOperatorName name =
+  if eq name "" then false
+  else ppAllOpChars name "!#$%&*+./<=>?@\\^|~:-"
+
+@category "engine-internal"
+ppAllOpChars : (s: String) -> (opChars: String) -> Bool
+ppAllOpChars s opChars =
+  let c = slice s 0 1
+  if eq c "" then true
+  else if elem c opChars then ppAllOpChars (slice s 1 (length s)) opChars
+  else false
+
+-- ppHeadAlpha sym — does `sym` start with an ASCII letter (px's `/^[a-z]/i`)?
+@category "engine-internal"
+ppHeadAlpha : (sym: String) -> Bool
+ppHeadAlpha sym = elem (slice sym 0 1) "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+-- ---------------------------------------------------------------------------
+-- ppApply — `head args…` (px's `pApply`). head at App+1; a 2-arg form with a
+-- list second arg spreads that list.
+-- ---------------------------------------------------------------------------
+
+@category "engine-internal"
+ppApply : (a: a) -> (ctx: a) -> (kw: a) -> String
+ppApply a ctx kw =
+  let headStr = printExpr (ppA0 a) 9 kw
+  let n = length a
+  if eq n 1
+  then concat headStr " ()"
+  else if (eq n 2) && (isArray (ppA1 a))
+  then ppWrap (concat headStr (concat " " (join (ppRenderList (ppA1 a) 9 kw []) " "))) (gt ctx 8)
+  else ppWrap (concat headStr (concat " " (join (ppRenderList (tailOr a) 9 kw []) " "))) (gt ctx 8)
+
+-- ---------------------------------------------------------------------------
+-- ppConstruct — `Name` / `Name arg…` / `Name { k = v }` (px's construct arm).
+-- ---------------------------------------------------------------------------
+
+@category "engine-internal"
+ppConstruct : (a: a) -> (ctx: a) -> (kw: a) -> String
+ppConstruct a ctx kw =
+  let name = ppConstructorSourceName (ppA0 a) kw
+  let n = length a
+  if eq n 1
+  then ppConstructorNullarySource name
+  else if (eq n 2) && (ppIsRecordArg (ppA1 a))
+  then ppConstructRecordArg name (ppA1 a) ctx kw
+  else ppWrap (concat name (concat " " (join (ppRenderList (tailOr a) 9 kw []) " "))) (gt ctx 8)
+
+@category "engine-internal"
+ppConstructorNullarySource : (name: String) -> String
+ppConstructorNullarySource name =
+  if (startsWith name "@{") || (gt (length (split name ".")) 1) then concat name " ()" else name
+
+-- A name is presentation, never constructor identity. Only a final source-frame
+-- route may name an exact target; unavailable text stays read-only in Code.
+@category "engine-internal"
+ppConstructorSourceName : (target: String) -> (kw: a) -> String
+ppConstructorSourceName target kw =
+  let routes = fromMaybe [] (lookup kw "constructorRoutes")
+  let candidates = filter (\r -> ppConstructorSourceRoute target routes kw r) routes
+  case head candidates of
+    Just route -> route.sourceName
+    Nothing -> ppConstructorIdentitySource target kw
+
+@category "engine-internal"
+ppAuthoringConstructorSummary : (target: String) -> (kw: a) -> String
+ppAuthoringConstructorSummary target kw =
+  concat (ppConstructorSourceName target kw) " { ... }"
+
+@category "engine-internal"
+ppAuthoringCallSummary : (target: String) -> (constructorCall: Bool) -> (hasArguments: Bool) -> (fallbackName: String) -> (kw: a) -> String
+ppAuthoringCallSummary target constructorCall hasArguments fallbackName kw =
+  let targets = fromMaybe [] (lookup kw "constructorTargets")
+  let isConstructor = constructorCall || (startsWith target "@ctor/") || (gt (length (filter (ppConstructorTargetMatches target) targets)) 0)
+  let name = if isConstructor then ppConstructorSourceName target kw else fallbackName
+  concat name (if hasArguments then "(...)" else "()")
+
+@category "engine-internal"
+ppConstructorIdentitySource : (target: String) -> (kw: a) -> String
+ppConstructorIdentitySource target kw =
+  let targets = fromMaybe [] (lookup kw "constructorTargets")
+  let visible = filter (ppConstructorTargetMatches target) targets
+  let identities = unique (flatten (map ppConstructorFunctionIds visible))
+  if eq (length identities) 1 then ppReferenceSource (ppA0 identities) kw
+  else if (not (startsWith target "@ctor/")) && (not (isUuid target)) then target
+  else "<no surface syntax: constructor unavailable in this scope>"
+
+@category "engine-internal"
+ppConstructorTargetMatches : (target: String) -> (entry: a) -> Bool
+ppConstructorTargetMatches target entry =
+  (eq (fromMaybe "" (lookup entry "id")) target) || (eq entry.targetId target) || (eq (fromMaybe "" (lookup entry "functionId")) target)
+
+@category "engine-internal"
+ppConstructorFunctionIds : (entry: a) -> List String
+ppConstructorFunctionIds entry =
+  case lookup entry "functionId" of
+    Just identity -> if isUuid identity then [identity] else []
+    Nothing -> []
+
+@category "engine-internal"
+ppConstructorSourceRoute : (target: String) -> (routes: List a) -> (kw: a) -> (r: a) -> Bool
+ppConstructorSourceRoute target routes kw r =
+  if ppConstructorTargetMatches target r
+  then if gt (length (ppConstructorFunctionIds r)) 0 then ppReferenceRouteReadable r routes (mapSet kw "typeReference" true) else false
+  else false
+
+-- ppConstructRecordArg — the single-object-arg construct: an all-positional
+-- (`_0, _1, …` in order) record prints juxtaposed `Name v0 v1`; otherwise the
+-- named-field form `Name { k = v, … }` (px:224-231). Keep one object-shaped
+-- positional payload named: a sole object argument otherwise becomes fields
+-- of the outer constructor before its nested expression is evaluated.
+@category "engine-internal"
+ppConstructRecordArg : (name: String) -> (obj: a) -> (ctx: a) -> (kw: a) -> String
+ppConstructRecordArg name obj ctx kw =
+  let es = entries obj
+  let first = ppFirstEntry es
+  let loneObject = (eq (length es) 1) && (ppIsObject first.value)
+  if (gt (length es) 0) && (ppAllPositional es 0) && (not loneObject)
+  then ppWrap (concat name (concat " " (join (ppRenderFieldValues es 9 kw []) " "))) (gt ctx 8)
+  else
+    let gap = ppNameGap (map (\field -> field.key) es) "a record field name"
+    if not (eq gap "") then concat "<no surface syntax: " (concat gap ">")
+    else ppWrap (concat name (concat " { " (concat (join (ppRenderFields es kw []) ", ") " }"))) (gt ctx 8)
+
+-- ppAllPositional es i — every entry key is `_<index>` in order (the canonical
+-- positional-payload encoding).
+@category "engine-internal"
+ppAllPositional : (es: a) -> (i: a) -> Bool
+ppAllPositional es i =
+  case head es of
+    Nothing -> true
+    Just f ->
+      if eq f.key (concat "_" (toString i))
+      then ppAllPositional (tailOr es) (add i 1)
+      else false
+
+-- ppRenderFieldValues — render each entry's VALUE at `prec` (the positional
+-- juxtaposition case).
+@category "engine-internal"
+ppRenderFieldValues : (es: a) -> (prec: a) -> (kw: a) -> (acc: a) -> a
+ppRenderFieldValues es prec kw acc =
+  case head es of
+    Nothing -> acc
+    Just f ->
+      let acc2 = appendItem (printExpr f.value prec kw) acc
+      case tail es of
+        Nothing -> acc2
+        Just rest -> ppRenderFieldValues rest prec kw acc2
+
+-- ---------------------------------------------------------------------------
+-- ppMethod — `Class.method [args]` (px's method arm). The canonical printed
+-- form for `>>=`/`<>` (parser sugar that normalises to a method node).
+-- ---------------------------------------------------------------------------
+
+@category "engine-internal"
+ppMethod : (a: a) -> (ctx: a) -> (kw: a) -> String
+ppMethod a ctx kw =
+  let qname = concat (ppA0 a) (concat "." (ppA1 a))
+  let rest = drop 2 a
+  if eq (length rest) 0
+  then qname
+  else ppWrap (concat qname (concat " " (join (ppRenderList rest 9 kw []) " "))) (gt ctx 8)
+
+-- ---------------------------------------------------------------------------
+-- ppRec — `{ k = v, … }` / `{}` record literal (px's `pRec`).
+-- ---------------------------------------------------------------------------
+
+@category "engine-internal"
+ppRec : (obj: a) -> (kw: a) -> String
+ppRec obj kw =
+  let es = entries obj
+  let gap = ppNameGap (map (\field -> field.key) es) "a record field name"
+  if not (eq gap "") then concat "<no surface syntax: " (concat gap ">")
+  else if eq (length es) 0
+  then "{}"
+  else concat "{ " (concat (join (ppRenderFields es kw []) ", ") " }")
+
+-- ---------------------------------------------------------------------------
+-- ppMatch / ppPat — `case scrut of` arms (px's `pMatch` / `pPat`).
+-- ---------------------------------------------------------------------------
+
+@category "engine-internal"
+ppMatch : (a: a) -> (kw: a) -> String
+ppMatch a kw =
+  let header = concat kw.case (concat " " (concat (printExpr (ppA0 a) 0 kw) (concat " " kw.of)))
+  let lines = ppMatchArms (tailOr a) kw (appendItem header [])
+  join lines "\n"
+
+-- ppMatchArms — walk (pattern, body) pairs; an UNPAIRED trailing arg is the
+-- `_`-dropped catch-all body (px's `i + 1 >= a.length` arm).
+@category "engine-internal"
+ppMatchArms : (args: a) -> (kw: a) -> (acc: a) -> a
+ppMatchArms args kw acc =
+  case head args of
+    Nothing -> acc
+    Just pat ->
+      let rest = tailOr args
+      case head rest of
+        Nothing -> appendItem (concat "  _ -> " (printExpr pat 0 kw)) acc
+        Just body ->
+          let scoped = ppWithBoundNames kw (ppPatternBoundNames pat)
+          let line = concat "  " (concat (ppPat pat scoped) (concat " -> " (printExpr body 0 scoped)))
+          ppMatchArms (tailOr rest) kw (appendItem line acc)
+
+@category "engine-internal"
+ppPatternBoundNames : (pattern: a) -> List String
+ppPatternBoundNames pattern =
+  if isArray pattern then flatten (map ppPatternBoundNames pattern)
+  else if not (ppIsObject pattern) then []
+  else case lookup pattern "$guard" of
+    Just guard -> ppPatternBoundNames (ppA0 guard)
+    Nothing -> case lookup pattern "$bind" of
+      Just name -> if (isString name) && (not (eq name "_")) then [name] else []
+      Nothing -> flatten (map (\field -> ppPatternBoundNames field.value) (ppNonTagEntries (entries pattern) []))
+
+-- ppPat p kw — pattern renderer (px's `pPat`): `_` / guard / bind / tagged /
+-- scalar / record.
+@category "engine-internal"
+ppPat : (p: a) -> (kw: a) -> String
+ppPat p kw =
+  if eq p "_" then "_"
+  else if ppIsObject p
+  then
+    case lookup p "$guard" of
+      Just g -> concat (ppPat (ppA0 g) kw) (concat " | " (printExpr (ppA1 g) 0 kw))
+      Nothing ->
+        case lookup p "$bind" of
+          Just nm -> nm
+          Nothing ->
+            case lookup p "$tag" of
+              Just tag -> ppPatTagged tag p kw
+              Nothing -> ppPatRecord p kw
+  else if isString p then jsLit p
+  else if isNumber p then toString p
+  else if isBoolean p then toString p
+  else toString p
+
+-- ppPatTagged — a constructor pattern: `Tag` (no fields) / `Tag v0 v1`
+-- (all-positional) / `Tag { k = v, … }` (named) (px:728-740).
+@category "engine-internal"
+ppPatTagged : (tag: String) -> (p: a) -> (kw: a) -> String
+ppPatTagged tag p kw =
+  let fields = ppNonTagEntries (entries p) []
+  let name = ppConstructorSourceName tag kw
+  if eq (length fields) 0
+  then name
+  else if ppAllPositional fields 0
+  then concat name (concat " " (join (ppPatValues fields kw []) " "))
+  else concat name (concat " { " (concat (join (ppPatFields fields kw []) ", ") " }"))
+
+-- ppNonTagEntries — entries with the `$tag` key dropped.
+@category "engine-internal"
+ppNonTagEntries : (es: a) -> (acc: a) -> a
+ppNonTagEntries es acc =
+  case head es of
+    Nothing -> acc
+    Just f ->
+      let acc2 = if eq f.key "$tag" then acc else appendItem f acc
+      case tail es of
+        Nothing -> acc2
+        Just rest -> ppNonTagEntries rest acc2
+
+-- ppPatValues — render each field's VALUE as a pattern (positional case).
+@category "engine-internal"
+ppPatValues : (es: a) -> (kw: a) -> (acc: a) -> a
+ppPatValues es kw acc =
+  case head es of
+    Nothing -> acc
+    Just f ->
+      let acc2 = appendItem (ppPat f.value kw) acc
+      case tail es of
+        Nothing -> acc2
+        Just rest -> ppPatValues rest kw acc2
+
+-- ppPatFields — `k = <pat>` per field (named-pattern case).
+@category "engine-internal"
+ppPatFields : (es: a) -> (kw: a) -> (acc: a) -> a
+ppPatFields es kw acc =
+  case head es of
+    Nothing -> acc
+    Just f ->
+      let acc2 = appendItem (concat f.key (concat " = " (ppPat f.value kw))) acc
+      case tail es of
+        Nothing -> acc2
+        Just rest -> ppPatFields rest kw acc2
+
+-- ppPatRecord — `{ k = <pat>, … }` (px's plain-object pattern arm, :744).
+@category "engine-internal"
+ppPatRecord : (p: a) -> (kw: a) -> String
+ppPatRecord p kw =
+  concat "{ " (concat (join (ppPatFields (entries p) kw []) ", ") " }")
+
+-- ---------------------------------------------------------------------------
+-- §B fixity reverse lookup — codeName → notation/prec/assoc.
+-- ---------------------------------------------------------------------------
+
+-- ppInfixOf name — the Infixable row for `name`. The printer's reverse of the
+-- parser's notation→codeName map (§B): the inverse of getInfixableByName, which
+-- projects ONLY the Infixable INSTANCES (parser-fixities.fenel) and EXCLUDES the
+-- `&&`/`||`/`>>=`/`<>` notations — the CANONICAL rows (NOT defaultFixityTable,
+-- which adds the structural `$`/`|>`/`&`/`in`/`.` rows getInfixableByName never
+-- carries — those would wrongly render `{call:["in",…]}` / `{call:[".",…]}` as
+-- infix). A row is listed ONLY when its notation lexes as an operator (symbolic,
+-- or a curated word operator: `and`/`or`): `Infixable std.concat`'s notation
+-- `cat` lexes as an identifier, so `a cat b` would read back as the application
+-- of `a` — concat has no row and prints as the application `concat a b`. So 13
+-- of the 14 canonical instances. An if-cascade keyed by bare codeName (the
+-- setSyntax idiom — a list literal as a mid-application argument does not attach
+-- under layout, and a bare nullary table ref does not auto-evaluate). Returns
+-- `Just { notation, prec, assoc }` or `Nothing`.
+@category "engine-internal"
+ppInfixOf : (name: String) -> a
+ppInfixOf name =
+  let cn = ppCodeName name
+  if eq cn "add" then Just { notation = "+", prec = 6, assoc = "left" }
+  else if eq cn "sub" then Just { notation = "-", prec = 6, assoc = "left" }
+  else if eq cn "mul" then Just { notation = "*", prec = 7, assoc = "left" }
+  else if eq cn "div" then Just { notation = "/", prec = 7, assoc = "left" }
+  else if eq cn "mod" then Just { notation = "%", prec = 7, assoc = "left" }
+  else if eq cn "eq" then Just { notation = "==", prec = 4, assoc = "none" }
+  else if eq cn "neq" then Just { notation = "!=", prec = 4, assoc = "none" }
+  else if eq cn "lt" then Just { notation = "<", prec = 4, assoc = "none" }
+  else if eq cn "gt" then Just { notation = ">", prec = 4, assoc = "none" }
+  else if eq cn "lte" then Just { notation = "<=", prec = 4, assoc = "none" }
+  else if eq cn "gte" then Just { notation = ">=", prec = 4, assoc = "none" }
+  else if eq cn "and" then Just { notation = "and", prec = 3, assoc = "right" }
+  else if eq cn "or" then Just { notation = "or", prec = 2, assoc = "right" }
+  else Nothing
+
+-- ppPrefixOf name — the Prefixable row for `name` (the only two: `not`/`negate`;
+-- `fenel/std/parser-fixities.fenel`). Same if-cascade idiom. Returns
+-- `Just { notation, prec }` or `Nothing`.
+@category "engine-internal"
+ppPrefixOf : (name: String) -> a
+ppPrefixOf name =
+  let cn = ppCodeName name
+  if eq cn "not" then Just { notation = "not", prec = 9 }
+  else if eq cn "negate" then Just { notation = "-", prec = 9 }
+  else Nothing
+
+-- ===========================================================================
+-- printSetExpr — the harvest's LAST structural SetExpr reader (px's
+-- `printSetExpr`, :637). The canonical input has 14 cases; eleven currently
+-- have refinement-surface syntax and ctor/mu/arrow take the safe fallback.
+-- Consumers: printType's `$refined` arm + printRefinementPredicate (TS).
+-- ===========================================================================
+
+@label "fenel-printer: printSetExpr"
+@description "Phase 3b-3f — render a canonical 14-case SetExpr to its refinement-predicate surface string (the harvest's LAST structural reader). 11 refinement-surface arms: SeAll → \"true\" / SeNone → \"false\" / SeWhere → printExpr pred None (THE blocker, now rides the Fenel expression printer) / SeRef → handle / SeEnum → `value in [v, …]` (jsLit values) / SeInterval → `lo <op> value` / `value <op> hi` AND-joined (jsLit bounds) / SeIntersect → comma-join (refinement AND) / SeUnion → `(…) or (…)` / SeDiff → `(…) and not (…)` / SeComplement → `not (…)` / SePattern → `matches <pattern>` (constant). SeCtor / SeMu / SeArrow use the conservative fallback until ux-parity defines their authoring syntax. Boundary legacy input is canonicalized before dispatch. Output is a plain STRING. Mirrors fenel-printer.ts:printSetExpr; dispatched from the TS wrapper; consumed by printType's $refined arm + printRefinementPredicate."
+@tags "engine" "fenel-printer" "printer" "set-expr" "reader" "phase-3b-3f"
+printSetExpr : (s: a) -> (kw: a) -> String
+printSetExpr s kw =
+  case s of
+    SeAll -> "true"
+    SeNone -> "false"
+    SeWhere { pred = pr } -> ppRefinementWhere pr kw
+    SeRef { handle = h } -> toString h
+    SeEnum { values = vs } -> ppSeEnum vs
+    SeInterval { interval = iv } -> ppSeInterval iv
+    SeIntersect { branches = bs } -> join (ppSetBranches bs kw []) ", "
+    SeUnion { branches = bs } -> join (ppSetParenBranches bs kw []) " or "
+    SeDiff { left = l, right = r } ->
+      concat "(" (concat (printSetExpr l kw) (concat ") and not (" (concat (printSetExpr r kw) ")")))
+    SeComplement { inner = i } -> concat "not (" (concat (printSetExpr i kw) ")")
+    SePattern { pattern = p } -> "matches <pattern>"
+    -- signature-substrate Phase 4 slice 3a — REDACTED, and it must stay a
+    -- constant. `ppSetLegacy`'s terminal is `jsLit s` (= JSON.stringify), which
+    -- would print the whole rigid record — scopeToken, ordinal and kind — into
+    -- user-visible refinement surface syntax. A rigid never has an authoring
+    -- spelling, so the only honest rendering is an opaque placeholder carrying
+    -- no token.
+    SeRigid {} -> "<rigid>"
+    _ -> ppSetLegacy s kw
+
+-- Comma predicates author a structural, lazy conjunction. Word `and` authors
+-- a callable instead, so retain the commas rather than changing the tree.
+@category "engine-internal"
+ppRefinementWhere : (pr: a) -> (kw: a) -> String
+ppRefinementWhere pr kw =
+  if ppIsExprNode pr
+  then
+    case lookup pr "and" of
+      Just predicates ->
+        if lt (length predicates) 2
+        then "<no surface syntax: a structural conjunction needs at least two predicates>"
+        else if ppHasStructuralAnd predicates
+        then "<no surface syntax: directly nested structural conjunctions>"
+        else join (ppRenderList predicates 0 kw []) ", "
+      Nothing -> printExpr pr 0 kw
+  else printExpr pr 0 kw
+
+@category "engine-internal"
+ppHasStructuralAnd : (es: a) -> Boolean
+ppHasStructuralAnd es =
+  case head es of
+    Nothing -> false
+    Just e ->
+      case lookup e "and" of
+        Just _ -> if ppIsExprNode e then true else ppHasStructuralAnd (fromMaybe [] (tail es))
+        Nothing -> ppHasStructuralAnd (fromMaybe [] (tail es))
+
+-- ppSeEnum — `value in [v0, v1, …]` (px:649), values jsLit'd.
+@category "engine-internal"
+ppSeEnum : (vs: a) -> String
+ppSeEnum vs = concat "value in [" (concat (join (ppJsLitList vs []) ", ") "]")
+
+@category "engine-internal"
+ppJsLitList : (vs: a) -> (acc: a) -> a
+ppJsLitList vs acc =
+  case head vs of
+    Nothing -> acc
+    Just x ->
+      let acc2 = appendItem (jsLit x) acc
+      case tail vs of
+        Nothing -> acc2
+        Just rest -> ppJsLitList rest acc2
+
+-- ppSeInterval — `lo <= value` / `lo < value` (lo side) AND `value <= hi` /
+-- `value < hi` (hi side), comma-joined; absent sides drop (px:653).
+@category "engine-internal"
+ppSeInterval : (iv: a) -> String
+ppSeInterval iv = join (concat (ppIntervalLo iv.lo) (ppIntervalHi iv.hi)) ", "
+
+@category "engine-internal"
+ppIntervalLo : (lo: a) -> a
+ppIntervalLo lo =
+  case lo of
+    Nothing -> []
+    Just b ->
+      let opStr = if b.inclusive then "<=" else "<"
+      appendItem (concat (jsLit b.value) (concat " " (concat opStr " value"))) []
+
+@category "engine-internal"
+ppIntervalHi : (hi: a) -> a
+ppIntervalHi hi =
+  case hi of
+    Nothing -> []
+    Just b ->
+      let opStr = if b.inclusive then "<=" else "<"
+      appendItem (concat "value " (concat opStr (concat " " (jsLit b.value)))) []
+
+-- ppSetBranches — `printSetExpr` per branch (SeIntersect; comma-AND).
+@category "engine-internal"
+ppSetBranches : (bs: a) -> (kw: a) -> (acc: a) -> a
+ppSetBranches bs kw acc =
+  case head bs of
+    Nothing -> acc
+    Just b ->
+      let acc2 = appendItem (printSetExpr b kw) acc
+      case tail bs of
+        Nothing -> acc2
+        Just rest -> ppSetBranches rest kw acc2
+
+-- ppSetParenBranches — `(printSetExpr)` per branch (SeUnion; ` or `-joined).
+@category "engine-internal"
+ppSetParenBranches : (bs: a) -> (kw: a) -> (acc: a) -> a
+ppSetParenBranches bs kw acc =
+  case head bs of
+    Nothing -> acc
+    Just b ->
+      let acc2 = appendItem (concat "(" (concat (printSetExpr b kw) ")")) acc
+      case tail bs of
+        Nothing -> acc2
+        Just rest -> ppSetParenBranches rest kw acc2
+
+-- ppSetLegacy — the `$`-key dual-read fallback (mirrors the set-expr-sql
+-- sefLegacy cascade as consumed by printSetExpr's peelSetExpr). $ref / $named
+-- both → SeRef handle; $diff is the legacy 2-element array. Final default →
+-- `JSON.stringify(s)` (px's unknown-shape arm).
+@category "engine-internal"
+ppSetLegacy : (s: a) -> (kw: a) -> String
+ppSetLegacy s kw =
+  case lookup s "$all" of
+    Just _ -> "true"
+    Nothing ->
+      case lookup s "$none" of
+        Just _ -> "false"
+        Nothing ->
+          case lookup s "$where" of
+            Just pr -> ppRefinementWhere pr kw
+            Nothing ->
+              case lookup s "$ref" of
+                Just h -> toString h
+                Nothing ->
+                  case lookup s "$named" of
+                    Just h -> toString h
+                    Nothing ->
+                      case lookup s "$enum" of
+                        Just vs -> ppSeEnum vs
+                        Nothing ->
+                          case lookup s "$interval" of
+                            Just iv -> ppSeInterval iv
+                            Nothing ->
+                              case lookup s "$intersect" of
+                                Just bs -> join (ppSetBranches bs kw []) ", "
+                                Nothing ->
+                                  case lookup s "$union" of
+                                    Just bs -> join (ppSetParenBranches bs kw []) " or "
+                                    Nothing ->
+                                      case lookup s "$complement" of
+                                        Just i -> concat "not (" (concat (printSetExpr i kw) ")")
+                                        Nothing ->
+                                          case lookup s "$pattern" of
+                                            Just p -> "matches <pattern>"
+                                            Nothing ->
+                                              case lookup s "$diff" of
+                                                Just d -> ppSetDiffArr d kw
+                                                Nothing -> jsLit s
+
+-- ppSetDiffArr — the legacy `$diff: [left, right]` array form.
+@category "engine-internal"
+ppSetDiffArr : (d: a) -> (kw: a) -> String
+ppSetDiffArr d kw =
+  let l = ppA0 d
+  let r = ppA1 d
+  concat "(" (concat (printSetExpr l kw) (concat ") and not (" (concat (printSetExpr r kw) ")")))
+
+-- ===========================================================================
+-- printType — the FenelType→surface renderer (printer-substrate Phase 1). The
+-- inverse of the parser's type grammar. Folds a `$`-free TtMarker tree (the TS
+-- marshal arm `printerTypeToMarker` in engine-bodies-dispatch.ts precomputed
+-- refHandle / peelList / peelMaybe / peelResult / peelEntityRef and carried raw
+-- SetExpr / Expression sub-nodes) → surface string. The 17-constructor walk:
+-- TtRef name · TtVar v · TtVoid/TtUnit · TtList → `[T]` · TtMaybe → `Maybe T` ·
+-- TtResult → `Result E A` · TtTuple → `(…)` · TtRecord → `{ f: T }` · TtArrow
+-- (0/1/n-param surface) · TtRefined → `base where <printSetExpr>` · TtEntityRef →
+-- `EntityRef<"X">` · TtTagged → `Tagged v p` · TtMap → `Map K V` ·
+-- TtVariant/TtLiteral/TtOther → the precomputed JSON dump · TtOpaque → name ·
+-- TtFunction → `Fn<name>` · TtEl → juxtaposition · TtType → `Type` · TtRaw →
+-- verbatim (legacy ann / non-object). Dispatches `printSetExpr` ($refined.set) +
+-- `printExpr` ($el value args). Mirrors fenel-printer.ts:printType; consumed by
+-- the TS shim + the px router's looksLikeType + type_sig arms.
+-- ===========================================================================
+
+@label "fenel-printer: printType"
+@description "printer-substrate Phase 1 — the FenelType pretty-printer (the parser's type-grammar inverse): a `$`-free TtMarker tree → .fenel type surface. The TS marshal arm (printerTypeToMarker, engine-bodies-dispatch.ts) precomputes the hard recognitions (refHandle / peelList / peelMaybe / peelResult / peelEntityRef) and carries raw `$refined.set` (→ printSetExpr) + `$el` value args (→ printExpr); the body folds marker → string over the 17 constructors (TtRef/TtVar/TtVoid/TtUnit/TtList→[T]/TtMaybe→Maybe T/TtResult→Result E A/TtTuple/TtRecord/TtArrow/TtRefined→base where <set>/TtEntityRef→EntityRef<\"X\">/TtTagged→Tagged v p/TtMap→Map K V/TtVariant+TtLiteral+TtOther→precomputed JSON/TtOpaque→name/TtFunction→Fn<name>/TtEl→juxtaposition/TtType→Type/TtRaw→verbatim). Container applications print as juxtaposition with every compound argument parenthesised (ppTypeArg) and an arrow's arrow/refined parameter and refined result parenthesised, so every printed type re-parses (no `>>`; modules-as-values Phase 2d). Mirrors fenel-printer.ts:printType; the TS printType is now a thin marshal+dispatch shim."
+@tags "engine" "fenel-printer" "printer" "type" "reader" "phase-printer-1"
+printType : (m: a) -> (kw: a) -> String
+printType m kw =
+  let typeKw = mapSet kw "constructorRoutes" []
+  if eq m.tag "TtRaw" then m.str
+  else if eq m.tag "TtRef" then ppTypeReferenceSource m.name typeKw
+  else if eq m.tag "TtVar" then m.v
+  else if eq m.tag "TtVoid" then "Void"
+  else if eq m.tag "TtUnit" then "Unit"
+  else if eq m.tag "TtList" then concat "[" (concat (printType m.elem typeKw) "]")
+  else if eq m.tag "TtMaybe" then concat "Maybe " (ppTypeArg m.value typeKw)
+  else if eq m.tag "TtResult" then concat "Result " (concat (ppTypeArg m.err typeKw) (concat " " (ppTypeArg m.ok typeKw)))
+  else if eq m.tag "TtTuple" then concat "(" (concat (join (ppTypeList m.items typeKw []) ", ") ")")
+  else if eq m.tag "TtRecord" then concat "{ " (concat (join (ppTypeFields m.fields typeKw []) ", ") " }")
+  else if eq m.tag "TtArrow" then ppArrow m.params m.returns typeKw
+  else if eq m.tag "TtRefined" then concat (printType m.base typeKw) (concat " where " (printSetExpr m.set typeKw))
+  else if eq m.tag "TtEntityRef" then concat "EntityRef<" (concat (jsLit m.name) ">")
+  else if eq m.tag "TtTagged" then concat "Tagged " (concat (ppTypeArg m.value typeKw) (concat " " (ppTypeArg m.phantom typeKw)))
+  else if eq m.tag "TtTaggedSingleton" then ppTaggedSingletonType m kw
+  else if eq m.tag "TtMap" then concat "Map " (concat (ppTypeArg m.keys typeKw) (concat " " (ppTypeArg m.values typeKw)))
+  else if eq m.tag "TtVariant" then m.json
+  else if eq m.tag "TtOpaque" then m.name
+  else if eq m.tag "TtFunction" then concat "Fn<" (concat m.name ">")
+  else if eq m.tag "TtEl" then ppEl m.head m.args typeKw
+  else if eq m.tag "TtType" then "Type"
+  else if eq m.tag "TtLiteral" then m.json
+  else m.json
+
+@category "engine-internal"
+ppTypeReferenceSource : (name: String) -> (kw: a) -> String
+ppTypeReferenceSource name kw =
+  let routes = fromMaybe [] (lookup kw "referenceRoutes")
+  if (isUuid name) || (gt (length (filter (ppReferenceRouteMatches name) routes)) 0)
+  then ppReferenceSource name (mapSet kw "typeReference" true)
+  else if ppNameIsIdent name then name else ppIdentitySource name
+
+@category "engine-internal"
+ppTaggedSingletonType : (m: a) -> (kw: a) -> String
+ppTaggedSingletonType m kw =
+  let name = ppGeneratedCallSource "std.taggedSingletonType" kw
+  let value = ppTypeValueSource m.phantomValue kw
+  concat name (concat " " (concat (ppTypeArg m.value kw) (concat " " (concat (ppTypeArg m.phantomBase kw) (concat " " value)))))
+
+-- A Type-application argument is type-parsed first. The ordinary case form
+-- makes its argument unambiguously data, including nullary constructors,
+-- empty lists/records and reference data that would otherwise parse as types.
+@category "engine-internal"
+ppTypeValueSource : (value: a) -> (kw: a) -> String
+ppTypeValueSource value kw =
+  let source = printExpr value 0 kw
+  if gt (length (filter (\token -> eq token.t "identity") (lexAll source))) 0 then "<no surface syntax: identity data inside a Type argument>"
+  else concat "(" (concat kw.case (concat " " (concat source (concat " " (concat kw.of " phantomValue -> phantomValue)")))))
+
+@category "engine-internal"
+ppGeneratedCallSource : (name: String) -> (kw: a) -> String
+ppGeneratedCallSource name kw =
+  let routes = fromMaybe [] (lookup kw "referenceRoutes")
+  if gt (length (filter (ppReferenceRouteMatches name) routes)) 0 then ppReferenceSource name kw
+  else if ppNameRootBound name kw then "<no surface syntax: construction function is shadowed>"
+  else ppCallSourceName name kw
+
+-- ppTypeList — group tuple items before their comma-separated neighbours.
+@category "engine-internal"
+ppTypeList : (xs: a) -> (kw: a) -> (acc: a) -> a
+ppTypeList xs kw acc =
+  case head xs of
+    Nothing -> acc
+    Just x ->
+      let item = if eq x.tag "TtRefined" then ppArrowParamType x kw else printType x kw
+      let acc2 = appendItem item acc
+      case tail xs of
+        Nothing -> acc2
+        Just rest -> ppTypeList rest kw acc2
+
+-- ppTypeFields — group field types so a refinement cannot consume the next field.
+@category "engine-internal"
+ppTypeFields : (fs: a) -> (kw: a) -> (acc: a) -> a
+ppTypeFields fs kw acc =
+  case head fs of
+    Nothing -> acc
+    Just f ->
+      let acc2 = appendItem (concat f.name (concat ": " (ppArrowParamType f.type kw))) acc
+      case tail fs of
+        Nothing -> acc2
+        Just rest -> ppTypeFields rest kw acc2
+
+-- ppArrow — the `$arrow` surface (printType:339): 0 params → `() -> ret`; a
+-- single auto-named (`_0`) or anonymous param → `T -> ret` (no parens); else
+-- `(p…) -> ret` with named params (`name: T`) for non-auto names.
+@category "engine-internal"
+ppArrow : (params: a) -> (returns: a) -> (kw: a) -> String
+ppArrow params returns kw =
+  let ret = if eq returns.tag "TtRefined" then concat "(" (concat (printType returns kw) ")") else printType returns kw
+  let n = length params
+  if eq n 0 then concat "() -> " ret
+  else
+    let p0 = ppA0 params
+    if (eq n 1) && ((eq p0.name "") || (eq p0.name "_0"))
+    then concat (ppArrowParamType p0.type kw) (concat " -> " ret)
+    else concat "(" (concat (join (ppArrowParams params kw []) ", ") (concat ") -> " ret))
+
+-- ppArrowParamType — group an arrow or refinement in a parameter, field or tuple slot
+-- (`(a -> b) -> c`; `->` is right-associative and `where` can consume the
+-- surrounding arrow or a comma-separated neighbour), anything else prints bare.
+@category "engine-internal"
+ppArrowParamType : (m: a) -> (kw: a) -> String
+ppArrowParamType m kw =
+  if (eq m.tag "TtArrow") || (eq m.tag "TtRefined")
+  then concat "(" (concat (printType m kw) ")")
+  else printType m kw
+
+-- ppTypeArg — a juxtaposed type argument (`Maybe T`, `Result E A`, a positional
+-- constructor field): parenthesised when compound (ppTypeNeedsParens), so the
+-- printed application re-parses as the same tree (modules-as-values Phase 2d —
+-- replaces the angle form, whose nested `>>` lexed as one operator).
+@category "engine-internal"
+ppTypeArg : (m: a) -> (kw: a) -> String
+ppTypeArg m kw =
+  if ppTypeNeedsParens m
+  then concat "(" (concat (printType m kw) ")")
+  else printType m kw
+
+-- ppTypeNeedsParens — does this printed type take more than one juxtaposition
+-- atom? Applications (Maybe / Result / Tagged / Map / a `$el` with args),
+-- arrows, refinements and the angle-spelled EntityRef / Fn do; a name, a
+-- variable, `[T]`, a tuple, a record, `Type`, `Unit`/`Void` do not.
+@category "engine-internal"
+ppTypeNeedsParens : (m: a) -> Bool
+ppTypeNeedsParens m =
+  if eq m.tag "TtMaybe" then true
+  else if eq m.tag "TtResult" then true
+  else if eq m.tag "TtTagged" then true
+  else if eq m.tag "TtTaggedSingleton" then true
+  else if eq m.tag "TtMap" then true
+  else if eq m.tag "TtArrow" then true
+  else if eq m.tag "TtRefined" then true
+  else if eq m.tag "TtEntityRef" then true
+  else if eq m.tag "TtFunction" then true
+  else if eq m.tag "TtEl" then gt (length m.args) 0
+  else false
+
+-- ppArrowParams — `name: T` for a named param, `T` for an auto-named one.
+@category "engine-internal"
+ppArrowParams : (ps: a) -> (kw: a) -> (acc: a) -> a
+ppArrowParams ps kw acc =
+  case head ps of
+    Nothing -> acc
+    Just p ->
+      let s = if p.named then concat p.name (concat ": " (ppArrowParamType p.type kw)) else ppArrowParamType p.type kw
+      let acc2 = appendItem s acc
+      case tail ps of
+        Nothing -> acc2
+        Just rest -> ppArrowParams rest kw acc2
+
+-- ppEl — `head arg…` juxtaposition for a `$el { call: [...] }` dependent type
+-- (printType:388). `head` is a string (the marker field); args are JaMarkers.
+@category "engine-internal"
+ppEl : (hd: a) -> (args: a) -> (kw: a) -> String
+ppEl hd args kw =
+  if not (isString hd) then "<no surface syntax: an exact identity type application>"
+  else if not (ppNameIsIdent hd) then "<no surface syntax: an exact identity type application>"
+  else if eq (length args) 0 then hd
+  else concat hd (concat " " (join (ppJuxArgs args kw []) " "))
+
+-- ppJuxArgs — ppJuxArg per element (the `$el` call-form args).
+@category "engine-internal"
+ppJuxArgs : (xs: a) -> (kw: a) -> (acc: a) -> a
+ppJuxArgs xs kw acc =
+  case head xs of
+    Nothing -> acc
+    Just x ->
+      let acc2 = appendItem (ppJuxArg x kw) acc
+      case tail xs of
+        Nothing -> acc2
+        Just rest -> ppJuxArgs rest kw acc2
+
+-- ppJuxArg — a juxtaposed type-app arg (printJuxArg): scalar → the precomputed
+-- `JaLit` string; bare type → printType; compound type → `(printType)`; an
+-- expression → `(printExpr)` (printer-substrate carries the raw expr through).
+@category "engine-internal"
+ppJuxArg : (ja: a) -> (kw: a) -> String
+ppJuxArg ja kw =
+  if eq ja.tag "JaLit" then ja.str
+  else if eq ja.tag "JaTypeBare" then printType ja.type kw
+  else if eq ja.tag "JaTypeParen" then concat "(" (concat (printType ja.type kw) ")")
+  else concat "(" (concat (printExpr ja.expr 0 kw) ")")
+
+-- ===========================================================================
+-- printTypeDef — the type-def renderer (pTypeDef). Folds a `$`-free Td marker
+-- (printerTypeDefToMarker): the form is precomputed (refined / alias / data /
+-- variant); the string assembly (params join, opaque/discriminator prefixes,
+-- ctor surface) is the body's job. Cross-calls printType (field/base/kindSig
+-- types) + printExpr (Phase-7d field defaults) + (via the refined-pred marker)
+-- printExpr / the precomputed formatSetExpr string.
+-- ===========================================================================
+
+@label "fenel-printer: printTypeDef"
+@description "printer-substrate Phase 1 — the type-def renderer (pTypeDef): a `$`-free Td marker (printerTypeDefToMarker, engine-bodies-dispatch.ts) → .fenel type-def surface. The form is precomputed (refined `Name = base | pred` / alias `Name = <type>` / Idris `data Name : kind where <ctors>` / variant `Name = Ctor f: T | …`); the body assembles the string (params join, `opaque \"<repr>\" ` + `@discriminator \"<name>\"` prefixes, positional-vs-named ctor fields, Phase-7d ` = <default>` via printExpr). Cross-calls printType (field/base/kindSig types) + printExpr (field defaults / `$where` preds). Mirrors fenel-printer.ts:pTypeDef; the TS px router's type_def arm is now a thin marshal+dispatch shim."
+@tags "engine" "fenel-printer" "printer" "type-def" "reader" "phase-printer-1"
+printTypeDef : (d: a) -> (kw: a) -> String
+printTypeDef d kw =
+  let params = if gt (length d.params) 0 then concat " " (join d.params " ") else ""
+  let prefix = if d.hasOpaque then concat "opaque " (concat (jsLit d.opaqueRepr) " ") else ""
+  let body =
+    if eq d.form "refined"
+    then concat prefix (concat d.name (concat params (concat " = " (concat (printType d.refinedBase kw) (concat " | " (ppRefPred d.refinedPred kw))))))
+    else if eq d.form "alias"
+    then concat prefix (concat d.name (concat params (concat " = " (printType d.alias kw))))
+    else if eq d.form "data"
+    then ppDataDecl d kw params
+    else ppVariantDecl d kw params prefix
+  if not (ppTypeDeclNameReadable d.name) then "<no surface syntax: a type declaration needs an admitted constructor name>"
+  else ppDecoratedDecl d.directives body
+
+-- ppRefPred — the refinement predicate (printRefinementPredicate): bare-ident
+-- shorthand `RpBare` → the fn name; `RpExpr` → printExpr inner; `RpRaw` → the
+-- precomputed `value ∈ <formatSetExpr>` string; `RpJson` → JSON fallback.
+@category "engine-internal"
+ppRefPred : (rp: a) -> (kw: a) -> String
+ppRefPred rp kw =
+  if eq rp.tag "RpBare" then rp.name
+  else if eq rp.tag "RpExpr" then printExpr rp.expr 0 kw
+  else if eq rp.tag "RpRaw" then rp.str
+  else rp.json
+
+-- ppDataDecl — `data Name [params] [: kindSig] where\n  Ctor : T\n…` (pTypeDef's
+-- Idris-style branch).
+@category "engine-internal"
+ppDataDecl : (d: a) -> (kw: a) -> (params: a) -> String
+ppDataDecl d kw params =
+  let hd = concat "data " (concat d.name params)
+  let withSig = if d.hasKindSig then concat hd (concat " : " (printType d.kindSig kw)) else hd
+  concat withSig (concat " where\n" (join (ppDataCtors d.dataCtors kw []) "\n"))
+
+-- ppDataCtors — `  Ctor : <type>` per ctor (`?` for a typeless ctor).
+@category "engine-internal"
+ppDataCtors : (cs: a) -> (kw: a) -> (acc: a) -> a
+ppDataCtors cs kw acc =
+  case head cs of
+    Nothing -> acc
+    Just c ->
+      let t = if c.hasType then printType c.type kw else "?"
+      let acc2 = appendItem (concat "  " (concat c.name (concat " : " t))) acc
+      case tail cs of
+        Nothing -> acc2
+        Just rest -> ppDataCtors rest kw acc2
+
+-- ppVariantDecl — `[@discriminator "<n>"\n][opaque "<r>" ]Name [params] =
+-- Ctor… | …` (pTypeDef's default variant branch).
+@category "engine-internal"
+ppVariantDecl : (d: a) -> (kw: a) -> (params: a) -> (prefix: a) -> String
+ppVariantDecl d kw params prefix =
+  let directivePrefix = if d.hasDisc then concat "@discriminator " (concat (jsLit d.disc) "\n") else ""
+  let names = fold (\acc c -> concat acc (map (\f -> f.name) (filter (\f -> f.named) c.fields))) [] d.variantCtors
+  let nameGap = ppCtorFieldNameGap names
+  if not (eq nameGap "") then concat "<no surface syntax: " (concat nameGap ">")
+  else concat directivePrefix (concat prefix (concat d.name (concat params (concat " = " (join (ppVariantCtors d.variantCtors kw []) " | ")))))
+
+-- ppVariantCtors — `Ctor` (no fields) / `Ctor <field…>` per ctor.
+@category "engine-internal"
+ppVariantCtors : (cs: a) -> (kw: a) -> (acc: a) -> a
+ppVariantCtors cs kw acc =
+  case head cs of
+    Nothing -> acc
+    Just c ->
+      let s = if eq (length c.fields) 0 then c.name else concat c.name (concat " " (join (ppCtorFields c.fields kw []) " "))
+      let acc2 = appendItem s acc
+      case tail cs of
+        Nothing -> acc2
+        Just rest -> ppVariantCtors rest kw acc2
+
+-- ppCtorFields — a ctor field surface: positional (auto `_n` name) → `T[ = def]`;
+-- named → `name: T[ = def]`. The Phase-7d ` = <default>` rides printExpr.
+@category "engine-internal"
+ppCtorFields : (fs: a) -> (kw: a) -> (acc: a) -> a
+ppCtorFields fs kw acc =
+  case head fs of
+    Nothing -> acc
+    Just f ->
+      let t = if f.hasType then printType f.type kw else "?"
+      let defSuffix = if f.hasDefault then concat " = (" (concat (printExpr f.def 0 kw) ")") else ""
+      -- a POSITIONAL field is one juxtaposed atom of the constructor: a compound
+      -- type is parenthesised (`Some (Maybe String)`), modules-as-values Phase 2d.
+      let pt = if f.hasType then ppTypeArg f.type kw else "?"
+      let s = if f.named then concat f.name (concat ": " (concat t defSuffix)) else concat pt defSuffix
+      let acc2 = appendItem s acc
+      case tail fs of
+        Nothing -> acc2
+        Just rest -> ppCtorFields rest kw acc2
+
+-- ===========================================================================
+-- printLegacyTypeExpr — the `read(T)`-with-schema legacy type-expr renderer
+-- (pLegacyTypeExpr). Folds a `$`-free Ls marker (printerLegacySchemaToMarker):
+-- a record schema → `{ f: T, … }`; a scalar → `Name` / `Name{fmt}` /
+-- `Name[lo..hi]`. The leaf names + format/interval discrimination are
+-- precomputed; the body assembles the surface.
+-- ===========================================================================
+
+@label "fenel-printer: printLegacyTypeExpr"
+@description "printer-substrate Phase 1 — the read(T)-with-schema legacy type-expr renderer (pLegacyTypeExpr): a `$`-free Ls marker (printerLegacySchemaToMarker, engine-bodies-dispatch.ts) → the legacy type-expr surface. A record schema → `{ name: <T>, … }` (recursive); a scalar → `Name` / `Name{fmt}` (named format set, `format:` stripped) / `Name[lo..hi]` (interval). Leaf display names (TYPE_NAMES) + the fmt/interval discrimination are precomputed at the marshal boundary; the body assembles the surface. Mirrors fenel-printer.ts:pLegacyTypeExpr; the TS pCallRead read-call arm dispatches this body for the inner type string."
+@tags "engine" "fenel-printer" "printer" "type" "legacy" "phase-printer-1"
+printLegacyTypeExpr : (m: a) -> String
+printLegacyTypeExpr m =
+  if eq m.tag "LsRecord"
+  then concat "{ " (concat (join (ppLegacyFields m.fields []) ", ") " }")
+  else if eq m.kind "fmt" then concat m.name (concat "{" (concat m.fmt "}"))
+  else if eq m.kind "interval" then concat m.name (concat "[" (concat (toString m.lo) (concat ".." (concat (toString m.hi) "]"))))
+  else m.name
+
+-- ppLegacyFields — `name: <printLegacyTypeExpr>` per record-schema field.
+@category "engine-internal"
+ppLegacyFields : (fs: a) -> (acc: a) -> a
+ppLegacyFields fs acc =
+  case head fs of
+    Nothing -> acc
+    Just f ->
+      let acc2 = appendItem (concat f.name (concat ": " (printLegacyTypeExpr f.schema))) acc
+      case tail fs of
+        Nothing -> acc2
+        Just rest -> ppLegacyFields rest acc2
+
+-- ===========================================================================
+-- printDecl — the DECLARATION renderer (printer-substrate Phase 2; pxDecl's
+-- non-type arms). Folds a `$`-free decl marker (declToMarker,
+-- engine-bodies-dispatch.ts) → `.fenel` text. Four forms: `def` →
+-- `name params = body` (`(op)` for operator names) · `type_sig` → `name : type`
+-- · `fixity` → `infixl 6 +` (the `l`/`r`/`n`→`infixl`/`infixr`/`infix` map is
+-- this body's pure if-cascade, NOT a marshal precompute) · `where` →
+-- `body where k = v, …`. TYPE slots arrive marshalled (TtMarker via printType);
+-- EXPRESSION slots arrive RAW (def.body / where body+binding values → printExpr).
+-- `isOp` is precomputed at the marshal boundary (a pure regex test). Mirrors
+-- fenel-printer.ts:pxDecl; the TS pxDecl arms are now thin marshal+dispatch
+-- shims. (`type_def` / `program` keep their own pxDecl→printTypeDef/printProgram
+-- dispatch — they are not printDecl arms.)
+-- ===========================================================================
+
+@label "fenel-printer: printDecl"
+@description "printer-substrate Phase 2 — the declaration renderer (pxDecl's non-type arms): a `$`-free decl marker (declToMarker, engine-bodies-dispatch.ts) → .fenel text. Four forms: def → `name params = body` (`(op)` LHS for operator names, params space-joined) / type_sig → `name : type` (type marshalled, rendered via printType) / fixity → `infixl|infixr|infix prec op` (the assoc l/r/n → infixl/infixr/infix map is this body's pure if-cascade) / where → `body where k = v, …` (kw.where localized; bindings comma-joined). EXPRESSION slots (def.body, where body + binding values) carried RAW → printExpr; the type_sig type → printType. isOp (the operator-name regex) precomputed at the marshal boundary. Mirrors fenel-printer.ts:pxDecl; the TS pxDecl def/type_sig/fixity/where arms are now thin marshal+dispatch shims."
+@tags "engine" "fenel-printer" "printer" "decl" "reader" "phase-printer-2"
+printDecl : (d: a) -> (kw: a) -> String
+printDecl d kw =
+  if eq d.tag "def" then ppDecoratedDecl d.directives (ppDef d kw)
+  else if eq d.tag "type_sig" then ppDecoratedDecl d.directives (ppTypeSig d kw)
+  else if eq d.tag "fixity" then ppFixity d
+  else if eq d.tag "module_decl" then concat "module " (concat d.name " where")
+  else if eq d.tag "import_decl" then ppImportDecl d
+  else ppWhere d kw
+
+-- Source declaration facets stay attached across every visual edit. Arguments
+-- use the engine's literal printer, so quotes/newlines never become syntax.
+@category "engine-internal"
+ppDecoratedDecl : (directives: List a) -> (body: String) -> String
+ppDecoratedDecl directives body =
+  let lines = map (\directive -> concat "@" (concat directive.name (if eq (length directive.args) 0 then "" else concat " " (join (map jsLit directive.args) " ")))) directives
+  if eq (length lines) 0 then body else concat (join lines "\n") (concat "\n" body)
+
+-- modules-as-values Phase 5c-1a (decision Q1 A): the selected and alias
+-- frames print as `using` (`using std (map)`, `using codec as c`); the
+-- qualified and hiding frames keep `import`. Both parsers read either keyword
+-- for the selected and alias frames, so every frame round-trips, the empty
+-- list and repeated names included.
+@category "engine-internal"
+ppImportDecl : (d: a) -> String
+ppImportDecl d =
+  let suffix =
+    if d.hasNames then concat " (" (concat (join d.names ", ") ")")
+    else if d.hasAlias then concat " as " d.alias
+    else if d.hasHiding then concat " hiding (" (concat (join d.hiding ", ") ")")
+    else ""
+  let keyword = if or d.hasNames d.hasAlias then "using " else "import "
+  concat keyword (concat d.module suffix)
+
+-- ppDef — `lhsName params = body` (pxDecl's def arm). `lhsName` = `(op)` when the
+-- name is an operator (precomputed `isOp`), else the bare name; `params` =
+-- ` p0 p1 …` or `""`; `body` rides printExpr at prec None.
+@category "engine-internal"
+ppDef : (d: a) -> (kw: a) -> String
+ppDef d kw =
+  let lhsName = if d.isOp then concat "(" (concat d.name ")") else d.name
+  let params = if gt (length d.params) 0 then concat " " (join d.params " ") else ""
+  concat lhsName (concat params (concat " = " (printExpr d.body 0 (ppWithBoundNames kw d.params))))
+
+-- ppTypeSig — `lhsName : type` (pxDecl's type_sig arm). The type arrives as a
+-- marshalled TtMarker → printType.
+@category "engine-internal"
+ppTypeSig : (d: a) -> (kw: a) -> String
+ppTypeSig d kw =
+  let lhsName = if d.isOp then concat "(" (concat d.name ")") else d.name
+  concat lhsName (concat " : " (printType d.type kw))
+
+-- ppFixity — `infixl|infixr|infix prec op` (pxDecl's fixity arm). The assoc
+-- vocab `l`/`r`/`n` → the keyword is a pure 3-arm if-cascade (NOT a marshal
+-- precompute — it is rendering logic). prec is a number (toString).
+@category "engine-internal"
+ppFixity : (d: a) -> String
+ppFixity d =
+  let word = if eq d.assoc "l" then "infixl" else if eq d.assoc "r" then "infixr" else "infix"
+  concat word (concat " " (concat (toString d.prec) (concat " " d.op)))
+
+-- ppWhere — `body where k = v, …` (pxDecl's where arm). `kw.where` is the
+-- localized keyword threaded by the router; bindings are `{key, value}` records
+-- (the marshal arm's Object.entries), values ride printExpr. No ctx wrap (= px).
+@category "engine-internal"
+ppWhere : (d: a) -> (kw: a) -> String
+ppWhere d kw =
+  let scoped = ppWithBoundNames kw (map (\binding -> binding.key) d.bindings)
+  let bodyS = printExpr d.body 0 scoped
+  let binds = join (ppWhereBinds d.bindings scoped []) ", "
+  concat bodyS (concat " " (concat kw.where (concat " " binds)))
+
+-- ppWhereBinds — `k = <printExpr v>` per where binding.
+@category "engine-internal"
+ppWhereBinds : (bs: a) -> (kw: a) -> (acc: a) -> a
+ppWhereBinds bs kw acc =
+  case head bs of
+    Nothing -> acc
+    Just b ->
+      let acc2 = appendItem (concat b.key (concat " = " (printExpr b.value 0 kw))) acc
+      case tail bs of
+        Nothing -> acc2
+        Just rest -> ppWhereBinds rest kw acc2
+
+-- ===========================================================================
+-- printProgram — the top-level item fold (printer-substrate Phase 2; pxDecl's
+-- program arm). Folds a list of PRE-CLASSIFIED item markers
+-- (programItemsToMarkers, engine-bodies-dispatch.ts) → `"\n\n"`-joined surface.
+-- The classification is a `$`-key read (the px router's 4-way routing —
+-- DECL_KEYS / read-schema-call / looksLikeType / else) so it precedes the marshal
+-- in TS; the body just dispatches per item tag: PiDecl → printDecl · PiTypeDef →
+-- printTypeDef · PiProgram → printProgram (nested) · PiLegacy → `read(…)` wrapper
+-- · PiType → printType · PiExpr → printExpr. Mirrors fenel-printer.ts:pxDecl's
+-- program arm + the px item routing; the TS program arm is a thin shim.
+-- ===========================================================================
+
+@label "fenel-printer: printProgram"
+@description "printer-substrate Phase 2 — the top-level program fold (pxDecl's program arm): a list of pre-classified item markers (programItemsToMarkers, engine-bodies-dispatch.ts) → the `\\n\\n`-joined surface. The px router's 4-way item classification (single-key DECL_KEYS → PiDecl/PiTypeDef/PiProgram, read-schema call → PiLegacy, looksLikeType → PiType, else → PiExpr) is a $-key read done TS-side; the body dispatches per tag: PiDecl → printDecl / PiTypeDef → printTypeDef / PiProgram → printProgram (nested) / PiLegacy → `read(<printLegacyTypeExpr>[ at \"src\"])` / PiType → printType / PiExpr → printExpr at prec None. Mirrors fenel-printer.ts:pxDecl's program arm; the TS program arm is a thin marshal+dispatch shim."
+@tags "engine" "fenel-printer" "printer" "program" "reader" "phase-printer-2"
+printProgram : (items: a) -> (kw: a) -> String
+printProgram items kw = join (ppProgItems items kw []) "\n\n"
+
+-- ppProgItems — render each program item marker (in source order; appendItem
+-- appends to END), accumulating a List String for the `"\n\n"` join.
+@category "engine-internal"
+ppProgItems : (items: a) -> (kw: a) -> (acc: a) -> a
+ppProgItems items kw acc =
+  case head items of
+    Nothing -> acc
+    Just it ->
+      let acc2 = appendItem (ppProgItem it kw) acc
+      case tail items of
+        Nothing -> acc2
+        Just rest -> ppProgItems rest kw acc2
+
+-- ppProgItem — dispatch one pre-classified item marker (px's per-item routing).
+@category "engine-internal"
+ppProgItem : (it: a) -> (kw: a) -> String
+ppProgItem it kw =
+  if eq it.tag "PiDecl" then printDecl it.decl kw
+  else if eq it.tag "PiTypeDef" then printTypeDef it.td kw
+  else if eq it.tag "PiProgram" then printProgram it.items kw
+  else if eq it.tag "PiLegacy" then ppReadWrap it
+  else if eq it.tag "PiType" then printType it.type kw
+  else printExpr it.expr 0 kw
+
+-- ppReadWrap — `read(<printLegacyTypeExpr schema>)` / `read(… at "src")`
+-- (mirrors pCallRead's wrapper for an inline read-schema program item).
+@category "engine-internal"
+ppReadWrap : (it: a) -> String
+ppReadWrap it =
+  let ts = printLegacyTypeExpr it.schema
+  if it.hasSource
+  then concat "read(" (concat ts (concat " at " (concat (jsLit it.source) ")")))
+  else concat "read(" (concat ts ")")
+
+-- ===========================================================================
+-- printReadItem — the top-level `read(T)` / `read(T at "src")` wrapper
+-- (printer-substrate Phase 3; the Fenel-first capstone). The former TS
+-- `pCallRead` rendered this wrapper string in TS; it is now Fenel-authored —
+-- a thin public entry over `ppReadWrap` (shared with the PiLegacy program-item
+-- arm). The TS read arm only marshals the `read`-schema call to the PiLegacy
+-- marker (`{schema, hasSource, source}` via printerReadCallToMarker,
+-- engine-bodies-dispatch.ts) and dispatches this body — ZERO rendering logic
+-- left in TS.
+-- ===========================================================================
+
+@label "fenel-printer: printReadItem"
+@description "printer-substrate Phase 3 — the `read(T)` / `read(T at \"src\")` legacy-call wrapper (the Fenel-first capstone): a PiLegacy marker (`{schema, hasSource, source}` via printerReadCallToMarker, engine-bodies-dispatch.ts) → `read(<printLegacyTypeExpr schema>)` / `read(… at \"src\")`. Promotes the ppReadWrap helper (shared with the program-item PiLegacy arm) to a public dispatchable entry so the former TS pCallRead rendering line is now Fenel-authored — zero rendering logic remains in fenel-printer.ts; the TS read arm only marshals the read-schema call + dispatches this body."
+@tags "engine" "fenel-printer" "printer" "read" "reader" "phase-printer-3"
+printReadItem : (it: a) -> String
+printReadItem it = ppReadWrap it
+
+-- Code's editability guard belongs to the same source printer. This preserves
+-- the former host scanner's strings, template interpolations, comments and
+-- incomplete-text behavior; it does not parse or resolve the expression.
+@label "Code text is readable"
+@category "engine-internal"
+codeLensTextIsReadable : String -> Bool
+codeLensTextIsReadable code =
+  if (not (contains code "\"$")) && (not (contains code "<no surface syntax:")) then true
+  else if (not (contains code "\"")) && (not (contains code "`")) then not (contains code "<no surface syntax:")
+  else
+    let text = ppCodeLiteralProjection code
+    not (ppCodeDumpPresent text.withStrings 0) && not (contains text.bare "<no surface syntax:")
+
+@category "engine-internal"
+ppCodeLiteralProjection : String -> { withStrings: String, bare: String }
+ppCodeLiteralProjection code = ppCodeLiteralScan code 0 [{ kind = "code", depth = 0 }] false "" ""
+
+@category "engine-internal"
+ppCodeLiteralScan : String -> Number -> List ({ kind: String, depth: Number }) -> Bool -> String -> String -> { withStrings: String, bare: String }
+ppCodeLiteralScan code index stack inString withStrings bare =
+  let state = fold ppCodeLiteralStep { stack = stack, inString = inString, escaped = false, dollar = false, withStrings = withStrings, bare = bare } (ppCodeLiteralParts (slice code index (length code)))
+  { withStrings = state.withStrings, bare = state.bare }
+
+-- Split only the original scanner's punctuation events. Ordinary text remains
+-- one run; std.fold supplies constant-stack traversal, including large data.
+@category "engine-internal"
+ppCodeLiteralParts : String -> List String
+ppCodeLiteralParts code =
+  fold (\parts marker -> if not (contains code marker) then parts else flatten (map (\part -> if not (contains part marker) then [part] else fold (\pieces piece -> appendItem piece (if eq (length pieces) 0 then pieces else appendItem marker pieces)) [] (split part marker)) parts)) [code] ["\\", "\"", "`", "{", "}", "$"]
+
+@category "engine-internal"
+ppCodeLiteralStep : { stack: List ({ kind: String, depth: Number }), inString: Bool, escaped: Bool, dollar: Bool, withStrings: String, bare: String } -> String -> { stack: List ({ kind: String, depth: Number }), inString: Bool, escaped: Bool, dollar: Bool, withStrings: String, bare: String }
+ppCodeLiteralStep state part =
+  if eq part "" then state
+  else if state.inString then
+    let appended = mapSet state "withStrings" (concat state.withStrings part)
+    if state.escaped then mapSet appended "escaped" false
+    else if eq part "\\" then mapSet appended "escaped" true
+    else if eq part "\"" then mapSet appended "inString" false
+    else appended
+  else
+    let frame = fromMaybe { kind = "code", depth = 0 } (last state.stack)
+    let parent = take (sub (length state.stack) 1) state.stack
+    if eq frame.kind "template" then
+      let reset = mapSet state "dollar" false
+      if state.escaped then mapSet reset "escaped" false
+      else if state.dollar && (eq part "{") then mapSet reset "stack" (appendItem { kind = "code", depth = 0 } state.stack)
+      else if eq part "\\" then mapSet reset "escaped" true
+      else if eq part "`" then mapSet reset "stack" parent
+      else if eq part "$" then mapSet reset "dollar" true
+      else reset
+    else if eq part "`" then mapSet state "stack" (appendItem { kind = "template", depth = 0 } state.stack)
+    else if (eq part "}") && (eq frame.depth 0) && (gt (length state.stack) 1) then mapSet state "stack" parent
+    else
+      let depth = if eq part "{" then add frame.depth 1 else if eq part "}" then sub frame.depth 1 else frame.depth
+      let next = mapSet (mapSet state "stack" (appendItem { kind = "code", depth = depth } parent)) "withStrings" (concat state.withStrings part)
+      if eq part "\"" then mapSet next "inString" true
+      else mapSet next "bare" (concat state.bare part)
+
+@category "engine-internal"
+ppCodeDumpPresent : String -> Number -> Bool
+ppCodeDumpPresent text index =
+  let parts = split (slice text index (length text)) "{"
+  let state = fold (\state part -> { previous = part, found = state.found || ((not (endsWith state.previous "@")) && (ppCodeDumpTail part 0)) }) { previous = fromMaybe "" (head parts), found = false } (tailOr parts)
+  state.found
+
+@category "engine-internal"
+ppCodeDumpTail : String -> Number -> Bool
+ppCodeDumpTail text index =
+  let prefix = trim (slice text index (length text))
+  (eq (charAt prefix 0) "\"") && (eq (charAt prefix 1) "$") && (not (eq (charAt prefix 2) "")) && (elem (charAt prefix 2) "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")

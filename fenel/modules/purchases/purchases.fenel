@@ -1,0 +1,549 @@
+-- =========================================================================
+-- Purchases full arc — create_purchase + mark_payment_step_paid +
+-- grant_step_entitlements.
+--
+-- Phase 12d sub-step 4 of the ts-elimination workstream. Lifts the three
+-- core/actions/purchases.ts handlers (~220 LOC of TS orchestration) to
+-- Fenel C-bodies behind thin Zod-parse + invokeIOAction + Result-unwrap
+-- wrappers. This is the first sub-step in 12d to introduce multi-state
+-- FSM ADTs (PurchaseState 3-state + PaymentStepState 2-state).
+--
+-- module-substrate Phase 3c (2026-05-30) — tier-1 pure Shape-B migration
+-- (WITH entities — proven by `time`'s Timestamp/Duration). This file is now
+-- the SOURCE OF TRUTH for the module's signatures + identity: it grew the
+-- `module purchases where` header, the per-function `name : Type` sigs, and
+-- the `@label`/`@description`/`@tags`/`@ioAction` facet directives that the
+-- loader lifts into the same Codeable/Labelable/Describable/Categorizable/
+-- Taggable/IOInvokable ClassInstances the retired `engine/src/modules/
+-- purchases.ts` defineFunction specs used to emit. The two ADTs ride along
+-- on `loaded.entities` automatically (the `data`-style decls below). The
+-- header keeps the LEGACY lowercase `purchases:` id-prefix + `purchases`
+-- category byte-identical. The TS spec wrapper shrank to a thin
+-- `loadFenelModule` seam. (Old filename `manage.fenel` consolidated into
+-- `purchases.fenel`.)
+--
+-- ADTs declared (surface as entities):
+--   PurchaseState     = PurchasePending | PurchaseActive | PurchaseCompleted
+--   PaymentStepState  = StepPending     | StepPaid
+--
+-- The cross-ADT naming convention prefixes case names with the ADT name —
+-- Fenel constructor names are global across all ADTs in scope so two ADTs
+-- each with a `Pending` case would collide.
+--
+-- Substrate consumed:
+--   - state:getInstance / state:listPaymentStepsByPurchase /
+--     state:tryCreateInstanceByName / state:updateInstance / state:appendEvent
+--   - time:nowIso
+--   - std:head / std:tail / std:filter / std:length / std:all /
+--     std:appendItem / std:mergeRecords / std:truthy / std:eq /
+--     std:ifElse / std:or
+--
+-- Decisions resolved (per the brief): A/B FSM ADTs (3-state + 2-state);
+-- C Result {Err e, Ok a} sentinel; D time:nowIso reused; E listPaymentSteps
+-- returns List<Record>; F PlanStep/PlanGrant stay TS schemas; I invokeIOAction
+-- async; J both ADTs registered as entities; L/M body-side string unlift at
+-- the write boundary, storage stays strings; N write-only event semantics.
+-- G one file (not two); K body-side lift.
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line (12a-3/4/7 surprise pattern; 12d-3 reaffirmed).
+-- =========================================================================
+
+module purchases where
+
+-- FSM ADTs --------------------------------------------------------------
+
+PurchaseState = PurchasePending | PurchaseActive | PurchaseCompleted
+
+PaymentStepState = StepPending | StepPaid
+
+-- Pure D helpers — string <-> ADT lift / unlift -------------------------
+
+-- liftPaymentStepStateStr — string -> PaymentStepState. Defaults to
+-- StepPending for any non-"paid" string (forward-compat for future
+-- intermediate states like "refunded" — caller is the one source of truth
+-- for what a non-paid state means; the body only branches on Paid vs
+-- not-Paid for idempotency).
+liftPaymentStepStateStr : String -> PaymentStepState
+@label "Lift payment-step state string"
+@description "Phase 12d sub-step 4 — pure D helper. String → PaymentStepState (StepPaid for 'paid'; StepPending otherwise). Body-side lift for the idempotency check at markStepPaidWithStep (Decision K-deviation: body-side lift because the body owns the state:listPaymentStepsByPurchase fetch)."
+@tags "purchase" "fsm" "pure" "phase-12d"
+liftPaymentStepStateStr s =
+  ifElse (eq s "paid") StepPaid StepPending
+
+-- paymentStepStateString — PaymentStepState -> string. The persisted
+-- string convention (lowercase) matches existing JSONB rows; no SQL
+-- migration needed (Decision M).
+paymentStepStateString : PaymentStepState -> String
+@label "Payment-step state string"
+@description "Phase 12d sub-step 4 — pure D helper. PaymentStepState → string (StepPending → 'pending'; StepPaid → 'paid'). Body-side unlift before state:updateInstance writes (Decision L); avoids round-tripping ADT shape through the substrate."
+@tags "purchase" "fsm" "pure" "phase-12d"
+paymentStepStateString state =
+  case state of
+    StepPending -> "pending"
+    StepPaid -> "paid"
+
+-- purchaseStateString — PurchaseState -> string. Sister of
+-- paymentStepStateString; same lowercase-string convention.
+purchaseStateString : PurchaseState -> String
+@label "Purchase state string"
+@description "Phase 12d sub-step 4 — pure D helper. PurchaseState → string (PurchasePending → 'pending'; PurchaseActive → 'active'; PurchaseCompleted → 'completed'). Sister of paymentStepStateString; same body-side unlift convention."
+@tags "purchase" "fsm" "pure" "phase-12d"
+purchaseStateString state =
+  case state of
+    PurchasePending -> "pending"
+    PurchaseActive -> "active"
+    PurchaseCompleted -> "completed"
+
+-- nextPurchaseState — pure FSM transition decision. allPaid → Completed;
+-- else → Active. The Pending -> {Active, Completed} transition is the
+-- only one defined for the post-first-payment moment; pre-payment the
+-- row is created with status="pending" by createPurchase and never
+-- enters this transition until markStepPaid fires.
+nextPurchaseState : Boolean -> PurchaseState
+@label "Next purchase state"
+@description "Phase 12d sub-step 4 — pure FSM transition decision. allPaid → PurchaseCompleted; else → PurchaseActive. The Pending → {Active, Completed} transition is the only one defined for post-first-payment; createPurchase writes the initial Pending state and never re-enters this transition until markStepPaid fires."
+@tags "purchase" "fsm" "pure" "phase-12d"
+nextPurchaseState allPaid =
+  ifElse allPaid PurchaseCompleted PurchaseActive
+
+-- listOrEmpty — defensive coerce on substrate-returned fields that may
+-- be undefined (DB row missing the key). std:length on undefined returns
+-- 0, std:filter on undefined would be unsafe — coerce up-front.
+listOrEmpty : {} -> {}
+@label "List or empty"
+@description "Phase 12d sub-step 4 — defensive coerce: truthy xs → xs; else → []. Used for substrate-returned fields that may be undefined when the DB row is missing the key (Risk 4: plan.steps / plan.grants)."
+@tags "purchase" "defensive" "pure" "phase-12d"
+listOrEmpty xs =
+  ifElse (truthy xs) xs []
+
+-- recordOrEmpty — defensive coerce for nullable record fields (e.g.
+-- grant.payload). Returns {} when the field is missing.
+recordOrEmpty : {} -> {}
+@label "Record or empty"
+@description "Phase 12d sub-step 4 — defensive coerce: truthy r → r; else → {}. Used for nullable record fields (Risk 5: grant.payload may be undefined; pre-port spread `grant.payload ?? {}`)."
+@tags "purchase" "defensive" "pure" "phase-12d"
+recordOrEmpty r =
+  ifElse (truthy r) r {}
+
+-- hasSteps — does plan have explicit payment_steps (>0)? Used by
+-- createPaymentStepsFromPlan + grants-selection to branch the 1-step
+-- vs multi-step plan shape.
+hasSteps : List ({}) -> Boolean
+@label "Has payment steps"
+@description "Phase 12d sub-step 4 — pure D helper. True iff plan has explicit payment_steps (length > 0). Branches the 1-step vs multi-step plan shape in createPaymentStepsFromPlan + selectGrants."
+@tags "purchase" "predicate" "pure" "phase-12d"
+hasSteps planSteps =
+  length planSteps > 0
+
+-- paymentStepCount — for the purchase_created event payload. Number of
+-- payment_step rows actually written: max(length planSteps, 1) per
+-- pre-port's `planSteps.length || 1`.
+paymentStepCount : List ({}) -> Number
+@label "Payment step count"
+@description "Phase 12d sub-step 4 — pure D helper. Number of payment_step rows: max(length planSteps, 1). For the purchase_created event payload's `stepCount` field. Mirrors pre-port `planSteps.length || 1`."
+@tags "purchase" "pure" "phase-12d"
+paymentStepCount planSteps =
+  let n = length planSteps
+  ifElse (n > 0) n 1
+
+-- allStepsPaid — every payment_step in the listed set has status="paid".
+-- The body calls this AFTER state:updateInstance for the in-progress
+-- step has fired, so the listing already reflects the just-paid status
+-- (the pre-port queried BEFORE the update and had to OR-in the current
+-- step's id; the substrate's sequencing makes that clause unnecessary).
+allStepsPaid : List ({}) -> Boolean
+@label "All steps paid"
+@description "Phase 12d sub-step 4 — pure D helper. Every payment_step in the listed set has status='paid'. Called AFTER the in-progress step's update lands (Risk 3 semantic improvement — the substrate sequencing means the listing already reflects the just-paid step, so the pre-port's `s.id === step.id || s.status === 'paid'` OR clause simplifies to just the status check)."
+@tags "purchase" "fsm" "pure" "phase-12d"
+allStepsPaid steps =
+  all steps (\s -> eq s.status "paid")
+
+-- findStepBySlug — Maybe<PaymentStep> lookup by stepSlug from a listed
+-- payment_step set. Sister of inventory's `case findInventoryBySlug ...`.
+findStepBySlug : List ({}) -> String -> Maybe ({})
+@label "Find step by slug"
+@description "Phase 12d sub-step 4 — pure D helper. Maybe<PaymentStep> lookup by stepSlug from a listed payment_step set. filter + head composition; sister of inventory's `case findInventoryBySlug ...`."
+@tags "purchase" "lookup" "pure" "phase-12d"
+findStepBySlug steps stepSlug =
+  let matches = filter (\s -> eq s.stepSlug stepSlug) steps
+  head matches
+
+-- findStepInPlan — Maybe<PlanStep> lookup by step.id from a plan's
+-- planSteps list. Mirrors the pre-port `planSteps.find((s) => s.id === stepSlug)`.
+findStepInPlan : List ({}) -> String -> Maybe ({})
+@label "Find step in plan"
+@description "Phase 12d sub-step 4 — pure D helper. Maybe<PlanStep> lookup by step.id from a plan's planSteps list. Mirrors pre-port `planSteps.find((s) => s.id === stepSlug)`."
+@tags "purchase" "lookup" "pure" "phase-12d"
+findStepInPlan planSteps stepSlug =
+  let matches = filter (\s -> eq s.id stepSlug) planSteps
+  head matches
+
+-- =========================================================================
+-- createPurchase — main C-body.
+-- Returns Result {code, message} {purchaseId, planSlug, profileId}.
+-- Composes:
+--   1. state:tryCreateInstanceByName "purchase" (with profileId + planId
+--      + status="pending" + caller-supplied extra data)
+--   2. createPaymentStepsFromPlan iteration (multi-step vs 1-step branch)
+--   3. state:appendEvent "purchase_created"
+-- =========================================================================
+
+-- createPurchase — ts-elimination-completion Phase 5 (5a-2): the wrapper's
+-- findPlanBySlug + `if (!plan) throw` + plan-field defaulting are FOLDED INTO
+-- the body. The entry resolves the plan via state:findPlanBySlug (new leaf),
+-- Nothing → ActionErr (pre-port wrapper threw `Plan not found: ${planSlug}`),
+-- Just plan → extract planId/amount/currency/steps with the pre-port defaults
+-- (`amount ?? 0` / `currency ?? "USD"` / `steps ?? []`) then run the original
+-- createPurchaseInner. The TS wrapper drops its @fenel/db import + the throw,
+-- draining purchases.ts from BOTH DIRECT_DB_LEAF_ALLOW and
+-- ACTION_HANDLER_CONTROL_FLOW_ALLOW. Arity 8 → 4.
+-- action-subsumption Phase 3 (2026-06-08) — createPurchase IS the public
+-- create_purchase action now (D1 COLLAPSE): the public field name is `data`
+-- (Maybe open record), the body's internal binder stays `extraData`; the
+-- `data ?? {}` default the TS handler did lifts INTO the body. The refinements
+-- create_purchase_params mirrored ride the sig (profileId : Uuid, planSlug :
+-- NonEmptyStr). The plan-field defaulting residual stays body-side. The TS
+-- handler is deleted; `adapter` stays a param (D4).
+createPurchase : Uuid -> NonEmptyStr -> Maybe ({}) -> String -> ActionResult
+@label "Create purchase"
+@description "Phase 13a sub-step 1 / action-subsumption Phase 3 — the public create_purchase action (no separate TS handler). Params ARE the public contract (profileId, planSlug, data?, adapter). Defaults data (?? {}), folds the wrapper's findPlanBySlug + not-found guard + plan-field defaulting (amount ?? 0 / currency ?? 'USD' / steps ?? []) into the body via state:findPlanBySlug."
+@tags "purchase" "create" "phase-13a"
+@ioAction "purchases.create_purchase"
+createPurchase profileId planSlug data adapter =
+  let extraData = case data of
+    Nothing -> {}
+    Just d -> d
+  case findPlanBySlug planSlug of
+    Nothing -> ActionErr { message = `Plan not found: ${planSlug}` }
+    Just plan -> createPurchaseWithPlan profileId planSlug plan extraData adapter
+
+-- createPurchaseWithPlan — Just-arm extraction (parseApp single-line). Reads
+-- the plan-shape fields with the pre-port defaults, then drives the original
+-- createPurchaseInner + ActionResult lift. `amount ?? 0` → ifElse truthy
+-- (0-safe: a real 0 maps to 0); `currency ?? "USD"` → ifElse truthy (DIVERGENCE:
+-- an empty-string currency would default to USD where the pre-port `?? ` kept ""
+-- — currency is never empty in practice); `steps ?? []` → listOrEmpty.
+createPurchaseWithPlan : String -> String -> {} -> {} -> String -> ActionResult
+@label "Create purchase (plan known)"
+@description "ts-elimination-completion Phase 5 (5a-2) — Just-arm extraction from createPurchase. Extracts planId/amount/currency/steps from the state:findPlanBySlug row with the pre-port defaults (amount ?? 0 via ifElse truthy 0-safe; currency ?? 'USD' via ifElse truthy; steps ?? [] via listOrEmpty), runs createPurchaseInner, lifts the inner Result to the ActionResult ADT."
+@tags "purchase" "create" "ts-elimination"
+createPurchaseWithPlan profileId planSlug plan extraData adapter =
+  let planId = plan.id
+  let planAmount = ifElse (truthy plan.amount) plan.amount 0
+  let planCurrency = ifElse (truthy plan.currency) plan.currency "USD"
+  let planSteps = listOrEmpty plan.steps
+  let r = createPurchaseInner profileId planSlug planId planAmount planCurrency planSteps extraData adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { purchaseId = ok.purchaseId, planSlug = ok.planSlug }, aggregateType = Just "purchase", aggregateId = Just ok.purchaseId, profileId = Just ok.profileId }
+
+-- createPurchaseInner — pre-13a-1 entry-point logic; returns Result.
+createPurchaseInner : String -> String -> String -> Number -> String -> List ({}) -> {} -> String -> {}
+@label "Create purchase (inner — Result)"
+@description "Phase 12d sub-step 4 — pre-13a entry-point logic; returns Result. Composes state:tryCreateInstanceByName 'purchase' + createPaymentStepsFromPlan + state:appendEvent."
+@tags "purchase" "create" "phase-13a"
+createPurchaseInner profileId planSlug planId planAmount planCurrency planSteps extraData adapter =
+  let purchaseBase = { profileId = profileId, planId = planId, status = "pending" }
+  let purchaseData = mergeRecords purchaseBase extraData
+  let r = tryCreateInstanceByName "purchase" purchaseData
+  if r.ok
+  then createPurchaseProceed r.value profileId planSlug planId planAmount planCurrency planSteps adapter
+  else Err { code = "create_failed", message = r.error }
+
+-- createPurchaseProceed — after the purchase row is created. Writes the
+-- payment_step row(s) per the plan shape, emits purchase_created, returns
+-- Ok payload with purchaseId for the wrapper's ActionResult.aggregateId
+-- and profileId for ActionResult.profileId.
+createPurchaseProceed : String -> String -> String -> String -> Number -> String -> List ({}) -> String -> {}
+@label "Create purchase (proceed)"
+@description "Phase 12d sub-step 4 — if-then-else arm extraction from createPurchase. After the purchase row is created: composes createPaymentStepsFromPlan + state:appendEvent 'purchase_created' + Ok payload return."
+@tags "purchase" "create" "phase-12d"
+createPurchaseProceed purchaseId profileId planSlug planId planAmount planCurrency planSteps adapter =
+  let _stepsCreated = createPaymentStepsFromPlan purchaseId planSteps planAmount planCurrency
+  let stepCount = paymentStepCount planSteps
+  let payload = { planSlug = planSlug, planId = planId, stepCount = stepCount, adapter = adapter }
+  let _emitted = appendEvent "purchase_created" payload (Just "purchase") (Just purchaseId) (Just profileId)
+  Ok { purchaseId = purchaseId, planSlug = planSlug, profileId = profileId }
+
+-- createPaymentStepsFromPlan — branches on plan shape. With explicit steps
+-- (>0), iterates and creates one payment_step per plan step. Without
+-- (1-step plan), creates a single synthetic payment_step keyed
+-- "payment" using the plan's top-level amount + currency.
+createPaymentStepsFromPlan : String -> List ({}) -> Number -> String -> Number
+@label "Create payment steps from plan"
+@description "Phase 12d sub-step 4 — branches on plan shape (multi-step vs 1-step). Multi-step: iterates and creates one payment_step per plan step via createStepsForExplicit. 1-step: creates a single synthetic payment_step keyed 'payment' via createStepForOnePlan."
+@tags "purchase" "create" "phase-12d"
+createPaymentStepsFromPlan purchaseId planSteps planAmount planCurrency =
+  if hasSteps planSteps
+  then createStepsForExplicit purchaseId planSteps
+  else createStepForOnePlan purchaseId planAmount planCurrency
+
+-- createStepForOnePlan — 1-step plan synthetic payment_step. The pre-port
+-- uses stepSlug="payment" as a fixed sentinel; the body preserves verbatim.
+createStepForOnePlan : String -> Number -> String -> Number
+@label "Create step for 1-step plan"
+@description "Phase 12d sub-step 4 — 1-step plan synthetic payment_step. Pre-port uses stepSlug='payment' as a fixed sentinel; preserved verbatim. Returns 0 (discarded counter)."
+@tags "purchase" "create" "phase-12d"
+createStepForOnePlan purchaseId planAmount planCurrency =
+  let data = { purchaseId = purchaseId, stepSlug = "payment", amount = planAmount, currency = planCurrency, status = "pending" }
+  let _r = tryCreateInstanceByName "payment_step" data
+  0
+
+-- createStepsForExplicit — head/tail recursion (sister of
+-- permissions/bootstrap.fenel:insertEach). Each iteration calls
+-- createOneStep on the head, recurses on the tail. The return is a
+-- discarded counter (0) — the pre-port doesn't accumulate step IDs and
+-- neither does this body.
+createStepsForExplicit : String -> List ({}) -> Number
+@label "Create steps for explicit plan"
+@description "Phase 12d sub-step 4 — head/tail recursion over planSteps. Each iteration calls createOneAndContinue; halts when empty. Sister of permissions/bootstrap.fenel:insertEach. Returns 0 (discarded counter)."
+@tags "purchase" "create" "phase-12d"
+createStepsForExplicit purchaseId planSteps =
+  case head planSteps of
+    Nothing -> 0
+    Just step -> createOneAndContinue purchaseId step planSteps
+
+createOneAndContinue : String -> {} -> List ({}) -> Number
+@label "Create one step and continue"
+@description "Phase 12d sub-step 4 — head-of-tail recursion driver. Calls createOneStep on the head; recurses on the tail via createStepsForExplicit. Returns 0 (discarded counter)."
+@tags "purchase" "create" "phase-12d"
+createOneAndContinue purchaseId step planSteps =
+  let _r = createOneStep purchaseId step
+  case tail planSteps of
+    Nothing -> 0
+    Just rest -> createStepsForExplicit purchaseId rest
+
+-- createOneStep — single payment_step row insert. Same shape as pre-port:
+-- {purchaseId, stepSlug=step.id, amount, currency, status="pending"}.
+createOneStep : String -> {} -> String
+@label "Create one payment step"
+@description "Phase 12d sub-step 4 — single payment_step row insert via state:tryCreateInstanceByName. Pre-port shape preserved: {purchaseId, stepSlug=step.id, amount, currency, status='pending'}. Returns the new instance id (discarded by callers)."
+@tags "purchase" "create" "phase-12d"
+createOneStep purchaseId step =
+  let data = { purchaseId = purchaseId, stepSlug = step.id, amount = step.amount, currency = step.currency, status = "pending" }
+  let r = tryCreateInstanceByName "payment_step" data
+  r.value
+
+-- =========================================================================
+-- markStepPaid — main C-body. The heaviest FSM in 12d.
+-- Returns Result {code, message} {stepSlug, allPaid, purchaseId, profileId}.
+-- =========================================================================
+
+-- action-subsumption Phase 3 (2026-06-08) — markStepPaid IS the public
+-- mark_payment_step_paid action now (D1 COLLAPSE): providerRef becomes a public
+-- `Maybe String` (the only optional), threaded through the chain to the
+-- omit-when-absent merge at markStepPaidProceed (an inline `providerRefPatch`
+-- let — `{}` when Nothing, `{providerRef = r}` when Just — mergeRecords'd into
+-- the step patch + payload, preserving the pre-port string | undefined → JSON
+-- key-drop). The refinements
+-- mark_payment_step_paid_params mirrored ride the sig (purchaseId : Uuid, stepSlug
+-- / provider : NonEmptyStr). The step-complete FSM residual stays body-side. The
+-- TS handler is deleted; `adapter` stays a param (D4).
+markStepPaid : Uuid -> NonEmptyStr -> NonEmptyStr -> Maybe String -> String -> ActionResult
+@label "Mark step paid"
+@description "Phase 13a sub-step 1 / action-subsumption Phase 3 — the public mark_payment_step_paid action (no separate TS handler). Params ARE the public contract (purchaseId, stepSlug, provider, providerRef?, adapter). Entry-point lifts the inner Result to the ActionResult ADT; the step-complete FSM residual stays body-side. purchases is an oracle-backed migrated module (verbatim-tag parity), so no `\"action\"` tag is added (Phase-2/3 convention)."
+@tags "purchase" "fsm" "phase-13a"
+@ioAction "purchases.mark_step_paid"
+markStepPaid purchaseId stepSlug provider providerRef adapter =
+  let r = markStepPaidInner purchaseId stepSlug provider providerRef adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { stepSlug = ok.stepSlug, allPaid = ok.allPaid, purchaseId = ok.purchaseId }, aggregateType = Just "purchase", aggregateId = Just ok.purchaseId, profileId = Just ok.profileId }
+
+-- markStepPaidInner — pre-13a-1 entry-point logic; returns Result.
+markStepPaidInner : String -> String -> String -> Maybe String -> String -> {}
+@label "Mark step paid (inner — Result)"
+@description "Phase 12d sub-step 4 — pre-13a entry-point logic; returns Result. The heaviest FSM in 12d."
+@tags "purchase" "fsm" "phase-13a"
+markStepPaidInner purchaseId stepSlug provider providerRef adapter =
+  case getInstance "purchase" purchaseId of
+    Nothing -> Err { code = "purchase_not_found", message = `Purchase not found: ${purchaseId}` }
+    Just purchase -> markStepPaidWithPurchase purchase purchaseId stepSlug provider providerRef adapter
+
+markStepPaidWithPurchase : {} -> String -> String -> String -> Maybe String -> String -> {}
+@label "Mark step paid (purchase known)"
+@description "Phase 12d sub-step 4 — case-arm extraction from markStepPaid. After state:getInstance 'purchase' succeeded: lists payment_steps via state:listPaymentStepsByPurchase, finds the target step by slug, branches on found/not-found."
+@tags "purchase" "fsm" "phase-12d"
+markStepPaidWithPurchase purchase purchaseId stepSlug provider providerRef adapter =
+  let steps = listPaymentStepsByPurchase purchaseId
+  case findStepBySlug steps stepSlug of
+    Nothing -> Err { code = "step_not_found", message = `Payment step not found: ${stepSlug}` }
+    Just step -> markStepPaidWithStep purchase purchaseId step stepSlug provider providerRef adapter
+
+-- markStepPaidWithStep — Risk 2 idempotency check on the LIFTED ADT.
+-- StepPaid arm errors; StepPending arm proceeds to the FSM transition.
+markStepPaidWithStep : {} -> String -> {} -> String -> String -> Maybe String -> String -> {}
+@label "Mark step paid (step known)"
+@description "Phase 12d sub-step 4 — case-arm extraction from markStepPaidWithPurchase. Risk 2 idempotency: lifts step.status via liftPaymentStepStateStr → PaymentStepState; case-arms on StepPaid → Err alreadyPaid; StepPending → proceed."
+@tags "purchase" "fsm" "idempotency" "phase-12d"
+markStepPaidWithStep purchase purchaseId step stepSlug provider providerRef adapter =
+  let stepState = liftPaymentStepStateStr step.status
+  case stepState of
+    StepPaid -> Err { code = "already_paid", message = `Step already paid: ${stepSlug}` }
+    StepPending -> markStepPaidProceed purchase purchaseId step stepSlug provider providerRef adapter
+
+-- markStepPaidProceed — after idempotency check. The step's status
+-- update lands first (so the subsequent listPaymentStepsByPurchase
+-- query reflects the just-paid status — Risk 3 simplification eliminates
+-- the pre-port's OR-current-step clause). Then re-fetch + compute allPaid
+-- + transition purchase state + emit events.
+markStepPaidProceed : {} -> String -> {} -> String -> String -> Maybe String -> String -> {}
+@label "Mark step paid (proceed)"
+@description "Phase 12d sub-step 4 — case-arm extraction from markStepPaidWithStep (StepPending arm). After idempotency check passed: state:updateInstance step → re-fetch via state:listPaymentStepsByPurchase → allStepsPaid → nextPurchaseState → purchaseStateString → state:updateInstance purchase → state:appendEvent 'payment_step_completed' → conditional state:appendEvent 'payment_completed' via emitPaymentCompletedIfAllPaid. Returns Ok payload with stepSlug + allPaid + purchaseId + profileId."
+@tags "purchase" "fsm" "phase-12d"
+markStepPaidProceed purchase purchaseId step stepSlug provider providerRef adapter =
+  let providerRefPatch = case providerRef of
+    Nothing -> {}
+    Just r -> { providerRef = r }
+  let stepPatchBase = { status = "paid", provider = provider, paidAt = nowIso }
+  let stepPatch = mergeRecords stepPatchBase providerRefPatch
+  let _u1 = updateInstance step.id stepPatch
+  let stepsAfter = listPaymentStepsByPurchase purchaseId
+  let allPaid = allStepsPaid stepsAfter
+  let nextStatus = purchaseStateString (nextPurchaseState allPaid)
+  let _u2 = updateInstance purchaseId { status = nextStatus }
+  let stepPayloadBase = { stepSlug = stepSlug, amount = step.amount, currency = step.currency, provider = provider, allPaid = allPaid, adapter = adapter }
+  let stepPayload = mergeRecords stepPayloadBase providerRefPatch
+  let _e1 = appendEvent "payment_step_completed" stepPayload (Just "purchase") (Just purchaseId) (Just purchase.profileId)
+  let _e2 = emitPaymentCompletedIfAllPaid allPaid purchaseId purchase.profileId adapter
+  Ok { stepSlug = stepSlug, allPaid = allPaid, purchaseId = purchaseId, profileId = purchase.profileId }
+
+-- emitPaymentCompletedIfAllPaid — Risk 6: 2 events on full payment.
+-- The if-then-else structural form is LAZY: when allPaid=false, the
+-- appendEvent call is NOT evaluated. ifElse would be eager and would
+-- fire the event regardless. Returns 0 (discarded counter) in either
+-- branch.
+emitPaymentCompletedIfAllPaid : Boolean -> String -> String -> String -> Number
+@label "Emit payment_completed if all paid"
+@description "Phase 12d sub-step 4 — Risk 6 lazy conditional emit. if-then-else structural form (LAZY) ensures state:appendEvent 'payment_completed' fires ONLY when allPaid=true. ifElse (eager) would call appendEvent regardless. Returns 0 (discarded counter) in either branch. Phase 13a sub-step 2: arity bumped by 2 (purchaseId + profileId) to thread provenance for the payment_completed event's aggregateType=Just \"purchase\" + aggregateId=Just purchaseId + profileId=Just profileId backfill."
+@tags "purchase" "event" "phase-12d"
+emitPaymentCompletedIfAllPaid allPaid purchaseId profileId adapter =
+  if allPaid
+  then appendEvent "payment_completed" { adapter = adapter } (Just "purchase") (Just purchaseId) (Just profileId)
+  else 0
+
+-- =========================================================================
+-- grantStepEntitlements — main C-body. Iterative grant loop.
+-- Returns Result {code, message} {grantedCount, entitlementIds, stepSlug,
+-- purchaseId, profileId}.
+-- =========================================================================
+
+-- action-subsumption Phase 2 (2026-06-08) — grantStepEntitlements IS the
+-- public grant_step_entitlements action now (D1 COLLAPSE; no marshalling to
+-- drop). The refinements grant_step_entitlements_params mirrored ride the sig:
+-- purchaseId : Uuid (format:uuid), stepSlug : NonEmptyStr. The TS handler is
+-- deleted; `adapter` stays a param (D4).
+grantStepEntitlements : Uuid -> NonEmptyStr -> String -> ActionResult
+@label "Grant step entitlements"
+@description "Phase 13a sub-step 1 / action-subsumption Phase 2 — the public grant_step_entitlements action (no separate TS handler). Entry-point lifts the inner Result to ActionResult ADT."
+@tags "purchase" "entitlement" "phase-13a"
+@ioAction "purchases.grant_step_entitlements"
+grantStepEntitlements purchaseId stepSlug adapter =
+  let r = grantStepEntitlementsInner purchaseId stepSlug adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { grantedCount = ok.grantedCount, entitlementIds = ok.entitlementIds, stepSlug = ok.stepSlug }, aggregateType = Just "purchase", aggregateId = Just ok.purchaseId, profileId = Just ok.profileId }
+
+-- grantStepEntitlementsInner — pre-13a-1 entry-point logic; returns Result.
+grantStepEntitlementsInner : String -> String -> String -> {}
+@label "Grant step entitlements (inner — Result)"
+@description "Phase 12d sub-step 4 — pre-13a entry-point logic; returns Result."
+@tags "purchase" "entitlement" "phase-13a"
+grantStepEntitlementsInner purchaseId stepSlug adapter =
+  case getInstance "purchase" purchaseId of
+    Nothing -> Err { code = "purchase_not_found", message = `Purchase not found: ${purchaseId}` }
+    Just purchase -> grantStepEntitlementsWithPurchase purchase purchaseId stepSlug adapter
+
+grantStepEntitlementsWithPurchase : {} -> String -> String -> String -> {}
+@label "Grant step entitlements (purchase known)"
+@description "Phase 12d sub-step 4 — case-arm extraction from grantStepEntitlements. After state:getInstance 'purchase' succeeded: looks up the plan via state:getInstance 'plan' using purchase.planId."
+@tags "purchase" "entitlement" "phase-12d"
+grantStepEntitlementsWithPurchase purchase purchaseId stepSlug adapter =
+  case getInstance "plan" purchase.planId of
+    Nothing -> Err { code = "plan_not_found", message = `Plan not found for purchase: ${purchaseId}` }
+    Just plan -> grantStepEntitlementsWithPlan purchase plan purchaseId stepSlug adapter
+
+grantStepEntitlementsWithPlan : {} -> {} -> String -> String -> String -> {}
+@label "Grant step entitlements (plan known)"
+@description "Phase 12d sub-step 4 — case-arm extraction from grantStepEntitlementsWithPurchase. After plan lookup succeeded: selectGrants resolves the grant list (multi-step vs 1-step fork), then forwards to grantAll iteration. Err-on-step-not-in-plan path propagates through the Result."
+@tags "purchase" "entitlement" "phase-12d"
+grantStepEntitlementsWithPlan purchase plan purchaseId stepSlug adapter =
+  case selectGrants plan stepSlug of
+    Err e -> Err e
+    Ok grants -> grantAll purchase grants purchaseId stepSlug adapter
+
+-- selectGrants — branches on plan shape (multi-step vs 1-step). Multi-step
+-- requires the named step to exist; 1-step uses the plan's top-level grants
+-- (defaulting to [] for plans with neither steps nor grants).
+selectGrants : {} -> String -> {}
+@label "Select grants for step"
+@description "Phase 12d sub-step 4 — pure D helper. Branches on plan shape (multi-step vs 1-step). Multi-step requires the named step to exist (returns Err step_not_in_plan); 1-step uses the plan's top-level grants (defaults to [] for plans with neither)."
+@tags "purchase" "entitlement" "pure" "phase-12d"
+selectGrants plan stepSlug =
+  let planSteps = listOrEmpty plan.steps
+  if hasSteps planSteps
+  then selectStepGrants planSteps stepSlug
+  else Ok (listOrEmpty plan.grants)
+
+selectStepGrants : List ({}) -> String -> {}
+@label "Select grants (multi-step plan)"
+@description "Phase 12d sub-step 4 — pure D helper. Looks up the matching step in planSteps via findStepInPlan; returns Err step_not_in_plan when missing, Ok step.grants (defensively listOrEmpty-coerced) when found."
+@tags "purchase" "entitlement" "pure" "phase-12d"
+selectStepGrants planSteps stepSlug =
+  case findStepInPlan planSteps stepSlug of
+    Nothing -> Err { code = "step_not_in_plan", message = `Step "${stepSlug}" not in plan` }
+    Just step -> Ok (listOrEmpty step.grants)
+
+-- grantAll — top-level iteration entry. Threads an empty list accumulator
+-- through grantEach to collect created entitlement IDs (mirrors pre-port's
+-- grantedIds.push(ent.id)). Wraps the final accumulator in the Result Ok
+-- with the response shape the wrapper threads to ActionResult.
+grantAll : {} -> List ({}) -> String -> String -> String -> {}
+@label "Grant all entitlements"
+@description "Phase 12d sub-step 4 — top-level iteration entry. Threads an empty list accumulator through grantEach to collect created entitlement IDs (mirrors pre-port `grantedIds.push(ent.id)`). Wraps the final accumulator in Result Ok with the response shape (grantedCount + entitlementIds + stepSlug + purchaseId + profileId)."
+@tags "purchase" "entitlement" "phase-12d"
+grantAll purchase grants purchaseId stepSlug adapter =
+  let acc0 = []
+  let grantedIds = grantEach purchase grants purchaseId stepSlug adapter acc0
+  Ok { grantedCount = length grantedIds, entitlementIds = grantedIds, stepSlug = stepSlug, purchaseId = purchaseId, profileId = purchase.profileId }
+
+-- grantEach — recursive head/tail iteration (sister of
+-- permissions/bootstrap.fenel:insertEach + this sub-step's
+-- createStepsForExplicit). Each iteration calls grantOneAndContinue;
+-- halts when the list is empty.
+grantEach : {} -> List ({}) -> String -> String -> String -> List String -> List String
+@label "Grant each (recursive)"
+@description "Phase 12d sub-step 4 — recursive head/tail iteration (sister of permissions/bootstrap.fenel:insertEach + this sub-step's createStepsForExplicit). Each iteration calls grantOneAndContinue; halts when grants is empty."
+@tags "purchase" "entitlement" "phase-12d"
+grantEach purchase grants purchaseId stepSlug adapter acc =
+  case head grants of
+    Nothing -> acc
+    Just grant -> grantOneAndContinue purchase grant grants purchaseId stepSlug adapter acc
+
+grantOneAndContinue : {} -> {} -> List ({}) -> String -> String -> String -> List String -> List String
+@label "Grant one and continue"
+@description "Phase 12d sub-step 4 — head-of-tail driver. Calls grantOneEntitlement on the head; appends the new entitlement id to acc; recurses on the tail via grantEach."
+@tags "purchase" "entitlement" "phase-12d"
+grantOneAndContinue purchase grant grants purchaseId stepSlug adapter acc =
+  let entId = grantOneEntitlement purchase grant purchaseId stepSlug adapter
+  let accNext = appendItem entId acc
+  case tail grants of
+    Nothing -> accNext
+    Just rest -> grantEach purchase rest purchaseId stepSlug adapter accNext
+
+-- grantOneEntitlement — per-grant: create the entitlement row + emit
+-- entitlement_granted. Returns the new entitlement's id for the
+-- accumulator. The grant.payload field is defensively coerced via
+-- recordOrEmpty (pre-port spread `grant.payload ?? {}`).
+grantOneEntitlement : {} -> {} -> String -> String -> String -> String
+@label "Grant one entitlement"
+@description "Phase 12d sub-step 4 — per-grant: create the entitlement row via state:tryCreateInstanceByName + emit entitlement_granted via state:appendEvent. Returns the new entitlement's id for the accumulator. Risk 5: grant.payload is defensively coerced via recordOrEmpty (pre-port spread `grant.payload ?? {}`)."
+@tags "purchase" "entitlement" "phase-12d"
+grantOneEntitlement purchase grant purchaseId stepSlug adapter =
+  let entData = { profileId = purchase.profileId, entitlementSlug = grant.entitlement, grantedByPurchaseId = purchaseId, grantedByStep = stepSlug, startsAt = nowIso, payload = recordOrEmpty grant.payload }
+  let r = tryCreateInstanceByName "entitlement" entData
+  let evPayload = { entitlementSlug = grant.entitlement, purchaseId = purchaseId, grantedByStep = stepSlug, adapter = adapter }
+  let _e = appendEvent "entitlement_granted" evPayload (Just "purchase") (Just purchaseId) (Just purchase.profileId)
+  r.value

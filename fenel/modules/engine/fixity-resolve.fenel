@@ -1,0 +1,160 @@
+module engine where
+
+-- =========================================================================
+-- The FIXITY RESOLVER in Fenel — precedence-climbing over a FLAT operand /
+-- operator sequence → nested `Syntax` (`SCall`) values. parser-substrate
+-- Phase 3, Step 1 (brief:
+-- `workstreams/parser-substrate/briefs/phase-3-expression-grammar.md`).
+--
+-- The expression grammar (`expr-grammar.fenel`, the OpSeq production) parses
+-- operators FLAT — `Operand (op Operand)*` captured as a `{ first, rest }`
+-- sequence (decision 4) — and its `PRed` reduction calls `resolveOpSeq` here
+-- to fold the flat sequence into the precedence-correct nested tree. So the
+-- grammar emits FINAL Syntax (no separate post-pass): the resolver IS the
+-- reduction. Fixity rides as DATA (decision 3): `resolveOpSeq` takes a fixity
+-- table closure-captured when the grammar is built; LIVE Infixable / block-
+-- scope sourcing is Phase 5's seam.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- PARITY TARGET — the TS Pratt loop `parseInfix` (`fenel-parser.ts:1532`):
+--   left = operand
+--   loop: op = peek; fix = table[op] ?? {assoc:"l", prec:9};
+--         if fix.prec < minPrec: break
+--         next = fix.assoc == "r" ? fix.prec : fix.prec + 1
+--         right = parseInfix(next); left = applyBinOp(op, left, right)
+-- so `"l"` AND `"n"` both climb at `prec + 1` (left-binding); only `"r"`
+-- re-enters at `prec` (right-binding). Non-associative (`"n"`) chains LEFT in
+-- the TS climb (the `prec+1` re-entry stops a same-prec peer) — mirrored here.
+--
+-- EMISSION (decision 2, pinned by RUNNING `jsonLogicToSyntax` on the TS parser
+-- output, Step 0.2): the clean operators emit `{call:[codeName, l, r]}` which
+-- the adapter maps to `SCall { fnId = codeName, args = [l, r] }`. So this
+-- resolver emits `SCall` UNIFORMLY. The applyBinOp SPECIAL emissions —
+-- `>>=`/`<>` ⇒ `{method:…}`, `|>`/`&` ⇒ `{"|>":…}`, `in` ⇒ `{in:…}` — are
+-- adapter GAPS at HEAD (the adapter Errs / mis-keys on them, Step 0.2), so
+-- those operator forms are FENCED from the expression differential (their
+-- fixity rows stay in the table for precedence fidelity / future un-fencing,
+-- but the grammar's op-token production admits only the SCall-clean set until
+-- Phase 5 extends the adapter). `fnId` in each row is the EMISSION codeName
+-- (`"+"` ⇒ `"add"`), pinned from `getInfixNotationToCodename()` (Step 0.3);
+-- a custom op (not in the table) defaults to `{ fnId = notation, prec = 9,
+-- assoc = "l" }` — key-as-fnId + `infixl 9` (the TS `?? {assoc:l,prec:9}` +
+-- `{call:[op,…]}` fall-through).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE FLAT SEQUENCE SHAPE: `{ first = Syntax, rest = [{ notation, operand }] }`
+-- — `first` the head operand, `rest` the left-to-right `(op operand)` tail
+-- (each `notation` the operator token's text, `operand` the already-built
+-- operand Syntax). `resolveFrom` is the functional precedence-climb returning
+-- `{ val, rest }` (value built so far + the unconsumed tail), threaded so the
+-- outer climb resumes where the inner one stopped.
+--
+-- NO new entities (Syntax is registered; the sequence + fixity rows are plain
+-- records — the Ws-marker / token-record precedent). NO laws.
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- The default fixity table — `STRUCTURAL_FIXITY` (`fenel-parser.ts:325`) ∪
+-- the Infixable projection (`fenel/std/parser-fixities.fenel`), exactly the
+-- merge `getDefaultFixity` (`:365`) builds. Each row: the operator NOTATION,
+-- the emission `fnId` (short codeName), `prec`, `assoc` (`l`/`r`/`n`). `cat`
+-- rides for table fidelity though the lexer never emits a `cat` operator token
+-- (it's an `ident`); `|>`/`&`/`in`/`>>=`/`<>` ride for precedence fidelity but
+-- are fenced from the differential (special-emission adapter gaps).
+-- -------------------------------------------------------------------------
+
+@label "Default fixity table"
+@description "The parser's default operator fixity as DATA: STRUCTURAL_FIXITY ($/|>/&/in/.) ∪ the std Infixable projection (the 14 canonical + &&/|| aliases + >>=/<> qualified-method ops), exactly the merge getDefaultFixity builds (fenel-parser.ts:365). Each row { notation, fnId, prec, assoc } — fnId the emission codeName (`+` ⇒ `add`), prec/assoc from STRUCTURAL_FIXITY + parser-fixities.fenel. Closure-captured by exprGrammar (decision 3); LIVE Infixable / block-scope sourcing is Phase 5. parser-substrate Phase 3."
+@tags "engine" "parser" "fixity" "parser-substrate" "phase-3"
+defaultFixityTable : a
+defaultFixityTable =
+  [ { notation = "$", fnId = "$", prec = 0, assoc = "r" }
+  , { notation = "|>", fnId = "|>", prec = 1, assoc = "l" }
+  , { notation = "&", fnId = "|>", prec = 1, assoc = "l" }
+  , { notation = "in", fnId = "in", prec = 4, assoc = "n" }
+  , { notation = ".", fnId = ".", prec = 9, assoc = "r" }
+  , { notation = "+", fnId = "add", prec = 6, assoc = "l" }
+  , { notation = "-", fnId = "sub", prec = 6, assoc = "l" }
+  , { notation = "*", fnId = "mul", prec = 7, assoc = "l" }
+  , { notation = "/", fnId = "div", prec = 7, assoc = "l" }
+  , { notation = "%", fnId = "mod", prec = 7, assoc = "l" }
+  , { notation = "cat", fnId = "concat", prec = 5, assoc = "r" }
+  , { notation = "==", fnId = "eq", prec = 4, assoc = "n" }
+  , { notation = "!=", fnId = "neq", prec = 4, assoc = "n" }
+  , { notation = "<", fnId = "lt", prec = 4, assoc = "n" }
+  , { notation = ">", fnId = "gt", prec = 4, assoc = "n" }
+  , { notation = "<=", fnId = "lte", prec = 4, assoc = "n" }
+  , { notation = ">=", fnId = "gte", prec = 4, assoc = "n" }
+  , { notation = "and", fnId = "and", prec = 3, assoc = "r" }
+  , { notation = "or", fnId = "or", prec = 2, assoc = "r" }
+  , { notation = "&&", fnId = "and", prec = 3, assoc = "r" }
+  , { notation = "||", fnId = "or", prec = 2, assoc = "r" }
+  , { notation = ">>=", fnId = "Monad.bind", prec = 1, assoc = "l" }
+  , { notation = "<>", fnId = "Monoid.mappend", prec = 6, assoc = "r" }
+  ]
+
+
+-- -------------------------------------------------------------------------
+-- Fixity lookup — linear scan over the table by `notation`; the unmatched
+-- (custom-operator) default mirrors the TS `?? {assoc:"l", prec:9}` + the
+-- key-as-fnId fall-through (`{call:[op,…]}`): `{ fnId = notation, prec = 9,
+-- assoc = "l" }`.
+-- -------------------------------------------------------------------------
+
+@label "Fixity of"
+@description "The fixity row { fnId, prec, assoc } for an operator `notation` in `table` — a linear scan; the unmatched (custom operator) default is { fnId = notation, prec = 9, assoc = \"l\" } (the TS `?? {assoc:l,prec:9}` + key-as-fnId `{call:[op,…]}` fall-through). Internal fixity-resolve helper."
+@tags "engine" "internal" "parser" "fixity" "parser-substrate" "phase-3"
+@category "engine-internal"
+fixityOf : (table: a) -> (notation: String) -> a
+fixityOf table notation =
+  case head table of
+    Nothing -> { fnId = notation, prec = 9, assoc = "l" }
+    Just row ->
+      if eq row.notation notation
+      then { fnId = row.fnId, prec = row.prec, assoc = row.assoc }
+      else
+        case tail table of
+          Nothing -> { fnId = notation, prec = 9, assoc = "l" }
+          Just rest -> fixityOf rest notation
+
+
+-- -------------------------------------------------------------------------
+-- Precedence climbing — the functional Pratt loop. `resolveFrom` mirrors
+-- `parseInfix(minPrec)`: fold `(op operand)` tail items into `left` while the
+-- operator precedence ≥ `minPrec`, re-entering the inner climb at `prec`
+-- (right-assoc) or `prec + 1` (left/non-assoc). Returns `{ val, rest }` — the
+-- value built + the unconsumed tail — so the outer climb resumes correctly.
+-- -------------------------------------------------------------------------
+
+@label "Resolve from"
+@description "The functional precedence-climb (Pratt) over a flat `(op operand)` tail: fold tail items into `left` while the operator's `prec ≥ minPrec`, re-entering at `prec` (right-assoc) / `prec + 1` (left + non-assoc) — the `fenel-parser.ts:1543` `next` rule. Each fold emits `SCall { fnId, args = [left, right] }`. A BACKTICK item (`bt = true`, P3b) bypasses the prec test entirely and re-enters at 0 — the TS `parseInfix` handles backticks in a separate unconditional loop AFTER the op-climb breaks (`fenel-parser.ts:1548`): the backtick captures the in-progress left at whatever depth the climb stopped and its rhs swallows the whole rest (`1 + x ``add`` y` ⇒ add(1, add(x, y))); notation IS the emission fnName (no table lookup). Items without a `bt` field (the pre-P3b callers) take the normal arm (absent ⇒ falsy). Returns `{ val, rest }` (value so far + unconsumed tail) so a stopped inner climb hands control back to the outer one. Internal fixity-resolve helper."
+@tags "engine" "internal" "parser" "fixity" "parser-substrate" "phase-3"
+@category "engine-internal"
+resolveFrom : (table: a) -> (left: a) -> (rest: a) -> (minPrec: a) -> a
+resolveFrom table left rest minPrec =
+  case head rest of
+    Nothing -> { val = left, rest = [] }
+    Just item ->
+      if item.bt
+      then
+        let rb = resolveFrom table item.operand (tailOr rest) 0
+        let combinedB = SCall { fnId = item.notation, args = appendItem rb.val (appendItem left []) }
+        resolveFrom table combinedB rb.rest minPrec
+      else
+        let fix = fixityOf table item.notation
+        if lt fix.prec minPrec
+        then { val = left, rest = rest }
+        else
+          let nextMin = if eq fix.assoc "r" then fix.prec else add fix.prec 1
+          let r = resolveFrom table item.operand (tailOr rest) nextMin
+          let combined = SCall { fnId = fix.fnId, args = appendItem r.val (appendItem left []) }
+          resolveFrom table combined r.rest minPrec
+
+@label "Resolve op sequence"
+@description "Fold a FLAT operator sequence `{ first = Syntax, rest = [{ notation, operand }] }` into the precedence-correct nested `SCall` tree, sourcing prec/assoc/fnId from `table` (the OpSeq production's `PRed` reduction, decision 4). Precedence-climbs from `first` at minPrec 0 via `resolveFrom`; a single-operand sequence (`rest = []`) returns `first` unchanged. Emission is `SCall` per the clean-operator parity (`jsonLogicToSyntax` maps `{call:[codeName,l,r]}` ⇒ SCall); special-emission ops (`|>`/`&`/`in`/`>>=`/`<>`) are fenced from the differential. parser-substrate Phase 3."
+@tags "engine" "parser" "fixity" "parser-substrate" "phase-3"
+resolveOpSeq : (table: a) -> (seq: a) -> a
+resolveOpSeq table seq =
+  let r = resolveFrom table seq.first seq.rest 0
+  r.val

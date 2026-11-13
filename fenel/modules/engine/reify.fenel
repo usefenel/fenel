@@ -1,0 +1,212 @@
+module engine where
+
+-- =========================================================================
+-- reify : Fn a b -> Result e { body: Expr, captures: Map String Value } —
+-- runtime introspection of a function value into its irreducible-core body +
+-- captured environment. expr-substrate Phase 3a (brief:
+-- `workstreams/expr-substrate/briefs/phase-3a-reify.md`).
+--
+-- `reify` is the runtime sibling of quotation `.{ … }` (P3b, parser-side):
+-- both yield `Expr` values, but `.{ … }` is parse-time sugar (no Fn value
+-- constructed) while `reify` introspects an EXISTING Fn value. They compose —
+-- `solveFn f = solve (reify f)` (P5): the user writes a lambda (⇒ a Fn value),
+-- then `reify` lifts its body to `Expr` for the solver. Unblocks P5's
+-- ergonomic surface.
+--
+-- LIFTS VIA THE PROVEN ADAPTER (decision 1). The body comes in as raw JSON
+-- Logic (a closure's `.body`, or a registry fn's stored body) and is lifted
+-- by `jsonLogicToExpr` (= `desugar ∘ jsonLogicToSyntax`, 810 Ok / 56 Err,
+-- 0-divergent vs the retired cascade; the live compile path since 4b). reify
+-- NEVER re-derives form recognition — any adapter `Err` threads through
+-- reify's Result unchanged.
+--
+-- RESULT-TYPED (decision 3, a VISIBLE amendment of the roadmap's locked
+-- happy-path sig `reify : Fn a b -> { body: Expr, captures: … }`). The sig
+-- cannot be total: bodyless `@native` fns (the 176 std natives, partials, and
+-- any non-Fenel-bodied value) have NO Fenel body to lift. Bodyless / not
+-- reifiable ⇒ `Err Unsupported` (REUSING the existing CompileError ctor — no
+-- new entity, zero law / ordered-entity movement; the adapter's own Errs are
+-- already this shape).
+--
+-- INPUT — the dispatch wrapper (`dispatchedReify` in engine-bodies-dispatch.ts)
+-- introspects the runtime Fn value and marshals it into one record:
+--   { body:   Maybe JsonLogic    — Just <marshalled body> for a Fenel-bodied
+--                                   closure / registry fn; Nothing for a
+--                                   native / partial / non-reifiable value.
+--   , params: List String        — the fn's formal param names (the local
+--                                   binding set the free-var walk excludes).
+--   , env:    List { name, value } — the captured lexical scope as name/value
+--                                   pairs (a closure's WHOLE `closure`
+--                                   DataContext; empty for a top-level
+--                                   registry fn — top-level fns capture
+--                                   nothing). }
+-- The wrapper reading `.body` / `.closure` off a runtime object is BOUNDARY
+-- MARSHALLING (the Phase 21.5 Option-B rationale), same class as
+-- `marshalNormaliseInput` — NOT a native (engine stays `nativeImplsCtx === {}`).
+--
+-- CAPTURES — free-var-FILTERED (decision 6). `FenelClosure.closure` is the
+-- WHOLE lexical scope at capture time (json-logic.ts:1729 `closure: { ...data }`),
+-- not just the body's free vars. So reify FILTERS the marshalled env to the
+-- body's free names: `collectFreeVars expr params []` (the make-closures-
+-- explicit walker, post-lift over `Expr`) computes the free set, and
+-- `reifyFilterCaptures` keeps only env entries whose name is free. This
+-- matches OQ2's intent — `reify (\x -> x + y)` yields the body PLUS the
+-- `{y: …}` capture (the y-only map, not the whole scope). Capture VALUES are
+-- NOT recursed (a captured closure stays a closure value); the slot is typed
+-- loosely (`Map String Value` is the documented P10-era-precision intent).
+--
+-- NOTE: persisted bodies stay JSON Logic AT REST (the OQ5 pin, 4c) — `Fn.body`
+-- types as `Expr` (catalog-resolved) but reify lifts at introspection time, no
+-- registry-storage retype.
+-- =========================================================================
+
+-- reify — lift a marshalled Fn value to `{ body: Expr, captures }`. Bodyless
+-- ⇒ Err Unsupported (decision 3); adapter Err threads through; on Ok, filter
+-- the captured env to the body's free vars (decision 6).
+@label "Reify"
+@description "Runtime introspection of a function value into its irreducible-core body (Expr) + captured environment. Lifts the raw JSON-Logic body via the proven `jsonLogicToExpr` adapter (never re-deriving form recognition); filters the captured lexical scope to the body's free vars via `collectFreeVars` + `reifyFilterCaptures`. Result-typed — bodyless @native fns / partials / non-reifiable values yield Err Unsupported (reusing the CompileError ctor, no new entity). The runtime sibling of quotation `.{ … }`; they compose as `solveFn f = solve (reify f)` (P5). expr-substrate Phase 3a."
+@tags "engine" "ir" "reify" "reflection" "expr-substrate" "phase-3a"
+reify : (input: { body: a, params: List String, env: a }) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a ({ body: Expr, captures: a })
+reify input ctorDefs nullValue =
+  case input.body of
+    Nothing ->
+      Err (Unsupported {
+        reason = "reify: function has no Fenel body (native, partial, or non-reifiable value)",
+        node = nullValue
+      })
+    Just b ->
+      case jsonLogicToExpr b ctorDefs nullValue of
+        Err e -> Err e
+        Ok expr -> reifyClosedResult expr input nullValue
+
+-- recipe-functions S2: an input built by the reflection boundary may carry
+-- `readerHeads` (the reader-semantics rewrite of free names, applied after
+-- import closing; see `reflectReaderSolverInput`) and per-entry `admitted`
+-- flags (the admitted-value snapshot): a KEPT capture that was not admitted
+-- refuses the reification (an unused one is dropped as before). The returned
+-- captures are `{ name, value }` pairs.
+@category "engine-internal"
+reifyClosedResult : (expr: Expr) -> (input: { params: List String, env: a }) -> (nullValue: a) -> Result a ({ body: Expr, captures: a })
+reifyClosedResult expr input nullValue =
+  let names = case lookup input "lexicalNames" of
+    Nothing -> {}
+    Just value -> value
+  let bound = concat input.params (map (\entry -> entry.name) input.env)
+  let lexicallyClosed = if eq (length (entries names)) 0 then expr else reifyCloseLexicalNames expr names bound
+  let closed = case lookup input "readerHeads" of
+    Nothing -> lexicallyClosed
+    Just heads -> reifyRenameFree lexicallyClosed heads bound
+  let free = collectFreeVars closed input.params []
+  let caps = reifyFilterCaptures input.env free []
+  if reflectAllAdmitted caps
+  then Ok { body = closed, captures = map (\entry -> { name = entry.name, value = entry.value }) caps }
+  else Err (Unsupported {
+    reason = "reify: a captured value the body uses is not an admitted Fenel value (a host function, handle or authority)",
+    node = nullValue
+  })
+
+-- reifyRenameFree — rename FREE names (call heads and variables no parameter,
+-- capture, lambda or pattern binds) through a `{ from, to }` table, keeping
+-- every other field of a node. `$`-sentinels and the core's structural heads
+-- are never renamed (`reflectStructuralHead`).
+@category "engine-internal"
+reifyRenamed : (name: String) -> (heads: a) -> (bound: List String) -> String
+reifyRenamed name heads bound =
+  if startsWith name "$" then name
+  else if elem (dottedHead name) bound then name
+  else case head (filter (\h -> eq h.from name) heads) of
+    Nothing -> name
+    Just h -> h.to
+
+@category "engine-internal"
+reifyRenameFree : (expr: Expr) -> (heads: a) -> (bound: List String) -> Expr
+reifyRenameFree expr heads bound = case expr of
+  ELit {} -> expr
+  EVar { name = name } -> mapSet expr "name" (reifyRenamed name heads bound)
+  ECall { fnId = name, args = args } ->
+    let renamedHead = if reflectStructuralHead expr name then name else reifyRenamed name heads bound
+    mapSet (mapSet expr "fnId" renamedHead) "args" (map (\arg -> reifyRenameFree arg heads bound) args)
+  ELambda { params = params, body = body } -> mapSet expr "body" (reifyRenameFree body heads (concat params bound))
+  other -> reifyRenameFreeStructure other heads bound
+
+@category "engine-internal"
+reifyRenameFreeStructure : (expr: Expr) -> (heads: a) -> (bound: List String) -> Expr
+reifyRenameFreeStructure expr heads bound = case expr of
+  EConstruct { args = args } -> mapSet expr "args" (map (\arg -> reifyRenameFree arg heads bound) args)
+  ERecord { fields = fields } -> mapSet expr "fields" (map (\field -> mapSet field "value" (reifyRenameFree field.value heads bound)) fields)
+  EMatch { scrutinee = scrutinee, arms = arms } -> mapSet (mapSet expr "scrutinee" (reifyRenameFree scrutinee heads bound)) "arms" (map (\arm -> reifyRenameFreeArm arm heads bound) arms)
+
+@category "engine-internal"
+reifyRenameFreeArm : (arm: a) -> (heads: a) -> (bound: List String) -> a
+reifyRenameFreeArm arm heads bound =
+  let local = collectPatternBindings arm.pattern bound
+  let body = mapSet arm "body" (reifyRenameFree arm.body heads local)
+  case lookup arm "guard" of
+    Nothing -> body
+    Just guard -> mapSet body "guard" (reifyRenameFree guard heads local)
+
+-- Import bindings were already selected by the source registry. Close only
+-- free Name references into those exact targets; literals and field identities
+-- remain data, and lambda/pattern binders keep their lexical shadowing. Every
+-- node is rewritten with `mapSet` on the slots it closes, so any other field
+-- the lift attached (the list-literal `lit` marker on an `appendItem` ECall,
+-- an EConstruct's `fields`, an arm's `guard`) rides through unchanged
+-- (recipe-functions S2: rebuilding the record used to drop `lit`).
+@category "engine-internal"
+reifyLexicalName : (name: String) -> (names: a) -> (bound: List String) -> String
+reifyLexicalName name names bound =
+  if elem (dottedHead name) bound then name
+  else case lookup names name of
+    Nothing -> name
+    Just target -> target
+
+@category "engine-internal"
+reifyCloseLexicalNames : (expr: Expr) -> (names: a) -> (bound: List String) -> Expr
+reifyCloseLexicalNames expr names bound = case expr of
+  ELit {} -> expr
+  EVar { name = name } -> mapSet expr "name" (reifyLexicalName name names bound)
+  ECall { fnId = name, args = args } ->
+    let closedHead = if reflectStructuralHead expr name then name else reifyLexicalName name names bound
+    mapSet (mapSet expr "fnId" closedHead) "args" (map (\arg -> reifyCloseLexicalNames arg names bound) args)
+  ELambda { params = params, body = body } -> mapSet expr "body" (reifyCloseLexicalNames body names (concat params bound))
+  other -> reifyCloseLexicalConstruct other names bound
+
+@category "engine-internal"
+reifyCloseLexicalConstruct : (expr: Expr) -> (names: a) -> (bound: List String) -> Expr
+reifyCloseLexicalConstruct expr names bound = case expr of
+  EConstruct { args = args } -> mapSet expr "args" (map (\arg -> reifyCloseLexicalNames arg names bound) args)
+  other -> reifyCloseLexicalStructure other names bound
+
+@category "engine-internal"
+reifyCloseLexicalStructure : (expr: Expr) -> (names: a) -> (bound: List String) -> Expr
+reifyCloseLexicalStructure expr names bound = case expr of
+  ERecord { fields = fields } -> mapSet expr "fields" (map (\field -> mapSet field "value" (reifyCloseLexicalNames field.value names bound)) fields)
+  EMatch { scrutinee = scrutinee, arms = arms } -> mapSet (mapSet expr "scrutinee" (reifyCloseLexicalNames scrutinee names bound)) "arms" (map (\arm -> reifyCloseLexicalArm arm names bound) arms)
+
+@category "engine-internal"
+reifyCloseLexicalArm : (arm: a) -> (names: a) -> (bound: List String) -> a
+reifyCloseLexicalArm arm names bound =
+  let local = collectPatternBindings arm.pattern bound
+  let body = mapSet arm "body" (reifyCloseLexicalNames arm.body names local)
+  case lookup arm "guard" of
+    Nothing -> body
+    Just guard -> mapSet body "guard" (reifyCloseLexicalNames guard names local)
+
+-- reifyFilterCaptures — filter the marshalled env (a list of {name, value}
+-- records) to those whose `.name` is in the body's free-var set, preserving
+-- env order. The capture-side analogue of make-closures-explicit's
+-- `filterToCaptures` (which filters a list of NAMES against an outer set); this
+-- keeps the {name, value} PAIRS so the captured runtime values ride along.
+@label "Reify filter captures"
+@description "Filter the marshalled env (a list of {name, value} records) to entries whose `.name` is in the body's free-var set, preserving env order. The capture-side analogue of make-closures-explicit's `filterToCaptures` — keeps the {name, value} pairs (with their captured runtime values) rather than just the names. Used by reify to project a closure's whole lexical scope down to its actual captures."
+@tags "engine" "internal" "reify" "expr-substrate" "phase-3a"
+@category "engine-internal"
+reifyFilterCaptures : (env: a) -> (free: List String) -> (acc: a) -> a
+reifyFilterCaptures env free acc =
+  case head env of
+    Nothing -> acc
+    Just e ->
+      let accNext = if elem e.name free then appendItem e acc else acc
+      case tail env of
+        Nothing -> accNext
+        Just rest -> reifyFilterCaptures rest free accNext

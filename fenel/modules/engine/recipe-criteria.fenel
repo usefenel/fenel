@@ -1,0 +1,983 @@
+module engine where
+
+using prover (EpistemicStatus)
+
+-- Criteria compose the existing checked extraction and rank-language judgment.
+-- No recipe is run over a pantry table. A witness is materialised only after
+-- the judgment has rechecked its encoded word. A source snapshot is data;
+-- public callers obtain it again from their current reader on every call.
+
+RecipeFamilyMember = RecipeFamilyMember rank: Nat membership: Maybe Bool identity: String
+RecipeFamilyScope = PantryFamily | PreparationFamily
+RecipeFamilyClaim a = RecipeFamilyClaim subject: a result: (RecipeClaim Bool)
+-- Both family scopes of one card, from one projection per category.
+RecipeFamilyScopes a = RecipeFamilyScopes pantry: List (RecipeFamilyClaim a) preparation: List (RecipeFamilyClaim a)
+RecipeFamilyResults = RecipeFamilyResults pantry: (RecipeClaim Bool) preparation: (RecipeClaim Bool)
+RecipeFoodDistance = RecipeFoodDistance left: Nat right: Nat distance: Maybe Number
+RecipeClaimContext = RecipeClaimContext snapshot: Maybe RecipeAnalysisSnapshot analysis: Maybe RecipeExtraction applications: List RecipeApplicationProposal assumptions: List ReifyOutcome family: List RecipeFamilyMember distances: List RecipeFoodDistance
+
+RecipeClaim a = RecipeKnown value: a status: EpistemicStatus context: RecipeClaimContext
+  | NoSuccessfulOutcome status: EpistemicStatus context: RecipeClaimContext
+  | RecipeUndetermined reasons: List RecipeRefusal context: RecipeClaimContext
+
+RecipeThresholdClaim = RecipeThresholdClaim implication: (RecipeClaim Bool) sufficiency: (RecipeClaim Bool) exactness: (RecipeClaim Bool)
+RecipeCountRange a = RecipeCountRange minimum: Nat maximum: Nat minimumPantry: List a minimumPreparation: List a maximumPantry: List a maximumPreparation: List a
+RecipeKindSpread a = RecipeKindSpread minimum: Number maximum: Number minimumPantry: List a minimumPreparation: List a maximumPantry: List a maximumPreparation: List a
+RecipeAlternativeFood a = RecipeAlternativeFood food: a included: RecipeConstraint
+RecipeAlternative a = RecipeAlternative condition: RecipeConstraint foods: List (RecipeAlternativeFood a) witnessPantry: List a witnessPreparation: List a
+
+-- `pantries` is the pantry set every question ranges over (RcAll: every
+-- pantry). `success` stays the recipe's own, unrestricted success constraint.
+RecipeCriteriaBasis = RecipeCriteriaBasis analysis: RecipeExtraction domain: CheckedRecipeDomain context: RecipeClaimContext success: RecipeConstraint pantries: RecipeConstraint witness: List Nat
+RecipeCriteriaGate = RecipeCriteriaReady basis: RecipeCriteriaBasis
+  | RecipeCriteriaImpossible context: RecipeClaimContext
+  | RecipeCriteriaBlocked reasons: List RecipeRefusal context: RecipeClaimContext
+RecipeCountWitness = RecipeCountWitness count: Nat pantry: List Nat preparation: List Nat
+RecipeSpreadWitness = RecipeSpreadWitness score: Number pantry: List Nat preparation: List Nat
+RecipeCheckedApplication = RecipeCheckedApplication result: RecipeSymbolicValue proposal: RecipeApplicationProposal
+RecipeFamilyProjection = RecipeFamilyProjection members: List RecipeFamilyMember applications: List RecipeApplicationProposal
+RecipeDistanceProjection = RecipeDistanceProjection distances: List RecipeFoodDistance applications: List RecipeApplicationProposal
+
+recipeCriteriaContext : (snapshot: RecipeAnalysisSnapshot) -> RecipeClaimContext
+recipeCriteriaContext snapshot = RecipeClaimContext { snapshot = Just snapshot, analysis = Nothing, applications = [], assumptions = [], family = [], distances = [] }
+
+recipeCriteriaAnd : (left: RecipeConstraint) -> (right: RecipeConstraint) -> RecipeConstraint
+recipeCriteriaAnd left right = case left of
+  RcNone -> RcNone
+  RcAll -> right
+  _ -> case right of
+    RcNone -> RcNone
+    RcAll -> left
+    _ -> RcAnd { terms = [left, right] }
+
+recipeCriteriaOr : (left: RecipeConstraint) -> (right: RecipeConstraint) -> RecipeConstraint
+recipeCriteriaOr left right = case left of
+  RcAll -> RcAll
+  RcNone -> right
+  _ -> case right of
+    RcAll -> RcAll
+    RcNone -> left
+    _ -> RcOr { terms = [left, right] }
+
+recipeCriteriaNot : (inner: RecipeConstraint) -> RecipeConstraint
+recipeCriteriaNot inner = case inner of
+  RcAll -> RcNone
+  RcNone -> RcAll
+  RcNot { inner = original } -> original
+  _ -> RcNot { inner = inner }
+
+recipeCriteriaAny : (terms: List RecipeConstraint) -> RecipeConstraint
+recipeCriteriaAny terms = fold recipeCriteriaOr RcNone terms
+
+recipeCriteriaSuccess : (analysis: RecipeExtraction) -> RecipeConstraint
+recipeCriteriaSuccess analysis = recipeCriteriaAny (map (\outcome -> recipeCriteriaAnd outcome.condition (recipeCriteriaAny (map (\preparation -> preparation.available) outcome.preparations))) analysis.outcomes)
+
+-- A pantry set is a plain Boolean combination of food memberships over the
+-- checked domain. Cardinality and unknown terms are refused, not interpreted.
+recipeCriteriaPantriesValid : (domain: CheckedRecipeDomain) -> (constraint: RecipeConstraint) -> Bool
+recipeCriteriaPantriesValid domain constraint = case constraint of
+  RcAll -> true
+  RcNone -> true
+  RcHasFood { rank = rank } -> std.some domain.foods (\food -> food.rank == rank)
+  RcAnd { terms = terms } -> all terms (recipeCriteriaPantriesValid domain)
+  RcOr { terms = terms } -> all terms (recipeCriteriaPantriesValid domain)
+  RcNot { inner = inner } -> recipeCriteriaPantriesValid domain inner
+  _ -> false
+
+-- One checked analysis for a card. The success verdict is asked over the
+-- pantry set, so Impossible means no successful pantry in the set and the
+-- stored witness lies in it. The set is kept beside `success`, never folded
+-- into it: `requirement ∧ ¬success` must still range over the set only.
+recipeCriteriaPrepare : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (pantries: RecipeConstraint) -> (budget: Nat) -> RecipeCriteriaGate
+recipeCriteriaPrepare snapshot proposal pantries budget =
+  if budget == 0 then RecipeCriteriaBlocked { reasons = [RecipeBudgetExhausted], context = recipeCriteriaContext snapshot }
+  else recipeCriteriaPrepareChecked snapshot (checkRecipeAnalysis snapshot proposal budget) pantries budget
+
+-- recipeCriteriaPrepare with the analysis check supplied: `check` must be
+-- checkRecipeAnalysis of this snapshot, its proposal and this budget (a card
+-- analysis carries all three; the pantry set changes only what follows).
+recipeCriteriaPrepareChecked : (snapshot: RecipeAnalysisSnapshot) -> (check: RecipeExtractionCheck) -> (pantries: RecipeConstraint) -> (budget: Nat) -> RecipeCriteriaGate
+recipeCriteriaPrepareChecked snapshot check pantries budget =
+  let context = recipeCriteriaContext snapshot
+  if budget == 0 then RecipeCriteriaBlocked { reasons = [RecipeBudgetExhausted], context = context }
+  else case check of
+    RecipeAnalysisRefused { residuals = residuals } -> RecipeCriteriaBlocked { reasons = if length residuals == 0 then [RecipeCertificateRejected] else map (\residual -> residual.reason) residuals, context = context }
+    RecipeAnalysisChecked { analysis = analysis, domain = domain, status = status } ->
+      let checkedContext = RecipeClaimContext { snapshot = Just snapshot, analysis = Just analysis, applications = [], assumptions = [], family = [], distances = [] }
+      if length analysis.residuals > 0 then RecipeCriteriaBlocked { reasons = map (\residual -> residual.reason) analysis.residuals, context = checkedContext }
+      else if not (recipeCriteriaExtractionGrade status) then RecipeCriteriaBlocked { reasons = [RecipeCertificateRejected], context = checkedContext }
+      else if not (recipeCriteriaPantriesValid domain pantries) then RecipeCriteriaBlocked { reasons = [RecipeInvalidDomain], context = checkedContext }
+      else
+        let success = recipeCriteriaSuccess analysis
+        case recipeConstraintVerdict domain (recipeCriteriaAnd pantries success) budget of
+          RecipeConstraintEmpty -> RecipeCriteriaImpossible { context = checkedContext }
+          RecipeConstraintUnknown { reason = reason } -> RecipeCriteriaBlocked { reasons = [reason], context = checkedContext }
+          RecipeConstraintWitness { ranks = ranks } -> RecipeCriteriaReady { basis = RecipeCriteriaBasis { analysis = analysis, domain = domain, context = checkedContext, success = success, pantries = pantries, witness = ranks } }
+
+-- The only way a criterion asks the judgment: the pantry set is a conjunct
+-- of every question. With RcAll the question is unchanged.
+recipeCriteriaVerdict : (basis: RecipeCriteriaBasis) -> (constraint: RecipeConstraint) -> (budget: Nat) -> RecipeConstraintVerdict
+recipeCriteriaVerdict basis constraint budget = recipeConstraintVerdict basis.domain (recipeCriteriaAnd basis.pantries constraint) budget
+
+recipeCriteriaGateContext : (gate: RecipeCriteriaGate) -> RecipeClaimContext
+recipeCriteriaGateContext gate = case gate of
+  RecipeCriteriaReady { basis = basis } -> basis.context
+  RecipeCriteriaImpossible { context = context } -> context
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> context
+  _ -> RecipeClaimContext { snapshot = Nothing, analysis = Nothing, applications = [], assumptions = [], family = [], distances = [] }
+
+recipeCriteriaExtractionGrade : (status: EpistemicStatus) -> Bool
+recipeCriteriaExtractionGrade status = case status of
+  SolverChecked -> true
+  Proven -> true
+  _ -> false
+
+recipeCriteriaBool : (basis: RecipeCriteriaBasis) -> (counterexamples: RecipeConstraint) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaBool basis counterexamples budget = case recipeCriteriaVerdict basis counterexamples budget of
+  RecipeConstraintEmpty -> RecipeKnown { value = true, status = SolverChecked, context = basis.context }
+  RecipeConstraintWitness { ranks = ranks } -> RecipeKnown { value = false, status = SolverChecked, context = basis.context }
+  RecipeConstraintUnknown { reason = reason } -> RecipeUndetermined { reasons = [reason], context = basis.context }
+
+recipeCriteriaContains : (ranks: List Nat) -> (rank: Nat) -> Bool
+recipeCriteriaContains ranks rank = std.some ranks (\candidate -> candidate == rank)
+
+recipeCriteriaHas : (ranks: List Nat) -> RecipeConstraint
+recipeCriteriaHas ranks = recipeCriteriaAny (map (\rank -> RcHasFood { rank = rank }) ranks)
+
+recipeCriteriaPreparationHas : (preparation: RecipePreparation) -> (rank: Nat) -> RecipeConstraint
+recipeCriteriaPreparationHas preparation rank = recipeCriteriaAny (map (\food -> food.included) (filter (\food -> food.rank == rank) preparation.foods))
+
+recipeCriteriaMissing : (analysis: RecipeExtraction) -> (rank: Nat) -> RecipeConstraint
+recipeCriteriaMissing analysis rank = recipeCriteriaAny (flatMap (\outcome -> map (\preparation -> recipeCriteriaAnd outcome.condition (recipeCriteriaAnd preparation.available (recipeCriteriaNot (recipeCriteriaPreparationHas preparation rank)))) outcome.preparations) analysis.outcomes)
+
+recipeCriteriaRankFacts : (basis: RecipeCriteriaBasis) -> (ranks: List Nat) -> (output: Bool) -> (budget: Nat) -> Result RecipeRefusal (List Nat)
+recipeCriteriaRankFacts basis ranks output budget = case head ranks of
+  Nothing -> Ok []
+  Just rank ->
+    let bad = if output then recipeCriteriaMissing basis.analysis rank else recipeCriteriaAnd basis.success (recipeCriteriaNot (RcHasFood { rank = rank }))
+    case recipeCriteriaVerdict basis bad budget of
+      RecipeConstraintUnknown { reason = reason } -> Err reason
+      verdict -> case recipeCriteriaRankFacts basis (fromMaybe [] (tail ranks)) output budget of
+        Err reason -> Err reason
+        Ok rest -> case verdict of
+          RecipeConstraintEmpty -> Ok (concat [rank] rest)
+          _ -> Ok rest
+
+recipeCriteriaGuaranteed : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (budget: Nat) -> RecipeClaim (List Nat)
+recipeCriteriaGuaranteed snapshot proposal budget = recipeCriteriaGuaranteedIn (recipeCriteriaPrepare snapshot proposal RcAll budget) budget
+
+recipeCriteriaGuaranteedIn : (gate: RecipeCriteriaGate) -> (budget: Nat) -> RecipeClaim (List Nat)
+recipeCriteriaGuaranteedIn gate budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> NoSuccessfulOutcome { status = SolverChecked, context = context }
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> RecipeUndetermined { reasons = reasons, context = context }
+  RecipeCriteriaReady { basis = basis } -> case recipeCriteriaRankFacts basis (map (\food -> food.rank) basis.domain.foods) true budget of
+    Err reason -> RecipeUndetermined { reasons = [reason], context = basis.context }
+    Ok ranks -> RecipeKnown { value = ranks, status = SolverChecked, context = basis.context }
+
+recipeCriteriaNecessary : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (budget: Nat) -> RecipeClaim (List Nat)
+recipeCriteriaNecessary snapshot proposal budget = recipeCriteriaNecessaryIn (recipeCriteriaPrepare snapshot proposal RcAll budget) budget
+
+recipeCriteriaNecessaryIn : (gate: RecipeCriteriaGate) -> (budget: Nat) -> RecipeClaim (List Nat)
+recipeCriteriaNecessaryIn gate budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> NoSuccessfulOutcome { status = SolverChecked, context = context }
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> RecipeUndetermined { reasons = reasons, context = context }
+  RecipeCriteriaReady { basis = basis } -> case recipeCriteriaRankFacts basis (map (\food -> food.rank) basis.domain.foods) false budget of
+    Err reason -> RecipeUndetermined { reasons = [reason], context = basis.context }
+    Ok ranks -> RecipeKnown { value = ranks, status = SolverChecked, context = basis.context }
+
+recipeCriteriaFamilyTrue : (membership: Maybe Bool) -> Bool
+recipeCriteriaFamilyTrue membership = case membership of
+  Just true -> true
+  _ -> false
+
+recipeCriteriaFamilyPossible : (membership: Maybe Bool) -> Bool
+recipeCriteriaFamilyPossible membership = case membership of
+  Just false -> false
+  _ -> true
+
+recipeCriteriaFamilyRowsValid : (domain: CheckedRecipeDomain) -> (members: List RecipeFamilyMember) -> Bool
+recipeCriteriaFamilyRowsValid domain members = length members == length domain.foods && all domain.foods (\food -> length (filter (\member -> member.rank == food.rank && member.identity == food.identity) members) == 1)
+
+-- Finite constructor projection is symbolic application to closed Food
+-- values, not recipe execution. Its transitions are independently replayed;
+-- supplied observation rows never become evidence for the function's result.
+recipeCriteriaSource : (assumptions: List ReifyOutcome) -> Result RecipeRefusal ReifiedFunction
+recipeCriteriaSource assumptions =
+  if length assumptions != 1 then Err RecipeUnsupported
+  else case head assumptions of
+    Nothing -> Err RecipeUnavailable
+    Just outcome -> case outcome of
+      Reified { package = source } -> Ok source
+      OpaqueBody { identity = identity, params = params } -> Err RecipeOpaque
+      Unavailable -> Err RecipeUnavailable
+
+recipeCriteriaApply : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (arguments: List RecipeSymbolicValue) -> (budget: Nat) -> Result RecipeRefusal RecipeCheckedApplication
+recipeCriteriaApply snapshot source arguments budget =
+  recipeCriteriaApplyWithIndex snapshot source Nothing arguments budget
+
+recipeCriteriaApplyWithIndex : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (index: Maybe Nat) -> (arguments: List RecipeSymbolicValue) -> (budget: Nat) -> Result RecipeRefusal RecipeCheckedApplication
+recipeCriteriaApplyWithIndex snapshot source index arguments budget =
+  let proposal = case index of
+        Nothing -> proposeRecipeApplication snapshot source arguments budget
+        Just selected -> proposeRecipeApplicationAt snapshot source selected arguments budget
+  let checked = case index of
+        Nothing -> checkRecipeApplication snapshot source arguments proposal budget
+        Just selected -> checkRecipeApplicationAt snapshot source selected arguments proposal budget
+  case checked of
+    Err reason -> Err reason
+    Ok value -> Ok (RecipeCheckedApplication { result = value, proposal = proposal })
+
+recipeCriteriaSourceBool : (value: RecipeSymbolicValue) -> Result RecipeRefusal Bool
+recipeCriteriaSourceBool value = case value of
+  RvLiteral { value = literal } -> if isBoolean literal then Ok literal else Err RecipeUnsupported
+  RvBoolean { constraint = constraint } -> case constraint of
+    RcAll -> Ok true
+    RcNone -> Ok false
+    _ -> Err RecipeUnsupported
+  _ -> Err RecipeUnsupported
+
+recipeCriteriaFamilyProjection : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (foods: List RecipeFoodRank) -> (budget: Nat) -> Result RecipeRefusal RecipeFamilyProjection
+recipeCriteriaFamilyProjection snapshot source foods budget = recipeCriteriaFamilyProjectionWithIndex snapshot source Nothing foods budget
+
+recipeCriteriaFamilyProjectionWithIndex : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (index: Maybe Nat) -> (foods: List RecipeFoodRank) -> (budget: Nat) -> Result RecipeRefusal RecipeFamilyProjection
+recipeCriteriaFamilyProjectionWithIndex snapshot source index foods budget = case head foods of
+  Nothing -> Ok (RecipeFamilyProjection { members = [], applications = [] })
+  Just food -> case recipeCriteriaApplyWithIndex snapshot source index [RvFood { rank = food.rank }] budget of
+    Err reason -> Err reason
+    Ok application -> case recipeDecodeApplicationMaybe snapshot application.result of
+      Err reason -> Err reason
+      Ok membership -> case recipeCriteriaMaybeBool membership of
+        Err reason -> Err reason
+        Ok value -> case recipeCriteriaFamilyProjectionWithIndex snapshot source index (fromMaybe [] (tail foods)) budget of
+          Err reason -> Err reason
+          Ok rest -> Ok (RecipeFamilyProjection { members = concat [RecipeFamilyMember { rank = food.rank, membership = value, identity = food.identity }] rest.members, applications = concat [application.proposal] rest.applications })
+
+-- The same projection with one batched check per category (the snapshot-only
+-- checks run once): proposals and checks are pure, so proposing every food
+-- first and folding in order gives recipeCriteriaFamilyProjectionWithIndex's
+-- result, including its first refusal.
+recipeCriteriaFamilyProjectionBatch : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (index: Nat) -> (foods: List RecipeFoodRank) -> (budget: Nat) -> Result RecipeRefusal RecipeFamilyProjection
+recipeCriteriaFamilyProjectionBatch snapshot source index foods budget =
+  recipeCriteriaFamilyProjectionChecked snapshot (rckApplicationSnapshotChecks snapshot budget) source index foods budget
+
+-- The same with the snapshot-only checks supplied: `checks` must be
+-- rckApplicationSnapshotChecks of this snapshot and budget.
+recipeCriteriaFamilyProjectionChecked : (snapshot: RecipeAnalysisSnapshot) -> (checks: { measure: { ok: Bool, count: Nat, height: Nat }, evidence: Bool, admission: Result RecipeRefusal CheckedRecipeDomain, reflection: Bool }) -> (source: ReifiedFunction) -> (index: Nat) -> (foods: List RecipeFoodRank) -> (budget: Nat) -> Result RecipeRefusal RecipeFamilyProjection
+recipeCriteriaFamilyProjectionChecked snapshot checks source index foods budget =
+  let argumentLists = map (\food -> [RvFood { rank = food.rank }]) foods
+  let proposals = proposeRecipeApplicationsAt snapshot source index argumentLists budget
+  let requests = zipWith (\arguments proposal -> RecipeApplicationRequest { arguments = arguments, proposal = proposal }) argumentLists proposals
+  let checked = checkRecipeApplicationsAtChecked snapshot checks source index requests budget
+  recipeCriteriaFamilyProjectionFold snapshot foods requests checked
+
+recipeCriteriaFamilyProjectionFold : (snapshot: RecipeAnalysisSnapshot) -> (foods: List RecipeFoodRank) -> (requests: List RecipeApplicationRequest) -> (checked: List (Result RecipeRefusal RecipeSymbolicValue)) -> Result RecipeRefusal RecipeFamilyProjection
+recipeCriteriaFamilyProjectionFold snapshot foods requests checked = case head foods of
+  Nothing -> Ok (RecipeFamilyProjection { members = [], applications = [] })
+  Just food -> case head checked of
+    Nothing -> Err RecipeUnsupported
+    Just result -> case head requests of
+      Nothing -> Err RecipeUnsupported
+      Just request -> case result of
+        Err reason -> Err reason
+        Ok value -> case recipeDecodeApplicationMaybe snapshot value of
+          Err reason -> Err reason
+          Ok membership -> case recipeCriteriaMaybeBool membership of
+            Err reason -> Err reason
+            Ok bool -> case recipeCriteriaFamilyProjectionFold snapshot (fromMaybe [] (tail foods)) (fromMaybe [] (tail requests)) (fromMaybe [] (tail checked)) of
+              Err reason -> Err reason
+              Ok rest -> Ok (RecipeFamilyProjection { members = concat [RecipeFamilyMember { rank = food.rank, membership = bool, identity = food.identity }] rest.members, applications = concat [request.proposal] rest.applications })
+            _ -> Err RecipeUnsupported
+          _ -> Err RecipeUnsupported
+        _ -> Err RecipeUnsupported
+
+recipeCriteriaMaybeBool : (value: Maybe RecipeSymbolicValue) -> Result RecipeRefusal (Maybe Bool)
+recipeCriteriaMaybeBool value = case value of
+  Nothing -> Ok Nothing
+  Just symbolic -> case recipeCriteriaSourceBool symbolic of
+    Err reason -> Err reason
+    Ok boolean -> Ok (Just boolean)
+
+recipeCriteriaObservedContext : (basis: RecipeCriteriaBasis) -> (assumptions: List ReifyOutcome) -> (family: List RecipeFamilyMember) -> (distances: List RecipeFoodDistance) -> (applications: List RecipeApplicationProposal) -> RecipeClaimContext
+recipeCriteriaObservedContext basis assumptions family distances applications = RecipeClaimContext { snapshot = basis.context.snapshot, analysis = Just basis.analysis, applications = applications, assumptions = assumptions, family = family, distances = distances }
+
+recipeCriteriaRequiredFamily : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (members: List RecipeFamilyMember) -> (assumptions: List ReifyOutcome) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaRequiredFamily snapshot proposal members assumptions budget = recipeCriteriaRequiredFamilyIn (recipeCriteriaPrepare snapshot proposal RcAll budget) members assumptions budget
+
+recipeCriteriaRequiredFamilyIn : (gate: RecipeCriteriaGate) -> (members: List RecipeFamilyMember) -> (assumptions: List ReifyOutcome) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaRequiredFamilyIn gate members assumptions budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> NoSuccessfulOutcome { status = SolverChecked, context = context }
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> RecipeUndetermined { reasons = reasons, context = context }
+  RecipeCriteriaReady { basis = basis } ->
+    let context = recipeCriteriaObservedContext basis assumptions members [] []
+    if not (recipeCriteriaFamilyRowsValid basis.domain members) then RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context }
+    else case recipeCriteriaSource assumptions of
+      Err reason -> RecipeUndetermined { reasons = [reason], context = context }
+      Ok source -> case basis.context.snapshot of
+        Just snapshot -> case recipeCriteriaFamilyProjection snapshot source basis.domain.foods budget of
+          Err reason -> RecipeUndetermined { reasons = [reason], context = context }
+          Ok projection -> recipeCriteriaRequiredFamilyProjected basis assumptions projection budget
+        _ -> RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context }
+
+recipeCriteriaRequiredFamilyProjected : (basis: RecipeCriteriaBasis) -> (assumptions: List ReifyOutcome) -> (projection: RecipeFamilyProjection) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaRequiredFamilyProjected basis assumptions projection budget =
+  recipeCriteriaFamilyProjected basis assumptions projection PantryFamily budget
+
+recipeCriteriaOnePreparationFamilyMissing : (ranks: List Nat) -> (preparation: RecipePreparation) -> RecipeConstraint
+recipeCriteriaOnePreparationFamilyMissing ranks preparation =
+  let included = filter (\food -> recipeCriteriaContains ranks food.rank) preparation.foods
+  recipeCriteriaAnd preparation.available (recipeCriteriaNot (recipeCriteriaAny (map (\food -> food.included) included)))
+
+recipeCriteriaOneOutcomeFamilyMissing : (ranks: List Nat) -> (outcome: RecipeOutcome) -> RecipeConstraint
+recipeCriteriaOneOutcomeFamilyMissing ranks outcome =
+  recipeCriteriaAnd outcome.condition (recipeCriteriaAny (map (recipeCriteriaOnePreparationFamilyMissing ranks) outcome.preparations))
+
+recipeCriteriaPreparationFamilyMissing : (analysis: RecipeExtraction) -> (ranks: List Nat) -> RecipeConstraint
+recipeCriteriaPreparationFamilyMissing analysis ranks =
+  recipeCriteriaAny (map (recipeCriteriaOneOutcomeFamilyMissing ranks) analysis.outcomes)
+
+recipeCriteriaFamilyMissing : (basis: RecipeCriteriaBasis) -> (scope: RecipeFamilyScope) -> (ranks: List Nat) -> RecipeConstraint
+recipeCriteriaFamilyMissing basis scope ranks = case scope of
+  PantryFamily -> recipeCriteriaAnd basis.success (recipeCriteriaNot (recipeCriteriaHas ranks))
+  PreparationFamily -> recipeCriteriaPreparationFamilyMissing basis.analysis ranks
+
+recipeCriteriaFamilyProjected : (basis: RecipeCriteriaBasis) -> (assumptions: List ReifyOutcome) -> (projection: RecipeFamilyProjection) -> (scope: RecipeFamilyScope) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaFamilyProjected basis assumptions projection scope budget =
+  let context = recipeCriteriaObservedContext basis assumptions projection.members [] projection.applications
+  let certain = map (\member -> member.rank) (filter (\member -> recipeCriteriaFamilyTrue member.membership) projection.members)
+  let possible = map (\member -> member.rank) (filter (\member -> recipeCriteriaFamilyPossible member.membership) projection.members)
+  case recipeCriteriaVerdict basis (recipeCriteriaFamilyMissing basis scope certain) budget of
+    RecipeConstraintEmpty -> RecipeKnown { value = true, status = SolverChecked, context = context }
+    _ -> case recipeCriteriaVerdict basis (recipeCriteriaFamilyMissing basis scope possible) budget of
+      RecipeConstraintWitness { ranks = ranks } -> RecipeKnown { value = false, status = SolverChecked, context = context }
+      RecipeConstraintUnknown { reason = reason } -> RecipeUndetermined { reasons = [reason], context = context }
+      _ -> RecipeUndetermined { reasons = [RecipeUnknownFact], context = context }
+
+recipeCriteriaFamilyFromSource : (gate: RecipeCriteriaGate) -> (source: ReifyOutcome) -> (index: Nat) -> (scope: RecipeFamilyScope) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaFamilyFromSource gate source index scope budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> NoSuccessfulOutcome { status = SolverChecked, context = context }
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> RecipeUndetermined { reasons = reasons, context = context }
+  RecipeCriteriaReady { basis = basis } ->
+    let assumptions = [source]
+    let context = recipeCriteriaObservedContext basis assumptions [] [] []
+    case recipeCriteriaSource assumptions of
+      Err reason -> RecipeUndetermined { reasons = [reason], context = context }
+      Ok package -> case basis.context.snapshot of
+        Nothing -> RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context }
+        Just snapshot -> case recipeCriteriaFamilyProjectionWithIndex snapshot package (Just index) basis.domain.foods budget of
+          Err reason -> RecipeUndetermined { reasons = [reason], context = context }
+          Ok projection -> recipeCriteriaFamilyProjected basis assumptions projection scope budget
+
+recipeCriteriaFamilyBatch : (gate: RecipeCriteriaGate) -> (subjects: List a) -> (sources: List ReifyOutcome) -> (index: Nat) -> (scope: RecipeFamilyScope) -> (budget: Nat) -> List (RecipeFamilyClaim a)
+recipeCriteriaFamilyBatch gate subjects sources index scope budget = case head subjects of
+  Nothing -> []
+  Just subject -> case head sources of
+    Nothing -> []
+    Just source -> concat [RecipeFamilyClaim { subject = subject, result = recipeCriteriaFamilyFromSource gate source index scope budget }] (recipeCriteriaFamilyBatch gate (fromMaybe [] (tail subjects)) (fromMaybe [] (tail sources)) (index + 1) scope budget)
+
+recipeCriteriaFamilyScopeValid : (scope: RecipeFamilyScope) -> Bool
+recipeCriteriaFamilyScopeValid scope = case scope of
+  PantryFamily -> true
+  PreparationFamily -> true
+  _ -> false
+
+-- Subjects label the same ordered actual function carriers acquired by the
+-- reader. Extraction is checked once; every predicate application is still
+-- independently replayed and retains its own source and missing-fact context.
+recipeCriteriaFamilies : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (subjects: List a) -> (scope: RecipeFamilyScope) -> (budget: Nat) -> List (RecipeFamilyClaim a)
+recipeCriteriaFamilies snapshot proposal subjects scope budget =
+  if not (recipeCriteriaFamilyScopeValid scope) || length subjects != length snapshot.functions then
+    map (\subject -> RecipeFamilyClaim { subject = subject, result = RecipeUndetermined { reasons = [RecipeInvalidDomain], context = recipeCriteriaContext snapshot } }) subjects
+  else recipeCriteriaFamiliesIn (recipeCriteriaPrepare snapshot proposal RcAll budget) subjects scope budget
+
+-- The gate's own snapshot supplies the ordered function carriers.
+recipeCriteriaFamiliesIn : (gate: RecipeCriteriaGate) -> (subjects: List a) -> (scope: RecipeFamilyScope) -> (budget: Nat) -> List (RecipeFamilyClaim a)
+recipeCriteriaFamiliesIn gate subjects scope budget =
+  let context = recipeCriteriaGateContext gate
+  case context.snapshot of
+    Just snapshot ->
+      if not (recipeCriteriaFamilyScopeValid scope) || length subjects != length snapshot.functions then
+        map (\subject -> RecipeFamilyClaim { subject = subject, result = RecipeUndetermined { reasons = [RecipeInvalidDomain], context = recipeCriteriaContext snapshot } }) subjects
+      else recipeCriteriaFamilyBatch gate subjects snapshot.functions 0 scope budget
+    _ -> map (\subject -> RecipeFamilyClaim { subject = subject, result = RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context } }) subjects
+
+-- One card asks both family scopes. The projection (which foods each
+-- category predicate holds for: one checked application per food) does not
+-- depend on the scope, so it is made once per category and feeds both. A
+-- certain member that is already a necessary food (pantry scope) or a
+-- guaranteed food (preparation scope) answers that scope: the missing-family
+-- set is then empty, which is what the verdict would establish.
+recipeCriteriaFamiliesSharedIn : (gate: RecipeCriteriaGate) -> (subjects: List a) -> (necessary: RecipeClaim (List Nat)) -> (guaranteed: RecipeClaim (List Nat)) -> (budget: Nat) -> RecipeFamilyScopes a
+recipeCriteriaFamiliesSharedIn gate subjects necessary guaranteed budget =
+  let context = recipeCriteriaGateContext gate
+  let pantryFoods = recipeCriteriaClaimRanks gate necessary
+  let preparationFoods = recipeCriteriaClaimRanks gate guaranteed
+  case context.snapshot of
+    Just snapshot ->
+      if length subjects != length snapshot.functions then
+        let invalid = map (\subject -> RecipeFamilyClaim { subject = subject, result = RecipeUndetermined { reasons = [RecipeInvalidDomain], context = recipeCriteriaContext snapshot } }) subjects
+        RecipeFamilyScopes { pantry = invalid, preparation = invalid }
+      else
+        -- The snapshot-only application checks (domain admission, reflection,
+        -- the evidence measure) are computed once for every category.
+        let checks = rckApplicationSnapshotChecks snapshot budget
+        recipeCriteriaFamilyBatchShared gate subjects snapshot.functions 0 pantryFoods preparationFoods checks budget
+    _ ->
+      let invalid = map (\subject -> RecipeFamilyClaim { subject = subject, result = RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context } }) subjects
+      RecipeFamilyScopes { pantry = invalid, preparation = invalid }
+
+-- Only a SolverChecked claim of this same gate (its context is the gate's own:
+-- same snapshot, same checked analysis) may answer a family requirement; any
+-- other claim answers nothing and the verdicts run as before.
+recipeCriteriaClaimRanks : (gate: RecipeCriteriaGate) -> (claim: RecipeClaim (List Nat)) -> List Nat
+recipeCriteriaClaimRanks gate claim = case gate of
+  RecipeCriteriaReady { basis = basis } -> case claim of
+    RecipeKnown { value = value, status = status, context = context } ->
+      if status == SolverChecked && context == basis.context then value else []
+    _ -> []
+  _ -> []
+
+recipeCriteriaFamilyBatchShared : (gate: RecipeCriteriaGate) -> (subjects: List a) -> (sources: List ReifyOutcome) -> (index: Nat) -> (pantryFoods: List Nat) -> (preparationFoods: List Nat) -> (checks: { measure: { ok: Bool, count: Nat, height: Nat }, evidence: Bool, admission: Result RecipeRefusal CheckedRecipeDomain, reflection: Bool }) -> (budget: Nat) -> RecipeFamilyScopes a
+recipeCriteriaFamilyBatchShared gate subjects sources index pantryFoods preparationFoods checks budget = case head subjects of
+  Nothing -> RecipeFamilyScopes { pantry = [], preparation = [] }
+  Just subject -> case head sources of
+    Nothing -> RecipeFamilyScopes { pantry = [], preparation = [] }
+    Just source ->
+      let results = recipeCriteriaFamilyFromSourceShared gate source index pantryFoods preparationFoods checks budget
+      let rest = recipeCriteriaFamilyBatchShared gate (fromMaybe [] (tail subjects)) (fromMaybe [] (tail sources)) (index + 1) pantryFoods preparationFoods checks budget
+      RecipeFamilyScopes { pantry = concat [RecipeFamilyClaim { subject = subject, result = results.pantry }] rest.pantry, preparation = concat [RecipeFamilyClaim { subject = subject, result = results.preparation }] rest.preparation }
+
+-- A card in two stages (recipes lane 2, Nov 8). The pantry-independent stage
+-- is a function of the snapshot alone: the proposal, its checked analysis and
+-- every function carrier's checked family projection (one checked
+-- application per food). A card over any pantry set is then that analysis
+-- plus the pantry-dependent verdicts, so a pantry change re-asks only the
+-- verdicts. Each stage computes exactly what recipeCriteriaPrepare and
+-- recipeCriteriaFamiliesSharedIn compute; nothing here is trusted beyond them.
+RecipeCardAnalysis = RecipeCardAnalysis snapshot: RecipeAnalysisSnapshot proposal: RecipeExtraction check: RecipeExtractionCheck projections: List (Result RecipeRefusal RecipeFamilyProjection)
+
+@label "Analyse recipe facts"
+@description "The pantry-independent part of the facts of a recipe:the checked analysis of the recipe and, for each category predicate, which foods it holds for (each one a checked application)."
+recipeCardAnalysis : (snapshot: RecipeAnalysisSnapshot) -> (budget: Nat) -> RecipeCardAnalysis
+recipeCardAnalysis snapshot budget =
+  let proposal = proposeRecipeAnalysis snapshot budget
+  -- The snapshot-only checks once, for the analysis check and every projection.
+  let checks = rckApplicationSnapshotChecks snapshot budget
+  let check = checkRecipeAnalysisChecked snapshot checks proposal budget
+  let projections = case check of
+        RecipeAnalysisChecked { domain = domain } ->
+          if budget == 0 then [] else recipeCardProjections snapshot checks snapshot.functions 0 domain.foods budget
+        _ -> []
+  RecipeCardAnalysis { snapshot = snapshot, proposal = proposal, check = check, projections = projections }
+
+-- One projection per function carrier, in order: the family rows' own
+-- recipeCriteriaSource then recipeCriteriaFamilyProjectionChecked.
+recipeCardProjections : (snapshot: RecipeAnalysisSnapshot) -> (checks: { measure: { ok: Bool, count: Nat, height: Nat }, evidence: Bool, admission: Result RecipeRefusal CheckedRecipeDomain, reflection: Bool }) -> (sources: List ReifyOutcome) -> (index: Nat) -> (foods: List RecipeFoodRank) -> (budget: Nat) -> List (Result RecipeRefusal RecipeFamilyProjection)
+recipeCardProjections snapshot checks sources index foods budget = case head sources of
+  Nothing -> []
+  Just source ->
+    let projection = case recipeCriteriaSource [source] of
+          Err reason -> Err reason
+          Ok package -> recipeCriteriaFamilyProjectionChecked snapshot checks package index foods budget
+    concat [projection] (recipeCardProjections snapshot checks (fromMaybe [] (tail sources)) (index + 1) foods budget)
+
+@label "Recipe facts gate"
+@description "The checked gate of a facts analysis over a pantry set (recipeCriteriaPrepare without a second analysis check)."
+recipeCriteriaPrepareFromAnalysis : (analysis: RecipeCardAnalysis) -> (pantries: RecipeConstraint) -> (budget: Nat) -> RecipeCriteriaGate
+recipeCriteriaPrepareFromAnalysis analysis pantries budget = recipeCriteriaPrepareChecked analysis.snapshot analysis.check pantries budget
+
+-- recipeCriteriaFamiliesSharedIn with each category's projection read from
+-- the card analysis of the same snapshot (any other analysis: InvalidDomain).
+@label "Recipe facts family rows"
+@description "Both family rows of the facts of a recipe from their analysis's projections: the pantry-dependent verdicts only."
+recipeCriteriaFamiliesFromAnalysis : (gate: RecipeCriteriaGate) -> (analysis: RecipeCardAnalysis) -> (subjects: List a) -> (necessary: RecipeClaim (List Nat)) -> (guaranteed: RecipeClaim (List Nat)) -> (budget: Nat) -> RecipeFamilyScopes a
+recipeCriteriaFamiliesFromAnalysis gate analysis subjects necessary guaranteed budget =
+  let context = recipeCriteriaGateContext gate
+  let pantryFoods = recipeCriteriaClaimRanks gate necessary
+  let preparationFoods = recipeCriteriaClaimRanks gate guaranteed
+  case context.snapshot of
+    Just snapshot ->
+      if length subjects != length snapshot.functions then
+        let invalid = map (\subject -> RecipeFamilyClaim { subject = subject, result = RecipeUndetermined { reasons = [RecipeInvalidDomain], context = recipeCriteriaContext snapshot } }) subjects
+        RecipeFamilyScopes { pantry = invalid, preparation = invalid }
+      else if not (analysis.snapshot == snapshot) || length analysis.projections != length snapshot.functions then
+        let foreign = map (\subject -> RecipeFamilyClaim { subject = subject, result = RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context } }) subjects
+        RecipeFamilyScopes { pantry = foreign, preparation = foreign }
+      else recipeCriteriaFamilyBatchProjected gate subjects snapshot.functions analysis.projections pantryFoods preparationFoods budget
+    _ ->
+      let invalid = map (\subject -> RecipeFamilyClaim { subject = subject, result = RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context } }) subjects
+      RecipeFamilyScopes { pantry = invalid, preparation = invalid }
+
+recipeCriteriaFamilyBatchProjected : (gate: RecipeCriteriaGate) -> (subjects: List a) -> (sources: List ReifyOutcome) -> (projections: List (Result RecipeRefusal RecipeFamilyProjection)) -> (pantryFoods: List Nat) -> (preparationFoods: List Nat) -> (budget: Nat) -> RecipeFamilyScopes a
+recipeCriteriaFamilyBatchProjected gate subjects sources projections pantryFoods preparationFoods budget = case head subjects of
+  Nothing -> RecipeFamilyScopes { pantry = [], preparation = [] }
+  Just subject -> case head sources of
+    Nothing -> RecipeFamilyScopes { pantry = [], preparation = [] }
+    Just source -> case head projections of
+      Nothing -> RecipeFamilyScopes { pantry = [], preparation = [] }
+      Just projected ->
+        let results = recipeCriteriaFamilyFromProjection gate source projected pantryFoods preparationFoods budget
+        let rest = recipeCriteriaFamilyBatchProjected gate (fromMaybe [] (tail subjects)) (fromMaybe [] (tail sources)) (fromMaybe [] (tail projections)) pantryFoods preparationFoods budget
+        RecipeFamilyScopes { pantry = concat [RecipeFamilyClaim { subject = subject, result = results.pantry }] rest.pantry, preparation = concat [RecipeFamilyClaim { subject = subject, result = results.preparation }] rest.preparation }
+
+-- recipeCriteriaFamilyFromSourceShared with the projection already computed
+-- (by recipeCardProjections, for this source of the same snapshot).
+recipeCriteriaFamilyFromProjection : (gate: RecipeCriteriaGate) -> (source: ReifyOutcome) -> (projected: Result RecipeRefusal RecipeFamilyProjection) -> (pantryFoods: List Nat) -> (preparationFoods: List Nat) -> (budget: Nat) -> RecipeFamilyResults
+recipeCriteriaFamilyFromProjection gate source projected pantryFoods preparationFoods budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> recipeCriteriaFamilyBoth (NoSuccessfulOutcome { status = SolverChecked, context = context })
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> recipeCriteriaFamilyBoth (RecipeUndetermined { reasons = reasons, context = context })
+  RecipeCriteriaReady { basis = basis } ->
+    let assumptions = [source]
+    let context = recipeCriteriaObservedContext basis assumptions [] [] []
+    case basis.context.snapshot of
+      Nothing -> recipeCriteriaFamilyBoth (RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context })
+      Just snapshot -> case projected of
+        Err reason -> recipeCriteriaFamilyBoth (RecipeUndetermined { reasons = [reason], context = context })
+        Ok projection ->
+          let pantry = recipeCriteriaFamilyProjectedKnown basis assumptions projection PantryFamily pantryFoods budget
+          let preparation = recipeCriteriaFamilyProjectedKnown basis assumptions projection PreparationFamily preparationFoods budget
+          RecipeFamilyResults { pantry = pantry, preparation = preparation }
+  _ -> recipeCriteriaFamilyBoth (RecipeUndetermined { reasons = [RecipeInvalidDomain], context = recipeCriteriaGateContext gate })
+
+recipeCriteriaFamilyBoth : (result: RecipeClaim Bool) -> RecipeFamilyResults
+recipeCriteriaFamilyBoth result = RecipeFamilyResults { pantry = result, preparation = result }
+
+recipeCriteriaFamilyFromSourceShared : (gate: RecipeCriteriaGate) -> (source: ReifyOutcome) -> (index: Nat) -> (pantryFoods: List Nat) -> (preparationFoods: List Nat) -> (checks: { measure: { ok: Bool, count: Nat, height: Nat }, evidence: Bool, admission: Result RecipeRefusal CheckedRecipeDomain, reflection: Bool }) -> (budget: Nat) -> RecipeFamilyResults
+recipeCriteriaFamilyFromSourceShared gate source index pantryFoods preparationFoods checks budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> recipeCriteriaFamilyBoth (NoSuccessfulOutcome { status = SolverChecked, context = context })
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> recipeCriteriaFamilyBoth (RecipeUndetermined { reasons = reasons, context = context })
+  RecipeCriteriaReady { basis = basis } ->
+    let assumptions = [source]
+    let context = recipeCriteriaObservedContext basis assumptions [] [] []
+    case recipeCriteriaSource assumptions of
+      Err reason -> recipeCriteriaFamilyBoth (RecipeUndetermined { reasons = [reason], context = context })
+      Ok package -> case basis.context.snapshot of
+        Nothing -> recipeCriteriaFamilyBoth (RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context })
+        Just snapshot -> case recipeCriteriaFamilyProjectionChecked snapshot checks package index basis.domain.foods budget of
+          Err reason -> recipeCriteriaFamilyBoth (RecipeUndetermined { reasons = [reason], context = context })
+          Ok projection ->
+            let pantry = recipeCriteriaFamilyProjectedKnown basis assumptions projection PantryFamily pantryFoods budget
+            let preparation = recipeCriteriaFamilyProjectedKnown basis assumptions projection PreparationFamily preparationFoods budget
+            RecipeFamilyResults { pantry = pantry, preparation = preparation }
+  _ -> recipeCriteriaFamilyBoth (RecipeUndetermined { reasons = [RecipeInvalidDomain], context = recipeCriteriaGateContext gate })
+
+recipeCriteriaFamilyProjectedKnown : (basis: RecipeCriteriaBasis) -> (assumptions: List ReifyOutcome) -> (projection: RecipeFamilyProjection) -> (scope: RecipeFamilyScope) -> (known: List Nat) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaFamilyProjectedKnown basis assumptions projection scope known budget =
+  let certain = map (\member -> member.rank) (filter (\member -> recipeCriteriaFamilyTrue member.membership) projection.members)
+  if std.some certain (\rank -> recipeCriteriaContains known rank) then
+    RecipeKnown { value = true, status = SolverChecked, context = recipeCriteriaObservedContext basis assumptions projection.members [] projection.applications }
+  else recipeCriteriaFamilyProjected basis assumptions projection scope budget
+
+recipeCriteriaThresholdBlocked : (reasons: List RecipeRefusal) -> (context: RecipeClaimContext) -> RecipeThresholdClaim
+recipeCriteriaThresholdBlocked reasons context =
+  let result = RecipeUndetermined { reasons = reasons, context = context }
+  RecipeThresholdClaim { implication = result, sufficiency = result, exactness = result }
+
+recipeCriteriaDistinct : (ranks: List Nat) -> List Nat
+recipeCriteriaDistinct ranks = case head ranks of
+  Nothing -> []
+  Just rank -> concat [rank] (recipeCriteriaDistinct (filter (\candidate -> candidate != rank) (fromMaybe [] (tail ranks))))
+
+recipeCriteriaKOfN : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (ranks: List Nat) -> (threshold: Nat) -> (budget: Nat) -> RecipeThresholdClaim
+recipeCriteriaKOfN snapshot proposal ranks threshold budget = recipeCriteriaKOfNIn (recipeCriteriaPrepare snapshot proposal RcAll budget) ranks threshold budget
+
+recipeCriteriaKOfNIn : (gate: RecipeCriteriaGate) -> (ranks: List Nat) -> (threshold: Nat) -> (budget: Nat) -> RecipeThresholdClaim
+recipeCriteriaKOfNIn gate ranks threshold budget = case gate of
+  RecipeCriteriaImpossible { context = context } ->
+    let result = NoSuccessfulOutcome { status = SolverChecked, context = context }
+    RecipeThresholdClaim { implication = result, sufficiency = result, exactness = result }
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> recipeCriteriaThresholdBlocked reasons context
+  RecipeCriteriaReady { basis = basis } ->
+    let selected = recipeCriteriaDistinct ranks
+    if not (recipeCriteriaQueryRanksValid basis.domain selected) then recipeCriteriaThresholdBlocked [RecipeInvalidDomain] basis.context
+    else
+      let requirement = if threshold > length selected then RcNone else RcCardinality { ranks = selected, lower = threshold, upper = length selected }
+      let implicationBad = recipeCriteriaAnd basis.success (recipeCriteriaNot requirement)
+      let sufficiencyBad = recipeCriteriaAnd requirement (recipeCriteriaNot basis.success)
+      RecipeThresholdClaim { implication = recipeCriteriaBool basis implicationBad budget, sufficiency = recipeCriteriaBool basis sufficiencyBad budget, exactness = recipeCriteriaBool basis (recipeCriteriaOr implicationBad sufficiencyBad) budget }
+
+recipeCriteriaQueryRanksValid : (domain: CheckedRecipeDomain) -> (ranks: List Nat) -> Bool
+recipeCriteriaQueryRanksValid domain ranks = all ranks (\rank -> std.some domain.foods (\food -> food.rank == rank) && length (filter (\candidate -> candidate == rank) ranks) == 1)
+
+-- Concrete constraint evaluation is used only to decode/recheck a single
+-- judgment-supplied witness, never to search or to establish a universal.
+recipeCriteriaValue : (constraint: RecipeConstraint) -> (ranks: List Nat) -> Maybe Bool
+recipeCriteriaValue constraint ranks = case constraint of
+  RcAll -> Just true
+  RcNone -> Just false
+  RcHasFood { rank = rank } -> Just (recipeCriteriaContains ranks rank)
+  RcAnd { terms = terms } -> recipeCriteriaValues terms ranks true
+  RcOr { terms = terms } -> recipeCriteriaValues terms ranks false
+  RcNot { inner = inner } -> case recipeCriteriaValue inner ranks of
+    Nothing -> Nothing
+    Just value -> Just (not value)
+  RcCardinality { ranks = selected, lower = lower, upper = upper } ->
+    let count = length (filter (\rank -> recipeCriteriaContains ranks rank) selected)
+    Just (count >= lower && count <= upper)
+  RcUnknown { identity = identity, reason = reason } -> Nothing
+
+recipeCriteriaValues : (terms: List RecipeConstraint) -> (ranks: List Nat) -> (conjunction: Bool) -> Maybe Bool
+recipeCriteriaValues terms ranks conjunction = case head terms of
+  Nothing -> Just conjunction
+  Just term -> case recipeCriteriaValue term ranks of
+    Just value -> if value != conjunction then Just value else recipeCriteriaValues (fromMaybe [] (tail terms)) ranks conjunction
+    Nothing -> case recipeCriteriaValues (fromMaybe [] (tail terms)) ranks conjunction of
+      Just rest -> if rest != conjunction then Just rest else Nothing
+      Nothing -> Nothing
+
+recipeCriteriaSelected : (foods: List RecipeFoodSelection) -> (pantry: List Nat) -> Result RecipeRefusal (List Nat)
+recipeCriteriaSelected foods pantry = case head foods of
+  Nothing -> Ok []
+  Just food -> case recipeCriteriaValue food.included pantry of
+    Nothing -> Err RecipeUnknownFact
+    Just included -> case recipeCriteriaSelected (fromMaybe [] (tail foods)) pantry of
+      Err reason -> Err reason
+      Ok rest -> Ok (if included then concat [food.rank] rest else rest)
+
+recipeCriteriaAt : (row: List RecipeConstraint) -> (index: Nat) -> RecipeConstraint
+recipeCriteriaAt row index = case head row of
+  Nothing -> RcNone
+  Just first -> if index == 0 then first else recipeCriteriaAt (fromMaybe [] (tail row)) (index - 1)
+
+recipeCriteriaCountRow : (row: List RecipeConstraint) -> (included: RecipeConstraint) -> (index: Nat) -> List RecipeConstraint
+recipeCriteriaCountRow row included index =
+  if index > length row then []
+  else
+    let without = recipeCriteriaAnd (recipeCriteriaAt row index) (recipeCriteriaNot included)
+    let withFood = if index == 0 then RcNone else recipeCriteriaAnd (recipeCriteriaAt row (index - 1)) included
+    concat [recipeCriteriaOr without withFood] (recipeCriteriaCountRow row included (index + 1))
+
+recipeCriteriaCountRows : (foods: List RecipeFoodSelection) -> (row: List RecipeConstraint) -> List RecipeConstraint
+recipeCriteriaCountRows foods row = case head foods of
+  Nothing -> row
+  Just food -> recipeCriteriaCountRows (fromMaybe [] (tail foods)) (recipeCriteriaCountRow row food.included 0)
+
+recipeCriteriaCount : (foods: List RecipeFoodSelection) -> (count: Nat) -> RecipeConstraint
+recipeCriteriaCount foods count =
+  let allIncluded = \food ->
+    case food.included of
+      RcAll -> true
+      _ -> false
+  let hasFoodMembership = \food ->
+    case food.included of
+      RcHasFood { rank = rank } -> rank == food.rank
+      _ -> false
+  if all foods allIncluded then if count == length foods then RcAll else RcNone
+  else if all foods hasFoodMembership then RcCardinality { ranks = map (\food -> food.rank) foods, lower = count, upper = count }
+  else recipeCriteriaAt (recipeCriteriaCountRows foods [RcAll]) count
+
+recipeCriteriaSize : (analysis: RecipeExtraction) -> (count: Nat) -> RecipeConstraint
+recipeCriteriaSize analysis count = recipeCriteriaAny (flatMap (\outcome -> map (\preparation -> recipeCriteriaAnd outcome.condition (recipeCriteriaAnd preparation.available (recipeCriteriaCount preparation.foods count))) outcome.preparations) analysis.outcomes)
+
+recipeCriteriaIncreasing : (ranks: List Nat) -> Bool
+recipeCriteriaIncreasing ranks = case head ranks of
+  Nothing -> true
+  Just first -> case head (fromMaybe [] (tail ranks)) of
+    Nothing -> true
+    Just second -> first < second && recipeCriteriaIncreasing (fromMaybe [] (tail ranks))
+
+recipeCriteriaWitnessPreparation : (basis: RecipeCriteriaBasis) -> (pantry: List Nat) -> (count: Nat) -> Result RecipeRefusal (List Nat)
+recipeCriteriaWitnessPreparation basis pantry count = recipeCriteriaWitnessOutcomes basis.domain basis.analysis.outcomes pantry count
+
+recipeCriteriaWitnessOutcomes : (domain: CheckedRecipeDomain) -> (outcomes: List RecipeOutcome) -> (pantry: List Nat) -> (count: Nat) -> Result RecipeRefusal (List Nat)
+recipeCriteriaWitnessOutcomes domain outcomes pantry count = case head outcomes of
+  Nothing -> Err RecipeInvalidPreparation
+  Just outcome -> case recipeCriteriaValue outcome.condition pantry of
+    Just true -> case recipeCriteriaWitnessPreparations domain outcome.preparations pantry count of
+      Ok foods -> Ok foods
+      Err reason -> recipeCriteriaWitnessOutcomes domain (fromMaybe [] (tail outcomes)) pantry count
+    _ -> recipeCriteriaWitnessOutcomes domain (fromMaybe [] (tail outcomes)) pantry count
+
+recipeCriteriaWitnessPreparations : (domain: CheckedRecipeDomain) -> (preparations: List RecipePreparation) -> (pantry: List Nat) -> (count: Nat) -> Result RecipeRefusal (List Nat)
+recipeCriteriaWitnessPreparations domain preparations pantry count = case head preparations of
+  Nothing -> Err RecipeInvalidPreparation
+  Just preparation -> case recipeCriteriaValue preparation.available pantry of
+    Just true -> case recipeCriteriaSelected preparation.foods pantry of
+      Ok foods -> if length foods == count && count > 0 && recipeCriteriaQueryRanksValid domain foods && recipeCriteriaIncreasing foods then Ok foods else recipeCriteriaWitnessPreparations domain (fromMaybe [] (tail preparations)) pantry count
+      Err reason -> recipeCriteriaWitnessPreparations domain (fromMaybe [] (tail preparations)) pantry count
+    _ -> recipeCriteriaWitnessPreparations domain (fromMaybe [] (tail preparations)) pantry count
+
+recipeCriteriaCountScan : (basis: RecipeCriteriaBasis) -> (count: Nat) -> (limit: Nat) -> (budget: Nat) -> Result RecipeRefusal (List RecipeCountWitness)
+recipeCriteriaCountScan basis count limit budget =
+  if count > limit then Ok []
+  else case recipeCriteriaVerdict basis (recipeCriteriaSize basis.analysis count) budget of
+    RecipeConstraintUnknown { reason = reason } -> Err reason
+    RecipeConstraintEmpty -> recipeCriteriaCountScan basis (count + 1) limit budget
+    RecipeConstraintWitness { ranks = pantry } -> case recipeCriteriaWitnessPreparation basis pantry count of
+      Err reason -> Err reason
+      Ok foods -> case recipeCriteriaCountScan basis (count + 1) limit budget of
+        Err reason -> Err reason
+        Ok rest -> Ok (concat [RecipeCountWitness { count = count, pantry = pantry, preparation = foods }] rest)
+
+recipeCriteriaLast : (items: List a) -> Maybe a
+recipeCriteriaLast items = case head items of
+  Nothing -> Nothing
+  Just first -> if length items == 1 then Just first else recipeCriteriaLast (fromMaybe [] (tail items))
+
+recipeCriteriaCountRange : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (budget: Nat) -> RecipeClaim (RecipeCountRange Nat)
+recipeCriteriaCountRange snapshot proposal budget = recipeCriteriaCountRangeIn (recipeCriteriaPrepare snapshot proposal RcAll budget) budget
+
+recipeCriteriaCountRangeIn : (gate: RecipeCriteriaGate) -> (budget: Nat) -> RecipeClaim (RecipeCountRange Nat)
+recipeCriteriaCountRangeIn gate budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> NoSuccessfulOutcome { status = SolverChecked, context = context }
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> RecipeUndetermined { reasons = reasons, context = context }
+  RecipeCriteriaReady { basis = basis } ->
+    -- General Boolean DP is bounded here; membership-only selections take
+    -- the cardinality language path. The bounded launch domain has 9 foods.
+    if length basis.domain.foods > 12 then RecipeUndetermined { reasons = [RecipeBudgetExhausted], context = basis.context }
+    else case recipeCriteriaCountScan basis 1 (length basis.domain.foods) budget of
+      Err reason -> RecipeUndetermined { reasons = [reason], context = basis.context }
+      Ok witnesses -> case head witnesses of
+        Nothing -> RecipeUndetermined { reasons = [RecipeInvalidPreparation], context = basis.context }
+        Just low -> case recipeCriteriaLast witnesses of
+          Nothing -> RecipeUndetermined { reasons = [RecipeInvalidPreparation], context = basis.context }
+          Just high -> RecipeKnown { value = RecipeCountRange { minimum = low.count, maximum = high.count, minimumPantry = low.pantry, minimumPreparation = low.preparation, maximumPantry = high.pantry, maximumPreparation = high.preparation }, status = SolverChecked, context = basis.context }
+
+-- Substitution is an exact Boolean cofactor over canonical pantry sets.
+-- The original constraints are checked before this transformation is used.
+recipeCriteriaToggle : (constraint: RecipeConstraint) -> (rank: Nat) -> (present: Bool) -> RecipeConstraint
+recipeCriteriaToggle constraint rank present = case constraint of
+  RcAll -> RcAll
+  RcNone -> RcNone
+  RcHasFood { rank = selected } ->
+    if selected == rank then
+      if present then RcAll else RcNone
+    else constraint
+  RcAnd { terms = terms } -> fold recipeCriteriaAnd RcAll (map (\term -> recipeCriteriaToggle term rank present) terms)
+  RcOr { terms = terms } -> recipeCriteriaAny (map (\term -> recipeCriteriaToggle term rank present) terms)
+  RcNot { inner = inner } -> recipeCriteriaNot (recipeCriteriaToggle inner rank present)
+  RcUnknown { identity = identity, reason = reason } -> constraint
+  RcCardinality { ranks = ranks, lower = lower, upper = upper } ->
+    if not (recipeCriteriaContains ranks rank) then constraint
+    else
+      let rest = filter (\candidate -> candidate != rank) ranks
+      if present && upper == 0 then RcNone
+      else
+        let lo = if present && lower > 0 then lower - 1 else lower
+        let hi = if present then upper - 1 else upper
+        if lo > length rest || lo > hi then RcNone else RcCardinality { ranks = rest, lower = lo, upper = hi }
+
+recipeCriteriaUnknownConstraint : (constraint: RecipeConstraint) -> Bool
+recipeCriteriaUnknownConstraint constraint = case constraint of
+  RcUnknown { identity = identity, reason = reason } -> true
+  RcAnd { terms = terms } -> std.some terms recipeCriteriaUnknownConstraint
+  RcOr { terms = terms } -> std.some terms recipeCriteriaUnknownConstraint
+  RcNot { inner = inner } -> recipeCriteriaUnknownConstraint inner
+  _ -> false
+
+recipeCriteriaOccurs : (analysis: RecipeExtraction) -> (rank: Nat) -> RecipeConstraint
+recipeCriteriaOccurs analysis rank = recipeCriteriaAny (flatMap (\outcome -> map (\preparation -> recipeCriteriaAnd outcome.condition (recipeCriteriaAnd preparation.available (recipeCriteriaPreparationHas preparation rank))) outcome.preparations) analysis.outcomes)
+
+recipeCriteriaStrictlyOptional : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (rank: Nat) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaStrictlyOptional snapshot proposal rank budget = recipeCriteriaStrictlyOptionalIn (recipeCriteriaPrepare snapshot proposal RcAll budget) rank budget
+
+-- Whether a constraint's syntax refers to a food. Unknown shapes count as
+-- referring to it, so the caller abstains.
+recipeCriteriaMentions : (constraint: RecipeConstraint) -> (rank: Nat) -> Bool
+recipeCriteriaMentions constraint rank = case constraint of
+  RcAll -> false
+  RcNone -> false
+  RcHasFood { rank = selected } -> selected == rank
+  RcAnd { terms = terms } -> std.some terms (\term -> recipeCriteriaMentions term rank)
+  RcOr { terms = terms } -> std.some terms (\term -> recipeCriteriaMentions term rank)
+  RcNot { inner = inner } -> recipeCriteriaMentions inner rank
+  _ -> true
+
+-- Over a pantry set S, a food is strictly optional when toggling it inside S
+-- never changes success and it occurs in some successful preparation of S.
+-- Reading for a set: when no pantry of S contains the food, no pantry of S
+-- can gain or lose it, so it is not strictly optional (false). When S itself
+-- refers to the food, toggling can leave S: abstain (Rule C). Otherwise S is
+-- closed under toggling the food and the check below, restricted to S, holds.
+recipeCriteriaStrictlyOptionalIn : (gate: RecipeCriteriaGate) -> (rank: Nat) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaStrictlyOptionalIn gate rank budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> NoSuccessfulOutcome { status = SolverChecked, context = context }
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> RecipeUndetermined { reasons = reasons, context = context }
+  RecipeCriteriaReady { basis = basis } ->
+    if not (recipeCriteriaQueryRanksValid basis.domain [rank]) then RecipeUndetermined { reasons = [RecipeInvalidDomain], context = basis.context }
+    else if recipeCriteriaUnknownConstraint basis.success then RecipeUndetermined { reasons = [RecipeUnsupported], context = basis.context }
+    else case recipeCriteriaVerdict basis (RcHasFood { rank = rank }) budget of
+      RecipeConstraintEmpty -> RecipeKnown { value = false, status = SolverChecked, context = basis.context }
+      RecipeConstraintUnknown { reason = reason } -> RecipeUndetermined { reasons = [reason], context = basis.context }
+      _ ->
+        if recipeCriteriaMentions basis.pantries rank then RecipeUndetermined { reasons = [RecipeUnsupported], context = basis.context }
+        else recipeCriteriaStrictlyOptionalToggled basis rank budget
+
+recipeCriteriaStrictlyOptionalToggled : (basis: RecipeCriteriaBasis) -> (rank: Nat) -> (budget: Nat) -> RecipeClaim Bool
+recipeCriteriaStrictlyOptionalToggled basis rank budget =
+  let without = recipeCriteriaToggle basis.success rank false
+  let withFood = recipeCriteriaToggle basis.success rank true
+  let changed = recipeCriteriaOr (recipeCriteriaAnd without (recipeCriteriaNot withFood)) (recipeCriteriaAnd withFood (recipeCriteriaNot without))
+  case recipeCriteriaVerdict basis changed budget of
+    RecipeConstraintWitness { ranks = ranks } -> RecipeKnown { value = false, status = SolverChecked, context = basis.context }
+    RecipeConstraintUnknown { reason = reason } -> RecipeUndetermined { reasons = [reason], context = basis.context }
+    RecipeConstraintEmpty -> case recipeCriteriaVerdict basis (recipeCriteriaOccurs basis.analysis rank) budget of
+      RecipeConstraintEmpty -> RecipeKnown { value = false, status = SolverChecked, context = basis.context }
+      RecipeConstraintWitness { ranks = ranks } -> RecipeKnown { value = true, status = SolverChecked, context = basis.context }
+      RecipeConstraintUnknown { reason = reason } -> RecipeUndetermined { reasons = [reason], context = basis.context }
+
+recipeCriteriaAlternatives : (basis: RecipeCriteriaBasis) -> (outcomes: List RecipeOutcome) -> (budget: Nat) -> Result RecipeRefusal (List (RecipeAlternative Nat))
+recipeCriteriaAlternatives basis outcomes budget = case head outcomes of
+  Nothing -> Ok []
+  Just outcome -> case recipeCriteriaAlternativePreparations basis outcome.condition outcome.preparations budget of
+    Err reason -> Err reason
+    Ok first -> case recipeCriteriaAlternatives basis (fromMaybe [] (tail outcomes)) budget of
+      Err reason -> Err reason
+      Ok rest -> Ok (concat first rest)
+
+recipeCriteriaAlternativePreparations : (basis: RecipeCriteriaBasis) -> (condition: RecipeConstraint) -> (preparations: List RecipePreparation) -> (budget: Nat) -> Result RecipeRefusal (List (RecipeAlternative Nat))
+recipeCriteriaAlternativePreparations basis condition preparations budget = case head preparations of
+  Nothing -> Ok []
+  Just preparation ->
+    let path = recipeCriteriaAnd condition preparation.available
+    case recipeCriteriaVerdict basis path budget of
+      RecipeConstraintUnknown { reason = reason } -> Err reason
+      RecipeConstraintEmpty -> recipeCriteriaAlternativePreparations basis condition (fromMaybe [] (tail preparations)) budget
+      RecipeConstraintWitness { ranks = pantry } -> case recipeCriteriaSelected preparation.foods pantry of
+        Err reason -> Err reason
+        Ok foods ->
+          if length foods == 0 || not (recipeCriteriaQueryRanksValid basis.domain foods && recipeCriteriaIncreasing foods) then Err RecipeInvalidPreparation
+          else case recipeCriteriaAlternativePreparations basis condition (fromMaybe [] (tail preparations)) budget of
+            Err reason -> Err reason
+            Ok rest -> Ok (concat [RecipeAlternative { condition = path, foods = map (\food -> RecipeAlternativeFood { food = food.rank, included = food.included }) preparation.foods, witnessPantry = pantry, witnessPreparation = foods }] rest)
+
+recipeCriteriaSubstitutes : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (budget: Nat) -> RecipeClaim (List (RecipeAlternative Nat))
+recipeCriteriaSubstitutes snapshot proposal budget = recipeCriteriaSubstitutesIn (recipeCriteriaPrepare snapshot proposal RcAll budget) budget
+
+-- Witnesses come from the set-restricted verdict, so they lie in the set; the
+-- reported condition stays the recipe's own path, without the set's literals.
+recipeCriteriaSubstitutesIn : (gate: RecipeCriteriaGate) -> (budget: Nat) -> RecipeClaim (List (RecipeAlternative Nat))
+recipeCriteriaSubstitutesIn gate budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> NoSuccessfulOutcome { status = SolverChecked, context = context }
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> RecipeUndetermined { reasons = reasons, context = context }
+  RecipeCriteriaReady { basis = basis } -> case recipeCriteriaAlternatives basis basis.analysis.outcomes budget of
+    Err reason -> RecipeUndetermined { reasons = [reason], context = basis.context }
+    Ok alternatives -> RecipeKnown { value = alternatives, status = SolverChecked, context = basis.context }
+
+recipeCriteriaDistanceRowsValid : (domain: CheckedRecipeDomain) -> (distances: List RecipeFoodDistance) -> Bool
+recipeCriteriaDistanceRowsValid domain distances = all distances (\row -> row.left < row.right && recipeCriteriaQueryRanksValid domain [row.left, row.right] && length (filter (\other -> other.left == row.left && other.right == row.right) distances) == 1)
+
+recipeCriteriaMaybeNumber : (value: Maybe RecipeSymbolicValue) -> Result RecipeRefusal (Maybe Number)
+recipeCriteriaMaybeNumber value = case value of
+  Nothing -> Ok Nothing
+  Just symbolic -> case symbolic of
+    RvLiteral { value = literal } -> if isNumber literal && numberIsFinite literal && literal >= 0 then Ok (Just literal) else Err RecipeInvalidDomain
+    _ -> Err RecipeUnsupported
+
+recipeCriteriaDistancePairs : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (left: RecipeFoodRank) -> (rights: List RecipeFoodRank) -> (budget: Nat) -> Result RecipeRefusal RecipeDistanceProjection
+recipeCriteriaDistancePairs snapshot source left rights budget = case head rights of
+  Nothing -> Ok (RecipeDistanceProjection { distances = [], applications = [] })
+  Just right -> case recipeCriteriaApply snapshot source [RvFood { rank = left.rank }, RvFood { rank = right.rank }] budget of
+    Err reason -> Err reason
+    Ok application -> case recipeDecodeApplicationMaybe snapshot application.result of
+      Err reason -> Err reason
+      Ok observed -> case recipeCriteriaMaybeNumber observed of
+        Err reason -> Err reason
+        Ok distance -> case recipeCriteriaDistancePairs snapshot source left (fromMaybe [] (tail rights)) budget of
+          Err reason -> Err reason
+          Ok rest -> Ok (RecipeDistanceProjection { distances = concat [RecipeFoodDistance { left = left.rank, right = right.rank, distance = distance }] rest.distances, applications = concat [application.proposal] rest.applications })
+
+recipeCriteriaDistanceProjection : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (foods: List RecipeFoodRank) -> (budget: Nat) -> Result RecipeRefusal RecipeDistanceProjection
+recipeCriteriaDistanceProjection snapshot source foods budget = case head foods of
+  Nothing -> Ok (RecipeDistanceProjection { distances = [], applications = [] })
+  Just left -> case recipeCriteriaDistancePairs snapshot source left (fromMaybe [] (tail foods)) budget of
+    Err reason -> Err reason
+    Ok first -> case recipeCriteriaDistanceProjection snapshot source (fromMaybe [] (tail foods)) budget of
+      Err reason -> Err reason
+      Ok rest -> Ok (RecipeDistanceProjection { distances = concat first.distances rest.distances, applications = concat first.applications rest.applications })
+
+recipeCriteriaDistance : (distances: List RecipeFoodDistance) -> (left: Nat) -> (right: Nat) -> Result RecipeRefusal Number
+recipeCriteriaDistance distances left right = case find (\row -> row.left == left && row.right == right) distances of
+  Nothing -> Err RecipeUnknownFact
+  Just row -> case row.distance of
+    Nothing -> Err RecipeUnknownFact
+    Just distance -> if numberIsFinite distance && distance >= 0 then Ok distance else Err RecipeInvalidDomain
+
+recipeCriteriaPairSum : (distances: List RecipeFoodDistance) -> (left: Nat) -> (others: List Nat) -> Result RecipeRefusal Number
+recipeCriteriaPairSum distances left others = case head others of
+  Nothing -> Ok 0
+  Just right -> case recipeCriteriaDistance distances left right of
+    Err reason -> Err reason
+    Ok distance -> case recipeCriteriaPairSum distances left (fromMaybe [] (tail others)) of
+      Err reason -> Err reason
+      Ok rest -> Ok (distance + rest)
+
+recipeCriteriaSpreadSum : (distances: List RecipeFoodDistance) -> (foods: List Nat) -> Result RecipeRefusal Number
+recipeCriteriaSpreadSum distances foods = case head foods of
+  Nothing -> Ok 0
+  Just first -> case recipeCriteriaPairSum distances first (fromMaybe [] (tail foods)) of
+    Err reason -> Err reason
+    Ok score -> case recipeCriteriaSpreadSum distances (fromMaybe [] (tail foods)) of
+      Err reason -> Err reason
+      Ok rest -> Ok (score + rest)
+
+recipeCriteriaFixedFoods : (basis: RecipeCriteriaBasis) -> (condition: RecipeConstraint) -> (foods: List RecipeFoodSelection) -> (budget: Nat) -> Result RecipeRefusal (List Nat)
+recipeCriteriaFixedFoods basis condition foods budget = case head foods of
+  Nothing -> Ok []
+  Just food ->
+    case recipeCriteriaVerdict basis (recipeCriteriaAnd condition (recipeCriteriaNot food.included)) budget of
+      RecipeConstraintEmpty -> case recipeCriteriaFixedFoods basis condition (fromMaybe [] (tail foods)) budget of
+        Err reason -> Err reason
+        Ok rest -> Ok (concat [food.rank] rest)
+      _ -> case recipeCriteriaVerdict basis (recipeCriteriaAnd condition food.included) budget of
+        RecipeConstraintEmpty -> recipeCriteriaFixedFoods basis condition (fromMaybe [] (tail foods)) budget
+        RecipeConstraintUnknown { reason = reason } -> Err reason
+        _ -> Err RecipeUnsupported
+
+recipeCriteriaSpreadPreparations : (basis: RecipeCriteriaBasis) -> (condition: RecipeConstraint) -> (preparations: List RecipePreparation) -> (distances: List RecipeFoodDistance) -> (budget: Nat) -> Result RecipeRefusal (List RecipeSpreadWitness)
+recipeCriteriaSpreadPreparations basis condition preparations distances budget = case head preparations of
+  Nothing -> Ok []
+  Just preparation ->
+    let path = recipeCriteriaAnd condition preparation.available
+    case recipeCriteriaVerdict basis path budget of
+      RecipeConstraintEmpty -> recipeCriteriaSpreadPreparations basis condition (fromMaybe [] (tail preparations)) distances budget
+      RecipeConstraintUnknown { reason = reason } -> Err reason
+      RecipeConstraintWitness { ranks = pantry } -> case recipeCriteriaFixedFoods basis path preparation.foods budget of
+        Err reason -> Err reason
+        Ok foods -> case recipeCriteriaSpreadSum distances foods of
+          Err reason -> Err reason
+          Ok total ->
+            let count = length foods
+            let score = if count < 2 then 0 else total / (count * (count - 1) / 2)
+            if count == 0 || not (numberIsFinite score) then Err RecipeInvalidPreparation
+            else case recipeCriteriaSpreadPreparations basis condition (fromMaybe [] (tail preparations)) distances budget of
+              Err reason -> Err reason
+              Ok rest -> Ok (concat [RecipeSpreadWitness { score = score, pantry = pantry, preparation = foods }] rest)
+
+recipeCriteriaSpreads : (basis: RecipeCriteriaBasis) -> (outcomes: List RecipeOutcome) -> (distances: List RecipeFoodDistance) -> (budget: Nat) -> Result RecipeRefusal (List RecipeSpreadWitness)
+recipeCriteriaSpreads basis outcomes distances budget = case head outcomes of
+  Nothing -> Ok []
+  Just outcome -> case recipeCriteriaSpreadPreparations basis outcome.condition outcome.preparations distances budget of
+    Err reason -> Err reason
+    Ok first -> case recipeCriteriaSpreads basis (fromMaybe [] (tail outcomes)) distances budget of
+      Err reason -> Err reason
+      Ok rest -> Ok (concat first rest)
+
+recipeCriteriaKindSpread : (snapshot: RecipeAnalysisSnapshot) -> (proposal: RecipeExtraction) -> (distances: List RecipeFoodDistance) -> (assumptions: List ReifyOutcome) -> (budget: Nat) -> RecipeClaim (RecipeKindSpread Nat)
+recipeCriteriaKindSpread snapshot proposal distances assumptions budget = recipeCriteriaKindSpreadIn (recipeCriteriaPrepare snapshot proposal RcAll budget) distances assumptions budget
+
+recipeCriteriaKindSpreadIn : (gate: RecipeCriteriaGate) -> (distances: List RecipeFoodDistance) -> (assumptions: List ReifyOutcome) -> (budget: Nat) -> RecipeClaim (RecipeKindSpread Nat)
+recipeCriteriaKindSpreadIn gate distances assumptions budget = case gate of
+  RecipeCriteriaImpossible { context = context } -> NoSuccessfulOutcome { status = SolverChecked, context = context }
+  RecipeCriteriaBlocked { reasons = reasons, context = context } -> RecipeUndetermined { reasons = reasons, context = context }
+  RecipeCriteriaReady { basis = basis } ->
+    let context = recipeCriteriaObservedContext basis assumptions [] distances []
+    if not (recipeCriteriaDistanceRowsValid basis.domain distances) then RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context }
+    else case recipeCriteriaSource assumptions of
+      Err reason -> RecipeUndetermined { reasons = [reason], context = context }
+      Ok source -> case basis.context.snapshot of
+        Just snapshot -> case recipeCriteriaDistanceProjection snapshot source basis.domain.foods budget of
+          Err reason -> RecipeUndetermined { reasons = [reason], context = context }
+          Ok projection -> recipeCriteriaKindSpreadProjected basis assumptions projection budget
+        _ -> RecipeUndetermined { reasons = [RecipeInvalidDomain], context = context }
+
+recipeCriteriaKindSpreadProjected : (basis: RecipeCriteriaBasis) -> (assumptions: List ReifyOutcome) -> (projection: RecipeDistanceProjection) -> (budget: Nat) -> RecipeClaim (RecipeKindSpread Nat)
+recipeCriteriaKindSpreadProjected basis assumptions projection budget =
+  let context = recipeCriteriaObservedContext basis assumptions [] projection.distances projection.applications
+  case recipeCriteriaSpreads basis basis.analysis.outcomes projection.distances budget of
+    Err reason -> RecipeUndetermined { reasons = [reason], context = context }
+    Ok witnesses -> case head witnesses of
+      Nothing -> RecipeUndetermined { reasons = [RecipeInvalidPreparation], context = context }
+      Just first ->
+        let low = fold (\acc row -> if row.score < acc.score then row else acc) first witnesses
+        let high = fold (\acc row -> if row.score > acc.score then row else acc) first witnesses
+        RecipeKnown { value = RecipeKindSpread { minimum = low.score, maximum = high.score, minimumPantry = low.pantry, minimumPreparation = low.preparation, maximumPantry = high.pantry, maximumPreparation = high.preparation }, status = SolverChecked, context = context }

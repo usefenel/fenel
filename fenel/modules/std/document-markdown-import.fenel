@@ -1,0 +1,318 @@
+module std where
+
+-- GP-63: a bounded, pure reader of the existing Document Markdown fragment.
+-- Ordinary one-line paragraphs, ATX headings, backtick spans/fences and the
+-- exporter's mixed XHTML inlines/blocks share the existing Doc* model. This
+-- is not a CommonMark implementation: lists, quotes, images, bracket links,
+-- delimiter emphasis, soft wraps, indentation and general HTML refuse.
+-- Paragraph/heading literal edge whitespace must be encoded as entities.
+-- Source uses LF; exact CR data remains available through numeric references.
+-- XML entities decode once outside code spans/fences; code stays literal.
+-- Exact <!----> separators are zero-width, including after escaped backticks.
+-- Only empty <code></code> is an inline XHTML fallback; nonempty inline code
+-- uses backticks. Raw XHTML blocks end at EOF or a blank line. Markdown numeric
+-- entities permit at most seven decimal/six hex digits; XHTML keeps its own
+-- exact existing entity/attribute policy.
+--
+-- Standard outline normalization attaches following blocks to the latest
+-- heading until a same/shallower heading. Levels may not skip a parent.
+-- Explicit XHTML notes retain their internal tree, then acquire their new
+-- outline position. Their consistent source heading baseline is read using
+-- the existing XHTML parser; normalized depth beyond six still refuses.
+-- Round trips preserve normalized text and outline-shaped trees: in each
+-- Markdown-authored block list, sections form a suffix containing sections
+-- only. XHTML note subtrees retain explicit boundaries. Arbitrary authored
+-- section endings cannot be recovered from Markdown, which erases them.
+-- Both source size (8192 code points) and existing export traversal (64 steps)
+-- bound the fragment. A whole-document export check validates the result.
+
+DocumentMarkdownSectionFrame = DocumentMarkdownSectionFrame title: List DocInline blocks: List DocBlock
+DocumentMarkdownOutline = DocumentMarkdownOutline root: List DocBlock sections: List DocumentMarkdownSectionFrame
+DocumentMarkdownLineParsed = DocumentMarkdownLineParsed cursor: DocumentHtmlCursor value: String newline: Boolean
+DocumentMarkdownCodeParsed = DocumentMarkdownCodeParsed cursor: DocumentHtmlCursor value: String
+
+@category "document-internal"
+documentMarkdownImportError : (cursor: DocumentHtmlCursor) -> (category: String) -> Result String a
+documentMarkdownImportError cursor category = Err (join ["Document Markdown ", category, " at code-point ", toString cursor.offset] "")
+
+@category "document-internal"
+documentMarkdownImportLine : (cursor: DocumentHtmlCursor) -> DocumentMarkdownLineParsed
+documentMarkdownImportLine cursor =
+  let content = takeWhile (\character -> not (eq character "\n")) cursor.remaining
+  let newline = eq (fromMaybe "" (head (drop (length content) cursor.remaining))) "\n"
+  DocumentMarkdownLineParsed { cursor = documentHtmlImportAdvance cursor (add (length content) (if newline then 1 else 0)), value = join content "", newline = newline }
+
+@category "document-internal"
+documentMarkdownImportAppendBlock : (outline: DocumentMarkdownOutline) -> (block: DocBlock) -> DocumentMarkdownOutline
+documentMarkdownImportAppendBlock outline block = case head outline.sections of
+  Nothing -> DocumentMarkdownOutline { root = appendItem block outline.root, sections = [] }
+  Just section -> DocumentMarkdownOutline { root = outline.root, sections = concat [DocumentMarkdownSectionFrame { title = section.title, blocks = appendItem block section.blocks }] (drop 1 outline.sections) }
+
+@category "document-internal"
+documentMarkdownImportCloseSections : (outline: DocumentMarkdownOutline) -> (keep: Nat) -> DocumentMarkdownOutline
+documentMarkdownImportCloseSections outline keep =
+  if lte (length outline.sections) keep then outline
+  else case head outline.sections of
+    Nothing -> outline
+    Just section ->
+      let parent = DocumentMarkdownOutline { root = outline.root, sections = drop 1 outline.sections }
+      documentMarkdownImportCloseSections (documentMarkdownImportAppendBlock parent (DocSection { title = section.title, blocks = section.blocks })) keep
+
+@category "document-internal"
+documentMarkdownImportPunctuation : (character: String) -> Boolean
+documentMarkdownImportPunctuation character =
+  let code = charCode character
+  or (and (gte code 33) (lte code 47)) (or (and (gte code 58) (lte code 64)) (or (and (gte code 91) (lte code 96)) (and (gte code 123) (lte code 126))))
+
+@category "document-internal"
+documentMarkdownImportEntity : (cursor: DocumentHtmlCursor) -> Result String DocumentHtmlLiteralParsed
+documentMarkdownImportEntity cursor =
+  let name = takeWhile (\character -> not (eq character ";")) (drop 1 cursor.remaining)
+  let count = add (length name) 2
+  let spelling = join name ""
+  let overlong = if startsWith spelling "#x" then gt (length name) 8 else if startsWith spelling "#" then gt (length name) 8 else false
+  if not (eq (fromMaybe "" (head (drop (add (length name) 1) cursor.remaining))) ";") then documentMarkdownImportError cursor "unclosed entity"
+  else if overlong then documentMarkdownImportError cursor "numeric entity exceeds the bounded Markdown digit count"
+  else case documentHtmlImportEntity spelling of
+    Err reason -> documentMarkdownImportError cursor reason
+    Ok literal -> Ok (DocumentHtmlLiteralParsed { cursor = documentHtmlImportAdvance cursor count, value = literal })
+
+@category "document-internal"
+documentMarkdownImportCodePadding : (literal: String) -> String
+documentMarkdownImportCodePadding literal =
+  if and (and (startsWith literal " ") (endsWith literal " ")) (not (all (chars literal) (\character -> eq character " "))) then join (drop 1 (fromMaybe [] (init (chars literal)))) ""
+  else literal
+
+@category "document-internal"
+documentMarkdownImportCodeScan : (cursor: DocumentHtmlCursor) -> (width: Nat) -> (parts: List String) -> Result String DocumentMarkdownCodeParsed
+documentMarkdownImportCodeScan cursor width parts =
+  if eq (length cursor.remaining) 0 then documentMarkdownImportError cursor "unclosed code span"
+  else if eq (fromMaybe "" (head cursor.remaining)) "\n" then documentMarkdownImportError cursor "multiline code spans are outside the fragment"
+  else if eq (fromMaybe "" (head cursor.remaining)) "`" then
+    let run = takeWhile (\character -> eq character "`") cursor.remaining
+    let after = documentHtmlImportAdvance cursor (length run)
+    if eq (length run) width then Ok (DocumentMarkdownCodeParsed { cursor = after, value = documentMarkdownImportCodePadding (join parts "") })
+    else documentMarkdownImportCodeScan after width (appendItem (join run "") parts)
+  else
+    let run = takeWhile (\character -> not (elem character ["`", "\n"])) cursor.remaining
+    documentMarkdownImportCodeScan (documentHtmlImportAdvance cursor (length run)) width (appendItem (join run "") parts)
+
+@category "document-internal"
+documentMarkdownImportCodeSpan : (cursor: DocumentHtmlCursor) -> Result String DocumentHtmlInlineParsed
+documentMarkdownImportCodeSpan cursor =
+  let opening = takeWhile (\character -> eq character "`") cursor.remaining
+  case documentMarkdownImportCodeScan (documentHtmlImportAdvance cursor (length opening)) (length opening) [] of
+    Err reason -> Err reason
+    Ok parsed -> Ok (DocumentHtmlInlineParsed { cursor = parsed.cursor, value = DocInlineCode { code = parsed.value } })
+
+@category "document-internal"
+documentMarkdownImportStyle : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> (inLink: Boolean) -> (strong: Boolean) -> Result String DocumentHtmlInlineParsed
+documentMarkdownImportStyle cursor nesting inLink strong =
+  let opening = if strong then "<strong>" else "<em>"
+  let closing = if strong then "</strong>" else "</em>"
+  case documentMarkdownImportInlines (documentHtmlImportAdvance cursor (length (chars opening))) nesting inLink closing [] of
+    Err reason -> Err reason
+    Ok parsed -> Ok (DocumentHtmlInlineParsed { cursor = parsed.cursor, value = if strong then DocStrong { content = parsed.value } else DocEmphasis { content = parsed.value } })
+
+@category "document-internal"
+documentMarkdownImportLink : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> Result String DocumentHtmlInlineParsed
+documentMarkdownImportLink cursor nesting = case documentHtmlImportAttribute (documentHtmlImportAdvance cursor 9) of
+  Err reason -> documentMarkdownImportError cursor reason
+  Ok attribute -> case documentExportLinkUrl attribute.value of
+    Err reason -> documentMarkdownImportError cursor reason
+    Ok _ -> case documentMarkdownImportInlines attribute.cursor nesting true "</a>" [] of
+      Err reason -> Err reason
+      Ok parsed -> Ok (DocumentHtmlInlineParsed { cursor = parsed.cursor, value = DocLink { url = attribute.value, content = parsed.value } })
+
+@category "document-internal"
+documentMarkdownImportInline : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> (inLink: Boolean) -> Result String DocumentHtmlInlineParsed
+documentMarkdownImportInline cursor nesting inLink =
+  if gt nesting 64 then documentMarkdownImportError cursor "nesting exceeds 64 steps"
+  else if documentHtmlImportStarts cursor "<em>" then documentMarkdownImportStyle cursor nesting inLink false
+  else if documentHtmlImportStarts cursor "<strong>" then documentMarkdownImportStyle cursor nesting inLink true
+  else if documentHtmlImportStarts cursor "<code></code>" then Ok (DocumentHtmlInlineParsed { cursor = documentHtmlImportAdvance cursor 13, value = DocInlineCode { code = "" } })
+  else if documentHtmlImportStarts cursor "<a href=\"" then
+    if inLink then documentMarkdownImportError cursor "nested links are refused"
+    else documentMarkdownImportLink cursor nesting
+  else if eq (fromMaybe "" (head cursor.remaining)) "`" then documentMarkdownImportCodeSpan cursor
+  else documentMarkdownImportError cursor "unsupported or malformed inline syntax"
+
+@category "document-internal"
+documentMarkdownImportInlines : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> (inLink: Boolean) -> (closing: String) -> (content: List DocInline) -> Result String DocumentHtmlInlinesParsed
+documentMarkdownImportInlines cursor nesting inLink closing content =
+  if gt nesting 64 then documentMarkdownImportError cursor "nesting exceeds 64 steps"
+  else if and (not (eq closing "")) (documentHtmlImportStarts cursor closing) then Ok (DocumentHtmlInlinesParsed { cursor = documentHtmlImportAdvance cursor (length (chars closing)), value = content })
+  else if eq (length cursor.remaining) 0 then
+    if eq closing "" then Ok (DocumentHtmlInlinesParsed { cursor = cursor, value = content })
+    else documentMarkdownImportError cursor "unclosed inline element"
+  else if documentHtmlImportStarts cursor "<!---->" then
+    let after = documentHtmlImportAdvance cursor 7
+    let preceding = case last content of
+      Just (DocInlineCode { code = literal }) -> true
+      Just (DocText { text = literal }) -> endsWith literal "`"
+      _ -> false
+    if and preceding (documentHtmlImportStarts after "`") then documentMarkdownImportInlines after nesting inLink closing content
+    else documentMarkdownImportError cursor "empty comments are supported only as backtick separators"
+  else if gte nesting 64 then documentMarkdownImportError cursor "nesting exceeds 64 steps"
+  else
+    let first = fromMaybe "" (head cursor.remaining)
+    if elem first ["<", "`"] then case documentMarkdownImportInline cursor (add nesting 1) inLink of
+      Err reason -> Err reason
+      Ok parsed -> documentMarkdownImportInlines parsed.cursor nesting inLink closing (documentHtmlImportAppendInline content parsed.value)
+    else if eq first "&" then case documentMarkdownImportEntity cursor of
+      Err reason -> Err reason
+      Ok parsed -> documentMarkdownImportInlines parsed.cursor nesting inLink closing (documentHtmlImportAppendInline content (DocText { text = parsed.value }))
+    else if eq first "\\" then
+      let character = fromMaybe "" (head (drop 1 cursor.remaining))
+      if or (eq character "") (not (documentMarkdownImportPunctuation character)) then documentMarkdownImportError cursor "unsupported or unfinished backslash escape"
+      else documentMarkdownImportInlines (documentHtmlImportAdvance cursor 2) nesting inLink closing (documentHtmlImportAppendInline content (DocText { text = character }))
+    else if elem first ["*", "_", "[", "]"] then documentMarkdownImportError cursor "delimiter emphasis, images and bracket links are outside the fragment; use XHTML inlines"
+    else if elem first ["\n", "\r", "\t"] then documentMarkdownImportError cursor "literal inline layout whitespace requires an entity"
+    else
+      let run = takeWhile (\character -> not (elem character ["<", "`", "&", "\\", "*", "_", "[", "]", "\n", "\r", "\t"])) cursor.remaining
+      documentMarkdownImportInlines (documentHtmlImportAdvance cursor (length run)) nesting inLink closing (documentHtmlImportAppendInline content (DocText { text = join run "" }))
+
+@category "document-internal"
+documentMarkdownImportFenceBody : (cursor: DocumentHtmlCursor) -> (fence: String) -> (parts: List String) -> Result String DocumentMarkdownCodeParsed
+documentMarkdownImportFenceBody cursor fence parts =
+  if eq (length cursor.remaining) 0 then documentMarkdownImportError cursor "unclosed code fence"
+  else
+    let line = documentMarkdownImportLine cursor
+    let characters = chars line.value
+    let indentation = takeWhile (\character -> eq character " ") characters
+    let run = takeWhile (\character -> eq character "`") (drop (length indentation) characters)
+    let trailing = drop (add (length indentation) (length run)) characters
+    let closing = and (lte (length indentation) 3) (and (gte (length run) (length (chars fence))) (all trailing (\character -> elem character [" ", "\t"])))
+    if closing then Ok (DocumentMarkdownCodeParsed { cursor = line.cursor, value = join parts "" })
+    else if not line.newline then documentMarkdownImportError cursor "unclosed code fence"
+    else documentMarkdownImportFenceBody line.cursor fence (appendItem (join [line.value, "\n"] "") parts)
+
+@category "document-internal"
+documentMarkdownImportFence : (cursor: DocumentHtmlCursor) -> (line: DocumentMarkdownLineParsed) -> Result String DocumentHtmlBlockParsed
+documentMarkdownImportFence cursor line =
+  let run = takeWhile (\character -> eq character "`") (chars line.value)
+  let identifier = join (drop (length run) (chars line.value)) ""
+  let language = if eq identifier "" then Nothing else Just identifier
+  case documentMarkdownLanguage language of
+    Err reason -> documentMarkdownImportError cursor reason
+    Ok _ ->
+      if not line.newline then documentMarkdownImportError cursor "unclosed code fence"
+      else case documentMarkdownImportFenceBody line.cursor (join run "") [] of
+        Err reason -> Err reason
+        Ok parsed -> Ok (DocumentHtmlBlockParsed { cursor = parsed.cursor, value = DocCode { language = language, source = parsed.value } })
+
+@category "document-internal"
+documentMarkdownImportNote : (cursor: DocumentHtmlCursor) -> (nesting: Nat) -> (baseline: Nat) -> Result String DocumentHtmlBlockParsed
+documentMarkdownImportNote cursor nesting baseline =
+  if gt baseline 6 then documentMarkdownImportError cursor "unsupported or malformed XHTML note"
+  else case documentHtmlImportNote cursor baseline nesting of
+    Ok parsed -> Ok parsed
+    Err reason ->
+      if and (lt baseline 6) (contains reason "expected <h") then documentMarkdownImportNote cursor nesting (add baseline 1)
+      else documentMarkdownImportError cursor reason
+
+@category "document-internal"
+documentMarkdownImportBlockBoundary : (cursor: DocumentHtmlCursor) -> Result String DocumentHtmlCursor
+documentMarkdownImportBlockBoundary cursor =
+  if or (eq (length cursor.remaining) 0) (eq (fromMaybe "" (head cursor.remaining)) "\n") then Ok cursor
+  else documentMarkdownImportError cursor "blocks require a blank line or a complete line boundary"
+
+@category "document-internal"
+documentMarkdownImportParsedBlock : (parsed: Result String DocumentHtmlBlockParsed) -> (html: Boolean) -> (outline: DocumentMarkdownOutline) -> Result String RichDocument
+documentMarkdownImportParsedBlock parsed html outline = case parsed of
+  Err reason -> Err reason
+  Ok block ->
+    let source = block.cursor.remaining
+    let ending = or (eq (length source) 0) (or (documentHtmlImportStarts block.cursor "\n\n") (eq source ["\n"]))
+    if and html (not ending) then documentMarkdownImportError block.cursor "raw XHTML blocks require a blank line or EOF before Markdown resumes"
+    else documentMarkdownImportBlocks block.cursor (documentMarkdownImportAppendBlock outline block.value)
+
+@category "document-internal"
+documentMarkdownImportUnsupportedBlock : (line: String) -> Boolean
+documentMarkdownImportUnsupportedBlock line =
+  let characters = chars line
+  let digits = takeWhile (\character -> elem character "0123456789") characters
+  let suffix = join (drop (length digits) characters) ""
+  let ordered = and (gt (length digits) 0) (or (elem suffix [".", ")"]) (or (startsWith suffix ". ") (startsWith suffix ") ")))
+  let ruleCharacters = filter (\character -> not (elem character [" ", "\t"])) characters
+  let rule = and (gte (length ruleCharacters) 3) (all ruleCharacters (\character -> eq character "-"))
+  or ordered (or rule (or (elem line ["-", "+"]) (or (startsWith line ">") (or (startsWith line "- ") (or (startsWith line "+ ") (startsWith line "~~~"))))))
+
+@category "document-internal"
+documentMarkdownImportEdgeWhitespace : (line: String) -> Boolean
+documentMarkdownImportEdgeWhitespace line = or (elem (fromMaybe "" (head (chars line))) [" ", "\t"]) (elem (fromMaybe "" (last (chars line))) [" ", "\t"])
+
+@category "document-internal"
+documentMarkdownImportClosingHashes : (title: String) -> Boolean
+documentMarkdownImportClosingHashes title =
+  let backwards = reverse (chars title)
+  let hashes = takeWhile (\character -> eq character "#") backwards
+  and (gt (length hashes) 0) (or (eq (length hashes) (length backwards)) (eq (fromMaybe "" (head (drop (length hashes) backwards))) " "))
+
+@category "document-internal"
+documentMarkdownImportHeading : (cursor: DocumentHtmlCursor) -> (line: DocumentMarkdownLineParsed) -> (level: Nat) -> (outline: DocumentMarkdownOutline) -> Result String RichDocument
+documentMarkdownImportHeading cursor line level outline =
+  let title = drop (add level 1) (chars line.value)
+  let literal = join title ""
+  if gt level 6 then documentMarkdownImportError cursor "heading depth exceeds six"
+  else if gt level (add (length outline.sections) 1) then documentMarkdownImportError cursor "heading levels may not skip a parent"
+  else if or (documentMarkdownImportEdgeWhitespace literal) (documentMarkdownImportClosingHashes literal) then documentMarkdownImportError cursor "heading edge whitespace or closing hashes must be escaped or encoded"
+  else case documentMarkdownImportInlines (DocumentHtmlCursor { remaining = title, offset = add cursor.offset (add level 1) }) level false "" [] of
+    Err reason -> Err reason
+    Ok parsed ->
+      let parent = documentMarkdownImportCloseSections outline (sub level 1)
+      let next = DocumentMarkdownOutline { root = parent.root, sections = concat [DocumentMarkdownSectionFrame { title = parsed.value, blocks = [] }] parent.sections }
+      documentMarkdownImportBlocks line.cursor next
+
+@category "document-internal"
+documentMarkdownImportParagraph : (cursor: DocumentHtmlCursor) -> (line: DocumentMarkdownLineParsed) -> (outline: DocumentMarkdownOutline) -> Result String RichDocument
+documentMarkdownImportParagraph cursor line outline =
+  if documentMarkdownImportEdgeWhitespace line.value then documentMarkdownImportError cursor "paragraph edge whitespace requires an entity; indentation is outside the fragment"
+  else if documentMarkdownImportUnsupportedBlock line.value then documentMarkdownImportError cursor "lists, quotes, thematic breaks and tilde fences are outside the fragment"
+  else case documentMarkdownImportBlockBoundary line.cursor of
+    Err _ -> documentMarkdownImportError line.cursor "soft-wrapped paragraphs are outside the fragment; separate paragraphs with a blank line"
+    Ok after -> case documentMarkdownImportInlines (DocumentHtmlCursor { remaining = chars line.value, offset = cursor.offset }) (add (length outline.sections) 1) false "" [] of
+      Err reason -> Err reason
+      Ok parsed -> documentMarkdownImportBlocks after (documentMarkdownImportAppendBlock outline (DocParagraph { content = parsed.value }))
+
+@category "document-internal"
+documentMarkdownImportBlocks : (cursor: DocumentHtmlCursor) -> (outline: DocumentMarkdownOutline) -> Result String RichDocument
+documentMarkdownImportBlocks cursor outline =
+  if eq (length cursor.remaining) 0 then
+    let closed = documentMarkdownImportCloseSections outline 0
+    Ok (RichDocument { blocks = closed.root })
+  else if eq (fromMaybe "" (head cursor.remaining)) "\n" then documentMarkdownImportBlocks (documentHtmlImportAdvance cursor (length (takeWhile (\character -> eq character "\n") cursor.remaining))) outline
+  else
+    let nesting = add (length outline.sections) 1
+    if documentHtmlImportStarts cursor "<p>" then documentMarkdownImportParsedBlock (documentHtmlImportParagraph cursor nesting) true outline
+    else if documentHtmlImportStarts cursor "<pre>" then documentMarkdownImportParsedBlock (documentHtmlImportBlockCode cursor) true outline
+    else if documentHtmlImportStarts cursor "<aside class=\"document-note\">" then documentMarkdownImportParsedBlock (documentMarkdownImportNote cursor nesting 1) true outline
+    else
+      let line = documentMarkdownImportLine cursor
+      let hashes = takeWhile (\character -> eq character "#") (chars line.value)
+      let ticks = takeWhile (\character -> eq character "`") (chars line.value)
+      let heading = and (gt (length hashes) 0) (or (eq (length hashes) (length (chars line.value))) (eq (fromMaybe "" (head (drop (length hashes) (chars line.value)))) " "))
+      let fence = and (gte (length ticks) 3) (not (contains (join (drop (length ticks) (chars line.value)) "") "`"))
+      if heading then documentMarkdownImportHeading cursor line (length hashes) outline
+      else if fence then documentMarkdownImportParsedBlock (documentMarkdownImportFence cursor line) false outline
+      else documentMarkdownImportParagraph cursor line outline
+
+@label "Document from Markdown"
+@description "Import a bounded Markdown/XHTML fragment into the same typed Document: blank-line-separated single-line paragraphs, consecutive-level ATX headings, backtick code spans/fences, composed XHTML emphasis/strong and safe links, empty inline-code fallbacks, and exact XHTML paragraph/code/note blocks terminated by a blank line or EOF. Standard outlines attach following blocks to the latest heading; explicit section ends are not recoverable. Merge adjacent text, remove empty text, decode bounded XML entities once outside literal code, and ignore exact backtick-separator comments. Delimiter emphasis, bracket links/images, lists, quotes, soft wraps, paragraph/opening indentation, general HTML, unsafe links, malformed syntax, literal CR, source over 8192 code points and normalized export-depth failures return Err with a code-point location. Round trips apply to outline-shaped representable Documents within both bounds, not arbitrary original trees or all CommonMark."
+@tags "document" "markdown" "conversion" "parse"
+documentFromMarkdown : (source: String) -> Result String RichDocument
+documentFromMarkdown source =
+  if not (isString source) then Err "Document Markdown expects literal source at code-point 0"
+  else
+    let characters = chars source
+    if gt (length characters) 8192 then Err "Document Markdown source exceeds 8192 code points at code-point 8192"
+    else
+      let admitted = takeWhile documentExportXmlCharacter characters
+      let beforeReturn = takeWhile (\character -> not (eq character "\r")) characters
+      if not (eq (length admitted) (length characters)) then documentMarkdownImportError (DocumentHtmlCursor { remaining = [], offset = length admitted }) "character outside the XML-safe fragment"
+      else if not (eq (length beforeReturn) (length characters)) then documentMarkdownImportError (DocumentHtmlCursor { remaining = [], offset = length beforeReturn }) "literal CR is outside the LF source fragment; encode exact data"
+      else case documentMarkdownImportBlocks (DocumentHtmlCursor { remaining = characters, offset = 0 }) (DocumentMarkdownOutline { root = [], sections = [] }) of
+        Err reason -> Err reason
+        Ok document -> case documentToMarkdown document of
+          Err reason -> documentMarkdownImportError (DocumentHtmlCursor { remaining = [], offset = 0 }) (join ["normalized document: ", reason] "")
+          Ok _ -> Ok document

@@ -1,0 +1,96 @@
+-- =========================================================================
+-- Subscription-ingress dispatch.
+--
+-- Phase 12c-routes sub-step 2 of the ts-elimination workstream. Single
+-- route POST /webhooks/sub/:slug. The centerpiece: the body returns the
+-- SubscriptionDispatch ADT (3 arms — TelegramCollectorDispatch /
+-- UserHandlerDispatch / NoHandlerConfigured); the TS wrapper switches
+-- on $tag and invokes the matching IO action with TS-held params
+-- (body / headers / slug).
+--
+-- Mirrors 12a-5's InvokeDecision pattern — dispatch target is a runtime-
+-- determined IO action string; no Fenel-side dynamic-dispatch primitive
+-- exists today, so the wrapper holds the action name and executes it.
+--
+-- The wrapper has already:
+--   - resolved the subscription via state:findSubscriptionBySlug
+--   - 404'd on Nothing / 403'd on disabled / 400'd on wrong source
+--   - verified the X-Webhook-Secret header (optional, when sub.secret set)
+--   - parsed JSON metadata to extract Maybe<String> kind + Maybe<String>
+--     botId fields
+--
+-- Decisions resolved:
+--   K2 (new SubscriptionDispatch ADT — sister of InvokeDecision; the
+--     dispatch arms have distinct semantics so reuse would be a forced fit)
+--   T (TS wrapper retains typed values; Fenel body returns the dispatch
+--     decision; wrapper switches on $tag and invokes with TS-held params)
+--
+-- module-substrate Phase 3p (2026-05-31) — the AGGREGATION-FRONTIER CLOSE.
+-- Lifted out of the retired `mixed-ingress` bundle into a fresh `module
+-- subscriptions where` module (the 3n single-file + ADT pattern): the 4 PURE
+-- fns + the `SubscriptionDispatch` ADT (the loader surfaces the type-def as an
+-- entity automatically). No stored @category (derives from the `subscriptions:`
+-- id prefix at read time, Phase 3j); all 4 fns are PURE so carry no requires.
+-- =========================================================================
+
+module subscriptions where
+
+-- SubscriptionDispatch — the dispatch ADT. Three arms:
+--   TelegramCollectorDispatch { botId } — invoke telegram_collector.handle_update
+--     with {botId, update: body} via the wrapper's invokeIOAction.
+--   UserHandlerDispatch { fnName } — invoke fnName via the wrapper's
+--     invokeIOAction with {slug, body, headers}.
+--   NoHandlerConfigured { reason } — 422 response.
+SubscriptionDispatch = TelegramCollectorDispatch botId: String
+  | UserHandlerDispatch fnName: String
+  | NoHandlerConfigured reason: String
+
+-- subscriptionDispatchDecide — top-level dispatch body. Resolves the
+-- subscription's metadata.kind first; falls through to the user-handler
+-- arm when kind isn't "telegram_collector". per parseApp's multi-line
+-- rule, the branch arms are extracted to top-level helpers.
+@label "Subscription dispatch decide"
+@description "POST /webhooks/sub/:slug body. The TS wrapper has already resolved the subscription via state:findSubscriptionBySlug + parsed metadata + verified the optional X-Webhook-Secret. Body returns SubscriptionDispatch (3 arms); wrapper switches on $tag and invokes the matching IO action."
+@tags "subscription" "ingress" "route" "phase-12c"
+subscriptionDispatchDecide : {} -> Maybe String -> Maybe String -> SubscriptionDispatch
+subscriptionDispatchDecide sub metadataKind metadataBotId =
+  let isTelegram = maybeEq metadataKind "telegram_collector"
+  let telegramArm = telegramCollectorArm metadataBotId
+  let userArm = userHandlerOrNone sub
+  ifElse isTelegram telegramArm userArm
+
+-- maybeEq — local helper for "Maybe<String> equals literal String".
+-- case-fall-through with empty-named-fields pattern (sub-step 1 surprise 1).
+@label "Maybe equals"
+@description "Phase 12c-routes sub-step 2 — Maybe<String>-equals-literal-String helper. Returns true when Just<v> with v == expected; false otherwise."
+@tags "subscription" "pure" "phase-12c"
+maybeEq : Maybe String -> String -> Boolean
+maybeEq mv expected =
+  case mv of
+    Just v -> eq v expected
+    _ -> false
+
+-- telegramCollectorArm — dispatch when metadata.kind = telegram_collector.
+-- Requires metadata.botId; falls back to NoHandlerConfigured on Nothing.
+@label "Telegram collector arm"
+@description "Phase 12c-routes sub-step 2 — dispatch when metadata.kind = telegram_collector. Returns TelegramCollectorDispatch when metadata.botId is present; NoHandlerConfigured otherwise."
+@tags "subscription" "pure" "phase-12c"
+telegramCollectorArm : Maybe String -> SubscriptionDispatch
+telegramCollectorArm metadataBotId =
+  case metadataBotId of
+    Just botId -> TelegramCollectorDispatch { botId = botId }
+    _ -> NoHandlerConfigured { reason = "metadata.botId missing" }
+
+-- userHandlerOrNone — dispatch via sub.handlerFunctionId. The wrapper
+-- resolves the function name TS-side (sub.handlerFunctionId is the
+-- function row's id; the wrapper looks up the codeName). Here we just
+-- pass through the resolved name from sub.handlerFunctionName (set by
+-- the wrapper from the looked-up row).
+@label "User handler or none"
+@description "Phase 12c-routes sub-step 2 — dispatch via sub.handlerFunctionName (looked up TS-side from sub.handlerFunctionId). Returns UserHandlerDispatch when present; NoHandlerConfigured otherwise."
+@tags "subscription" "pure" "phase-12c"
+userHandlerOrNone : {} -> SubscriptionDispatch
+userHandlerOrNone sub =
+  case sub.handlerFunctionName of
+    Just fnName -> UserHandlerDispatch { fnName = fnName }
+    _ -> NoHandlerConfigured { reason = "Subscription has no handler configured" }

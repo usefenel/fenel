@@ -1,0 +1,198 @@
+-- =========================================================================
+-- Games — interactivity layered on signals + events. A `Game` packages
+-- four pieces (initial state, update fn, view fn, input Event stream).
+-- The closure-construction helpers (`gameToAnim`, `gameToMovie`,
+-- `runGame`, `mkGame`) live on the TS-native side because they touch
+-- representations records can't construct directly in source today; the
+-- `.fenel` file just declares the `Game` entity itself.
+--
+-- Phase 4g of ts-elimination: this body was previously the inline
+-- `const GAMES_SRC = \`…\`` template literal at engine/src/modules/games.ts;
+-- extracted verbatim. No lambda escapes in this body (the inline source
+-- is a single entity declaration with no function bodies). References to
+-- `Event` / `Picture` resolve through the catalog walk.
+--
+-- module-substrate Phase 3g (2026-05-30) — the 6 TS natives (mkGame plain +
+-- gameStateAt / _gameViewAt / gameToAnim / gameToMovie / runGame ctx),
+-- previously hand-assembled defineFunction specs, are now @native FOREIGN
+-- DECLARATIONS here; their impls live in ffi/games-ffi.ts (which imports
+-- sound-ffi's sampleSoundNative leaf-to-leaf for the gameAudioAt helper). All 6
+-- carry the `games` category — equal to the module-name default, so no
+-- @category is needed. games has NO own Sampleable/Renderable/other dispatch
+-- instances (only the per-function identity facets).
+-- =========================================================================
+
+module games where
+
+using std (max, round, mod, clamp, head, drop, concat, imageResize, imageSolid, imageOverlay, imageRotate180, imageCrop)
+using picture (Raster)
+using events (event, eventEntry)
+using animation (renderAnim)
+
+Game = Game initial: a update: (a, b) -> a view: a -> Picture inputs: Event
+
+-- ----- Foreign declarations (native-backed; impl in ffi/games-ffi.ts) -------
+-- `mkGame` is a pure record constructor (plain native → nativeImpls); the other
+-- 5 re-enter the evaluator to fold inputs / render state / emit live markers
+-- (CTX natives → nativeImplsCtx). No Fenel body: the registry resolves each
+-- call to the ffi leaf keyed by codeName.
+
+@native
+@label "Make game"
+@description "Build a Game from initial state, update function, view function, and an input Event stream."
+@tags "games" "interactive" "constructor"
+mkGame : (initial: a, update: ((s: a, i: b) -> a), view: ((s: a) -> Picture), inputs: Event) -> Game
+
+@native
+@label "Game state at time"
+@description "Compute a Game's state at a given Time by folding all inputs ≤ t through the update function."
+@tags "games" "primitive"
+gameStateAt : (game: Game, t: Time) -> a
+
+@native
+@label "Game view at time (internal)"
+@description "Internal: state at t → render via view fn. Used by gameToAnim/gameToMovie closures."
+@tags "games" "internal"
+_gameViewAt : (game: Game, t: Time) -> Picture
+
+@native
+@label "Game to Animation"
+@description "Convert a Game into an Animation: at each instant, derive the current state from the input stream and render it via the Game's view function."
+@tags "games" "bridge"
+gameToAnim : (game: Game) -> animation.Animation
+
+@native
+@label "Game to Movie"
+@description "Convert a Game + Sound into a Movie. Visuals derive from the game; audio plays in sync."
+@tags "games" "bridge"
+gameToMovie : (game: Game, audio: Sound) -> Movie
+
+@native
+@label "Run game (live)"
+@description "IO bridge: hand a Game off to the live runtime. The frontend recognises the result and renders an interactive surface where DOM events (clicks, keys) feed into the Game's input stream in real time. Calling from headless contexts returns a marker that downstream consumers can treat as a deterministic Movie."
+@tags "games" "io" "interactive"
+runGame : (game: Game) -> LiveGame
+
+-- ----- Image game (GP-60 / launch demo 2) -----------------------------------
+-- `imageGame` turns any Image into a short game clip: the image, shrunk once
+-- to fit a 16 by 16 box, is the player's sprite in a 64 by 48 arena. A fixed,
+-- recorded stream of 24 moves (one per frame at 8 fps) drives an ordinary
+-- Game built with `mkGame`; each move steps the sprite 4 pixels, walls stop
+-- it, and touching the coin scores and moves the coin on. `gameToAnim` and
+-- `renderAnim` render the finite clip for the shared frame player. The
+-- clip is a pure function of the image: give it a live reference and every
+-- edit of the source image re-renders the game.
+--
+-- Placement uses only raster operations: the sprite sits in the bottom-right
+-- corner of a transparent canvas one arena larger than itself, and the arena
+-- window cropped from that canvas at (W - x, H - y) shows it at (x, y).
+
+@label "Image game move"
+@description "One recorded player move of the image game: a 4-pixel step right, left, up or down."
+@tags "games" "demo"
+ImageGameMove = StepRight | StepLeft | StepUp | StepDown
+
+@label "Image game state"
+@description "Where the sprite stands (x, y, in pixels from the arena's top-left corner), which coin is next and how many coins were collected."
+@tags "games" "demo"
+ImageGameState = ImageGameState x: Number y: Number coin: Number score: Number
+
+@label "Image game sprite"
+@description "Shrink an image once to fit a 16 by 16 box, keeping its aspect ratio."
+@tags "games" "demo" "picture"
+imageGameSprite : (img: Image) -> Image
+imageGameSprite img =
+  let longest = max 1 (max img.width img.height)
+  imageResize img (max 1 (round (16 * img.width / longest))) (max 1 (round (16 * img.height / longest)))
+
+@label "Place image"
+@description "A transparent width by height layer showing the sprite with its top-left corner at (x, y). Parts outside the layer are clipped."
+@tags "games" "picture"
+imageGamePlace : (sprite: Image) -> (x: Number) -> (y: Number) -> (width: Number) -> (height: Number) -> Image
+imageGamePlace sprite x y width height =
+  let canvas = imageSolid (width + sprite.width) (height + sprite.height) 0 0 0 0
+  let cornered = imageRotate180 (imageOverlay (imageRotate180 sprite) canvas)
+  imageCrop cornered (width - x) (height - y) width height
+
+@label "Image game coin position"
+@description "Where coin number n of the image game lies; the three positions repeat."
+@tags "games" "demo"
+imageGameCoinAt : (n: Number) -> { x: Number, y: Number }
+imageGameCoinAt n =
+  let k = mod n 3
+  if k == 0 then { x = 28, y = 22 }
+  else if k == 1 then { x = 56, y = 38 }
+  else { x = 52, y = 12 }
+
+@label "Image game move: x"
+@description "Horizontal pixels of one move: 4 right, 4 left, none up or down."
+@tags "games" "demo"
+imageGameDx : (move: ImageGameMove) -> Number
+imageGameDx move = case move of
+  StepRight -> 4
+  StepLeft -> 0 - 4
+  _ -> 0
+
+@label "Image game move: y"
+@description "Vertical pixels of one move: 4 down, 4 up, none right or left."
+@tags "games" "demo"
+imageGameDy : (move: ImageGameMove) -> Number
+imageGameDy move = case move of
+  StepDown -> 4
+  StepUp -> 0 - 4
+  _ -> 0
+
+@label "Image game step"
+@description "Apply one recorded move: step the sprite 4 pixels inside the 64 by 48 arena; touching the 6 by 6 coin scores one and moves the coin on."
+@tags "games" "demo"
+imageGameStep : (sprite: Image) -> (current: ImageGameState) -> (move: ImageGameMove) -> ImageGameState
+imageGameStep sprite current move =
+  let nx = clamp (current.x + imageGameDx move) 0 (64 - sprite.width)
+  let ny = clamp (current.y + imageGameDy move) 0 (48 - sprite.height)
+  let spot = imageGameCoinAt current.coin
+  let touches = nx < spot.x + 6 && spot.x < nx + sprite.width && ny < spot.y + 6 && spot.y < ny + sprite.height
+  let gained = if touches then 1 else 0
+  { x = nx, y = ny, coin = current.coin + gained, score = current.score + gained }
+
+@label "Image game score bar"
+@description "The score drawn as a white bar along the arena's top edge, 6 pixels per coin; the bare arena before the first coin."
+@tags "games" "demo" "picture"
+imageGameScored : (arena: Image) -> (score: Number) -> Image
+imageGameScored arena score =
+  if score > 0
+    then imageOverlay (imageGamePlace (imageSolid (score * 6) 2 240 240 240 255) 1 1 64 48) arena
+    else arena
+
+@label "Image game frame"
+@description "Draw one state: the dark arena, a score bar along the top edge, the gold coin and the sprite."
+@tags "games" "demo" "picture"
+imageGameFrame : (sprite: Image) -> (current: ImageGameState) -> Image
+imageGameFrame sprite current =
+  let spot = imageGameCoinAt current.coin
+  let coinLayer = imageGamePlace (imageSolid 6 6 250 200 40 255) spot.x spot.y 64 48
+  let background = imageGameScored (imageSolid 64 48 24 32 56 255) current.score
+  imageOverlay (imageGamePlace sprite current.x current.y 64 48) (imageOverlay coinLayer background)
+
+@label "Image game moves"
+@description "The recorded input stream: 24 moves, one every eighth of a second."
+@tags "games" "demo"
+imageGameMoves : (unit: Any) -> List ImageGameMove
+imageGameMoves unit = [StepRight, StepRight, StepRight, StepRight, StepRight, StepRight, StepRight, StepRight, StepDown, StepDown, StepDown, StepDown, StepRight, StepRight, StepRight, StepRight, StepUp, StepUp, StepUp, StepUp, StepUp, StepUp, StepLeft, StepLeft]
+
+@label "Image game inputs"
+@description "Timestamp each recorded move at its frame: move k happens at k / 8 seconds."
+@tags "games" "demo"
+imageGameInputs : (k: Number) -> (moves: List ImageGameMove) -> List EventEntry
+imageGameInputs k moves = case head moves of
+  Just move -> concat [eventEntry (k / 8) move] (imageGameInputs (k + 1) (drop 1 moves))
+  Nothing -> []
+
+@label "Image game"
+@description "Play a short game whose player sprite is this image: 24 recorded moves through a small arena collecting coins, rendered as a 3-second, 64 by 48 pixel clip at 8 fps. Edit the image and the game follows."
+@tags "games" "demo" "picture" "animation" "pin"
+imageGame : (img: Image) -> animation.FrameSequence
+imageGame img =
+  let sprite = imageGameSprite img
+  let start = { x = 4, y = 18, coin = 0, score = 0 }
+  let game = mkGame start (\current move -> imageGameStep sprite current move) (\current -> Raster (imageGameFrame sprite current)) (event (imageGameInputs 0 (imageGameMoves 0)))
+  renderAnim (gameToAnim game) 3 8 64 48

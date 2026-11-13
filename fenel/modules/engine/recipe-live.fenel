@@ -1,0 +1,598 @@
+module engine where
+
+using std (eq, head, tail, fromMaybe, length, concat, appendItem, lt, lte, gt, gte, not, elem, includes, unique, distinctCount, filter, some, all, map, fold, sort)
+
+-- The host observes a reader once. These functions only inspect the admitted
+-- ordinary data from that observation: they never call the recipe, its rank
+-- function, a captured callable, or a primitive under admission.
+-- An admitted package remains data; readers revalidate before reusing it.
+
+@category "engine-internal"
+recipePrimitiveRequests : List ({ role: RecipePrimitiveRole, callable: Any, constructorSlots: List Nat })
+recipePrimitiveRequests = [
+  { role = RecipeEq, callable = eq, constructorSlots = [] },
+  { role = RecipeHead, callable = head, constructorSlots = [1] },
+  { role = RecipeTail, callable = tail, constructorSlots = [1] },
+  { role = RecipeFromMaybe, callable = fromMaybe, constructorSlots = [1] },
+  { role = RecipeLength, callable = length, constructorSlots = [] },
+  { role = RecipeConcat, callable = concat, constructorSlots = [] },
+  { role = RecipeAppendItem, callable = appendItem, constructorSlots = [] },
+  { role = RecipeLess, callable = lt, constructorSlots = [] },
+  { role = RecipeLessEqual, callable = lte, constructorSlots = [] },
+  { role = RecipeGreater, callable = gt, constructorSlots = [] },
+  { role = RecipeGreaterEqual, callable = gte, constructorSlots = [] },
+  { role = RecipeNot, callable = not, constructorSlots = [] },
+  { role = RecipeIncludes, callable = includes, constructorSlots = [] },
+  { role = RecipeUnique, callable = unique, constructorSlots = [] },
+  { role = RecipeDistinctCount, callable = distinctCount, constructorSlots = [] },
+  { role = RecipeFilter, callable = filter, constructorSlots = [] },
+  { role = RecipeSome, callable = std.some, constructorSlots = [] },
+  { role = RecipeElem, callable = elem, constructorSlots = [] },
+  { role = RecipeAll, callable = all, constructorSlots = [] },
+  { role = RecipeMap, callable = map, constructorSlots = [] },
+  { role = RecipeFold, callable = fold, constructorSlots = [] }
+]
+
+@category "engine-internal"
+recipeObservedRest : (items: List a) -> List a
+recipeObservedRest items = fromMaybe [] (tail items)
+
+-- Content comparison is representation-sensitive. In particular, the std
+-- loose scalar eq is used only after both snapshots have the same scalar
+-- kind, so a changed literal 1 -> "1" cannot admit a replacement primitive.
+-- Unsupported carriers abstain; callable captures retain their identity.
+@category "engine-internal"
+recipeObservedValueEqual : (left: Any) -> (right: Any) -> (depth: Nat) -> Bool
+recipeObservedValueEqual left right depth =
+  if depth == 0 then false
+  else case representationValueSnapshot left of
+    SnapshotNumber number -> case representationValueSnapshot right of
+      SnapshotNumber other -> number == other
+      _ -> false
+    SnapshotString text -> case representationValueSnapshot right of
+      SnapshotString other -> text == other
+      _ -> false
+    SnapshotBoolean flag -> case representationValueSnapshot right of
+      SnapshotBoolean other -> flag == other
+      _ -> false
+    SnapshotArray items -> case representationValueSnapshot right of
+      SnapshotArray others -> recipeObservedListEqual items others (depth - 1)
+      _ -> false
+    SnapshotRecord fields -> case representationValueSnapshot right of
+      SnapshotRecord others ->
+        let leftCallable = deepEqSnapshotCallable (SnapshotRecord fields)
+        let rightCallable = deepEqSnapshotCallable (SnapshotRecord others)
+        if leftCallable && rightCallable then std.eq left right
+        else if leftCallable || rightCallable then false
+        else length fields == length others && recipeObservedFieldsEqual fields others (depth - 1)
+      _ -> false
+    _ -> false
+
+-- The host iterates the pairs: one evaluator frame group per list, never one
+-- per element (a browser worker's stack holds a few hundred nested calls).
+-- As before, every pair of the common prefix is compared, in order, and the
+-- lists are equal when all of them are and the lengths agree.
+@category "engine-internal"
+recipeObservedListEqual : (left: List Any) -> (right: List Any) -> (depth: Nat) -> Bool
+recipeObservedListEqual left right depth =
+  let verdicts = std.zipWith (\value other -> recipeObservedValueEqual value other depth) left right
+  length left == length right && std.all verdicts (\verdict -> verdict)
+
+@category "engine-internal"
+recipeObservedFieldsEqual : (left: List RepresentationOwnField) -> (right: List RepresentationOwnField) -> (depth: Nat) -> Bool
+recipeObservedFieldsEqual left right depth = case head left of
+  Nothing -> true
+  Just field ->
+    let stringNames = case representationValueSnapshot left of
+          SnapshotArray _ -> case representationValueSnapshot right of
+            SnapshotArray _ -> std.all left (\entry -> isString entry.name) && std.all right (\entry -> isString entry.name)
+            _ -> false
+          _ -> false
+    if stringNames then
+      let index = std.fromEntries (map (\entry -> { key = entry.name, value = entry }) right)
+      if length (std.entries index) == length right then recipeObservedFieldsEqualIndexed left index depth
+      else recipeObservedFieldsEqualLegacy left right depth
+    else recipeObservedFieldsEqualLegacy left right depth
+
+-- A fold in the host, for the same reason as recipeObservedListEqual: a
+-- record of a thousand fields (a carrier's lexical names) must not nest a
+-- thousand calls. The traversal is the recursion's: fields in order, one
+-- lookup each, every found value compared, and nothing after the first
+-- missing name (Nothing is that stop; it answers false).
+@category "engine-internal"
+recipeObservedFieldsEqualIndexed : (left: List RepresentationOwnField) -> (index: Any) -> (depth: Nat) -> Bool
+recipeObservedFieldsEqualIndexed left index depth =
+  let compareField = \state field ->
+        case state of
+          Nothing -> Nothing
+          Just matched -> case lookup index field.name of
+            Nothing -> Nothing
+            Just other -> Just (matched && recipeObservedValueEqual field.value other.value depth)
+  case fold compareField (Just true) left of
+    Just matched -> matched
+    Nothing -> false
+
+@category "engine-internal"
+recipeObservedFieldsEqualLegacy : (left: List RepresentationOwnField) -> (right: List RepresentationOwnField) -> (depth: Nat) -> Bool
+recipeObservedFieldsEqualLegacy left right depth = case head left of
+  Nothing -> true
+  Just field ->
+    let matches = filter (\other -> other.name == field.name) right
+    if length matches != 1 then false
+    else
+      let other = at matches 0
+      recipeObservedValueEqual field.value other.value depth && recipeObservedFieldsEqualLegacy (recipeObservedRest left) right depth
+
+-- Only the known package metadata is omitted. A capture or Expr literal
+-- whose ordinary fields happen to be named source/generation stays exact.
+@category "engine-internal"
+recipeObservedPackageLocalEqual : (left: ReifiedFunction) -> (right: ReifiedFunction) -> Bool
+recipeObservedPackageLocalEqual left right =
+  recipeObservedValueEqual left.params right.params 128 && recipeObservedValueEqual left.body right.body 128 && recipeObservedValueEqual left.captures right.captures 128 && recipeObservedValueEqual left.constructors right.constructors 128
+
+@category "engine-internal"
+recipeObservedOutcomeEqual : (left: ReifyOutcome) -> (right: ReifyOutcome) -> (depth: Nat) -> Bool
+recipeObservedOutcomeEqual left right depth =
+  if depth == 0 then false
+  else case left of
+    Reified { package = package } -> case right of
+      Reified { package = other } -> recipeObservedPackageLocalEqual package other && recipeObservedDependenciesEqual package.dependencies other.dependencies (depth - 1)
+      _ -> false
+    OpaqueBody { params = params } -> case right of
+      OpaqueBody { params = others } -> recipeObservedValueEqual params others 128
+      _ -> false
+    Unavailable -> false
+
+@category "engine-internal"
+recipeObservedDependenciesEqual : (left: List ReifiedDependency) -> (right: List ReifiedDependency) -> (depth: Nat) -> Bool
+recipeObservedDependenciesEqual left right depth = case head left of
+  Nothing -> length right == 0
+  Just dependency -> case head right of
+    Nothing -> false
+    Just other -> dependency.identity == other.identity && recipeObservedOutcomeEqual dependency.outcome other.outcome depth && recipeObservedDependenciesEqual (recipeObservedRest left) (recipeObservedRest right) depth
+
+@category "engine-internal"
+recipeObservedTrue : (value: Any) -> Bool
+recipeObservedTrue value = case representationValueSnapshot value of
+  SnapshotBoolean flag -> flag
+  _ -> false
+
+@category "engine-internal"
+recipeObservedRouteEqual : (route: Any) -> Bool
+recipeObservedRouteEqual route =
+  let readableImplementation = case route.current of
+    Reified {} -> true
+    -- Equal absent native pointers do not fingerprint an opaque source
+    -- implementation. Only actual selected native-pointer parity admits it.
+    OpaqueBody {} -> case lookup route "nativeRoute" of
+      Just nativeRoute -> recipeObservedTrue nativeRoute
+      Nothing -> false
+    _ -> false
+  readableImplementation && recipeObservedTrue route.sameRoute && recipeObservedValueEqual route.signature route.canonicalSignature 128 && recipeObservedOutcomeEqual route.current route.canonical 128
+
+-- A route observation may contain the helper's full independently reflected
+-- graph while its root dependency entry is shallow. Compare their local
+-- package content here; the whole root graph is checked separately below.
+@category "engine-internal"
+recipeObservedLocalOutcomeEqual : (left: ReifyOutcome) -> (right: ReifyOutcome) -> Bool
+recipeObservedLocalOutcomeEqual left right = case left of
+  Reified { package = package } -> case right of
+    Reified { package = other } -> recipeObservedPackageLocalEqual package other
+    _ -> false
+  OpaqueBody { params = params } -> case right of
+    OpaqueBody { params = others } -> recipeObservedValueEqual params others 128
+    _ -> false
+  Unavailable -> false
+
+@category "engine-internal"
+recipeObservedDependencyRoutes : (dependencies: List ReifiedDependency) -> (canonical: List ReifiedDependency) -> (routes: List Any) -> Bool
+recipeObservedDependencyRoutes dependencies canonical routes = recipeObservedDependencyRoutesWith dependencies canonical routes []
+
+-- recipeObservedRouteEqual of every route, computed once per observation: a
+-- dependency route is otherwise compared again for every primitive (and
+-- representation method) that depends on it (recipes lane 2, Nov 8).
+@category "engine-internal"
+recipeObservedRouteVerdicts : (routes: List Any) -> List ({ identity: String, ok: Bool })
+recipeObservedRouteVerdicts routes = map (\route -> { identity = route.identity, ok = recipeObservedRouteEqual route }) routes
+
+-- The verdict of this route: the precomputed one when exactly one entry has
+-- its identity (verdicts are computed from the same route list, whose
+-- identities a dependency lookup requires to be unique), else computed.
+@category "engine-internal"
+recipeObservedRouteVerdict : (verdicts: List ({ identity: String, ok: Bool })) -> (route: Any) -> Bool
+recipeObservedRouteVerdict verdicts route =
+  let matches = filter (\verdict -> verdict.identity == route.identity) verdicts
+  case head matches of
+    Just verdict -> if length matches == 1 then verdict.ok else recipeObservedRouteEqual route
+    _ -> recipeObservedRouteEqual route
+
+@category "engine-internal"
+recipeObservedDependencyRoutesWith : (dependencies: List ReifiedDependency) -> (canonical: List ReifiedDependency) -> (routes: List Any) -> (verdicts: List ({ identity: String, ok: Bool })) -> Bool
+recipeObservedDependencyRoutesWith dependencies canonical routes verdicts = case head dependencies of
+  Nothing -> true
+  Just dependency ->
+    let actualRoutes = filter (\route -> route.identity == dependency.identity) routes
+    let expected = filter (\other -> other.identity == dependency.identity) canonical
+    if length actualRoutes != 1 || length expected != 1 then false
+    else
+      let route = at actualRoutes 0
+      let expectedRoute = at expected 0
+      recipeObservedRouteVerdict verdicts route && recipeObservedLocalOutcomeEqual dependency.outcome route.current && recipeObservedLocalOutcomeEqual expectedRoute.outcome route.canonical && recipeObservedDependencyRoutesWith (recipeObservedRest dependencies) canonical routes verdicts
+
+@category "engine-internal"
+recipeReaderDistinctConstructors : (constructors: List ConstructorRef) -> List ConstructorRef
+recipeReaderDistinctConstructors constructors =
+  fold (\kept reference -> if std.some kept (\other -> recipeObservedValueEqual reference other 128) then kept else appendItem reference kept) [] constructors
+
+@category "engine-internal"
+recipeReaderDistinctBindings : (bindings: List RecipeNameBinding) -> List RecipeNameBinding
+recipeReaderDistinctBindings bindings =
+  fold (\kept binding -> if std.some kept (\other -> other.name == binding.name && other.target == binding.target) then kept else appendItem binding kept) [] bindings
+
+@category "engine-internal"
+recipeReaderDistinctConstructorIdentities : (identities: List RecipeConstructorIdentity) -> List RecipeConstructorIdentity
+recipeReaderDistinctConstructorIdentities identities =
+  fold (\kept identity -> if std.some kept (\other -> other.target == identity.target && other.functionId == identity.functionId) then kept else appendItem identity kept) [] identities
+
+@category "engine-internal"
+recipeObservedConstructorsResolved : (constructors: List ConstructorRef) -> Bool
+recipeObservedConstructorsResolved constructors =
+  let constructorResolved = \reference ->
+        case reference of
+          ConstructorRef { written = written, target = target } -> written != "" && target != "" && length (filter (\other -> other.written == written) constructors) == 1
+          _ -> false
+  std.all constructors constructorResolved
+
+@category "engine-internal"
+recipeObservedPrimitive : (routes: List Any) -> (primitive: Any) -> RecipePrimitiveAdmission
+recipeObservedPrimitive routes primitive = recipeObservedPrimitiveWith routes [] primitive
+
+@category "engine-internal"
+recipeObservedPrimitiveWith : (routes: List Any) -> (verdicts: List ({ identity: String, ok: Bool })) -> (primitive: Any) -> RecipePrimitiveAdmission
+recipeObservedPrimitiveWith routes verdicts primitive =
+  let contentAndRoute = recipeObservedRouteEqual primitive
+  let closureRoutes = case primitive.current of
+    Reified { package = package } -> case primitive.canonical of
+      Reified { package = other } -> recipeObservedDependencyRoutesWith package.dependencies other.dependencies routes verdicts
+      _ -> false
+    OpaqueBody {} -> true
+    Unavailable -> false
+  let observedConstructors = case primitive.current of
+    Reified { package = package } -> package.constructors
+    _ -> primitive.constructors
+  let constructors = recipeReaderDistinctConstructors observedConstructors
+  RecipePrimitiveAdmission { identity = primitive.identity, role = primitive.role, admitted = contentAndRoute && closureRoutes && recipeObservedConstructorsResolved constructors, constructors = constructors }
+
+-- Source admissions identify an actual reflected occurrence. Only the flat
+-- dependency list is normalized for matching: its local source, generation,
+-- parameters, body, captures and constructor resolutions remain exact.
+@category "engine-internal"
+recipeReaderSourceCoreEqual : (left: ReifiedFunction) -> (right: ReifiedFunction) -> Bool
+recipeReaderSourceCoreEqual left right =
+  let leftCore = mapSet left "dependencies" []
+  let rightCore = mapSet right "dependencies" []
+  let callableCore = deepEqSnapshotCallable (representationValueSnapshot leftCore) || deepEqSnapshotCallable (representationValueSnapshot rightCore)
+  let sourceCompatible =
+        if callableCore then true
+        else case lookup leftCore "source" of
+          Nothing -> true
+          Just source -> case lookup rightCore "source" of
+            Nothing -> true
+            Just other -> recipeObservedValueEqual source other 128
+  if sourceCompatible then recipeObservedValueEqual leftCore rightCore 128 else false
+
+@category "engine-internal"
+recipeObservedSourceAdmitted : (observed: Any) -> (primitives: List Any) -> (admissions: List RecipePrimitiveAdmission) -> Bool
+recipeObservedSourceAdmitted observed primitives admissions =
+  if recipeObservedTrue observed.selectedBody then true
+  else case observed.primitiveIdentity of
+    Nothing -> false
+    Just identity ->
+      let tokens = filter (\token -> token.identity == identity && token.admitted) admissions
+      let current = filter (\primitive -> primitive.identity == identity) primitives
+      if length tokens != 1 || length current != 1 then false
+      else
+        let primitive = at current 0
+        case observed.base of
+          Reified { package = package } -> case primitive.current of
+            Reified { package = other } -> recipeReaderSourceCoreEqual package other
+            _ -> false
+          _ -> false
+
+@category "engine-internal"
+recipeReaderDistinctSources : (sources: List RecipeSourceAdmission) -> List RecipeSourceAdmission
+recipeReaderDistinctSources sources =
+  fold (\kept admission -> if std.some kept (\other -> other.admitted == admission.admitted && recipeReaderSourceCoreEqual other.source admission.source) then kept else appendItem admission kept) [] sources
+
+@category "engine-internal"
+recipeObservedSources : (sources: List Any) -> (primitives: List Any) -> (admissions: List RecipePrimitiveAdmission) -> List RecipeSourceAdmission
+recipeObservedSources sources primitives admissions =
+  recipeReaderDistinctSources (map (\observed -> RecipeSourceAdmission { source = observed.source, admitted = recipeObservedSourceAdmitted observed primitives admissions }) sources)
+
+-- This context is comparison data, not a public reification. A closure's
+-- sourceFunction is preserved by the carrier comparison; no execution or
+-- public OpaqueBody boundary is relaxed by collecting its written names.
+@category "engine-internal"
+recipeReaderRepresentationMethodContext : (carrier: ReflectCarrier) -> (ctorDefs: List CtorDefEntry) -> (ctorRows: List ({ target: String, wireName: String })) -> Maybe ({ expression: Expr, references: List String, constructors: List ConstructorRef })
+recipeReaderRepresentationMethodContext carrier ctorDefs ctorRows = case carrier of
+  ReflectNamed { identity = identity, params = params, body = body, env = env, lexicalNames = names } -> case recipeReaderRepresentationMethodNames params body env names ctorDefs ctorRows of
+    Nothing -> Nothing
+    Just context -> Just (mapSet context "references" (reflectAddName identity context.references))
+  ReflectClosure { params = params, body = body, env = env, lexicalNames = names, fix = fixName } -> case fixName of
+    Nothing -> recipeReaderRepresentationMethodNames params body env names ctorDefs ctorRows
+    Just self -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+recipeReaderRepresentationMethodNames : (params: List String) -> (body: Any) -> (env: List Any) -> (names: Any) -> (ctorDefs: List CtorDefEntry) -> (ctorRows: List ({ target: String, wireName: String })) -> Maybe ({ expression: Expr, references: List String, constructors: List ConstructorRef })
+recipeReaderRepresentationMethodNames params body env names ctorDefs ctorRows =
+  -- The placeholder affects only literal values, which both name walkers
+  -- ignore; it is never returned as a function body or evaluated.
+  case jsonLogicToExpr body ctorDefs Nothing of
+    Err reason -> Nothing
+    Ok expression ->
+      let bound = concat params (map (\entry -> entry.name) env)
+      let closed = reifyCloseLexicalNames expression names bound
+      let kept = reifyFilterCaptures env (collectFreeVars closed params []) []
+      if not (reflectAllAdmitted kept) then Nothing
+      else case recipeReaderRepresentationCaptureReferences kept (reflectDynNames closed []) (reflectReferences closed bound []) of
+        Nothing -> Nothing
+        Just references -> Just { expression = closed, references = references, constructors = reflectConstructorRefs (reflectWrittenConstructors closed []) ctorRows [] }
+
+@category "engine-internal"
+recipeReaderRepresentationCaptureReferences : (captures: List Any) -> (dynamic: List String) -> (references: List String) -> Maybe (List String)
+recipeReaderRepresentationCaptureReferences captures dynamic references = case head captures of
+  Nothing -> Just references
+  Just capture -> case recipeReaderRepresentationCallableReferences (reflectCallablesOf capture) capture.name dynamic references of
+    Nothing -> Nothing
+    Just next -> recipeReaderRepresentationCaptureReferences (recipeObservedRest captures) dynamic next
+
+-- Captured references are added conservatively, including type references:
+-- this comparison-only walker never invokes the reader's type/name leaf.
+-- A nested captured closure/partial needs its own comparison context, so this
+-- initial fragment refuses it rather than treating raw identity as a route.
+@category "engine-internal"
+recipeReaderRepresentationCallableReferences : (callables: List ReflectCallable) -> (name: String) -> (dynamic: List String) -> (references: List String) -> Maybe (List String)
+recipeReaderRepresentationCallableReferences callables name dynamic references = case head callables of
+  Nothing -> Just references
+  Just callable -> case callable of
+    CallableIdentity { identity = identity } -> recipeReaderRepresentationCallableReferences (recipeObservedRest callables) name dynamic (reflectAddName identity references)
+    CallableRef { identity = identity } -> recipeReaderRepresentationCallableReferences (recipeObservedRest callables) name dynamic (reflectAddName identity references)
+    CallableIfCalled { identity = identity } -> recipeReaderRepresentationCallableReferences (recipeObservedRest callables) name dynamic (reflectAddName identity references)
+    CallableCarrier {} -> Nothing
+
+-- Exact equality alone is insufficient for a native declaration whose own
+-- named or executable premises can change. This initial context fragment
+-- admits only self references; dependent, unknown, refinement and map-key
+-- premises remain residual. Self applications retain generic List tails.
+@category "engine-internal"
+recipeReaderRepresentationNativeType : (type: TraversalType) -> (self: String) -> Bool
+recipeReaderRepresentationNativeType type self = case type of
+  TtNamed { name = name } -> name == self
+  TtVar {} -> true
+  TtUnit {} -> true
+  TtVoid {} -> true
+  TtTypeUniverse {} -> true
+  TtEl {} -> false
+  TtUnknown {} -> false
+  TtRecord { fields = fields } -> std.all fields (\field -> recipeReaderRepresentationNativeType field.type self)
+  TtVariant { cases = cases } -> std.all cases (\variant -> std.all variant.fields (\field -> recipeReaderRepresentationNativeType field.type self))
+  TtTuple { items = items } -> std.all items (\item -> recipeReaderRepresentationNativeType item self)
+  TtMap {} -> false
+  TtApp { head = name, args = args } -> name == self && std.all args (\arg -> recipeReaderRepresentationNativeType arg self)
+  TtRefined {} -> false
+  TtMu { body = body } -> recipeReaderRepresentationNativeType body self
+  TtTagged { value = value, phantom = phantom } -> recipeReaderRepresentationNativeType value self && recipeReaderRepresentationNativeType phantom self
+  TtOpaque { pure = pure } -> recipeReaderRepresentationNativeType pure self
+  TtArrow { params = params, returns = returns } -> std.all params (\param -> recipeReaderRepresentationNativeType param.type self) && recipeReaderRepresentationNativeType returns self
+  TtUnion { branches = branches } -> std.all branches (\branch -> recipeReaderRepresentationNativeType branch self)
+  TtIntersect { branches = branches } -> std.all branches (\branch -> recipeReaderRepresentationNativeType branch self)
+  TtComplement { inner = inner } -> recipeReaderRepresentationNativeType inner self
+  _ -> false
+
+@category "engine-internal"
+recipeReaderRepresentationNamedRoutes : (references: List String) -> (routes: List Any) -> Bool
+recipeReaderRepresentationNamedRoutes references routes =
+  std.all references (\reference -> length (filter (\route -> route.identity == reference) routes) == 1)
+
+@category "engine-internal"
+recipeReaderRepresentationRouteClosed : (routes: List Any) -> (route: Any) -> Bool
+recipeReaderRepresentationRouteClosed routes route = recipeReaderRepresentationRouteClosedWith routes [] route
+
+@category "engine-internal"
+recipeReaderRepresentationRouteClosedWith : (routes: List Any) -> (verdicts: List ({ identity: String, ok: Bool })) -> (route: Any) -> Bool
+recipeReaderRepresentationRouteClosedWith routes verdicts route =
+  let inspectRepresentationRoute = \unit ->
+        case route.current of
+          Reified { package = package } -> case route.canonical of
+            Reified { package = other } -> recipeObservedDependencyRoutesWith package.dependencies other.dependencies routes verdicts
+            _ -> false
+          OpaqueBody {} -> true
+          _ -> false
+  recipeObservedRouteVerdict verdicts route && inspectRepresentationRoute 0
+
+@category "engine-internal"
+recipeReaderRepresentationCarrierEqual : (current: Any) -> (canonical: Any) -> Bool
+recipeReaderRepresentationCarrierEqual current canonical =
+  if recipeObservedValueEqual current.carrier canonical.carrier 128 then true
+  else case current.carrier of
+    ReflectClosure {} -> case canonical.carrier of
+      ReflectClosure {} ->
+        if length current.context.references != 0 || length canonical.context.references != 0 || length current.context.constructors != 0 || length canonical.context.constructors != 0 then false
+        else case representationValueSnapshot current.carrier of
+          SnapshotRecord fields -> case representationValueSnapshot canonical.carrier of
+            SnapshotRecord others ->
+              let retained = filter (\field -> field.name != "lexicalNames") fields
+              let expected = filter (\field -> field.name != "lexicalNames") others
+              length retained == length expected && recipeObservedFieldsEqual retained expected 128
+            _ -> false
+          _ -> false
+      _ -> false
+    _ -> false
+
+@category "engine-internal"
+recipeReaderRepresentationMethodEqual : (current: Any) -> (canonical: Any) -> (routes: List Any) -> Bool
+recipeReaderRepresentationMethodEqual current canonical routes = recipeReaderRepresentationMethodEqualWith current canonical routes []
+
+@category "engine-internal"
+recipeReaderRepresentationMethodEqualWith : (current: Any) -> (canonical: Any) -> (routes: List Any) -> (verdicts: List ({ identity: String, ok: Bool })) -> Bool
+recipeReaderRepresentationMethodEqualWith current canonical routes verdicts =
+  let exactCarrier = recipeReaderRepresentationCarrierEqual current canonical
+  let exactContext = recipeObservedValueEqual current.context canonical.context 128
+  let namedRoutes = recipeReaderRepresentationNamedRoutes current.context.references routes
+  let constructorContext = recipeObservedConstructorsResolved (recipeReaderDistinctConstructors current.context.constructors)
+  let packageContext = case current.package of
+    Reified { package = package } -> case canonical.package of
+      Reified { package = other } -> recipeObservedOutcomeEqual current.package canonical.package 128 && recipeObservedDependencyRoutesWith package.dependencies other.dependencies routes verdicts
+      _ -> false
+    -- OpaqueBody is not an implementation fingerprint. The complete raw
+    -- carrier and comparison context above own this comparison instead.
+    OpaqueBody {} -> case canonical.package of
+      OpaqueBody {} -> true
+      _ -> false
+    _ -> false
+  exactCarrier && exactContext && namedRoutes && constructorContext && packageContext
+
+@category "engine-internal"
+recipeObservedRepresentationSelected : (current: Any) -> (canonical: Any) -> (routes: List Any) -> Bool
+recipeObservedRepresentationSelected current canonical routes =
+  let exactNative = recipeObservedValueEqual current.native canonical.native 128
+  let exactDeclaration = recipeObservedValueEqual current.nativeDeclaration canonical.nativeDeclaration 128
+  let declarationHandle = current.nativeDeclaration.handle
+  let closedDeclaration = isString declarationHandle && declarationHandle != "" && recipeReaderRepresentationNativeType current.nativeDeclaration.type declarationHandle
+  let exactConstructors = recipeObservedValueEqual current.ctors canonical.ctors 128 && recipeObservedConstructorsResolved (recipeReaderDistinctConstructors current.ctors)
+  let verdicts = recipeObservedRouteVerdicts routes
+  let closedRoutes = std.all routes (recipeReaderRepresentationRouteClosedWith routes verdicts)
+  exactNative && exactDeclaration && closedDeclaration && exactConstructors && closedRoutes && recipeReaderRepresentationMethodEqualWith current.lift canonical.lift routes verdicts && recipeReaderRepresentationMethodEqualWith current.lower canonical.lower routes verdicts
+
+@category "engine-internal"
+recipeObservedRepresentation : (observed: Any) -> RecipeRepresentationAdmission
+recipeObservedRepresentation observed =
+  let admitted =
+    if observed.current.kind == "none" && observed.canonical.kind == "none" then true
+    else if observed.current.kind == "selected" && observed.canonical.kind == "selected" then recipeObservedRepresentationSelected observed.current observed.canonical observed.routes
+    else false
+  RecipeRepresentationAdmission { constructor = observed.constructor, owner = observed.owner, admitted = admitted }
+
+@category "engine-internal"
+recipeObservedRepresentations : (observed: List Any) -> List RecipeRepresentationAdmission
+recipeObservedRepresentations observed =
+  fold (\kept row -> if std.some kept (\other -> other.constructor == row.constructor && other.owner == row.owner && other.admitted == row.admitted) then kept else appendItem row kept) [] (map recipeObservedRepresentation observed)
+
+@category "engine-internal"
+recipeObservedConstructor : (constructors: List ConstructorRef) -> (written: String) -> Maybe String
+recipeObservedConstructor constructors written =
+  let matches = filter (\reference -> reference.written == written) constructors
+  if length matches != 1 then Nothing
+  else case at matches 0 of
+    ConstructorRef { target = target } -> Just target
+    _ -> Nothing
+
+@category "engine-internal"
+recipeObservedConstructorIdentity : (identities: List RecipeConstructorIdentity) -> (target: String) -> Maybe String
+recipeObservedConstructorIdentity identities target =
+  let matches = filter (\row -> row.target == target || row.functionId == target) identities
+  if target == "" || length matches != 1 then Nothing
+  else
+    let row = at matches 0
+    if row.functionId == "" then Nothing else Just row.functionId
+
+@category "engine-internal"
+recipeObservedRankArm : (constructors: List ConstructorRef) -> (identities: List RecipeConstructorIdentity) -> (arm: Any) -> Maybe ({ identity: String, rank: Nat })
+recipeObservedRankArm constructors identities arm = case lookup arm "guard" of
+  Just guard -> Nothing
+  Nothing -> case arm.pattern of
+    PatConstruct { ctor = written, args = args } ->
+      if length args != 0 then Nothing
+      else case arm.body of
+        ELit { value = rank } ->
+          if not (isNumber rank) then Nothing
+          else if not (numberIsFinite rank) || rank < 0 || rank != floor rank then Nothing
+          else case recipeObservedConstructor constructors written of
+            Nothing -> Nothing
+            Just target -> case recipeObservedConstructorIdentity identities target of
+              Nothing -> Nothing
+              Just identity -> Just { identity = identity, rank = rank }
+        _ -> Nothing
+    _ -> Nothing
+
+@category "engine-internal"
+recipeObservedRankArms : (constructors: List ConstructorRef) -> (identities: List RecipeConstructorIdentity) -> (arms: List Any) -> Maybe (List ({ identity: String, rank: Nat }))
+recipeObservedRankArms constructors identities arms = case head arms of
+  Nothing -> Just []
+  Just arm -> case recipeObservedRankArm constructors identities arm of
+    Nothing -> Nothing
+    Just row -> case recipeObservedRankArms constructors identities (recipeObservedRest arms) of
+      Nothing -> Nothing
+      Just rest -> Just (concat [row] rest)
+
+@category "engine-internal"
+recipeObservedRanks : (rank: ReifiedFunction) -> (identities: List RecipeConstructorIdentity) -> Maybe (List ({ identity: String, rank: Nat }))
+recipeObservedRanks rank identities =
+  if length rank.params != 1 then Nothing
+  else case rank.body of
+    EMatch { scrutinee = scrutinee, arms = arms } -> case scrutinee of
+      EVar { name = name } -> if name == at rank.params 0 then recipeObservedRankArms rank.constructors identities arms else Nothing
+      _ -> Nothing
+    _ -> Nothing
+
+@category "engine-internal"
+recipeObservedFoods : (foods: List Any) -> (ranks: List Any) -> Maybe (List RecipeFoodRank)
+recipeObservedFoods foods ranks = case head foods of
+  Nothing -> if length ranks == 0 then Just [] else Nothing
+  Just food ->
+    let matches = filter (\row -> row.identity == food.identity) ranks
+    if not (isString food.written) || not (isString food.wire) || food.written == "" || food.wire != food.written || food.wire == "True" || food.wire == "False" then Nothing
+    else if not (isString food.identity) || food.identity == "" || length matches != 1 then Nothing
+    else
+      let matched = at matches 0
+      let remaining = filter (\row -> row.identity != food.identity) ranks
+      case recipeObservedFoods (recipeObservedRest foods) remaining of
+        Nothing -> Nothing
+        Just rest -> Just (concat [RecipeFoodRank { identity = food.identity, value = food.value, rank = matched.rank }] rest)
+
+@category "engine-internal"
+recipeObservedDomain : (observation: Any) -> Result RecipeRefusal RecipeDomainSnapshot
+recipeObservedDomain observation = case observation.rank of
+  Reified { package = rank } -> case observation.canonical of
+    Reified { package = canonical } -> case observation.canonicalAfter of
+      Reified { package = canonicalAfter } -> case recipeObservedRanks rank (recipeReaderDistinctConstructorIdentities observation.constructorIdentities) of
+        Nothing -> Err RecipeInvalidDomain
+        Just ranks -> case recipeObservedFoods observation.foods ranks of
+          Nothing -> Err RecipeInvalidDomain
+          Just foods ->
+            let orderedFoods = sort (\food -> food.rank) foods
+            let scopes = [RecipeDeclarationScope { declaration = RecipeFoodDeclaration, owner = observation.food.owner, bindings = recipeReaderDistinctBindings observation.food.bindings }, RecipeDeclarationScope { declaration = RecipePantryDeclaration, owner = observation.pantry.owner, bindings = recipeReaderDistinctBindings observation.pantry.bindings }, RecipeDeclarationScope { declaration = RecipeIngredientsDeclaration, owner = observation.ingredients.owner, bindings = recipeReaderDistinctBindings observation.ingredients.bindings }]
+            Ok (RecipeDomainSnapshot { foodType = observation.food.type, pantryType = observation.pantry.type, ingredientsType = observation.ingredients.type, foods = orderedFoods, rankVersion = observation.rankVersion, rankFunction = rank, canonicalFunction = canonical, canonicalAfterFunction = canonicalAfter, scopes = scopes })
+      _ -> Err RecipeInvalidDomain
+    _ -> Err RecipeInvalidDomain
+  _ -> Err RecipeInvalidDomain
+
+@category "engine-internal"
+recipeSnapshotFromReaderObservation : (observation: Any) -> Result RecipeRefusal RecipeAnalysisSnapshot
+recipeSnapshotFromReaderObservation observation =
+  if not (recipeObservedTrue observation.factsAdmitted) then Err RecipeUnknownFact
+  else case observation.recipe of
+    Unavailable -> Err RecipeUnavailable
+    OpaqueBody {} -> Err RecipeOpaque
+    Reified { package = recipe } -> case recipeObservedDomain observation of
+      Err reason -> Err reason
+      Ok domain ->
+        let verdicts = recipeObservedRouteVerdicts observation.routes
+        let primitives = map (recipeObservedPrimitiveWith observation.routes verdicts) observation.primitives
+        let sources = recipeObservedSources observation.sources observation.primitives primitives
+        Ok (RecipeAnalysisSnapshot { recipe = recipe, domain = domain, facts = observation.facts, rule = observation.rule, primitives = primitives, generation = recipe.generation, callables = observation.callables, constructorIdentities = recipeReaderDistinctConstructorIdentities observation.constructorIdentities, sources = sources, functions = observation.functions, representations = recipeObservedRepresentations observation.representations })
+
+-- Domain presentation has no recipe/fact/rule premise. The host reacquires
+-- these source declarations for the current reader before each use.
+@category "engine-internal"
+recipeDomainContextFromReaderObservation : (observation: Any) -> Result RecipeRefusal ({ domain: RecipeDomainSnapshot, primitives: List RecipePrimitiveAdmission, generation: Maybe Number, constructorIdentities: List RecipeConstructorIdentity, sources: List RecipeSourceAdmission, representations: List RecipeRepresentationAdmission })
+recipeDomainContextFromReaderObservation observation = case recipeObservedDomain observation of
+  Err reason -> Err reason
+  Ok domain -> case observation.rank of
+    Reified { package = rank } ->
+      let verdicts = recipeObservedRouteVerdicts observation.routes
+      let primitives = map (recipeObservedPrimitiveWith observation.routes verdicts) observation.primitives
+      let sources = recipeObservedSources observation.sources observation.primitives primitives
+      Ok { domain = domain, primitives = primitives, generation = rank.generation, constructorIdentities = recipeReaderDistinctConstructorIdentities observation.constructorIdentities, sources = sources, representations = recipeObservedRepresentations observation.representations }
+    _ -> Err RecipeInvalidDomain

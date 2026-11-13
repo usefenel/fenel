@@ -1,0 +1,1423 @@
+module engine where
+
+-- =========================================================================
+-- jsonLogicToSyntax / jsonLogicToExpr — the JSON-Logic source-format adapter.
+-- expr-substrate Phase 4a (brief:
+-- `workstreams/expr-substrate/briefs/phase-4a-jsonlogic-to-syntax-adapter.md`).
+--
+-- JSON Logic IS a surface format — its `{if}` / `{let}` / `{do}` frames are
+-- exactly `Syntax`'s sugars. So this adapter maps each JSON-Logic form 1:1 to
+-- a `Syntax` case (`fenel/std/syntax.fenel`, 11 cases — surface frames
+-- PRESERVED) and reuses `desugar` (`desugar.fenel`, P2) for the lowering to
+-- `Expr`:
+--
+--   jsonLogicToSyntax : JsonLogic -> … -> Result a Syntax    (the form-map)
+--   jsonLogicToExpr   = desugar <$> jsonLogicToSyntax        (the composition)
+--
+-- This single-sources the canonical core encodings (the SLet/SDo/SIf/SOp →
+-- Expr lowerings live in `desugar` ALONE — this file never re-derives them)
+-- and gives `desugar` its first real caller, validating the P2 encodings
+-- against real stored-body shapes.
+--
+-- NOTHING in the live pipeline calls this adapter yet. 4b wires the
+-- `CoreExpr → Expr` replace inside the compile passes + re-routes the
+-- compile-`{js,wasm,llvm}` seams through `jsonLogicToExpr`; 4c retires the
+-- compiler entry's JSON-Logic knowledge. 4a is purely additive.
+--
+-- INPUT TYPE (decision 1): the EXISTING registered `JsonLogic` ADT
+-- (`JlNull | JlBool | JlNumber | JlString | JlArray | JlTagged | JlObject` +
+-- `JlField`, declared in `normalise-to-core.fenel`). The raw→ADT marshalling
+-- already exists (`marshalJsonLogic` in `engine-bodies-dispatch.ts`); the TS
+-- wrapper `dispatchedJsonLogicToExpr` reuses it — NO second marshaller.
+--
+-- HELPER REUSE: the target-AGNOSTIC structural helpers of
+-- `normalise-to-core.fenel` (list/JsonLogic walkers that yield strings or
+-- raw nodes — `normalizeToArgList`, `ifNthArg`, `ifTailFrom`, `ifTailExcept`,
+-- `unwrapFirstField`, `resolveCallee`, `lookupCtorDef`, `lookupFieldInList`,
+-- `allKeysInCtorDef`, `shouldUseNamedFields`, `positionalFieldsForCtor`,
+-- `objectHasDollarPrefixedKey`, `lastBindingName`, `isUnsupportedOp`,
+-- `opNotationToCodeName`, `collectParamNames`) are CALLED directly through the
+-- `module engine where` union (cross-file resolution proven, e.g.
+-- `parseEffectFnId`). Only the TARGET-producing arms get `jls*` mirrors. This
+-- avoids ~17 duplicate functions and inherits the proven structural logic.
+--
+-- THE FORM TABLE (every recognised JSON-Logic shape → Syntax case):
+--   JlNull / JlBool / JlNumber / JlString  ⇒ SLit          (scalars; JlNull
+--                                            carries `nullValue`)
+--   JlArray [a, b, …]                       ⇒ left-folded `appendItem`-chain of
+--                                            SCalls over a `SLit {value = []}`
+--                                            base (decision 4 — `Syntax` has no
+--                                            list case; chain's desugar image is
+--                                            exactly what the pipeline digests)
+--   JlTagged {$tag, …}                      ⇒ SConstruct (±fields, dual-arm)
+--   JlObject (0 keys)                       ⇒ SRecord []
+--   JlObject (≥2 keys, no `$`-prefix)       ⇒ SRecord
+--   JlObject (single key) dispatches on the key:
+--     {var: "n"}                            ⇒ SVar
+--     {if | ?:: [...]}                       ⇒ SIf (nested for the multi-arm
+--                                            chain; surface frame preserved —
+--                                            NOT pre-lowered to ECall "if")
+--     {let: {…}}                             ⇒ SLet (implicit body = last
+--                                            binding's SVar, mirroring JSON-
+--                                            Logic let)
+--     {do: [...]}                            ⇒ re-nested SLet/SDo (4a ERRATUM
+--                                            fix): leading consecutive {let:…}
+--                                            items merge into SLet bindings
+--                                            scoping over the rest; mid-stream
+--                                            lets nest recursively (mirrors
+--                                            lowerDoSequence/collectLeadingLets/
+--                                            lowerTailExprs — the flat-statement
+--                                            re-nesting is SOURCE-FORMAT
+--                                            structure, NOT lowering). Pure
+--                                            expr segments ⇒ SDo with NO
+--                                            singleton-unwrap (that lowering
+--                                            stays in desugar)
+--     {fn: [...]}                            ⇒ SLambda (paren-list + flat shapes)
+--     {call: [callee, …]}                    ⇒ SCall (callee via resolveCallee)
+--     {construct: [Tag, …]}                  ⇒ SConstruct (±fields)
+--     {match: [scrut, p1, b1, …]}            ⇒ SMatch (arms = {pattern, body};
+--                                            patterns via jlsPattern → `Pattern`;
+--                                            a GUARDED arm element
+--                                            `{$guard:[pat,cond]}` ⇒ the arm gains
+--                                            a `guard` Syntax field, jlsGuardParts
+--                                            + jsonLogicToSyntax — Phase 3)
+--     {where: [body, {x:1,…}]}              ⇒ SWhere (fenel-surface-extensions
+--                                            Phase 4; bindings-object → list via
+--                                            jlsLetBindings; desugar → let)
+--     {method: [cls, method, …args]}        ⇒ SMethod (fenel-surface-extensions
+--                                            Phase 6; cls+method JlStrings, args
+--                                            via jlsExprList; desugar → dotted-
+--                                            fnId ECall)
+--     {ann: [e, T]}                          ⇒ SAnn (modules-as-values Phase 2d;
+--                                            e lowered, the `$`-keyed FenelType T
+--                                            carried OPAQUELY as its JsonLogic
+--                                            image; desugar is transparent except
+--                                            over SMethod, which jsonLogicToExpr
+--                                            rejects)
+--     {and | or: [...]}                      ⇒ SCall
+--     unsupported op (map/filter/…)         ⇒ Err Unsupported (inherited from
+--                                            normalise-to-core's recognised
+--                                            form set — the adapter mirrors the
+--                                            compile front-end; these Err shapes
+--                                            feed 4b)
+--     `$`-prefixed marker key               ⇒ Err Unsupported
+--     operator-notation key (+, ==, cat, …) ⇒ SCall (resolved codeName)
+--     any other key                         ⇒ SCall (key-as-fnId)
+--
+-- THE SOp-NEVER-EMITTED RULE (decision 4): the adapter NEVER produces `SOp`.
+-- SOp is the `.fenel`-parser's render-as-infix surface marker; JSON Logic
+-- carries no infix fidelity worth preserving. Operator-notation keys and
+-- and/or lower to `SCall` of the resolved head. desugar's SOp arm stays
+-- exercised by its own tests only until 4b's parser work.
+--
+-- THE SURFACE-FRAMES-PRESERVED RULE (amended by the 4a erratum): the sugar
+-- frames map to `SIf`/`SLet`/`SDo` — the adapter does NO if-lowering and NO
+-- singleton-do-unwrap (those lowerings live in `desugar`; composition unwraps
+-- exactly once). BUT do-embedded flat lets DO re-nest HERE: `{do:
+-- [{let:{x:1}}, e]}` ⇒ `SLet {bindings, body = SDo [e']}` — JSON Logic's
+-- do-frame is the FLAT statement encoding where a `{let}` item's bindings
+-- scope FORWARD over the remaining statements; re-nesting that into
+-- structured SLet-with-body is source-format normalisation (what a
+-- Syntax-emitting parser would emit directly), not a lowering decision. The
+-- first 4a cut emitted SDo verbatim for let items, mis-scoping them as
+-- self-contained SLets (bindings unreachable from the rest) — fixed by
+-- mirroring lowerDoSequence's collect/tail walk.
+--
+-- RESULT-AT-BOUNDARY / DESUGAR-TOTAL SPLIT (decision 3): the adapter is
+-- `Result`-wrapped — it inherits normalise-to-core's error arms (unknown
+-- shapes, malformed forms) via the shared `Unsupported` constructor. `desugar`
+-- stays TOTAL; `jsonLogicToExpr` threads the adapter's Err through and applies
+-- the total desugar on the Ok path.
+--
+-- SHARED Pat* TAGS (decision 4): the `Pat*` case names are SHARED between the
+-- std `Pattern` ADT (`expr.fenel`) and the engine `CorePattern` ADT by design
+-- (P1 kept them). Construction is tag-only (`{$tag: "PatLit", …}`) so the
+-- values are byte-identical; jlsPattern targets `Pattern` and the produced
+-- shapes pass through `desugar`'s SMatch arm untouched.
+--
+-- BODY STYLE: bare `[]` / `[a, …]` list literals (5b14 — no threaded
+-- `emptyList` param, mirroring desugar); accumulator-threaded recursion with
+-- case-on-Err at every recursive site for the Result-threading walkers (the
+-- `lowerArgList`/`lowerJlArrayItemsAcc` proven idiom). `jls*` helper names
+-- verified collision-free against the engine union (duplicate id = LOAD-TIME
+-- ERROR); NO entity decls (JsonLogic/JlField/Syntax/Expr/Pattern all exist).
+-- =========================================================================
+
+-- JsonLogic / JlField / CtorDefEntry — the typed ADT view of the raw
+-- marshalled input. expr-substrate Phase 4c — these decls MOVED here from
+-- `normalise-to-core.fenel` (decision 4: the adapter owns its input type). The
+-- dispatch wrapper's `marshalJsonLogic` (engine-bodies-dispatch.ts) converts
+-- each JS shape to its canonical variant, preserving JS object key insertion
+-- order by encoding fields as `List<JlField>` (the `tag` field on JlTagged
+-- carries the discriminator separately; JlObject.fields excludes none). The
+-- ~21 target-agnostic structural helpers still in normalise-to-core.fenel
+-- reference these through the `module engine where` union.
+JsonLogic a =
+  JlNull
+  | JlBool value: a
+  | JlNumber value: a
+  | JlString value: a
+  | JlArray items: a
+  | JlTagged tag: String fields: a
+  | JlObject fields: a
+
+-- JlField — one entry in a JlObject / JlTagged fields list. Named-record shape
+-- mirroring the parser's `{name, value}` convention so pattern bindings via
+-- field name work uniformly.
+JlField a = JlField name: String value: a
+
+-- CtorDefEntry — one entry in the marshalled ctorDefs list. The wrapper
+-- converts the JS map into identity-bearing field-slot entries. Unambiguous
+-- entries carry `ambiguous = false`; omitted unscoped spellings with multiple
+-- semantic owners are published as `ambiguous = true` sentinels so lowering
+-- fails closed rather than inheriting module-order meaning.
+CtorDefEntry = CtorDefEntry name: String wireName: String fields: a ambiguous: Boolean
+
+-- jsonLogicToSyntax — the form-map entry + recursive worker. 7-arm dispatch
+-- over a JsonLogic node, mirroring lowerExpr's cascade but targeting `Syntax`
+-- cases (surface frames preserved). Scalars ⇒ SLit; JlArray ⇒ the appendItem
+-- chain; JlTagged ⇒ SConstruct; JlObject ⇒ jlsObjectExpr (empty/single/multi).
+@label "JSON Logic to Syntax"
+@description "The JSON-Logic source-format adapter (form-map). Maps each JSON-Logic form 1:1 to a Syntax case — surface frames PRESERVED (`{if}` ⇒ SIf, `{let}` ⇒ SLet, `{do}` ⇒ SDo verbatim, operators/and/or ⇒ SCall — never SOp). Mirrors normalise-to-core's recognition cascade but targets Syntax instead of CoreExpr, reusing the target-agnostic structural helpers. Result-wrapped (inherits the Unsupported error arms). Input is the existing JsonLogic ADT (marshalled by the dispatch wrapper). `jsonLogicToExpr` composes this with the total `desugar`. expr-substrate Phase 4a; gives desugar its first real caller. NOTHING in the live pipeline calls it until 4b."
+@tags "engine" "ir" "adapter" "expr-substrate" "phase-4a"
+jsonLogicToSyntax : (node: (JsonLogic Any)) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a (Syntax Any)
+jsonLogicToSyntax node ctorDefs nullValue =
+  case node of
+    JlNull -> Ok (SLit { value = nullValue })
+    JlBool { value = b } -> Ok (SLit { value = b })
+    JlNumber { value = n } -> Ok (SLit { value = n })
+    JlString { value = s } -> Ok (SLit { value = s })
+    JlArray { items = xs } -> jlsArrayItems xs ctorDefs nullValue
+    JlTagged { tag = t, fields = fs } -> jlsTagged t fs ctorDefs nullValue
+    JlObject { fields = fs } -> jlsObjectExpr fs ctorDefs nullValue node
+
+-- jsonLogicToExpr — the composition `desugar ∘ jsonLogicToSyntax`. Threads the
+-- adapter's Err through; applies the total desugar on the Ok path. This is the
+-- seam 4b's compiler re-layer + P3's reify consume.
+@label "JSON Logic to Expr"
+@description "Composition `desugar ∘ jsonLogicToSyntax` — lifts raw JSON Logic straight to the irreducible core Expr ADT. Threads the adapter's Err through (Result-at-boundary); rejects an annotation over a qualified method call (Err Unsupported via desugarAnnotationError — its written type selects the instance, modules-as-values Phase 2d); applies the total desugar on the Ok path. The seam 4b's compiler-entry re-layer and P3's reify consume. expr-substrate Phase 4a."
+@tags "engine" "ir" "adapter" "expr-substrate" "phase-4a"
+jsonLogicToExpr : (node: (JsonLogic Any)) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a (Expr Any)
+jsonLogicToExpr node ctorDefs nullValue =
+  case jsonLogicToSyntax node ctorDefs nullValue of
+    Err e -> Err e
+    Ok s ->
+      -- modules-as-values Phase 2d: an annotation over a qualified method call
+      -- selects the instance by its written type — the compile path cannot
+      -- erase it, so it is rejected here, before the total desugar.
+      case desugarAnnotationError s of
+        Just reason -> Err (Unsupported { reason = reason, node = node })
+        Nothing -> Ok (desugar s)
+
+-- jlsArrayItems — admit JlArray at expression position. Items are lowered with
+-- the native `map` (no recursion over the list), then `syntaxListLiteral`
+-- (below) builds the list Syntax shared with the grammar's `buildList`: one
+-- pure-data SLit when every item is plain data, else the lit-marked
+-- `appendItem` chain over `SLit {value = []}` (source order preserved). The
+-- first item error, in source order, is returned as before.
+@label "JLS array items"
+@description "Lower a JlArray: lower every item (native map), return the first item error in source order, else the shared list-literal Syntax (`syntaxListLiteral`): a pure-data SLit for plain data, the lit-marked `appendItem` chain otherwise."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsArrayItems : (items: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a (Syntax Any)
+jlsArrayItems items ctorDefs nullValue =
+  case jlsPureList items nullValue of
+    Just raw -> Ok (if eq (length raw) 0 then SLit { value = [] } else mapSet (SLit { value = raw }) "pureData" true)
+    Nothing ->
+      let lowered = map (\item -> jsonLogicToSyntax item ctorDefs nullValue) items
+      case fold (\found result -> jlsFirstErrStep found result) Nothing lowered of
+        Just e -> Err e
+        Nothing -> Ok (syntaxListLiteral (map (\result -> jlsOkValue result) lowered))
+
+-- jlsPureList — the JSON-Logic-level fast path of `jlsArrayItems` for plain
+-- JSON data (a pasted image's pixel list): the raw value is read straight from
+-- the JsonLogic nodes, without lowering every item to Syntax and reading it
+-- back. It answers only where the general path provably builds the same
+-- pureData SLit (see `jlsPureValue`); anything else returns Nothing and takes
+-- the general path, which also reports every lowering error.
+@label "JLS plain-data list"
+@description "The raw JSON array of a JlArray whose items are all plain JSON data (jlsPureValue), or Nothing. Same result as lowering each item and building the pureData SLit, without the per-item Syntax round trip."
+@tags "engine" "internal" "expr-substrate"
+@category "engine-internal"
+jlsPureList : (items: a) -> (nullValue: b) -> Maybe c
+jlsPureList items nullValue =
+  let raws = map (\item -> jlsPureValue item nullValue) items
+  if all raws (\raw -> syntaxPureKnown raw) then Just (map (\raw -> syntaxPureKnownValue raw) raws) else Nothing
+
+@label "JLS plain-data value"
+@description "The raw value of a JsonLogic node that the general path lowers to plain-data Syntax: a String, Number or Boolean; null when the null value is a scalar; a plain-data JlArray; a JlObject with no field or with two or more fields whose names are unique, not $-prefixed, not digit-leading and not __proto__, and whose values are plain data. Single-key objects (operator forms), tagged values and everything else are Nothing."
+@tags "engine" "internal" "expr-substrate"
+@category "engine-internal"
+jlsPureValue : (node: a) -> (nullValue: b) -> Maybe c
+jlsPureValue node nullValue =
+  case node of
+    JlNull -> if or (isString nullValue) (or (isNumber nullValue) (or (isBoolean nullValue) (isNull nullValue))) then Just nullValue else Nothing
+    JlBool { value = b } -> Just b
+    JlNumber { value = n } -> Just n
+    JlString { value = s } -> Just s
+    JlArray { items = xs } -> jlsPureList xs nullValue
+    JlObject { fields = fs } -> jlsPureObject fs nullValue
+    _ -> Nothing
+
+@label "JLS plain-data object"
+@description "The raw record of a JlObject's fields when the general path lowers it to a plain-data SRecord (no field, or two or more fields with unique, non-$-prefixed, non digit-leading, non __proto__ names and plain-data values); else Nothing."
+@tags "engine" "internal" "expr-substrate"
+@category "engine-internal"
+jlsPureObject : (fields: a) -> (nullValue: b) -> Maybe c
+jlsPureObject fields nullValue =
+  let names = map (\field -> field.name) fields
+  if eq (length fields) 1 then Nothing
+  else if not (all names (\name -> and (isString name) (and (not (startsWith name "$")) (and (not (eq name "__proto__")) (not (elem (slice name 0 1) ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])))))) then Nothing
+  else if not (eq (length (dedupStr names)) (length names)) then Nothing
+  else
+    let raws = map (\field -> jlsPureValue field.value nullValue) fields
+    if not (all raws (\raw -> syntaxPureKnown raw)) then Nothing
+    -- mapSet in field order, exactly as syntaxPureRecord builds the general path's record.
+    else Just (fold (\record pair -> mapSet record pair.key pair.value) {} (zipWith (\field raw -> { key = field.name, value = syntaxPureKnownValue raw }) fields raws))
+
+@label "JLS first error step"
+@description "Fold step keeping the first Err of a list of item lowerings (source order)."
+@tags "engine" "internal" "expr-substrate"
+@category "engine-internal"
+jlsFirstErrStep : (found: Maybe a) -> (result: Result a b) -> Maybe a
+jlsFirstErrStep found result =
+  case found of
+    Just e -> found
+    Nothing ->
+      case result of
+        Err e -> Just e
+        Ok v -> Nothing
+
+@label "JLS ok value"
+@description "The value of an Ok item lowering (called only after every item lowered Ok)."
+@tags "engine" "internal" "expr-substrate"
+@category "engine-internal"
+jlsOkValue : (result: Result a b) -> b
+jlsOkValue result =
+  case result of
+    Ok v -> v
+    Err e -> e
+
+-- syntaxListLiteral — the ONE list-literal Syntax builder, shared by the
+-- JSON-Logic adapter (`jlsArrayItems`) and the grammar (`buildList`) so the
+-- Syntax-space differential stays equal. A non-empty list whose every item is
+-- plain data (see `syntaxPureValue`) is ONE `SLit` holding the raw JSON array,
+-- marked `pureData = true` with `mapSet` (like the chain's `lit`); `desugar`
+-- re-expands it into exactly the chain's Expr, `syntaxToJsonLogic` emits the
+-- same array, and inference types it as the chain (`inferencePureData`). Any
+-- other list keeps the lit-marked `appendItem` chain, built with `fold`. This
+-- keeps lowering and inference linear for data literals (a pasted image's
+-- pixel list) instead of an N-deep chain every pass recursed through.
+@label "Syntax list literal"
+@description "Build a list literal's Syntax from its item Syntaxes: an empty list is `SLit []`; a list of plain data is one `pureData`-marked SLit holding the raw JSON array; any other list is the lit-marked `appendItem` chain over `SLit []` (args [item, acc], left-folded)."
+@tags "engine" "internal" "expr-substrate" "parser"
+@category "engine-internal"
+syntaxListLiteral : (items: a) -> a
+syntaxListLiteral items =
+  if eq (length items) 0 then SLit { value = [] }
+  else
+    let raws = map (\item -> syntaxPureValue item) items
+    if all raws (\raw -> syntaxPureKnown raw)
+    then mapSet (SLit { value = map (\raw -> syntaxPureKnownValue raw) raws }) "pureData" true
+    else syntaxListChain items
+
+@label "Syntax list chain"
+@description "The lit-marked `appendItem` SCall chain of a list literal over a `SLit {value = []}` base: each item wraps the accumulator as `SCall appendItem [item, acc]`, left to right."
+@tags "engine" "internal" "expr-substrate" "parser"
+@category "engine-internal"
+syntaxListChain : (items: a) -> a
+syntaxListChain items =
+  fold (\acc item -> mapSet (SCall { fnId = "appendItem", args = concat (appendItem item []) (appendItem acc []) }) "lit" true) (SLit { value = [] }) items
+
+@label "Syntax pure-data value"
+@description "The raw JSON value of a plain-data Syntax, or Nothing: a pureData-marked SLit; an unmarked SLit holding a String, Number, Boolean, null or the empty list; an anonymous SRecord whose field rows are exactly {name, value} with unique names (not digit-leading, not __proto__) and plain-data values. Anything else (variables, calls, chains, constructors, metadata-carrying nodes) is not plain data."
+@tags "engine" "internal" "expr-substrate" "parser"
+@category "engine-internal"
+syntaxPureValue : (node: a) -> Maybe b
+syntaxPureValue node =
+  case node of
+    SLit { value = v } ->
+      if eq node.pureData true then Just v
+      else if not (eq (length (entries node)) 2) then Nothing
+      else if or (isString v) (or (isNumber v) (or (isBoolean v) (isNull v))) then Just v
+      else if and (isArray v) (eq (length v) 0) then Just v
+      else Nothing
+    SRecord { fields = fields } ->
+      if not (eq (length (entries node)) 2) then Nothing
+      else syntaxPureRecord fields
+    _ -> Nothing
+
+@label "Syntax pure-data record"
+@description "The raw record of an anonymous SRecord's field rows when every row is exactly {name, value}, names are unique, not digit-leading and not __proto__, and every value is plain data; else Nothing."
+@tags "engine" "internal" "expr-substrate" "parser"
+@category "engine-internal"
+syntaxPureRecord : (fields: a) -> Maybe b
+syntaxPureRecord fields =
+  let names = map (\field -> field.name) fields
+  if not (all fields (\field -> syntaxPureFieldRow field)) then Nothing
+  else if not (eq (length (dedupStr names)) (length names)) then Nothing
+  else if not (all fields (\field -> syntaxPureKnown (syntaxPureValue field.value))) then Nothing
+  else Just (fold (\record field -> mapSet record field.name (syntaxPureKnownValue (syntaxPureValue field.value))) {} fields)
+
+@label "Syntax pure-data field row"
+@description "A record field row that a raw JSON object reproduces exactly: only name and value, a String name that is not __proto__ and does not start with a digit (JavaScript orders such keys first)."
+@tags "engine" "internal" "expr-substrate" "parser"
+@category "engine-internal"
+syntaxPureFieldRow : (field: a) -> Boolean
+syntaxPureFieldRow field =
+  and (eq (length (entries field)) 2) (and (isString field.name) (and (not (eq field.name "__proto__")) (not (elem (slice field.name 0 1) ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]))))
+
+@label "Syntax pure-data known"
+@description "True for Just."
+@tags "engine" "internal" "expr-substrate" "parser"
+@category "engine-internal"
+syntaxPureKnown : (raw: Maybe a) -> Boolean
+syntaxPureKnown raw =
+  case raw of
+    Just v -> true
+    Nothing -> false
+
+@label "Syntax pure-data known value"
+@description "The value of a Just (called only after syntaxPureKnown)."
+@tags "engine" "internal" "expr-substrate" "parser"
+@category "engine-internal"
+syntaxPureKnownValue : (raw: Maybe a) -> a
+syntaxPureKnownValue raw =
+  case raw of
+    Just v -> v
+    Nothing -> raw
+
+@label "Syntax of pure data"
+@description "Re-expand a raw plain-data value into the Syntax the adapter built before pure-data SLits: scalars as SLit, the empty list as SLit [], a non-empty list as the lit-marked appendItem chain, a record as an anonymous SRecord of {name, value} rows. `desugar` uses it so every Expr consumer sees the chain's exact Expr."
+@tags "engine" "internal" "expr-substrate" "parser"
+@category "engine-internal"
+syntaxOfPureData : (raw: a) -> b
+syntaxOfPureData raw =
+  if and (isArray raw) (eq (length raw) 0) then SLit { value = [] }
+  else if isArray raw then syntaxListChain (map (\item -> syntaxOfPureData item) raw)
+  else if or (isString raw) (or (isNumber raw) (or (isBoolean raw) (isNull raw))) then SLit { value = raw }
+  else SRecord { fields = map (\entry -> { name = entry.key, value = syntaxOfPureData entry.value }) (entries raw) }
+
+-- jlsArrayItemsAcc — accumulator-threaded inner loop. For each item in
+-- left-to-right order wrap the current acc with `appendItem(item, acc)`; the
+-- SCall args list holds [item, acc] (appendItem's `(item, arr)` param order).
+-- Unused since `jlsArrayItems` builds through `syntaxListLiteral` (2026-11-08);
+-- kept for its lock row and the module census. Retirement candidate.
+@label "JLS array items (accumulator)"
+@description "Accumulator-threaded inner loop for jlsArrayItems. Each item wraps the acc with `SCall appendItem [item, acc]`, mirroring appendItem's `(item, arr)` order."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsArrayItemsAcc : (items: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (acc: (Syntax Any)) -> Result a (Syntax Any)
+jlsArrayItemsAcc items ctorDefs nullValue acc =
+  case head items of
+    Nothing -> Ok acc
+    Just first ->
+      let firstR = jsonLogicToSyntax first ctorDefs nullValue
+      case firstR of
+        Err e -> Err e
+        Ok firstS ->
+          let argsList = appendItem acc (appendItem firstS [])
+          -- `lit = true` marks this as a LIST-LITERAL desugar (a JlArray source),
+          -- distinguishing it from a genuine `{call:["appendItem",…]}` (which the
+          -- `call` arm lowers WITHOUT the marker). Keeps the Syntax byte-identical
+          -- to the grammar's `buildList` (which sets the same marker) so the
+          -- Syntax-space differential agrees; `syntaxToJsonLogic`'s collectList
+          -- flattens ONLY lit-marked chains. Added via `mapSet` (NOT a constructor
+          -- field) — `lit` is not a declared `SCall` formal, so a constructor-form
+          -- `SCall { …, lit = true }` would mis-parse as a positional `SCall { _0 }`
+          -- the marshal pattern can't match (parser-substrate Phase 7k Class A).
+          let nextAcc = mapSet (SCall { fnId = "appendItem", args = argsList }) "lit" true
+          case tail items of
+            Nothing -> Ok nextAcc
+            Just rest -> jlsArrayItemsAcc rest ctorDefs nullValue nextAcc
+
+-- jlsObjectExpr — handle a JlObject at expression position. Empty ⇒ SRecord [];
+-- single-key ⇒ jlsSingleKey; multi-key ⇒ reject `$`-prefixed keys then build
+-- SRecord. Length-discriminated (std:tail returns `Just []` for singletons).
+@label "JLS object expression"
+@description "Handle a JlObject at expression position: empty ⇒ SRecord []; single-key ⇒ jlsSingleKey; multi-key ⇒ reject `$`-prefixed keys then SRecord."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsObjectExpr : (fields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsObjectExpr fields ctorDefs nullValue originalNode =
+  let n = length fields
+  if eq n 0
+  then Ok (SRecord { fields = [] })
+  else if eq n 1
+  then
+    let first = unwrapFirstField fields
+    jlsSingleKey first.name first.value ctorDefs nullValue originalNode
+  else
+    if objectHasDollarPrefixedKey fields
+    then Err (Unsupported {
+           reason = "$-prefixed multi-key object at expression position is not a value",
+           node = originalNode
+         })
+    else jlsRecordFields fields ctorDefs nullValue []
+
+-- jlsRecordFields — walk a list of JlField, lowering each value and
+-- accumulating `{name, value}` records into the SRecord's fields list.
+@label "JLS record fields"
+@description "Walk a list of JlField, lowering each value to Syntax and accumulating `{name, value}` records into an SRecord."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsRecordFields : (fields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (acc: a) -> Result a (Syntax Any)
+jlsRecordFields fields ctorDefs nullValue acc =
+  case head fields of
+    Nothing -> Ok (SRecord { fields = acc })
+    Just f ->
+      let loweredValue = jsonLogicToSyntax f.value ctorDefs nullValue
+      case loweredValue of
+        Err e -> Err e
+        Ok v ->
+          let accNext = appendItem { name = f.name, value = v } acc
+          case tail fields of
+            Nothing -> Ok (SRecord { fields = accNext })
+            Just rest -> jlsRecordFields rest ctorDefs nullValue accNext
+
+-- jlsTagged — a pre-evaluated tagged value (`{$tag: "Just", value: 5}`) ⇒
+-- SConstruct with source-side field names preserved. Dual-arm: drop the
+-- `fields` key when there are no named fields (mirror lowerTagged).
+@label "JLS tagged value"
+@description "A pre-evaluated tagged value (`{$tag: \"Just\", value: 5}`) ⇒ SConstruct with identity-bearing constructor slots when metadata is unambiguous. Ambiguous unscoped constructor metadata returns structured CompileError.Unsupported; unknown or positional shapes omit `fields`."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsTagged : (tag: String) -> (fields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a (Syntax Any)
+jlsTagged tag fields ctorDefs nullValue =
+  if lookupCtorDefAmbiguous tag ctorDefs
+  then Err (Unsupported { reason = "constructor name has ambiguous metadata", node = JlTagged { tag = tag, fields = fields } })
+  else
+    let ctorDefM = lookupCtorDef tag ctorDefs
+    let namedR = jlsTryNamedRecordLiteral tag ctorDefM [JlObject { fields = fields }] ctorDefs nullValue
+    case namedR of
+      Just result -> result
+      Nothing ->
+        let result = jlsTaggedFields fields ctorDefs nullValue [] []
+        case result of
+          Err e -> Err e
+          Ok pair -> Ok (SConstruct { ctor = tag, args = pair.args })
+
+-- jlsTaggedFields — walk a JlTagged's field list, lowering each value while
+-- accumulating positional args + field names. Returns `{args, fields}`.
+@label "JLS tagged fields"
+@description "Walk a JlTagged's field list, lowering each value to Syntax while accumulating positional args + field names. Returns `{args, fields}` wrapped in Result."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsTaggedFields : (fields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (argsAcc: a) -> (fieldsAcc: a) -> a
+jlsTaggedFields fields ctorDefs nullValue argsAcc fieldsAcc =
+  case head fields of
+    Nothing -> Ok { args = argsAcc, fields = fieldsAcc }
+    Just f ->
+      let loweredValue = jsonLogicToSyntax f.value ctorDefs nullValue
+      case loweredValue of
+        Err e -> Err e
+        Ok v ->
+          let argsNext = appendItem v argsAcc
+          let fieldsNext = appendItem f.name fieldsAcc
+          case tail fields of
+            Nothing -> Ok { args = argsNext, fields = fieldsNext }
+            Just rest -> jlsTaggedFields rest ctorDefs nullValue argsNext fieldsNext
+
+-- jlsSingleKey — the single-key JlObject dispatcher. Mirrors lowerSingleKey's
+-- recognition cascade but emits Syntax frames (SIf/SLet/SDo preserved; SCall
+-- for call/and/or/operator/fnId — NEVER SOp). The unsupported-op Err arm is
+-- inherited from normalise-to-core's recognised form set (the adapter mirrors
+-- the compile front-end; these Err shapes feed 4b).
+@label "JLS single-key op"
+@description "Single-key JlObject dispatcher mirroring lowerSingleKey's cascade but emitting Syntax frames (SIf/SLet/SDo preserved; SCall for call/and/or/operator/fnId — never SOp). Inherits the unsupported-op Err arm."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsSingleKey : (op: String) -> (rawArgs: (JsonLogic Any)) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsSingleKey op rawArgs ctorDefs nullValue originalNode =
+  let argList = normalizeToArgList rawArgs []
+  if eq op "$ref"
+  then
+    case rawArgs of
+      JlString { value = handle } ->
+        if eq handle "" then Err (Unsupported { reason = "empty reference identity", node = originalNode })
+        else Ok (mapSet (SVar { name = handle }) "identity" true)
+      other -> Err (Unsupported { reason = "reference identity requires exact text", node = originalNode })
+  else if eq op "var"
+  then jlsVarOp argList originalNode
+  else if eq op "if"
+  then jlsIfChain argList ctorDefs nullValue originalNode
+  else if eq op "?:"
+  then jlsIfChain argList ctorDefs nullValue originalNode
+  else if eq op "let"
+  then jlsLetOp rawArgs ctorDefs nullValue originalNode
+  else if eq op "do"
+  then jlsDoOp argList ctorDefs nullValue originalNode
+  else if eq op "fn"
+  then jlsFnOp argList ctorDefs nullValue originalNode
+  else if eq op "call"
+  then jlsCallOp argList ctorDefs nullValue originalNode
+  else if eq op "construct"
+  then jlsConstructOp argList ctorDefs nullValue originalNode
+  else if eq op "match"
+  then jlsMatchOp argList ctorDefs nullValue originalNode
+  else if eq op "and"
+  then jlsAndOrOp op argList ctorDefs nullValue
+  else if eq op "or"
+  then jlsAndOrOp op argList ctorDefs nullValue
+  else if eq op "where"
+  then jlsWhere argList ctorDefs nullValue originalNode
+  else if eq op "method"
+  then jlsMethod argList ctorDefs nullValue originalNode
+  else if eq op "ann"
+  then jlsAnn argList ctorDefs nullValue originalNode
+  else if isUnsupportedOp op
+  then Err (Unsupported {
+         reason = concat "Phase 5 CompileJs doesn't yet handle '" (concat op "' op"),
+         node = originalNode
+       })
+  else jlsOperatorOrFnId op rawArgs argList ctorDefs nullValue originalNode
+
+-- jlsVarOp — `{var: "name"}` ⇒ `SVar { name }`. The arg must be a JlString.
+@label "JLS var op"
+@description "`{var: \"name\"}` ⇒ `SVar { name }`. Errors on non-string arg."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsVarOp : (argList: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsVarOp argList originalNode =
+  case head argList of
+    Nothing ->
+      Err (Unsupported { reason = "var requires a string name argument", node = originalNode })
+    Just first ->
+      case first of
+        JlString { value = name } -> Ok (SVar { name = name })
+        JlNull -> Err (Unsupported { reason = "var requires a string name argument", node = originalNode })
+        JlBool -> Err (Unsupported { reason = "var requires a string name argument", node = originalNode })
+        JlNumber -> Err (Unsupported { reason = "var requires a string name argument", node = originalNode })
+        JlArray -> Err (Unsupported { reason = "var requires a string name argument", node = originalNode })
+        JlTagged -> Err (Unsupported { reason = "var requires a string name argument", node = originalNode })
+        JlObject -> Err (Unsupported { reason = "var requires a string name argument", node = originalNode })
+
+-- jlsLetOp — `{let: {x: 1, y: 2}}` ⇒ `SLet { bindings, body = SVar lastName }`.
+-- The arg is a single JlObject of bindings; the implicit-body-as-last-binding
+-- semantics mirror JSON-Logic let (and lowerLetOp). desugar owns the actual
+-- let → applied-ELambda lowering.
+@label "JLS let op"
+@description "`{let: {x: 1, y: 2}}` ⇒ `SLet { bindings, body = SVar lastName }`. Implicit-body-as-last-binding mirrors JSON-Logic let; desugar owns the let → applied-ELambda lowering."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsLetOp : (rawArgs: (JsonLogic Any)) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsLetOp rawArgs ctorDefs nullValue originalNode =
+  case rawArgs of
+    JlObject { fields = letFields } ->
+      let bindingsResult = jlsLetBindings letFields ctorDefs nullValue []
+      case bindingsResult of
+        Err e -> Err e
+        Ok bindings ->
+          if eq (length bindings) 0
+          then Err (Unsupported { reason = "let with no bindings", node = originalNode })
+          else
+            let lastName = lastBindingName bindings
+            Ok (SLet {
+              bindings = bindings,
+              body = SVar { name = lastName }
+            })
+    JlNull -> Err (Unsupported { reason = "let requires an object of bindings", node = originalNode })
+    JlBool -> Err (Unsupported { reason = "let requires an object of bindings", node = originalNode })
+    JlNumber -> Err (Unsupported { reason = "let requires an object of bindings", node = originalNode })
+    JlString -> Err (Unsupported { reason = "let requires an object of bindings", node = originalNode })
+    JlArray -> Err (Unsupported { reason = "let requires an object of bindings", node = originalNode })
+    JlTagged -> Err (Unsupported { reason = "let requires an object of bindings", node = originalNode })
+
+-- jlsLetBindings — walk a JlObject's field list as let bindings, lowering each
+-- value to Syntax and accumulating `{name, value}` records.
+@label "JLS let bindings"
+@description "Walk a JlObject's field list as let bindings, lowering each value to Syntax and accumulating `{name, value}` records."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsLetBindings : (fields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (acc: a) -> a
+jlsLetBindings fields ctorDefs nullValue acc =
+  case head fields of
+    Nothing -> Ok acc
+    Just f ->
+      let loweredValue = jsonLogicToSyntax f.value ctorDefs nullValue
+      case loweredValue of
+        Err e -> Err e
+        Ok v ->
+          let accNext = appendItem { name = f.name, value = v } acc
+          case tail fields of
+            Nothing -> Ok accNext
+            Just rest -> jlsLetBindings rest ctorDefs nullValue accNext
+
+-- jlsDoOp — `{do: [...]}` ⇒ the re-nested SLet/SDo structure (4a erratum fix).
+-- JSON Logic's do-frame is the FLAT statement encoding: embedded single-key
+-- `{let: …}` items introduce bindings scoping FORWARD over the remaining
+-- statements. Mirrors lowerDoSequence: collect leading consecutive lets into
+-- SLet bindings; the rest walks via jlsTailExprs (mid-stream lets nest
+-- recursively). Pure segments emit SDo with NO singleton-unwrap (desugar's
+-- lowering decision — desugar unwraps the SDo singleton, so the composed Expr
+-- byte-equals the old CoreLet{bindings, body}/unwrapSingleton shapes).
+@label "JLS do op"
+@description "`{do: [...]}` ⇒ re-nested SLet/SDo: leading consecutive `{let:…}` items merge into SLet bindings scoping over the rest (JSON Logic's flat statement encoding re-nested as source-format structure, mirroring lowerDoSequence); mid-stream lets nest recursively; pure expr segments ⇒ SDo with NO singleton-unwrap (that lowering stays in desugar). Errors on empty/lets-empty do."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsDoOp : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsDoOp argList ctorDefs nullValue originalNode =
+  if eq (length argList) 0
+  then Err (Unsupported { reason = "do with no expressions", node = originalNode })
+  else
+    let leadResult = jlsCollectLeadingLets argList ctorDefs nullValue []
+    case leadResult of
+      Err e -> Err e
+      Ok lead ->
+        if eq (length lead.rest) 0
+        then
+          if eq (length lead.bindings) 0
+          then Err (Unsupported { reason = "do with no expressions", node = originalNode })
+          else
+            let lastName = lastBindingName lead.bindings
+            Ok (SLet { bindings = lead.bindings, body = SVar { name = lastName } })
+        else
+          let tailResult = jlsTailExprs lead.rest ctorDefs nullValue originalNode []
+          case tailResult of
+            Err e -> Err e
+            Ok restExprs ->
+              let body = SDo { exprs = restExprs }
+              if eq (length lead.bindings) 0
+              then Ok body
+              else Ok (SLet { bindings = lead.bindings, body = body })
+
+-- jlsCollectLeadingLets — walk from the head of a `do` arg list, accumulating
+-- consecutive `{let: {...}}` forms into a bindings list (values lowered to
+-- Syntax). Returns `{bindings, rest}` where rest is the unconsumed tail.
+-- Reuses isSingleLetObject + extractLetFields (target-agnostic) from
+-- normalise-to-core; mirrors collectLeadingLets.
+@label "JLS collect leading lets"
+@description "Walk from the head of a `do` arg list, accumulating consecutive `{let: …}` forms into a Syntax bindings list. Returns `{bindings, rest}`. Mirrors collectLeadingLets via the reused isSingleLetObject/extractLetFields."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsCollectLeadingLets : (args: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (bindingsAcc: a) -> a
+jlsCollectLeadingLets args ctorDefs nullValue bindingsAcc =
+  case head args of
+    Nothing -> Ok { bindings = bindingsAcc, rest = [] }
+    Just first ->
+      if isSingleLetObject first
+      then
+        let letFields = extractLetFields first []
+        let bindingsResult = jlsLetBindings letFields ctorDefs nullValue bindingsAcc
+        case bindingsResult of
+          Err e -> Err e
+          Ok bindingsNext ->
+            case tail args of
+              Nothing -> Ok { bindings = bindingsNext, rest = [] }
+              Just rest -> jlsCollectLeadingLets rest ctorDefs nullValue bindingsNext
+      else Ok { bindings = bindingsAcc, rest = args }
+
+-- jlsTailExprs — walk the post-leading-let tail of a `do` arg list, lowering
+-- each expr to Syntax. A mid-stream `{let: {...}}` folds the REMAINING items
+-- into a nested re-nesting via a recursive jlsDoOp call (mirrors
+-- lowerTailExprs' recursive lowerDoSequence).
+@label "JLS tail exprs"
+@description "Walk the post-leading-let tail of a `do` arg list, lowering each expr to Syntax. Mid-stream `{let: …}` triggers a recursive jlsDoOp on the remaining items (nested SLet scope). Mirrors lowerTailExprs."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsTailExprs : (args: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> (acc: a) -> a
+jlsTailExprs args ctorDefs nullValue originalNode acc =
+  case head args of
+    Nothing -> Ok acc
+    Just first ->
+      if isSingleLetObject first
+      then
+        let nestedResult = jlsDoOp args ctorDefs nullValue originalNode
+        case nestedResult of
+          Err e -> Err e
+          Ok nestedExpr -> Ok (appendItem nestedExpr acc)
+      else
+        let loweredFirst = jsonLogicToSyntax first ctorDefs nullValue
+        case loweredFirst of
+          Err e -> Err e
+          Ok v ->
+            let accNext = appendItem v acc
+            case tail args of
+              Nothing -> Ok accNext
+              Just rest -> jlsTailExprs rest ctorDefs nullValue originalNode accNext
+
+-- jlsExprList — lower a list of JsonLogic nodes as Syntax, accumulating into a
+-- list. Used by SDo exprs, SCall args, and the and/or arg paths.
+@label "JLS expr list"
+@description "Lower a list of JsonLogic nodes to Syntax, accumulating into a list. Used by SDo exprs, SCall args, and and/or."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsExprList : (args: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (acc: a) -> a
+jlsExprList args ctorDefs nullValue acc =
+  case head args of
+    Nothing -> Ok acc
+    Just h ->
+      let loweredH = jsonLogicToSyntax h ctorDefs nullValue
+      case loweredH of
+        Err e -> Err e
+        Ok v ->
+          let accNext = appendItem v acc
+          case tail args of
+            Nothing -> Ok accNext
+            Just rest -> jlsExprList rest ctorDefs nullValue accNext
+
+-- jlsIfChain — fold a multi-arm `if` arg list into a right-associated nested
+-- SIf chain (surface frame preserved — SIf, not pre-lowered ECall "if";
+-- desugar owns that). 2-arg ⇒ implicit `else null`; 3-arg ⇒ if c then t else e;
+-- 5+ odd-arg ⇒ if c1 then t1 else (nested SIf …). Mirrors lowerIfChain.
+@label "JLS if chain"
+@description "Fold a multi-arm `if` arg list into a right-associated nested SIf chain (surface frame preserved). 2-arg: implicit `else null` (SLit nullValue); 3-arg: standard SIf; 5+: right-fold. desugar owns the SIf → ECall \"if\" lowering."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsIfChain : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsIfChain argList ctorDefs nullValue originalNode =
+  let n = length argList
+  if lt n 2
+  then Err (Unsupported { reason = "if requires at least [cond, then]", node = originalNode })
+  else if eq n 2
+  then jlsIfThree argList ctorDefs nullValue true nullValue
+  else if eq n 3
+  then jlsIfThree argList ctorDefs nullValue false nullValue
+  else if eq (mod n 2) 0
+  then Err (Unsupported { reason = "if with even arg-count needs a final else", node = originalNode })
+  else
+    let condArg = ifNthArg argList 0
+    let thenArg = ifNthArg argList 1
+    let rest = ifTailFrom argList 2 []
+    let condR = jsonLogicToSyntax condArg ctorDefs nullValue
+    case condR of
+      Err e -> Err e
+      Ok cond ->
+        let thenR = jsonLogicToSyntax thenArg ctorDefs nullValue
+        case thenR of
+          Err e -> Err e
+          Ok then_ ->
+            let restR = jlsIfChain rest ctorDefs nullValue originalNode
+            case restR of
+              Err e -> Err e
+              Ok els ->
+                Ok (mapSet (SIf { cond = cond, then = then_, else = els }) "structural" true)
+
+-- jlsIfThree — the 2-arg and 3-arg if forms. useImplicitElse=true ⇒ else =
+-- SLit { value = nullArg }; otherwise the third arg is lowered.
+@label "JLS if (3-arg form)"
+@description "Handle the 2-arg and 3-arg if forms. useImplicitElse=true ⇒ else = SLit { value = nullArg }; otherwise the third arg is lowered."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsIfThree : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (useImplicitElse: Boolean) -> (nullArg: a) -> Result a (Syntax Any)
+jlsIfThree argList ctorDefs nullValue useImplicitElse nullArg =
+  let condArg = ifNthArg argList 0
+  let thenArg = ifNthArg argList 1
+  let condR = jsonLogicToSyntax condArg ctorDefs nullValue
+  case condR of
+    Err e -> Err e
+    Ok cond ->
+      let thenR = jsonLogicToSyntax thenArg ctorDefs nullValue
+      case thenR of
+        Err e -> Err e
+        Ok then_ ->
+          if useImplicitElse
+          then Ok (mapSet (SIf { cond = cond, then = then_, else = SLit { value = nullArg } }) "structural" true)
+          else
+            let elseArg = ifNthArg argList 2
+            let elsR = jsonLogicToSyntax elseArg ctorDefs nullValue
+            case elsR of
+              Err e -> Err e
+              Ok els -> Ok (mapSet (SIf { cond = cond, then = then_, else = els }) "structural" true)
+
+-- jlsFnOp — `{fn: [["p1","p2"], body]}` (paren-list) OR `{fn: ["p1","p2",body]}`
+-- (flat) ⇒ `SLambda { params, body }`. Mirrors lowerFnOp's dual-shape handling.
+@label "JLS fn op"
+@description "`{fn: [[\"p1\",\"p2\"], body]}` OR `{fn: [\"p1\",\"p2\",body]}` ⇒ `SLambda`. Handles both paren-list and flat param shapes."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsFnOp : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsFnOp argList ctorDefs nullValue originalNode =
+  if lt (length argList) 2
+  then Err (Unsupported { reason = "fn requires at least [param, body]", node = originalNode })
+  else
+    let firstArg = ifNthArg argList 0
+    case firstArg of
+      JlArray { items = paramList } ->
+        let paramsResult = collectParamNames paramList originalNode []
+        case paramsResult of
+          Err e -> Err e
+          Ok params ->
+            let bodyArg = ifNthArg argList 1
+            let bodyR = jsonLogicToSyntax bodyArg ctorDefs nullValue
+            case bodyR of
+              Err e -> Err e
+              Ok body -> Ok (SLambda { params = params, body = body })
+      JlNull -> jlsFnFlat argList ctorDefs nullValue originalNode
+      JlBool -> jlsFnFlat argList ctorDefs nullValue originalNode
+      JlNumber -> jlsFnFlat argList ctorDefs nullValue originalNode
+      JlString -> jlsFnFlat argList ctorDefs nullValue originalNode
+      JlTagged -> jlsFnFlat argList ctorDefs nullValue originalNode
+      JlObject -> jlsFnFlat argList ctorDefs nullValue originalNode
+
+-- jlsFnFlat — the flat `{fn: ["p1", "p2", ..., body]}` form. Last element is
+-- the body; everything before is a string param name.
+@label "JLS fn (flat form)"
+@description "Flat `{fn: [\"p1\", \"p2\", ..., body]}` shape. Last element is the body; everything before is a string param name."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsFnFlat : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsFnFlat argList ctorDefs nullValue originalNode =
+  let n = length argList
+  let bodyIdx = sub n 1
+  let paramsList = ifTailExcept argList bodyIdx 0 []
+  let paramsResult = collectParamNames paramsList originalNode []
+  case paramsResult of
+    Err e -> Err e
+    Ok params ->
+      let bodyArg = ifNthArg argList bodyIdx
+      let bodyR = jsonLogicToSyntax bodyArg ctorDefs nullValue
+      case bodyR of
+        Err e -> Err e
+        Ok body -> Ok (SLambda { params = params, body = body })
+
+-- jlsCallOp — `{call: [callee, ...args]}` ⇒ `SCall { fnId, args }`. Callee via
+-- the reused resolveCallee (direct string or `{var: name}` ⇒ `$dyn:name`).
+@label "JLS call op"
+@description "`{call: [callee, ...args]}` ⇒ `SCall { fnId, args }`. Callee resolved via the reused resolveCallee (direct string or `{var: name}` ⇒ `$dyn:name`)."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsCallOp : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsCallOp argList ctorDefs nullValue originalNode =
+  if lt (length argList) 1
+  then Err (Unsupported { reason = "call requires a callee", node = originalNode })
+  else
+    let callee = ifNthArg argList 0
+    let fnIdR = resolveCallee callee originalNode
+    case fnIdR of
+      Err e ->
+        -- Preserve the canonical projection followed by nullary application.
+        -- The applied carrier follows SCall's existing internal lit convention.
+        if eq (length argList) 1 then
+          case jsonLogicToSyntax callee ctorDefs nullValue of
+            Err other -> Err e
+            Ok projection ->
+              case projection of
+                SMethod { args = args } ->
+                  if and (eq (length args) 0) (not (eq projection.applied true))
+                  then Ok (mapSet projection "applied" true) else Err e
+                other -> Err e
+        else Err e
+      Ok fnId ->
+        let restArgs = ifTailFrom argList 1 []
+        let argsR = jlsExprList restArgs ctorDefs nullValue []
+        case argsR of
+          Err e -> Err e
+          Ok args ->
+            let call = SCall { fnId = fnId, args = args }
+            Ok (if elem fnId ["if", "?:", "and", "or", "std:and", "std:or"] then mapSet call "structural" false else call)
+
+-- jlsConstructOp — `{construct: [Tag, ...]}` ⇒ `SConstruct { ctor, args,
+-- fields? }`. The `fields` key disambiguates the named-record-literal case
+-- (single object arg whose keys all match a registered ctorDef) from the
+-- positional case. Mirrors lowerConstructOp.
+@label "JLS construct op"
+@description "`{construct: [Tag, ...]}` ⇒ `SConstruct { ctor, args, fields? }`. Unambiguous named-record metadata preserves identity-bearing slots in `fields`; ambiguous unscoped constructor metadata returns structured CompileError.Unsupported; positional and unknown shapes omit `fields`."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsConstructOp : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsConstructOp argList ctorDefs nullValue originalNode =
+  if lt (length argList) 1
+  then Err (Unsupported { reason = "construct's first arg must be a string ctor name", node = originalNode })
+  else
+    let ctorArg = ifNthArg argList 0
+    case ctorArg of
+      JlString { value = ctor } ->
+        if lookupCtorDefAmbiguous ctor ctorDefs
+        then Err (Unsupported { reason = "constructor name has ambiguous metadata", node = originalNode })
+        else
+          let ctorDefM = lookupCtorDef ctor ctorDefs
+          let restArgs = ifTailFrom argList 1 []
+          let namedR = jlsTryNamedRecordLiteral ctor ctorDefM restArgs ctorDefs nullValue
+          case namedR of
+            Just result -> result
+            Nothing ->
+              let argsR = jlsExprList restArgs ctorDefs nullValue []
+              case argsR of
+                Err e -> Err e
+                Ok args ->
+                  let positionalFields = positionalFieldsForCtor ctorDefM (length args)
+                  case positionalFields of
+                    Nothing -> Ok (SConstruct { ctor = ctor, args = args })
+                    Just pf ->
+                      Ok (SConstruct { ctor = ctor, args = args, fields = pf })
+      JlNull -> Err (Unsupported { reason = "construct's first arg must be a string ctor name", node = originalNode })
+      JlBool -> Err (Unsupported { reason = "construct's first arg must be a string ctor name", node = originalNode })
+      JlNumber -> Err (Unsupported { reason = "construct's first arg must be a string ctor name", node = originalNode })
+      JlArray -> Err (Unsupported { reason = "construct's first arg must be a string ctor name", node = originalNode })
+      JlTagged -> Err (Unsupported { reason = "construct's first arg must be a string ctor name", node = originalNode })
+      JlObject -> Err (Unsupported { reason = "construct's first arg must be a string ctor name", node = originalNode })
+
+-- jlsTryNamedRecordLiteral — when the construct call has exactly one remaining
+-- arg AND it's a JlObject AND the ctorDef is registered AND every key matches a
+-- declared field, lower it as a named-field SConstruct with args in ctorDef
+-- order. Returns `Just (Ok | Err)` on success, `Nothing` to fall through.
+@label "JLS try named-record literal"
+@description "When construct's only arg is a JlObject matching a registered ctorDef's declared fields, lower it as a named-field SConstruct (args in ctorDef order). Returns Just (Ok|Err) on success, Nothing to fall through to positional."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsTryNamedRecordLiteral : (ctor: String) -> (ctorDefM: a) -> (restArgs: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> a
+jlsTryNamedRecordLiteral ctor ctorDefM restArgs ctorDefs nullValue =
+  if eq (length restArgs) 1
+  then
+    let only = ifNthArg restArgs 0
+    case only of
+      JlObject { fields = recFields } ->
+        case ctorDefM of
+          Nothing -> Nothing
+          Just ctorDef ->
+            if eq (length recFields) 0
+            then Nothing
+            else if allKeysInCtorDef recFields ctorDef
+                 then Just (jlsBuildNamedRecordResult ctor ctorDef recFields ctorDefs nullValue)
+                 else Nothing
+      JlNull -> Nothing
+      JlBool -> Nothing
+      JlNumber -> Nothing
+      JlString -> Nothing
+      JlArray -> Nothing
+      JlTagged -> Nothing
+  else Nothing
+
+-- jlsBuildNamedRecordResult — iterate ctorDef order, looking up each field in
+-- recFields and lowering the value. Returns the assembled SConstruct (Ok) or
+-- Err. The ctorDef-order iteration keeps the args/fields stable per ctor
+-- regardless of source-side key order.
+@label "JLS build named-record result"
+@description "Iterate ctorDef order, looking up each field in recFields and lowering the value to Syntax. Assembles the named-field SConstruct."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsBuildNamedRecordResult : (ctor: String) -> (ctorDef: List CompileFieldSlot) -> (recFields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a (Syntax Any)
+jlsBuildNamedRecordResult ctor ctorDef recFields ctorDefs nullValue =
+  let result = jlsWalkCtorDef ctorDef recFields ctorDefs nullValue [] []
+  case result of
+    Err e -> Err e
+    Ok pair ->
+      Ok (SConstruct { ctor = ctor, args = pair.args, fields = pair.fields })
+
+-- jlsWalkCtorDef — iterate a ctorDef's field names. For each name present in
+-- recFields, lower the value and accumulate (args, fields). Absent names are
+-- skipped (mirrors walkCtorDef's `if (!(fieldName in recordLiteral)) continue`).
+@label "JLS walk ctor def"
+@description "Iterate a ctorDef's field names. For each present in recFields, lower the value to Syntax and accumulate (args, fields). Absent names are skipped."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsWalkCtorDef : (ctorDef: List CompileFieldSlot) -> (recFields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (argsAcc: a) -> (fieldsAcc: a) -> a
+jlsWalkCtorDef ctorDef recFields ctorDefs nullValue argsAcc fieldsAcc =
+  case head ctorDef of
+    Nothing -> Ok { args = argsAcc, fields = fieldsAcc }
+    Just fieldSlot ->
+      let lookupResult = lookupFieldInList fieldSlot.wireName recFields
+      case lookupResult of
+        Nothing ->
+          case tail ctorDef of
+            Nothing -> Ok { args = argsAcc, fields = fieldsAcc }
+            Just rest ->
+              jlsWalkCtorDef rest recFields ctorDefs nullValue argsAcc fieldsAcc
+        Just fieldValue ->
+          let loweredValue = jsonLogicToSyntax fieldValue ctorDefs nullValue
+          case loweredValue of
+            Err e -> Err e
+            Ok v ->
+              let argsNext = appendItem v argsAcc
+              let fieldsNext = appendItem fieldSlot fieldsAcc
+              case tail ctorDef of
+                Nothing -> Ok { args = argsNext, fields = fieldsNext }
+                Just rest ->
+                  jlsWalkCtorDef rest recFields ctorDefs nullValue argsNext fieldsNext
+
+-- jlsMatchOp — `{match: [scrutinee, p1, b1, p2, b2, ...]}` ⇒ `SMatch {
+-- scrutinee, arms }`. Walks the args pair-wise after the scrutinee. Patterns
+-- via jlsPattern target the std `Pattern` ADT (shared Pat* tags).
+@label "JLS match op"
+@description "`{match: [scrutinee, p1, b1, p2, b2, ...]}` ⇒ `SMatch { scrutinee, arms }`. Walks args pair-wise after the scrutinee; patterns via jlsPattern target the std Pattern ADT."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsMatchOp : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsMatchOp argList ctorDefs nullValue originalNode =
+  if lt (length argList) 1
+  then Err (Unsupported { reason = "match requires a scrutinee", node = originalNode })
+  else
+    let scrutArg = ifNthArg argList 0
+    let scrutR = jsonLogicToSyntax scrutArg ctorDefs nullValue
+    case scrutR of
+      Err e -> Err e
+      Ok scrutinee ->
+        let rest = ifTailFrom argList 1 []
+        let armsR = jlsMatchArms rest ctorDefs nullValue originalNode []
+        case armsR of
+          Err e -> Err e
+          Ok arms -> Ok (SMatch { scrutinee = scrutinee, arms = arms })
+
+-- jlsMatchArms — walk a list of (pattern, body) pairs. An odd, UNPAIRED trailing
+-- arg is the `_`-dropped catch-all (default) body: the TS parser lowers a bare
+-- `_ -> body` arm to the match's unpaired default element
+-- (`{match:[scrut, …, body]}` — no pattern element, fenel-parser.ts:1818-1824),
+-- and the runtime's matchPattern already treats it (and the literal `"_"`) as a
+-- match-anything default. So the adapter (the live compile IR path, NOT the
+-- interpreter) recognises the unpaired tail and synthesises the canonical `_`
+-- pattern `PatWildcard` — the SAME shape jlsPattern (JlString "_") and
+-- the grammar's buildConPat produce. Existing pattern egress restores the wire
+-- underscore, while the shared Pattern remains unambiguously wildcard. Pattern via
+-- jlsPattern, body via jsonLogicToSyntax. fenel-surface-extensions Phase 1 Step 2
+-- (was: errored "match arm is missing a body" on this shape).
+@label "JLS match arms"
+@description "Walk a list of (pattern, body) pairs accumulating `{pattern, body}` records. An odd, UNPAIRED trailing arg is the `_`-dropped catch-all body (the TS parser drops a bare `_ -> body` arm to `{match:[scrut, …, body]}`): the adapter synthesises the canonical `PatWildcard` (the jlsPattern/buildConPat shape) so the Syntax/compile IR accepts it — the interpreter already does. Pattern via jlsPattern, body via jsonLogicToSyntax. fenel-surface-extensions Phase 1 Step 2."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsMatchArms : (args: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> (acc: a) -> a
+jlsMatchArms args ctorDefs nullValue originalNode acc =
+  case head args of
+    Nothing -> Ok acc
+    Just patArg ->
+      case tail args of
+        Nothing -> jlsCatchAllArm patArg ctorDefs nullValue acc
+        Just rest1 ->
+          case head rest1 of
+            Nothing -> jlsCatchAllArm patArg ctorDefs nullValue acc
+            Just bodyArg ->
+              case jlsGuardParts patArg of
+                Just gp ->
+                  let patR = jlsPattern gp.pat ctorDefs nullValue
+                  case patR of
+                    Err e -> Err e
+                    Ok pat ->
+                      let condR = jsonLogicToSyntax gp.cond ctorDefs nullValue
+                      case condR of
+                        Err e -> Err e
+                        Ok guardS ->
+                          let bodyR = jsonLogicToSyntax bodyArg ctorDefs nullValue
+                          case bodyR of
+                            Err e -> Err e
+                            Ok body ->
+                              let accNext = appendItem { pattern = pat, guard = guardS, body = body } acc
+                              case tail rest1 of
+                                Nothing -> Ok accNext
+                                Just rest2 ->
+                                  jlsMatchArms rest2 ctorDefs nullValue originalNode accNext
+                Nothing ->
+                  let patR = jlsPattern patArg ctorDefs nullValue
+                  case patR of
+                    Err e -> Err e
+                    Ok pat ->
+                      let bodyR = jsonLogicToSyntax bodyArg ctorDefs nullValue
+                      case bodyR of
+                        Err e -> Err e
+                        Ok body ->
+                          let accNext = appendItem { pattern = pat, body = body } acc
+                          case tail rest1 of
+                            Nothing -> Ok accNext
+                            Just rest2 ->
+                              jlsMatchArms rest2 ctorDefs nullValue originalNode accNext
+
+-- jlsGuardParts — recognise a GUARDED match arm's pattern-position element: the
+-- oracle encodes it as `{$guard:[pat, cond]}` (fenel-surface-extensions Phase 3),
+-- which `marshalJsonLogic` lifts to a `JlObject` with a single `$guard` field
+-- whose value is a 2-element `JlArray [patNode, condNode]`. Returns `Just {pat,
+-- cond}` (both raw JsonLogic nodes — pat lifts via jlsPattern, cond via
+-- jsonLogicToSyntax) or `Nothing` for any non-guard pattern arg. Reading the
+-- `$guard` field NAME is a plain string compare (the marshal already turned the
+-- `$`-key into a JlField name) — NOT `$`-key authoring.
+@label "JLS guard parts"
+@description "Recognise a guarded match arm's `{$guard:[pat,cond]}` pattern-position element (a JlObject single `$guard` field over a 2-elem JlArray) ⇒ Just {pat, cond} (raw JsonLogic nodes), else Nothing. fenel-surface-extensions Phase 3."
+@tags "engine" "internal" "expr-substrate" "phase-4a" "fenel-surface-extensions" "phase-3"
+@category "engine-internal"
+jlsGuardParts : (node: (JsonLogic Any)) -> a
+jlsGuardParts node =
+  case node of
+    JlObject { fields = fs } ->
+      if eq (length fs) 1
+      then
+        let first = unwrapFirstField fs
+        if eq first.name "$guard"
+        then
+          case first.value of
+            JlArray { items = its } ->
+              if eq (length its) 2
+              then Just { pat = at its 0, cond = at its 1 }
+              else Nothing
+            other -> Nothing
+        else Nothing
+      else Nothing
+    other -> Nothing
+
+-- jlsCatchAllArm — an unpaired trailing match arg is the `_`-dropped catch-all
+-- (default) body. Lower it as an expression and append an arm carrying the
+-- canonical `PatWildcard` — the SAME shape jlsPattern (JlString "_") and
+-- the grammar's buildConPat produce. The existing match-pattern egress restores
+-- the operational underscore without confusing it with a literal Pattern. fenel-surface-
+-- extensions Phase 1 Step 2.
+@label "JLS catch-all arm"
+@description "An unpaired trailing match arg is the `_`-dropped catch-all body: lower it via jsonLogicToSyntax and append `{ pattern = PatWildcard, body }` (the canonical `_` pattern jlsPattern/buildConPat produce). fenel-surface-extensions Phase 1 Step 2."
+@tags "engine" "internal" "expr-substrate" "phase-4a" "fenel-surface-extensions" "phase-1"
+@category "engine-internal"
+jlsCatchAllArm : (defaultBody: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (acc: a) -> a
+jlsCatchAllArm defaultBody ctorDefs nullValue acc =
+  let bodyR = jsonLogicToSyntax defaultBody ctorDefs nullValue
+  case bodyR of
+    Err e -> Err e
+    Ok body -> Ok (appendItem { pattern = PatWildcard, body = body } acc)
+
+-- jlsAndOrOp — `{and: [...]}` / `{or: [...]}` ⇒ `SCall { fnId, args }`.
+-- Surfaces and/or as SCalls (NEVER SOp) so desugar lowers them to ECalls;
+-- the per-target emitter decides ternary vs operator form downstream.
+@label "JLS and/or op"
+@description "`{and: [...]}` / `{or: [...]}` ⇒ `SCall { fnId, args }` (never SOp). desugar lowers to ECall; the per-target emitter decides ternary vs operator form downstream."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsAndOrOp : (op: String) -> (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a (Syntax Any)
+jlsAndOrOp op argList ctorDefs nullValue =
+  let argsR = jlsExprList argList ctorDefs nullValue []
+  case argsR of
+    Err e -> Err e
+    Ok args -> Ok (mapSet (SCall { fnId = op, args = args }) "structural" true)
+
+-- jlsWhere — `{where: [body, {x: 1, y: 2}]}` ⇒ `SWhere { body, bindings }`
+-- (fenel-surface-extensions Phase 4). A function-level `where` is scoped-let; the
+-- oracle encodes it `{where:[body, bindingsObj]}` (bindings a FLAT object, like
+-- `let`). The bindings-object → `[{name, value}]` list conversion REUSES
+-- `jlsLetBindings` (the SLet binding walk — same `{name, value}` shape), the
+-- inverse of syntaxToJsonLogic's `sRecordToJl` fold. `desugar` lowers SWhere to
+-- the same Expr as the equivalent SLet (the compile path proof — D2).
+@label "JLS where op"
+@description "`{where: [body, {x: 1, …}]}` ⇒ `SWhere { body, bindings = [{name, value}] }`. The bindings-object → list conversion reuses jlsLetBindings (the SLet binding walk); desugar lowers SWhere to the let-equivalent Expr. fenel-surface-extensions Phase 4."
+@tags "engine" "internal" "expr-substrate" "phase-4a" "fenel-surface-extensions" "phase-4"
+@category "engine-internal"
+jlsWhere : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsWhere argList ctorDefs nullValue originalNode =
+  if lt (length argList) 2
+  then Err (Unsupported { reason = "where requires [body, bindings]", node = originalNode })
+  else
+    let bodyArg = ifNthArg argList 0
+    let bindingsArg = ifNthArg argList 1
+    let bodyR = jsonLogicToSyntax bodyArg ctorDefs nullValue
+    case bodyR of
+      Err e -> Err e
+      Ok body ->
+        case bindingsArg of
+          JlObject { fields = letFields } ->
+            let bindingsResult = jlsLetBindings letFields ctorDefs nullValue []
+            case bindingsResult of
+              Err e -> Err e
+              Ok bindings -> Ok (SWhere { body = body, bindings = bindings })
+          JlNull -> Err (Unsupported { reason = "where requires an object of bindings", node = originalNode })
+          JlBool -> Err (Unsupported { reason = "where requires an object of bindings", node = originalNode })
+          JlNumber -> Err (Unsupported { reason = "where requires an object of bindings", node = originalNode })
+          JlString -> Err (Unsupported { reason = "where requires an object of bindings", node = originalNode })
+          JlArray -> Err (Unsupported { reason = "where requires an object of bindings", node = originalNode })
+          JlTagged -> Err (Unsupported { reason = "where requires an object of bindings", node = originalNode })
+
+-- jlsAnn — `{ann: [e, T]}` ⇒ `SAnn { expr, type }` (modules-as-values Phase 2d).
+-- The inverse of syntaxToJsonLogic's SAnn arm. `e` lowers via jsonLogicToSyntax;
+-- the type is a `$`-keyed FenelType, which the ingress marshal hands over as its
+-- JsonLogic ADT image — carried OPAQUELY (no Fenel body reads a type's `$`-keys;
+-- the TS marshal's ann arm unmarshals it when lowered back). Exactly two args.
+@label "JLS annotation op"
+@description "`{ann: [e, T]}` ⇒ `SAnn { expr, type }` (a type annotation `(e : T)`): e lowers via jsonLogicToSyntax; the `$`-keyed FenelType T rides OPAQUELY as its JsonLogic image. Exactly two args (Err otherwise). desugar is transparent except over SMethod (rejected by jsonLogicToExpr). modules-as-values Phase 2d."
+@tags "engine" "internal" "expr-substrate" "modules-as-values" "phase-2d"
+@category "engine-internal"
+jlsAnn : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsAnn argList ctorDefs nullValue originalNode =
+  if not (eq (length argList) 2)
+  then Err (Unsupported { reason = "ann requires [expression, type]", node = originalNode })
+  else
+    case jsonLogicToSyntax (ifNthArg argList 0) ctorDefs nullValue of
+      Err e -> Err e
+      Ok e -> Ok (SAnn { expr = e, type = ifNthArg argList 1 })
+
+-- jlsMethod — `{method: [cls, method, …args]}` ⇒ `SMethod { cls, method, args }`
+-- (fenel-surface-extensions Phase 6). A module-qualified-method head; the wire
+-- shape flattens cls+method (raw JlStrings) then the arg nodes. The inverse of
+-- `syntaxToJsonLogic`'s SMethod arm: read the first two args as the class +
+-- method strings (Err on non-string), lower the rest via the existing
+-- `jlsExprList`. `desugar` lowers SMethod to the dotted-fnId `ECall (cls ++ "." ++
+-- method)` (the documented compile-path stance; the interpreted production path
+-- evaluates `{method}` reflectively, json-logic.ts methodOp). Mirrors the TS
+-- oracle's `asQualifiedMethod`-driven `{method:[…]}` emission (fenel-parser.ts).
+@label "JLS method op"
+@description "`{method: [cls, method, …args]}` ⇒ `SMethod { cls, method, args }` (a module-qualified-method head). cls+method are the first two JlString args (Err otherwise); the rest lower via jlsExprList. desugar lowers SMethod to a dotted-fnId ECall. fenel-surface-extensions Phase 6."
+@tags "engine" "internal" "expr-substrate" "phase-4a" "fenel-surface-extensions" "phase-6"
+@category "engine-internal"
+jlsMethod : (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsMethod argList ctorDefs nullValue originalNode =
+  if lt (length argList) 2
+  then Err (Unsupported { reason = "method requires [cls, method, …args]", node = originalNode })
+  else
+    let clsArg = ifNthArg argList 0
+    let methodArg = ifNthArg argList 1
+    case clsArg of
+      JlString { value = cls } ->
+        case methodArg of
+          JlString { value = method } ->
+            let restArgs = ifTailFrom argList 2 []
+            let argsR = jlsExprList restArgs ctorDefs nullValue []
+            case argsR of
+              Err e -> Err e
+              Ok args -> Ok (SMethod { cls = cls, method = method, args = args })
+          JlNull -> Err (Unsupported { reason = "method's method name must be a string", node = originalNode })
+          JlBool -> Err (Unsupported { reason = "method's method name must be a string", node = originalNode })
+          JlNumber -> Err (Unsupported { reason = "method's method name must be a string", node = originalNode })
+          JlArray -> Err (Unsupported { reason = "method's method name must be a string", node = originalNode })
+          JlTagged -> Err (Unsupported { reason = "method's method name must be a string", node = originalNode })
+          JlObject -> Err (Unsupported { reason = "method's method name must be a string", node = originalNode })
+      JlNull -> Err (Unsupported { reason = "method's class name must be a string", node = originalNode })
+      JlBool -> Err (Unsupported { reason = "method's class name must be a string", node = originalNode })
+      JlNumber -> Err (Unsupported { reason = "method's class name must be a string", node = originalNode })
+      JlArray -> Err (Unsupported { reason = "method's class name must be a string", node = originalNode })
+      JlTagged -> Err (Unsupported { reason = "method's class name must be a string", node = originalNode })
+      JlObject -> Err (Unsupported { reason = "method's class name must be a string", node = originalNode })
+
+-- jlsOperatorOrFnId — the default-case fall-through. Tries the reused
+-- operator-notation map first (`+` ⇒ `add`, `==` ⇒ `eq`, …); on miss, rejects
+-- `$`-prefixed markers as type-system data; finally disambiguates by VALUE SHAPE
+-- (sfr canonical form, parser-substrate Phase 7c, option A): a NON-EMPTY-array
+-- value stays the key-as-fnId universal CALL form (SCall); any other value
+-- (scalar / var / call / empty array) ⇒ a single-field RECORD (SRecord). This
+-- This is legacy RAW-IR compatibility, not the source grammar's record rule.
+-- buildRecord preserves every explicit `{name = value}` field as SRecord;
+-- this adapter has no source intent for an unannotated one-key object. Exact
+-- source parity for this non-injective case is checked before this adapter.
+-- The operator-notation arm always sees array args ⇒ unaffected.
+@label "JLS operator or fnId"
+@description "Default raw-IR fall-through: tries the operator-notation map first (`+` ⇒ add, …); on miss rejects `$`-prefixed markers; then retains legacy compatibility by value shape — a non-empty-array value ⇒ key-as-fnId SCall, any other value ⇒ single-field SRecord. Explicit source records preserve record intent separately in buildRecord."
+@tags "engine" "internal" "expr-substrate" "phase-4a" "parser-substrate" "phase-7c"
+@category "engine-internal"
+jlsOperatorOrFnId : (op: String) -> (rawArgs: (JsonLogic Any)) -> (argList: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (originalNode: (JsonLogic Any)) -> Result a (Syntax Any)
+jlsOperatorOrFnId op rawArgs argList ctorDefs nullValue originalNode =
+  let coded = opNotationToCodeName op
+  case coded of
+    Just codeName ->
+      let argsR = jlsExprList argList ctorDefs nullValue []
+      case argsR of
+        Err e -> Err e
+        Ok args -> Ok (SCall { fnId = codeName, args = args })
+    Nothing ->
+      if startsWith op "$"
+      then Err (Unsupported {
+             reason = concat "$-prefixed marker '" (concat op "' at expression position is not a value"),
+             node = originalNode
+           })
+      else
+        case rawArgs of
+          JlArray { items = xs } ->
+            if gt (length xs) 0
+            then
+              let argsR = jlsExprList argList ctorDefs nullValue []
+              case argsR of
+                Err e -> Err e
+                Ok args -> Ok (SCall { fnId = op, args = args })
+            else
+              case jsonLogicToSyntax rawArgs ctorDefs nullValue of
+                Err e -> Err e
+                Ok v -> Ok (SRecord { fields = appendItem { name = op, value = v } [] })
+          other ->
+            case jsonLogicToSyntax rawArgs ctorDefs nullValue of
+              Err e -> Err e
+              Ok v -> Ok (SRecord { fields = appendItem { name = op, value = v } [] })
+
+-- jlsPattern — lower a JSON-Logic-shaped pattern AST to the std `Pattern` ADT.
+-- Four shapes: PatWildcard (the operational string "_"), PatLit (other
+-- primitives), PatVar (`{var: name}` / `{$bind: name}`),
+-- PatConstruct (`{$tag: "Ctor", ...subPatterns}`). The Pat* tags are SHARED
+-- with CorePattern by design (byte-identical construction). `nullValue` threads
+-- so a null literal pattern lowers to `PatLit { value = nullValue }`.
+@label "JLS pattern"
+@description "Lower a JSON-Logic-shaped pattern AST to the std Pattern ADT. PatWildcard for the operational underscore; PatLit / PatVar / PatConstruct otherwise (Pat* tags shared with CorePattern by design). Array patterns are not lowerable (Err)."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsPattern : (node: (JsonLogic Any)) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a (Pattern Any)
+jlsPattern node ctorDefs nullValue =
+  case node of
+    JlNull -> Ok (PatLit { value = nullValue })
+    JlBool { value = b } -> Ok (PatLit { value = b })
+    JlNumber { value = n } -> Ok (PatLit { value = n })
+    JlString { value = s } -> if eq s "_" then Ok PatWildcard else Ok (PatLit { value = s })
+    JlArray ->
+      Err (Unsupported { reason = "pattern of type array is not lowerable", node = node })
+    JlTagged { tag = t, fields = fs } -> jlsTaggedPattern t fs ctorDefs nullValue
+    JlObject { fields = fs } -> jlsObjectPattern fs ctorDefs node
+
+-- jlsObjectPattern — dispatch on the structural pattern shape of a JlObject:
+-- `{var: name}` ⇒ PatVar; `{$bind: name}` ⇒ PatVar; otherwise error.
+@label "JLS object pattern"
+@description "Dispatch on the structural pattern shape of a JlObject: `{var: name}` or `{$bind: name}` ⇒ PatVar; otherwise error."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsObjectPattern : (fields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (originalNode: (JsonLogic Any)) -> Result a (Pattern Any)
+jlsObjectPattern fields ctorDefs originalNode =
+  if eq (length fields) 1
+  then
+    let first = unwrapFirstField fields
+    if eq first.name "var"
+    then case first.value of
+      JlString { value = s } -> Ok (PatVar { name = s })
+      JlNull -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlBool -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlNumber -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlArray -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlTagged -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlObject -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+    else if eq first.name "$bind"
+    then case first.value of
+      JlString { value = s } -> Ok (PatVar { name = s })
+      JlNull -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlBool -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlNumber -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlArray -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlTagged -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+      JlObject -> Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+    else Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+  else Err (Unsupported { reason = "pattern shape not recognised by Core IR lowering", node = originalNode })
+
+-- jlsTaggedPattern — constructor pattern from a `{$tag: "Just", value:
+-- <subpat>}` shape. Sub-pattern values recurse via jlsPattern. When the ctor is
+-- registered and every source-level field is declared, populate `fields` (named
+-- reads). Unknown/positional shapes leave fields off; ambiguous unscoped
+-- constructor metadata fails closed.
+@label "JLS tagged pattern"
+@description "Constructor pattern from a `{$tag: \"Just\", value: <subpat>}` shape. Unambiguous registered metadata preserves identity-bearing PatConstruct.fields; ambiguous unscoped constructor metadata returns structured CompileError.Unsupported; unknown or positional shapes omit fields."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsTaggedPattern : (tag: String) -> (fields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a (Pattern Any)
+jlsTaggedPattern tag fields ctorDefs nullValue =
+  if lookupCtorDefAmbiguous tag ctorDefs
+  then Err (Unsupported { reason = "constructor name has ambiguous metadata", node = JlTagged { tag = tag, fields = fields } })
+  else
+    let result = jlsTaggedPatternFields fields ctorDefs nullValue [] []
+    case result of
+      Err e -> Err e
+      Ok pair ->
+        let ctorDefM = lookupCtorDef tag ctorDefs
+        let useNamed = shouldUseNamedFields pair.fields ctorDefM
+        if useNamed
+        then case ctorDefM of
+          Nothing -> Ok (PatConstruct { ctor = tag, args = pair.args })
+          Just ctorDef ->
+            Ok (PatConstruct {
+              ctor = tag,
+              args = pair.args,
+              fields = resolveCtorFieldSlots pair.fields ctorDef []
+            })
+        else Ok (PatConstruct { ctor = tag, args = pair.args })
+
+-- jlsTaggedPatternFields — walk a JlTagged pattern's field list, recursively
+-- lowering each value to a sub-pattern. Accumulates (args, fields).
+@label "JLS tagged pattern fields"
+@description "Walk a JlTagged pattern's field list, recursively lowering each value to a sub-pattern. Accumulates (args, fields)."
+@tags "engine" "internal" "expr-substrate" "phase-4a"
+@category "engine-internal"
+jlsTaggedPatternFields : (fields: a) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> (argsAcc: a) -> (fieldsAcc: a) -> a
+jlsTaggedPatternFields fields ctorDefs nullValue argsAcc fieldsAcc =
+  case head fields of
+    Nothing -> Ok { args = argsAcc, fields = fieldsAcc }
+    Just f ->
+      let subR = jlsPattern f.value ctorDefs nullValue
+      case subR of
+        Err e -> Err e
+        Ok sub ->
+          let argsNext = appendItem sub argsAcc
+          let fieldsNext = appendItem f.name fieldsAcc
+          case tail fields of
+            Nothing -> Ok { args = argsNext, fields = fieldsNext }
+            Just rest ->
+              jlsTaggedPatternFields rest ctorDefs nullValue argsNext fieldsNext

@@ -1,0 +1,50 @@
+// Shared host evaluator vocabulary for syntax-role authoring adapters.
+export const RUNTIME_AUTHORING_OPERATORS: readonly {
+  op: string;
+  label: string;
+  operands?: readonly string[];
+}[] = [
+  { op: "var", label: "Variable", operands: ["Path", "Default value"] },
+  { op: "missing", label: "Missing fields", operands: ["Field"] },
+  { op: "missing_some", label: "Required fields", operands: ["Minimum count", "Fields"] },
+  { op: "if", label: "Conditional" },
+  { op: "?:", label: "Conditional (legacy)" },
+  { op: "match", label: "Pattern match" },
+  { op: "and", label: "All conditions" },
+  { op: "or", label: "Any condition" },
+  { op: "min", label: "Minimum" },
+  { op: "max", label: "Maximum" },
+  { op: "&", label: "Bitwise and" },
+  { op: "|", label: "Bitwise or" },
+  { op: "^", label: "Bitwise xor" },
+  { op: "~", label: "Bitwise complement" },
+  { op: "<<", label: "Shift left" },
+  { op: ">>", label: "Shift right" },
+  { op: "substr", label: "Substring", operands: ["Text", "Start", "Length"] },
+  { op: "length", label: "Length", operands: ["Value"] },
+  { op: "in", label: "Contains", operands: ["Value", "Collection"] },
+  { op: "merge", label: "Merge lists" },
+  { op: "map", label: "Map items", operands: ["Items", "Item expression"] },
+  { op: "filter", label: "Filter items", operands: ["Items", "Item condition"] },
+  { op: "reduce", label: "Reduce items", operands: ["Items", "Step (current, accumulator)", "Initial value"] },
+  { op: "all", label: "Every item", operands: ["Items", "Item condition"] },
+  { op: "some", label: "Some item", operands: ["Items", "Item condition"] },
+  { op: "none", label: "No item", operands: ["Items", "Item condition"] },
+  { op: "let", label: "Let bindings" },
+  { op: "do", label: "Sequence" },
+  { op: "ann", label: "Type annotation", operands: ["Expression", "Type"] },
+  { op: "where", label: "Local bindings", operands: ["Body", "Bindings"] },
+  { op: "withInstance", label: "Scoped instance", operands: ["Instance", "Body"] },
+  { op: "type_def", label: "Type declaration", operands: ["Declaration"] },
+  { op: "construct", label: "Construct a value" },
+  { op: "method", label: "Dispatch method" },
+  { op: "deepEq", label: "Structural equality", operands: ["Left", "Right"] },
+  { op: "call", label: "Call a function" },
+  { op: "pipe", label: "Pipeline" },
+  { op: "|>", label: "Pipe into function", operands: ["Value", "Function"] },
+  { op: "fn", label: "Lambda" },
+  { op: "apply", label: "Apply arguments", operands: ["Function", "Arguments"] },
+  ...["add", "sub", "mul", "div", "mod", "negate", "eq", "neq", "lt", "lte", "gt", "gte", "not", "concat", "ifElse", "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "cat", "!", "!!"]
+    .map((op) => ({ op, label: op })),
+];
+

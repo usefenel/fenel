@@ -1,0 +1,435 @@
+-- Codec: source-owned JSON trees and strict Base64 admission.
+-- Base64 syntax, byte validation and canonical decode/encode agreement are
+-- Fenel-owned; the host only exposes byte carriers and raw conversions.
+-- Compared with the old host gate, nonzero padding bits and fractional or
+-- missing array bytes now refuse instead of being silently normalized.
+-- JSON recursion, duplicate normalization, key order and finite-number refusal
+-- are Fenel-owned. The host seam parses syntax, projects/assembles one raw
+-- representation level and exposes existing scalar spelling through std.jsLit.
+-- Ordinary keys retain JS-object order (integer indices first); canonical
+-- pairs render directly in lexical order, including integer-like keys.
+-- Compared with the previous host tree walkers: own __proto__ keys survive,
+-- overflowing decoded numbers and authored nonfinite numbers refuse instead
+-- of becoming null, and canonical numeric-looking keys now sort lexically.
+-- Raw public wrap/unwrap compatibility stays, including total wrap's fallback
+-- to JsonNull for unsupported host values. The firstName lens placeholders
+-- remain a separate legacy port; the tree repair does not claim to fix them.
+
+module codec where
+
+using std (map, fold, some, all, filter, concat, appendItem, join, length, bindResult, sort, isString, isBoolean, isNumber, isArray, numberIsFinite, jsLit, not, tryParseInt, toString, floor, chars, charCode, slice, endsWith)
+
+-- ----- ADT vocabulary (consolidated from types.fenel) ----------------------
+-- JsonValue is the structured form of JSON: the 6 wire-level cases
+-- (null / bool / number / string / array / object). jsonEncode renders
+-- the pair tree in Fenel; jsonDecode wraps the
+-- JSON.parse result recursively into JsonValue. JsonObject holds its pairs as
+-- `[JsonObjectEntry]` (a list of key/value pairs) rather than a Map<String,
+-- JsonValue> (separate substrate concern). Single `JsonNumber Number` variant
+-- — JSON wire format doesn't distinguish integer vs fractional; the Decodable
+-- JsonValue Int instance runs the integer check at decode time.
+
+JsonValue = JsonNull
+  | JsonBool value: Boolean
+  | JsonNumber value: Number
+  | JsonString value: String
+  | JsonArray items: [JsonValue]
+  | JsonObject pairs: [JsonObjectEntry]
+
+JsonObjectEntry = JsonObjectEntry key: String value: JsonValue
+
+-- modules-as-values Phase 2d — the serialized side of `isoCanonicalJson`, a
+-- named refinement of String: a string is canonical iff it decodes and
+-- `canonicalJsonEncode` of the decoded value is `Ok` of the same string
+-- (sorted keys, no whitespace, finite numbers). Membership runs the Fenel
+-- predicate `isCanonicalJsonString` below.
+CanonicalJsonString = String | isCanonicalJsonString value
+
+-- The compatibility byte-carrier projection is shallow: values stay raw
+-- until the source validates every byte. ArrayBuffer/Uint8Array conversion
+-- and Buffer/btoa/atob remain representation boundaries, not admission rules.
+
+@native
+base64ByteValuesHost : (input: Any) -> Maybe (List Any)
+
+@native
+base64EncodeHost : (values: List Byte) -> Result String String
+
+@native
+base64DecodeHost : (input: String) -> Result String Bytes
+
+base64ByteAdmitted : (value: a) -> Bool
+base64ByteAdmitted value = isNumber value && numberIsFinite value && value >= 0 && value <= 255 && floor value == value
+
+@label "Base64 Encode"
+@description "RFC 4648 base64 encoding. Takes raw bytes, returns the canonical-alphabet base64 string. Pure — no IO; the underlying Buffer / btoa lookup is a runtime detail. Pairs with `base64Decode` to form `IsoBase64`."
+@tags "codec" "base64" "encode" "iso"
+base64Encode : Bytes -> Result String String
+base64Encode input = case base64ByteValuesHost input of
+  Nothing -> Err "base64Encode: expected readable Bytes (Uint8Array, ArrayBuffer or a list of whole bytes)."
+  Just values ->
+    if all values base64ByteAdmitted then base64EncodeHost values
+    else Err "base64Encode: every byte must be a finite whole number from 0 through 255."
+
+base64AlphabetCharacter : (character: String) -> Bool
+base64AlphabetCharacter character =
+  let code = charCode character
+  (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || character == "+" || character == "/"
+
+base64TextAdmitted : (input: String) -> Bool
+base64TextAdmitted input =
+  if not (isString input) then false
+  else
+    let size = length input
+    if size - floor (size / 4) * 4 != 0 then false
+    else
+      let padding = if endsWith input "==" then 2 else if endsWith input "=" then 1 else 0
+      all (chars (slice input 0 (size - padding))) base64AlphabetCharacter
+
+@label "Base64 Decode"
+@description "RFC 4648 base64 decoding. Strict — rejects whitespace, URL-safe chars, wrong padding. The strictness matters for the round-trip law: a decoder that silently accepts non-canonical inputs would break encode-decode-encode invariance."
+@tags "codec" "base64" "decode" "iso"
+base64Decode : String -> Result String Bytes
+base64Decode input =
+  if not (base64TextAdmitted input) then Err "base64Decode: input is not strict RFC 4648 base64 (whitespace / URL-safe chars / wrong padding)."
+  else bindResult (base64DecodeHost input) (\bytes ->
+    bindResult (base64Encode bytes) (\canonical ->
+      if canonical == input then Ok bytes
+      else Err "base64Decode: nonzero padding bits are not canonical RFC 4648 base64."))
+
+@label "JSON Encode"
+@description "Serialize JsonValue in Fenel, using the host codec only to spell strings and finite numbers. Preserve own object keys and last-key-wins pair semantics. Refuse non-finite numbers and unsupported host values. Pairs with jsonDecode."
+@tags "codec" "json" "encode" "iso"
+jsonEncode : JsonValue -> Result String String
+jsonEncode value = bindResult (jsonEncodingTree value) (jsonRender false "")
+
+@label "JSON Decode"
+@description "Parse JSON syntax with JSON.parse, then construct JsonValue recursively in Fenel. Parse failures and numbers outside the finite Number representation return Err. Duplicate text keys keep the last value."
+@tags "codec" "json" "decode" "iso"
+jsonDecode : String -> Result String JsonValue
+jsonDecode input = bindResult (jsonParseHost input) (jsonWrapChecked true)
+
+@label "Depth-bounded JSON decode"
+@description "Use the existing JSON syntax codec, then refuse a value deeper than the supplied maximum before recursively constructing its JsonValue children. The root has depth zero. Syntax, duplicate keys and Number normalization follow jsonDecode; general jsonDecode has no added depth limit."
+@tags "codec" "json" "decode" "bounded"
+jsonDecodeBounded : (maximumDepth: Nat) -> (input: String) -> Result String JsonValue
+jsonDecodeBounded maximumDepth input = bindResult (jsonParseHost input) (jsonWrapCheckedAtDepth true (Just maximumDepth) 0)
+
+@label "Canonical JSON Encode"
+@description "Serialize a JSON value with deterministic key order (lexicographic) and no whitespace variance. Suitable for hashing / signing / cross-machine equality. Refuses non-finite numbers (NaN / Infinity) since `JSON.stringify`'s `null` substitution would break round-trip."
+@tags "codec" "json" "canonical" "encode" "iso"
+canonicalJsonEncode : JsonValue -> Result String CanonicalJsonString
+canonicalJsonEncode value = bindResult (jsonEncodingTree value) (jsonRender true "")
+
+@label "Canonical JSON Decode"
+@description "Parse a canonical-form JSON string. Same as `jsonDecode` — `JSON.parse` already discards whitespace, so canonical and ordinary parsing coincide on the decode side."
+@tags "codec" "json" "canonical" "decode" "iso"
+canonicalJsonDecode : CanonicalJsonString -> Result String JsonValue
+canonicalJsonDecode input = jsonDecode input
+
+@label "Wrap as JsonValue"
+@description "Recursively lift a raw JS value into the JsonValue ADT (JsonNull / JsonBool / JsonNumber / JsonString / JsonObject). Total at the boundary — undefined and unsupported types become JsonNull. Pair with codec:jsonEncode when a call site has a raw JS value but the encoder expects a wrapped JsonValue."
+@tags "codec" "json" "wrap" "boundary"
+wrapJsonValue : a -> JsonValue
+wrapJsonValue value = case jsonWrapChecked false value of
+  Ok wrapped -> wrapped
+  Err _ -> JsonNull
+
+@label "Unwrap JsonValue"
+@description "Lower a wrapped JsonValue ADT down to its raw JS shape. JsonNull → null, JsonBool/Number/String → underlying primitive, JsonArray → JS array, JsonObject → plain Record (pairs collapsed to key/value). Inverse of codec:wrapJsonValue. Total — passes raw-JS inputs through unchanged."
+@tags "codec" "json" "unwrap" "boundary"
+unwrapJsonValue : JsonValue -> a
+unwrapJsonValue value = case jsonWrappedValue value of
+  Nothing -> value
+  Just wrapped -> case wrapped of
+    JsonArray { items } -> jsonHostAssemble (JsonHostParts { scalar = Nothing, items = Just (map unwrapJsonValue items), pairs = Nothing })
+    JsonObject { pairs } ->
+      let lowered = map (\pair -> JsonHostPair { key = pair.key, value = unwrapJsonValue pair.value }) (jsonNormalizePairs pairs)
+      jsonHostAssemble (JsonHostParts { scalar = Nothing, items = Nothing, pairs = Just lowered })
+    _ -> jsonHostAssemble (JsonHostParts { scalar = Just wrapped, items = Nothing, pairs = Nothing })
+
+-- One host level, not a second JSON tree: raw children stay opaque to the
+-- marshaller until the Fenel recursion visits them. The inverse assembles one
+-- level from children that Fenel already lowered. Neither host leaf recurses.
+JsonHostPair = JsonHostPair key: String value: Any
+JsonHostParts = JsonHostParts scalar: Maybe JsonValue items: Maybe (List Any) pairs: Maybe (List JsonHostPair)
+
+@native
+jsonHostParts : (value: Any) -> JsonHostParts
+
+@native
+jsonHostAssemble : (parts: JsonHostParts) -> Any
+
+@native
+jsonWrappedValue : (value: Any) -> Maybe JsonValue
+
+@native
+jsonParseHost : (input: String) -> Result String Any
+
+jsonWrapChecked : (strict: Boolean) -> (value: a) -> Result String JsonValue
+jsonWrapChecked strict value = jsonWrapCheckedAtDepth strict Nothing 0 value
+
+jsonWrapCheckedAtDepth : (strict: Boolean) -> (maximumDepth: Maybe Nat) -> (depth: Nat) -> (value: a) -> Result String JsonValue
+jsonWrapCheckedAtDepth strict maximumDepth depth value = case maximumDepth of
+  Just limit ->
+    if depth > limit then Err (join ["Use JSON with maximum value depth ", toString limit, "; the root has depth zero."] "")
+    else jsonWrapNode strict maximumDepth depth value
+  Nothing -> jsonWrapNode strict maximumDepth depth value
+
+jsonWrapNode : (strict: Boolean) -> (maximumDepth: Maybe Nat) -> (depth: Nat) -> (value: a) -> Result String JsonValue
+jsonWrapNode strict maximumDepth depth value =
+  let parts = jsonHostParts value
+  case parts.scalar of
+    Just scalar -> case scalar of
+      JsonNumber { value = number } ->
+        if strict && not (numberIsFinite number) then Err "JSON codec: number exceeds the finite Number representation"
+        else Ok scalar
+      _ -> Ok scalar
+    Nothing -> case parts.items of
+      Just items -> bindResult (jsonWrapItems strict maximumDepth (depth + 1) items) (\wrapped -> Ok (JsonArray { items = wrapped }))
+      Nothing -> case parts.pairs of
+        Just pairs -> bindResult (jsonWrapPairs strict maximumDepth (depth + 1) pairs) (\wrapped -> Ok (JsonObject { pairs = wrapped }))
+        Nothing -> if strict then Err "JSON codec: value has no JSON representation (undefined / function / symbol)" else Ok JsonNull
+
+jsonWrapItems : (strict: Boolean) -> (maximumDepth: Maybe Nat) -> (depth: Nat) -> (items: List a) -> Result String (List JsonValue)
+jsonWrapItems strict maximumDepth depth items =
+  fold (\state item -> bindResult state (\wrapped -> bindResult (jsonWrapCheckedAtDepth strict maximumDepth depth item) (\child -> Ok (appendItem child wrapped)))) (Ok []) items
+
+jsonWrapPairs : (strict: Boolean) -> (maximumDepth: Maybe Nat) -> (depth: Nat) -> (pairs: List JsonHostPair) -> Result String (List JsonObjectEntry)
+jsonWrapPairs strict maximumDepth depth pairs =
+  fold (\state pair -> bindResult state (\wrapped -> bindResult (jsonWrapCheckedAtDepth strict maximumDepth depth pair.value) (\child -> Ok (appendItem (JsonObjectEntry { key = pair.key, value = child }) wrapped)))) (Ok []) pairs
+
+jsonEncodingTree : (value: a) -> Result String JsonValue
+jsonEncodingTree value = case jsonWrappedValue value of
+  Just wrapped -> Ok wrapped
+  Nothing -> jsonWrapChecked true value
+
+-- Last payload wins without changing the first occurrence's position, as in
+-- the previous JS-object boundary. Render directly so __proto__ is ordinary
+-- key data and canonical integer-like keys keep their lexical order.
+jsonReplacePair : (pairs: List JsonObjectEntry) -> (pair: JsonObjectEntry) -> List JsonObjectEntry
+jsonReplacePair pairs pair =
+  if some pairs (\entry -> entry.key == pair.key) then map (\entry -> if entry.key == pair.key then pair else entry) pairs
+  else appendItem pair pairs
+
+jsonNormalizePairs : (pairs: List JsonObjectEntry) -> List JsonObjectEntry
+jsonNormalizePairs pairs = fold jsonReplacePair [] pairs
+
+jsonPairIndex : (pair: JsonObjectEntry) -> Maybe Number
+jsonPairIndex pair = case tryParseInt pair.key of
+  Just index -> if index >= 0 && index < 4294967295 && toString index == pair.key then Just index else Nothing
+  Nothing -> Nothing
+
+jsonPairIsIndex : (pair: JsonObjectEntry) -> Boolean
+jsonPairIsIndex pair = case jsonPairIndex pair of
+  Just _ -> true
+  Nothing -> false
+
+jsonPairIndexValue : (pair: JsonObjectEntry) -> Number
+jsonPairIndexValue pair = case jsonPairIndex pair of
+  Just index -> index
+  Nothing -> 0
+
+jsonOrderPairs : (canonical: Boolean) -> (pairs: List JsonObjectEntry) -> List JsonObjectEntry
+jsonOrderPairs canonical pairs =
+  if canonical then sort (\pair -> pair.key) pairs
+  else concat (sort jsonPairIndexValue (filter jsonPairIsIndex pairs)) (filter (\pair -> not (jsonPairIsIndex pair)) pairs)
+
+jsonRenderItems : (canonical: Boolean) -> (path: String) -> (items: List JsonValue) -> Result String String
+jsonRenderItems canonical path items =
+  bindResult (fold (\state item -> bindResult state (\texts -> bindResult (jsonRender canonical (join [path, "[", toString (length texts), "]"] "") item) (\text -> Ok (appendItem text texts)))) (Ok []) items) (\texts -> Ok (join ["[", join texts ",", "]"] ""))
+
+jsonRenderPairs : (canonical: Boolean) -> (path: String) -> (pairs: List JsonObjectEntry) -> Result String String
+jsonRenderPairs canonical path pairs =
+  let normalized = jsonNormalizePairs pairs
+  let ordered = jsonOrderPairs canonical normalized
+  bindResult (fold (\state pair -> bindResult state (\texts ->
+    if not (isString pair.key) then Err "jsonEncode: object keys must be Strings"
+    else bindResult (jsonRender canonical (if path == "" then pair.key else join [path, ".", pair.key] "") pair.value) (\text -> Ok (appendItem (join [jsLit pair.key, ":", text] "") texts)))) (Ok []) ordered) (\texts -> Ok (join ["{", join texts ",", "}"] ""))
+
+jsonRender : (canonical: Boolean) -> (path: String) -> (value: JsonValue) -> Result String String
+jsonRender canonical path value = case value of
+  JsonNull -> Ok "null"
+  JsonBool { value = boolean } -> if isBoolean boolean then Ok (jsLit boolean) else Err "jsonEncode: expected Boolean"
+  JsonNumber { value = number } ->
+    if isNumber number && numberIsFinite number then Ok (jsLit number)
+    else Err (join [if canonical then "canonicalJsonEncode" else "jsonEncode", ": non-finite number at ", if path == "" then "(root)" else path] "")
+  JsonString { value = text } -> if isString text then Ok (jsLit text) else Err "jsonEncode: expected String"
+  JsonArray { items } -> if isArray items then jsonRenderItems canonical path items else Err "jsonEncode: array items must be a list"
+  JsonObject { pairs } ->
+    if not (isArray pairs) then Err "jsonEncode: object pairs must be a list"
+    else if not (all pairs (\pair -> isString pair.key)) then Err "jsonEncode: object keys must be Strings"
+    else jsonRenderPairs canonical path pairs
+  _ -> Err "jsonEncode: expected JsonValue"
+
+-- ----- Primitive Decodable JsonValue T bodies (4 inline → .fenel) ----------
+-- These 4 were hand-written inline JSON-Logic `match` literals resident in
+-- codec.ts (the legacy exception). Phase 3d authors them as proper `.fenel`
+-- `case` bodies (the Fenel-first direction): pattern-match the JsonValue
+-- variant + return Result String T. First concrete Decodable JsonValue T
+-- consumers; the registered typeclass instances (instances.fenel) hold
+-- references to these functions (`decode = codec.decodeJsonInt`). JSON-Logic wire form differs from the old hand-written shape
+-- but the behaviour is identical (verified by the suite + codec.test.ts).
+
+decodeJsonString : JsonValue -> Result String String
+@label "Decode JsonString"
+@description "Extract a String from a JsonValue. Returns Ok s when the JsonValue is a JsonString; Err otherwise. First concrete Decodable JsonValue T instance — downstream higher-arity decoders compose these."
+@tags "codec" "json" "decode" "decodable" "pure"
+decodeJsonString jv =
+  case jv of
+    JsonString { value = s } -> Ok s
+    _ -> Err "decodeJsonString: expected JsonString"
+
+decodeJsonBool : JsonValue -> Result String Boolean
+@label "Decode JsonBool"
+@description "Extract a Boolean from a JsonValue. Returns Ok b when the JsonValue is a JsonBool; Err otherwise."
+@tags "codec" "json" "decode" "decodable" "pure"
+decodeJsonBool jv =
+  case jv of
+    JsonBool { value = b } -> Ok b
+    _ -> Err "decodeJsonBool: expected JsonBool"
+
+decodeJsonNumber : JsonValue -> Result String Number
+@label "Decode JsonNumber"
+@description "Extract a Number from a JsonValue. Returns Ok n when the JsonValue is a JsonNumber; Err otherwise. JSON's wire format doesn't distinguish Int vs fractional — use codec:decodeJsonInt for integer-only extraction."
+@tags "codec" "json" "decode" "decodable" "pure"
+decodeJsonNumber jv =
+  case jv of
+    JsonNumber { value = n } -> Ok n
+    _ -> Err "decodeJsonNumber: expected JsonNumber"
+
+decodeJsonInt : JsonValue -> Result String Int
+@label "Decode JsonInt"
+@description "Extract an Int from a JsonValue. Returns Ok n when the JsonValue is a JsonNumber holding a finite integral n (the Int stays a JS number); Err for non-Number JsonValue variants, NaN, the infinities and fractional numbers. Implementation: pattern-match JsonNumber, then n - n = 0 (false for NaN and the infinities) and n = floor n."
+@tags "codec" "json" "decode" "decodable" "pure"
+decodeJsonInt jv =
+  case jv of
+    JsonNumber { value = n } ->
+      if not (eq (sub n n) 0) then Err "decodeJsonInt: expected Int, got a non-finite Number"
+      else if eq n (floor n) then Ok n else Err "decodeJsonInt: expected Int, got fractional Number"
+    _ -> Err "decodeJsonInt: expected JsonNumber"
+
+isCanonicalJsonString : String -> Boolean
+@label "Is Canonical JSON String"
+@description "The CanonicalJsonString predicate: True iff the string parses as JSON (codec:jsonDecode) and codec:canonicalJsonEncode of the parsed value is Ok of the same string (sorted keys, no whitespace, finite numbers). False on a parse failure or an encoding failure."
+@tags "codec" "json" "canonical" "refinement" "pure"
+isCanonicalJsonString s =
+  case jsonDecode s of
+    Ok v ->
+      case canonicalJsonEncode v of
+        Ok t -> eq t s
+        Err _ -> False
+    Err _ -> False
+
+-- ----- Decoder combinators (consolidated from decoders.fenel) --------------
+-- Composition substrate for the typed Update decoder + every record-tier
+-- sibling. The 4 primitive Decodable JsonValue T instances are the leaves;
+-- these compose them via higher-order-fn passing (decoder fns are first-class
+-- arguments), not via typeclass dispatch — the registry's `findInstance` only
+-- matches on the first type argument (args[0]), so a parametric Decodable
+-- JsonValue (Maybe a) / (List a) can't be resolved by the second type-param.
+-- All return Result DecErr a; short-circuit chaining via std:bindResult.
+
+findPair : [JsonObjectEntry] -> String -> Maybe JsonValue
+@label "Find JsonObject pair"
+@description "First JsonObjectEntry in pairs whose key matches; Nothing if absent. Returns Maybe JsonValue."
+@tags "codec" "json" "decode" "pure"
+findPair pairs fieldName =
+  let foundMaybe = find (\pair -> pair.key == fieldName) pairs
+  case foundMaybe of
+    Nothing -> Nothing
+    Just pair -> Just pair.value
+
+decodeRecordField : JsonValue -> String -> (JsonValue -> Result String a) -> Result String (Maybe a)
+@label "Decode record field (optional)"
+@description "Extract an OPTIONAL field from a JsonObject. Field absent ↦ Ok Nothing (Telegram-wire convention). Field present ↦ feed JsonValue through inner decoder; Ok wraps as Just; Err propagates."
+@tags "codec" "json" "decode" "pure"
+decodeRecordField obj fieldName innerDecoder =
+  case obj of
+    JsonObject { pairs } ->
+      case findPair pairs fieldName of
+        Nothing -> Ok (Nothing)
+        Just v ->
+          case innerDecoder $ v of
+            Err e -> Err e
+            Ok x -> Ok (Just x)
+    _ -> Err "decodeRecordField: expected JsonObject"
+
+decodeRecordRequiredField : JsonValue -> String -> (JsonValue -> Result String a) -> Result String a
+@label "Decode record field (required)"
+@description "Extract a REQUIRED field from a JsonObject. Field absent ↦ Err with the missing-field name. Field present ↦ inner decoder result verbatim (Ok x | Err e)."
+@tags "codec" "json" "decode" "pure"
+decodeRecordRequiredField obj fieldName innerDecoder =
+  case obj of
+    JsonObject { pairs } ->
+      case findPair pairs fieldName of
+        Nothing -> Err (concat "decodeRecordRequiredField: missing field " fieldName)
+        Just v -> innerDecoder $ v
+    _ -> Err "decodeRecordRequiredField: expected JsonObject"
+
+sequenceDecodes : [JsonValue] -> (JsonValue -> Result String a) -> Result String [a]
+@label "Sequence JsonValue decodes"
+@description "Fold a list of JsonValues through an inner decoder, short-circuiting on the first Err. Returns Result DecErr (List a). Implemented via std:fold over an Ok [] seed accumulator."
+@tags "codec" "json" "decode" "pure"
+sequenceDecodes items innerDecoder =
+  let folder = \acc item -> bindResult acc (\xs -> bindResult (innerDecoder $ item) (\x -> Ok (appendItem x xs)))
+  let seed = Ok []
+  fold folder seed items
+
+decodeJsonMaybe : (JsonValue -> Result String a) -> JsonValue -> Result String (Maybe a)
+@label "Decode JsonValue → Maybe a"
+@description "Maybe combinator. JsonNull decodes to Ok Nothing; everything else feeds through the inner decoder + wraps Ok as Just. Used at field-decode level where the JsonValue is present but may be explicit-null; absent-field handling is done by decodeRecordField at the JsonObject-pairs level."
+@tags "codec" "json" "decode" "maybe" "pure"
+decodeJsonMaybe innerDecoder jv =
+  case jv of
+    JsonNull -> Ok (Nothing)
+    _ ->
+      case innerDecoder $ jv of
+        Err e -> Err e
+        Ok x -> Ok (Just x)
+
+decodeJsonList : (JsonValue -> Result String a) -> JsonValue -> Result String [a]
+@label "Decode JsonValue → List a"
+@description "List combinator. Expects JsonArray; maps the inner decoder over each item; short-circuits on the first Err via codec:sequenceDecodes."
+@tags "codec" "json" "decode" "list" "pure"
+decodeJsonList innerDecoder jv =
+  case jv of
+    JsonArray { items } -> sequenceDecodes items innerDecoder
+    _ -> Err "decodeJsonList: expected JsonArray"
+
+decodeRecordListField : JsonValue -> String -> (JsonValue -> Result String a) -> Result String [a]
+@label "Decode record list field"
+@description "Extract a LIST-typed field with Telegram-wire empty-default semantics. Field absent ↦ Ok []. Field present ↦ decode via codec:decodeJsonList."
+@tags "codec" "json" "decode" "list" "pure"
+decodeRecordListField obj fieldName innerDecoder =
+  case obj of
+    JsonObject { pairs } ->
+      case findPair pairs fieldName of
+        Nothing -> Ok []
+        Just v -> decodeJsonList innerDecoder v
+    _ -> Err "decodeRecordListField: expected JsonObject"
+
+hasPair : [JsonObjectEntry] -> String -> Boolean
+@label "Has JsonObject pair"
+@description "True if pairs contains a JsonObjectEntry with the named key. Used by decodeUpdate to dispatch on which variant key is present in the inbound JsonObject before extracting the payload."
+@tags "codec" "json" "decode" "pure"
+hasPair pairs fieldName =
+  case findPair pairs fieldName of
+    Nothing -> false
+    Just _v -> true
+
+-- ----- Lens method foreign declarations (native-backed) --------------------
+-- view = lossy projection of the `firstName` field; put = re-inject preserving
+-- the rest of the record. See the Record-type DIVERGENCE note in the header.
+
+@native
+@label "View firstName"
+@description "Project the `firstName` field out of a record. Empty string when the field is absent — encoded as the lens's `view` direction (lossy: every other field is dropped)."
+@tags "codec" "lens" "view"
+recordFirstNameView : {} -> String
+
+@native
+@label "Put firstName"
+@description "Set the `firstName` field on the supplied record context, preserving every other field. The `put` direction of the firstName lens — context provides the information the lossy `view` discarded."
+@tags "codec" "lens" "put"
+recordFirstNamePut : {} -> String -> {}

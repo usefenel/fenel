@@ -1,0 +1,107 @@
+-- =========================================================================
+-- Stripe webhook ingress.
+--
+-- Phase 12d sub-step 5 of the ts-elimination workstream. Single route
+-- POST /webhooks/stripe. The TS wrapper handles:
+--   - signature verification via crypto:verifyStripeSignature (Stripe SDK
+--     does sig-verify + event decode in one call — rolling-secret
+--     protocol; substrate IO leaf)
+--   - 400 reject on Nothing return
+--
+-- Body decides per-event-type dispatch. Today only
+-- `checkout.session.completed` drives action dispatch; future event types
+-- (refunds, disputes, chargebacks) join as case-arms (Risk 5 — shape
+-- supports additive extensions without lifting to ADT per Decision E).
+--
+-- Substrate consumed:
+--   - dispatch:dispatchAction (from 12d-2)
+--
+-- Decisions resolved (per the brief):
+--   E: NO PaymentEventType ADT this sub-step — string discriminator.
+--      Only 1 event type is handled; an ADT for a 1-arm dispatch would
+--      be over-engineered. Future arms join as additional case-arms;
+--      revisit lifting to ADT when 3+ event types are handled.
+--   F: stripeWebhook registered via mixedIngressModule (sister of
+--      webhooks:calendlyWebhook from 12c-routes-2). Avoids a new engine
+--      module for a single body.
+--   L: Sig-verify + JSON-parse stay route-side. The route reads raw
+--      body + signature header, invokes crypto:verifyStripeSignature
+--      substrate, 400-rejects on Nothing, then passes the verified event
+--      Record to the body via invokeIOAction.
+--   M: appendEvent provenance fields drop (same as 12d-3 / 12d-4 / 12d-5
+--      payments — grep audit confirms no consumer queries the events by
+--      aggregateType/aggregateId/profileId).
+--
+-- module-substrate Phase 3p (2026-05-31) — the AGGREGATION-FRONTIER CLOSE.
+-- Decision F above ("stripeWebhook registered via mixedIngressModule") is now
+-- SUPERSEDED: the `mixed-ingress` bundle is dissolved and stripe + calendly
+-- form their own `webhooks` module via a 2-file `module webhooks where` union.
+-- This file's 4 fns (stripeWebhook + handleCheckoutSessionCompleted +
+-- recordOrEmptyForWebhook + dispatchPaymentCompleted) union with calendly.fenel's
+-- 2. No stored @category (derives from the `webhooks:` id prefix, Phase 3j);
+-- HasStateIO is INFERRED transitively except recordOrEmptyForWebhook (PURE).
+-- =========================================================================
+
+module webhooks where
+
+-- stripeWebhook — POST /webhooks/stripe body. The wrapper has already
+-- verified the Stripe-Signature envelope (crypto:verifyStripeSignature
+-- substrate) and passes the verified event Record verbatim. Per Decision
+-- E, event.type is a string discriminator; today only "checkout.session.completed"
+-- drives dispatch; everything else falls through with {received: true}.
+@label "Stripe webhook"
+@description "POST /webhooks/stripe body. The TS wrapper handles raw body read + signature header + sig-verify via crypto:verifyStripeSignature + 400 reject on Nothing. Body case-arms on event.type: 'checkout.session.completed' → dispatch:dispatchAction mark_payment_step_paid + grant_step_entitlements; else → no-op {received: true}. Sister of webhooks:calendlyWebhook."
+@tags "webhook" "stripe" "route" "phase-12d"
+stripeWebhook : {} -> {}
+stripeWebhook event =
+  let eventType = event.type
+  if eq eventType "checkout.session.completed" then handleCheckoutSessionCompleted event
+  else { received = true }
+
+-- handleCheckoutSessionCompleted — checkout.session.completed arm. The
+-- event payload's session lives at event.data.object; its metadata
+-- (round-tripped via Stripe from the create_payment_link body's
+-- createStripeCheckoutSession metadata field — Decision O) carries
+-- accountId / purchaseId / stepSlug / profileId. Missing-metadata path
+-- short-circuits to {received: true} (the pre-port logs a warning and
+-- 200s; ports semantically — no action dispatch fires, so the runtime
+-- behavior is identical).
+@label "Handle checkout.session.completed"
+@description "Phase 12d sub-step 5 — checkout.session.completed arm. Reads session metadata (purchaseId / stepSlug — round-tripped via Stripe from create_payment_link's createStripeCheckoutSession metadata field, Decision O), short-circuits on missing fields, delegates to dispatchPaymentCompleted for the two action dispatches."
+@tags "webhook" "stripe" "phase-12d"
+handleCheckoutSessionCompleted : {} -> {}
+handleCheckoutSessionCompleted event =
+  let session = event.data.object
+  let metadata = recordOrEmptyForWebhook session.metadata
+  let purchaseId = metadata.purchaseId
+  let stepSlug = metadata.stepSlug
+  if (truthy purchaseId) and (truthy stepSlug)
+  then dispatchPaymentCompleted purchaseId stepSlug session.id
+  else { received = true }
+
+-- recordOrEmptyForWebhook — defensive coerce for session.metadata which
+-- may be missing on Stripe events that don't carry metadata. Returns
+-- {} when the field is missing. Inlined here (not in shared scope) to
+-- keep parseApp single-line at the let binding.
+@label "Record or empty (webhook)"
+@description "Phase 12d sub-step 5 — defensive coerce for session.metadata which may be missing on Stripe events. Returns {} when the field is missing. Sister of purchases:recordOrEmpty; inlined in this module's scope to keep parseApp single-line."
+@tags "webhook" "stripe" "defensive" "pure" "phase-12d"
+recordOrEmptyForWebhook : {} -> {}
+recordOrEmptyForWebhook r =
+  ifElse (truthy r) r {}
+
+-- dispatchPaymentCompleted — composes the two action dispatches
+-- (mark_payment_step_paid + grant_step_entitlements). The provider
+-- is hard-coded "stripe" since this webhook is Stripe-specific
+-- (matches pre-port verbatim). The session.id from the event payload
+-- becomes the providerRef.
+@label "Dispatch payment completed"
+@description "Phase 12d sub-step 5 — composes two action dispatches (mark_payment_step_paid + grant_step_entitlements) via dispatch:dispatchAction. The provider is hard-coded 'stripe' since this webhook is Stripe-specific; session.id from the event payload becomes the providerRef. Returns {received: true}."
+@tags "webhook" "stripe" "phase-12d"
+dispatchPaymentCompleted : String -> String -> String -> {}
+dispatchPaymentCompleted purchaseId stepSlug sessionId =
+  let markParams = { purchaseId = purchaseId, stepSlug = stepSlug, provider = "stripe", providerRef = sessionId }
+  let _mark = dispatchAction "mark_payment_step_paid" markParams
+  let grantParams = { purchaseId = purchaseId, stepSlug = stepSlug }
+  let _grant = dispatchAction "grant_step_entitlements" grantParams
+  { received = true }

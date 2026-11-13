@@ -1,0 +1,573 @@
+module engine where
+
+-- type-to-set.fenel — the Fenel-owned FenelType → SetExpr projection.
+--
+-- Field-identity Phase 3 retires the recursive TypeScript TypeMarker mirror.
+-- The host performs one descriptor-safe, `$`-key boundary projection to the
+-- shared TraversalType ADT.  This module then owns every semantic choice:
+-- named towers, datatype constructors, μ binding and shadowing, arrow fields,
+-- refined composition, Boolean constructor exclusion, and finite-map
+-- membership predicates.  `semanticKey` is the only field identity; `wireName`
+-- is a current serialization projection.
+
+@label "Type-to-set semantic input error"
+@description "Validate the shared TraversalType boundary before type-to-set projection. Nothing means identity-total and structurally admissible; Just carries the first Fenel-owned diagnostic."
+@tags "engine" "field-identity" "type-to-set" "phase-3"
+typeToSetSemanticError : (type: TraversalType) -> Maybe String
+typeToSetSemanticError type =
+  if not (eq (canonicalRepresentationName type) "") then Nothing
+  else traversalSemanticSlotsError type
+
+@label "Type to set expr"
+@description "Internal presentation-only compatibility view of typeToSetProjection.set. Evidence consumers must use the envelope and reject known projection loss; the raw shape carries no exactness promise."
+@tags "engine" "inference" "field-identity" "phase-3"
+typeToSetExpr : (type: TraversalType) -> SetExpr
+typeToSetExpr type =
+  let projection = typeToSetProjection type
+  projection.set
+
+@label "Type to set projection"
+@description "Project a TraversalType together with the Fenel-owned known-loss flag. The set retains its historical presentation shape; degraded means evidence must abstain and inference must widen. False means no known projection loss was found, not that every independent type/map semantic rule is proved sound."
+@tags "engine" "inference" "field-identity" "type-to-set"
+typeToSetProjection : (type: TraversalType) -> ({ set: SetExpr, degraded: Boolean })
+typeToSetProjection type =
+  case typeToSetSemanticError type of
+    Just _ -> { set = SeAll, degraded = true }
+    Nothing -> { set = typeToSetNode type [], degraded = typeToSetDegradedNode type [] }
+
+-- Exactness travels beside the shape, including through antitone complement
+-- and through constructors that discard their input's representation (refined
+-- bases and finite-map element guards). Bound variables share the projector's
+-- lexical stack. Future traversal constructors fail closed.
+@category "engine-internal"
+typeToSetDegradedNode : (type: TraversalType) -> (bound: List String) -> Boolean
+typeToSetDegradedNode type bound = case type of
+  TtNamed { origin = origin } -> eq origin "opaque"
+  TtVar { name = name } -> not (typeToSetNameBound name bound)
+  TtVoid {} -> false
+  TtUnit {} -> true
+  TtTypeUniverse {} -> true
+  TtEl {} -> true
+  TtTuple {} -> true
+  TtTagged {} -> true
+  TtApp {} -> true
+  TtUnknown {} -> true
+  TtRecord { fields = fields } ->
+    std.some fields (\field -> typeToSetDegradedNode field.type bound)
+  TtVariant { cases = cases } ->
+    if typeToSetHasCoercingCase cases then true
+    else std.some cases (\current -> std.some current.fields (\field -> typeToSetDegradedNode field.type bound))
+  TtArrow { params = params, returns = returns } ->
+    if std.some params (\param -> typeToSetDegradedNode param.type bound) then true
+    else typeToSetDegradedNode returns bound
+  TtMu { var = name, body = body } -> typeToSetDegradedNode body (appendItem name bound)
+  TtOpaque { name = name, pure = pure } ->
+    if elem name ["Rational", "Nat", "Int"]
+    then eq (canonicalRepresentationNameIn type bound) ""
+    else typeToSetDegradedNode pure (appendItem name bound)
+  TtRefined { base = base, setView = refinement } ->
+    if typeToSetDegradedNode base bound then true else typeToSetMarkedSet refinement
+  TtMap { canonicalKeys = keys, values = values } ->
+    if typeToSetMarkedSet keys then true
+    else case typeMapFiniteCard keys of
+      Nothing -> true
+      Just card ->
+        if not (ttHostArrayLength card) then true
+        else if typeToSetExactNumericFace (typeToSetNode values bound) then true
+        else typeToSetDegradedNode values bound
+  TtUnion { branches = branches } -> std.some branches (\branch -> typeToSetDegradedNode branch bound)
+  TtIntersect { branches = branches } -> std.some branches (\branch -> typeToSetDegradedNode branch bound)
+  TtComplement { inner = inner } -> typeToSetDegradedNode inner bound
+  _ -> true
+
+-- A refinement/key can itself contain a previously projected SetExpr. Inspect
+-- every semantic child, never opaque enum values or predicate-code payloads.
+-- This also protects direct Fenel callers that did not pass through a host
+-- canonicalizer that hoists descendant markers.
+@category "engine-internal"
+typeToSetMarkedSet : (set: SetExpr) -> Boolean
+typeToSetMarkedSet set =
+  let marked = case mapGet set "semanticProjectionDegraded" of
+        Just flag -> eq flag true
+        Nothing -> false
+  if marked then true
+  else case set of
+    SeAll -> false
+    SeNone -> false
+    SeEnum {} -> false
+    SeInterval {} -> false
+    SeRef {} -> false
+    SeWhere {} -> false
+    SeRigid {} -> false
+    SeCtor { fields = fields } -> std.some fields (\field -> typeToSetMarkedSet field.set)
+    SeArrow { params = params, returns = returns } ->
+      if std.some params (\param -> typeToSetMarkedSet param.set) then true else typeToSetMarkedSet returns
+    SeMu { body = body } -> typeToSetMarkedSet body
+    SeUnion { branches = branches } -> std.some branches typeToSetMarkedSet
+    SeIntersect { branches = branches } -> std.some branches typeToSetMarkedSet
+    SeDiff { left = left, right = right } -> if typeToSetMarkedSet left then true else typeToSetMarkedSet right
+    SeComplement { inner = inner } -> typeToSetMarkedSet inner
+    SePattern { pattern = pattern } -> typeToSetMarkedPattern pattern
+    _ -> true
+
+@category "engine-internal"
+typeToSetMarkedPattern : (pattern: a) -> Boolean
+typeToSetMarkedPattern pattern = case pattern of
+  SpEmpty -> false
+  SpEps -> false
+  SpMatch { pred = pred } -> typeToSetMarkedSet pred
+  SpSeq { a = left, b = right } -> if typeToSetMarkedPattern left then true else typeToSetMarkedPattern right
+  SpAlt { a = left, b = right } -> if typeToSetMarkedPattern left then true else typeToSetMarkedPattern right
+  SpRep { child = child } -> typeToSetMarkedPattern child
+  SpGroup { child = child, type = type } ->
+    if typeToSetMarkedPattern child then true
+    else case type of
+      Nothing -> false
+      Just set -> typeToSetMarkedSet set
+  _ ->
+    case mapGet pattern "t" of
+      Nothing -> true
+      Just tag ->
+        if or (eq tag "empty") (eq tag "eps") then false
+        else if eq tag "match" then typeToSetMarkedSet pattern.pred
+        else if or (eq tag "seq") (eq tag "alt")
+          then if typeToSetMarkedPattern pattern.a then true else typeToSetMarkedPattern pattern.b
+        else if eq tag "rep" then typeToSetMarkedPattern pattern.child
+        else if eq tag "group"
+          then if typeToSetMarkedPattern pattern.child then true
+          else case mapGet pattern "type" of
+            Nothing -> false
+            Just type -> if isNull type then false else typeToSetMarkedSet type
+        else true
+
+@category "engine-internal"
+typeToSetNode : (type: TraversalType) -> (bound: List String) -> SetExpr
+typeToSetNode type bound = case type of
+  TtRefined { base = base, setView = refinement } -> typeRefinedToSet base refinement bound
+  TtOpaque { pure = pure, name = name } ->
+    let representationName = canonicalRepresentationNameIn type bound
+    if not (eq representationName "")
+    then typeNamedToSet representationName
+    else
+      let innerBound = appendItem name bound
+      let body = typeToSetNode pure innerBound
+      if typeToSetUsesName pure name
+        then SeMu { var = name, body = body }
+        else body
+  TtNamed { name = name, origin = origin } ->
+    if eq origin "opaque" then SeAll
+    else if typeToSetNameBound name bound
+      then SeRef { handle = name }
+      else typeNamedToSet name
+  TtVar { name = name } ->
+    if typeToSetNameBound name bound
+      then SeRef { handle = name }
+      else SeAll
+  TtVoid { raw = _ } -> SeNone
+  TtMu { var = name, body = body } ->
+    SeMu { var = name, body = typeToSetNode body (appendItem name bound) }
+  TtVariant { cases = cases } ->
+    if typeToSetHasCoercingCase cases
+      then SeAll
+      else typeVariantToSet cases bound
+  TtRecord { fields = fields } -> typeRecordToSet fields bound
+  TtMap { canonicalKeys = keys, values = values } -> typeMapToSet keys values bound
+  TtArrow { params = params, returns = returns } -> typeArrowToSet params returns bound
+  -- signature-substrate Phase 1 (projection totality, doc §11.3): the three
+  -- Boolean-lattice formers project to their definitional set denotations
+  -- instead of falling through to the `_ -> SeAll` ⊤-degrade. The deciders
+  -- already handled Se∪/Se∩/Se¬ (containment.fenel trio + the Se* faces);
+  -- only this projection was coarse — a ported omission (the ctor comment in
+  -- type-traversal.fenel says "anything still falling through stays
+  -- sound-but-coarse"), not deliberate semantics. `bound` threads through so
+  -- μ/opaque binder references under a former stay lexical (SeRef-bound).
+  TtUnion { branches = branches } ->
+    SeUnion { branches = map (\branch -> typeToSetNode branch bound) branches }
+  TtIntersect { branches = branches } ->
+    SeIntersect { branches = map (\branch -> typeToSetNode branch bound) branches }
+  TtComplement { inner = inner } ->
+    SeComplement { inner = typeToSetNode inner bound }
+  _ -> SeAll
+
+-- An opaque carrier needs the same membership face as its named owner. The
+-- host carries generated-lock keys or authenticated current-reader declaration
+-- observations; source decides whether this
+-- exact identified declaration has a canonical numeric signature. Names
+-- alone never replace an authored pure type. The concrete wire checks are
+-- carrier conditions, after semantic-key lookup, not field identities.
+@label "Canonical numeric representation name"
+@description "Recognize the standard Rational, Nat or Int opaque signature through generated-lock keys or authenticated current-reader field observations, concrete carrier slots, and direct named references. Reader identities must agree with the exact qualified system owner; SourceHandles must also carry the canonical system field path. Missing facts, another signature or invalid identities cannot select numeric Membership."
+@tags "engine" "type-to-set" "membership" "numeric" "field-identity"
+@category "engine-internal"
+canonicalRepresentationName : (type: TraversalType) -> String
+canonicalRepresentationName type = case type of
+  TtOpaque { name = name, pure = pure } ->
+    if not (elem name ["Rational", "Nat", "Int"]) then ""
+    else case mapGet type "readerCanonicalOwner" of
+      Just (Just facts) -> canonicalRepresentationReader type name pure facts
+      _ -> canonicalRepresentationRepository type name pure
+  _ -> ""
+
+@category "engine-internal"
+canonicalRepresentationRepository : (type: TraversalType) -> (name: String) -> (pure: TraversalType) -> String
+canonicalRepresentationRepository type name pure =
+    if not (traversalSemanticSlotsValid type) then ""
+    else if eq name "Rational" then case mapGet type "repositoryRationalKeys" of
+      Nothing -> ""
+      Just keys -> if canonicalRepresentationRecord pure keys.num keys.den "num" "den" "Int" "PositiveNat" false then name else ""
+    else case mapGet type "repositoryIntegerKeys" of
+      Nothing -> ""
+      Just keys ->
+        let canonical = if eq name "Nat"
+              then canonicalRepresentationNat pure keys.natPred false
+              else canonicalRepresentationRecord pure keys.intMagnitude keys.intNegative "magnitude" "negative" "Nat" "Bool" false
+        if canonical then name else ""
+
+@category "engine-internal"
+canonicalRepresentationReader : (type: TraversalType) -> (name: String) -> (pure: TraversalType) -> (facts: a) -> String
+canonicalRepresentationReader type name pure facts =
+  if eq facts.readerOwnerIdentity "" then ""
+  else if not (eq facts.readerOwnerIdentity facts.expectedSystemIdentity) then ""
+  else case traversalSemanticSlotsErrorWithSourceHandles type of
+    Just error -> ""
+    Nothing ->
+      let numKey = canonicalRepresentationReaderKey facts.fields name "num" [FieldNamed { name = "num" }]
+      let denKey = canonicalRepresentationReaderKey facts.fields name "den" [FieldNamed { name = "den" }]
+      let magnitudeKey = canonicalRepresentationReaderKey facts.fields name "magnitude" [FieldNamed { name = "magnitude" }]
+      let negativeKey = canonicalRepresentationReaderKey facts.fields name "negative" [FieldNamed { name = "negative" }]
+      let predKey = canonicalRepresentationReaderKey facts.fields name "pred" [FieldCase { name = "Succ" }, FieldNamed { name = "pred" }]
+      let canonical = if eq name "Rational"
+            then canonicalRepresentationRecord pure numKey denKey "num" "den" "Int" "PositiveNat" true
+            else if eq name "Int"
+              then canonicalRepresentationRecord pure magnitudeKey negativeKey "magnitude" "negative" "Nat" "Bool" true
+              else canonicalRepresentationNat pure predKey true
+      if canonical then name else ""
+
+@category "engine-internal"
+canonicalRepresentationReaderKey : (fields: List a) -> (name: String) -> (wireName: String) -> (path: List FieldPathSegment) -> Maybe FieldKey
+canonicalRepresentationReaderKey fields name wireName path =
+  case find (\field -> eq field.wireName wireName) fields of
+    Nothing -> Nothing
+    Just field ->
+      if fieldKeyValid field.key then Just field.key
+      else case fieldKeyHandle field.key of
+        Nothing -> Nothing
+        Just handle ->
+          let owner = TypeFieldOwner { module = Just "system", localId = name }
+          let expected = fieldIdentityQualifiedName owner path
+          if and (fieldKeyValidWithSourceHandles field.key) (eq handle expected) then Just field.key else Nothing
+
+@category "engine-internal"
+canonicalRepresentationRecord : (pure: TraversalType) -> (firstKey: Maybe FieldKey) -> (secondKey: Maybe FieldKey) -> (firstWire: String) -> (secondWire: String) -> (firstPart: String) -> (secondPart: String) -> (sourceHandles: Boolean) -> Boolean
+canonicalRepresentationRecord pure firstKey secondKey firstWire secondWire firstPart secondPart sourceHandles = case pure of
+  TtRecord { fields = fields } ->
+    if not (eq (length fields) 2) then false
+    else case firstKey of
+      Nothing -> false
+      Just keyA -> case secondKey of
+        Nothing -> false
+        Just keyB -> case canonicalRepresentationFindField fields keyA sourceHandles of
+          Nothing -> false
+          Just first -> case canonicalRepresentationFindField fields keyB sourceHandles of
+            Nothing -> false
+            Just second ->
+              if not (eq first.wireName firstWire) then false
+              else if not (eq second.wireName secondWire) then false
+              else if not (canonicalRepresentationPart first.type firstPart) then false
+              else canonicalRepresentationPart second.type secondPart
+  _ -> false
+
+@category "engine-internal"
+canonicalRepresentationNat : (pure: TraversalType) -> (predecessorKey: Maybe FieldKey) -> (sourceHandles: Boolean) -> Boolean
+canonicalRepresentationNat pure predecessorKey sourceHandles = case pure of
+  TtVariant { cases = cases, discriminator = discriminator } ->
+    let standardDiscriminator = case discriminator of Nothing -> true; Just value -> eq value "$tag"
+    if not standardDiscriminator then false
+    else if not (eq (length cases) 2) then false
+    else case setAlgebraFindCaseByName cases "Zero" of
+      Nothing -> false
+      Just zero -> if not (eq (length zero.fields) 0) then false
+        else case setAlgebraFindCaseByName cases "Succ" of
+          Nothing -> false
+          Just succ -> if not (eq (length succ.fields) 1) then false
+            else case predecessorKey of
+              Nothing -> false
+              Just key -> case canonicalRepresentationFindField succ.fields key sourceHandles of
+                Nothing -> false
+                Just predecessor ->
+                  and (eq predecessor.wireName "pred") (canonicalRepresentationPart predecessor.type "Nat")
+  _ -> false
+
+@category "engine-internal"
+canonicalRepresentationFindField : (fields: List TtField) -> (key: FieldKey) -> (sourceHandles: Boolean) -> Maybe TtField
+canonicalRepresentationFindField fields key sourceHandles =
+  if sourceHandles then find (\field -> fieldKeyEqWithSourceHandles field.semanticKey key) fields
+  else findFieldByKey fields key
+
+@category "engine-internal"
+canonicalRepresentationPart : (type: TraversalType) -> (name: String) -> Boolean
+canonicalRepresentationPart type name = case type of
+  TtNamed { name = actual, origin = origin } -> and (eq origin "ref") (eq actual name)
+  _ -> false
+
+@category "engine-internal"
+canonicalRepresentationNameIn : (type: TraversalType) -> (bound: List String) -> String
+canonicalRepresentationNameIn type bound =
+  let name = canonicalRepresentationName type
+  let dependencies = if eq name "Rational" then ["Rational", "Int", "PositiveNat"]
+        else if eq name "Nat" then ["Nat", "ℕ"]
+        else ["Int", "ℤ", "Nat", "Bool"]
+  if std.some dependencies (\dependency -> typeToSetNameBound dependency bound) then "" else name
+
+@category "engine-internal"
+typeToSetRationalOpaque : (type: TraversalType) -> Boolean
+typeToSetRationalOpaque type = eq (canonicalRepresentationName type) "Rational"
+
+-- Finite-map presentation currently authors only isNumber/isString element
+-- guards. Exact numeric Membership also admits record carriers, so that
+-- presentation cannot serve as membership evidence for these element sets.
+@category "engine-internal"
+typeToSetExactNumericFace : (set: SetExpr) -> Boolean
+typeToSetExactNumericFace set = case set of
+  SeInterval {} -> true
+  SeRef { handle = handle } -> elem handle ["Nat", "Int", "Rational", "ℕ", "ℤ", "ℚ"]
+  SeUnion { branches = branches } -> std.some branches typeToSetExactNumericFace
+  SeIntersect { branches = branches } -> std.some branches typeToSetExactNumericFace
+  SeDiff { left = left, right = right } -> or (typeToSetExactNumericFace left) (typeToSetExactNumericFace right)
+  SeComplement { inner = inner } -> typeToSetExactNumericFace inner
+  SeMu { body = body } -> typeToSetExactNumericFace body
+  SeCtor { fields = fields } -> std.some fields (\field -> typeToSetExactNumericFace field.set)
+  _ -> false
+
+-- Bound names are a lexical stack, not host identity. Inner μ/opaque binders
+-- shadow an equal outer spelling in `typeToSetUsesName` below.
+@category "engine-internal"
+typeToSetNameBound : (name: String) -> (bound: List String) -> Boolean
+typeToSetNameBound name bound =
+  case head bound of
+    Nothing -> false
+    Just candidate ->
+      if eq name candidate
+        then true
+        else typeToSetNameBound name (tailOr bound)
+
+@category "engine-internal"
+typeToSetUsesName : (type: TraversalType) -> (target: String) -> Boolean
+typeToSetUsesName type target = case type of
+  TtNamed { name = name, origin = origin } ->
+    if eq origin "opaque" then false else eq name target
+  TtVar { name = name } -> eq name target
+  TtMu { var = name, body = body } ->
+    if eq name target then false else typeToSetUsesName body target
+  TtOpaque { name = name, pure = pure } ->
+    if eq name target then false else typeToSetUsesName pure target
+  TtRecord { fields = fields } -> typeToSetFieldsUseName fields target
+  TtVariant { cases = cases } -> typeToSetCasesUseName cases target
+  TtMap { values = values } -> typeToSetUsesName values target
+  TtRefined { base = base } -> typeToSetUsesName base target
+  TtArrow { params = params, returns = returns } ->
+    if typeToSetArrowParamsUseName params target then true else typeToSetUsesName returns target
+  -- signature-substrate Phase 1 — the binder-usage companion of the three
+  -- projection arms above: without these, an opaque/μ name referenced ONLY
+  -- under a ∪/∩/¬ former was reported unused, the SeMu wrapper was skipped,
+  -- and the projected body carried a DANGLING SeRef (an unbound handle the
+  -- membership face can only abstain on).
+  TtUnion { branches = branches } -> typeToSetBranchesUseName branches target
+  TtIntersect { branches = branches } -> typeToSetBranchesUseName branches target
+  TtComplement { inner = inner } -> typeToSetUsesName inner target
+  _ -> false
+
+@category "engine-internal"
+typeToSetFieldsUseName : (fields: List TtField) -> (target: String) -> Boolean
+typeToSetFieldsUseName fields target =
+  case head fields of
+    Nothing -> false
+    Just field ->
+      if typeToSetUsesName field.type target
+        then true
+        else typeToSetFieldsUseName (tailOr fields) target
+
+@category "engine-internal"
+typeToSetArrowParamsUseName : (params: List TtArrowParam) -> (target: String) -> Boolean
+typeToSetArrowParamsUseName params target =
+  case head params of
+    Nothing -> false
+    Just param ->
+      if typeToSetUsesName param.type target
+        then true
+        else typeToSetArrowParamsUseName (tailOr params) target
+
+-- signature-substrate Phase 1 — branch-list twin of the nominal slot walkers for
+-- the ∪/∩ formers (each branch is a bare TraversalType, not a field slot).
+@category "engine-internal"
+typeToSetBranchesUseName : (branches: List TraversalType) -> (target: String) -> Boolean
+typeToSetBranchesUseName branches target =
+  case head branches of
+    Nothing -> false
+    Just branch ->
+      if typeToSetUsesName branch target
+        then true
+        else typeToSetBranchesUseName (tailOr branches) target
+
+@category "engine-internal"
+typeToSetCasesUseName : (cases: List TtVariantCase) -> (target: String) -> Boolean
+typeToSetCasesUseName cases target =
+  case head cases of
+    Nothing -> false
+    Just current ->
+      if typeToSetFieldsUseName current.fields target
+        then true
+        else typeToSetCasesUseName (tailOr cases) target
+
+@category "engine-internal"
+typeToSetHasCoercingCase : (cases: List TtVariantCase) -> Boolean
+typeToSetHasCoercingCase cases =
+  case head cases of
+    Nothing -> false
+    Just current ->
+      if eq current.name "True"
+        then true
+        else if eq current.name "False"
+          then true
+          else typeToSetHasCoercingCase (tailOr cases)
+
+@label "type-to-set: variant"
+@description "Project a non-coercing TraversalType variant to a union of identity-bearing SeCtor branches."
+@tags "engine" "internal" "field-identity" "type-to-set" "phase-3"
+@category "engine-internal"
+typeVariantToSet : (cases: List TtVariantCase) -> (bound: List String) -> SetExpr
+typeVariantToSet cases bound =
+  SeUnion { branches = map (\current -> typeCaseToCtor current bound) cases }
+
+@label "type-to-set: record"
+@description "Project a TraversalType record to its synthetic empty-name SeCtor using semantic field keys."
+@tags "engine" "internal" "field-identity" "type-to-set" "phase-3"
+@category "engine-internal"
+typeRecordToSet : (fields: List TtField) -> (bound: List String) -> SetExpr
+typeRecordToSet fields bound =
+  SeCtor { ctor = "", fields = map (\field -> typeFieldToCtorField field bound) fields }
+
+@category "engine-internal"
+typeCaseToCtor : (current: TtVariantCase) -> (bound: List String) -> SetExpr
+typeCaseToCtor current bound =
+  SeCtor {
+    ctor = current.name,
+    fields = map (\field -> typeFieldToCtorField field bound) current.fields
+  }
+
+@category "engine-internal"
+typeFieldToCtorField : (field: TtField) -> (bound: List String) -> SetCtorField
+typeFieldToCtorField field bound =
+  SetCtorField {
+    key = field.semanticKey,
+    wireName = field.wireName,
+    set = typeToSetNode field.type bound
+  }
+
+@label "type-to-set: arrow"
+@description "Project a TraversalType arrow to SeArrow. Parameter order remains positional while each reflected domain retains its semantic key and current wire projection."
+@tags "engine" "internal" "field-identity" "type-to-set" "phase-3"
+@category "engine-internal"
+typeArrowToSet : (params: List TtArrowParam) -> (returns: TraversalType) -> (bound: List String) -> SetExpr
+typeArrowToSet params returns bound =
+  let projectedParams = map (\param -> typeParamToArrowParam param bound) params
+  let projectedReturns = typeToSetNode returns bound
+  SeArrow { params = projectedParams, returns = projectedReturns }
+
+@category "engine-internal"
+typeParamToArrowParam : (param: TtArrowParam) -> (bound: List String) -> SetArrowParam
+typeParamToArrowParam param bound =
+  SetArrowParam {
+    key = param.semanticKey,
+    wireName = param.wireName,
+    set = typeToSetNode param.type bound
+  }
+
+-- Fenel recognizes the exact Fin n key domain [0,n) and authors its JSON-Logic
+-- membership predicate through mapSet's dynamic-key boundary.
+@label "type-to-set: map"
+@description "Project a finite-Fin-keyed TraversalType map to its canonical SeWhere membership predicate; open or malformed key domains remain unconstrained."
+@tags "engine" "internal" "array-substrate" "field-identity" "phase-3"
+@category "engine-internal"
+typeMapToSet : (keys: SetExpr) -> (values: TraversalType) -> (bound: List String) -> SetExpr
+typeMapToSet keys values bound =
+  case typeMapFiniteCard keys of
+    Nothing -> SeAll
+    Just card -> SeWhere {
+      pred = typeMapMembershipPred card (mapElemGuard (typeToSetNode values bound))
+    }
+
+@label "type-to-set: finite-map membership predicate"
+@description "Author the canonical JSON-Logic predicate for a total Fin n map: exact length, plus the representable numeric or string element guard. Dynamic operator keys are data supplied to mapSet."
+@tags "engine" "internal" "array-substrate" "type-to-set" "phase-3"
+@category "engine-internal"
+typeMapMembershipPred : (card: Number) -> (elemGuard: String) -> Any
+typeMapMembershipPred card elemGuard =
+  let valueVar = mapSet {} "var" "value"
+  let lengthCall = mapSet {} "call" ["length", valueVar]
+  let lengthCheck = mapSet {} "==" [lengthCall, card]
+  if not (or (eq elemGuard "number") (eq elemGuard "string"))
+    then lengthCheck
+    else
+      let guardFn = if eq elemGuard "number" then "isNumber" else "isString"
+      let elemVar = mapSet {} "var" "x"
+      let elemCheck = mapSet {} "call" [guardFn, elemVar]
+      let elemLambda = mapSet {} "fn" [["x"], elemCheck]
+      let allCheck = mapSet {} "call" ["all", valueVar, elemLambda]
+      mapSet {} "and" [lengthCheck, allCheck]
+
+@category "engine-internal"
+typeMapFiniteCard : (keys: SetExpr) -> Maybe Number
+typeMapFiniteCard keys = case keys of
+  SeInterval { interval = interval } ->
+    case interval.lo of
+      Nothing -> Nothing
+      Just lo ->
+        case interval.hi of
+          Nothing -> Nothing
+          Just hi ->
+            if not (isNumber lo.value) then Nothing
+            else if not (isNumber hi.value) then Nothing
+            else if not (eq lo.value 0) then Nothing
+            else if not lo.inclusive then Nothing
+            else if hi.inclusive then Nothing
+            else Just hi.value
+  _ -> Nothing
+
+@category "engine-internal"
+mapElemGuard : (elemSet: SetExpr) -> String
+mapElemGuard elemSet =
+  case elemSet of
+    SeRef { handle = handle } ->
+      if eq handle "ℝ" then "number"
+      else if eq handle "ℤ" then "number"
+      else if eq handle "ℕ" then "number"
+      else if eq handle "String" then "string"
+      else "any"
+    _ -> "any"
+
+@label "type-to-set: refined"
+@description "Compose a refined TraversalType base with its canonical SetExpr view."
+@tags "engine" "internal" "type-to-set" "phase-3"
+@category "engine-internal"
+typeRefinedToSet : (base: TraversalType) -> (refinement: SetExpr) -> (bound: List String) -> SetExpr
+typeRefinedToSet base refinement bound =
+  let baseSet = typeToSetNode base bound
+  if eq (seTag baseSet) "SeAll"
+    then refinement
+    else SeIntersect { branches = appendItem refinement (appendItem baseSet []) }
+
+@label "type-to-set: named"
+@description "Project the named atom tower and otherwise preserve a named SetExpr reference."
+@tags "engine" "internal" "type-to-set" "phase-3"
+@category "engine-internal"
+typeNamedToSet : (name: String) -> SetExpr
+typeNamedToSet name =
+  if eq name "Number" then SeRef { handle = "ℝ" }
+  else if eq name "Int" then SeRef { handle = "ℤ" }
+  else if eq name "ℤ" then SeRef { handle = "ℤ" }
+  else if eq name "Nat" then SeRef { handle = "ℕ" }
+  else if eq name "ℕ" then SeRef { handle = "ℕ" }
+  else if eq name "String" then SeRef { handle = "String" }
+  else if eq name "Boolean" then SeEnum { values = appendItem false (appendItem true []) }
+  else SeRef { handle = name }

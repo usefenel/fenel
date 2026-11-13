@@ -1,0 +1,762 @@
+module engine where
+
+-- Recipe-functions S3: a bounded regular-language fragment of emptiness.
+-- Pantry ranks are NOT SetPattern tokens. SePattern denotes strings: the
+-- checked codec is rank r -> ASCII Char(65+r), with 0 <= r < 26. Its inverse
+-- and exact alphabet are checked before derivative facts are constructed.
+-- The product carries a canonical-domain residual, so complement is relative
+-- to admitted pantries. Only completed empty states are memoized; a shared
+-- work budget crosses adaptation, recognition, successors and siblings. No
+-- assignments or pantries are enumerated. A food-membership atom (exactly the lowered RcHasFood pattern)
+-- is its own language node: on canonical words its derivative is All at its
+-- own rank, None past it, itself before it, which is the Pat derivative there.
+-- TCB ledger rows: recipe.rank.empty, recipe.rank.cardinality.
+-- These conditional data APIs confer no reader/snapshot admission or grade.
+
+RecipeRankLanguage = RrlAll | RrlNone | RrlPat pat: (Pat Any)
+  | RrlHas rank: Nat
+  | RrlCount ranks: List Nat lower: Nat upper: Nat
+  | RrlOr left: RecipeRankLanguage right: RecipeRankLanguage
+  | RrlAnd left: RecipeRankLanguage right: RecipeRankLanguage
+  | RrlNot inner: RecipeRankLanguage
+
+RecipeRankPredicate = RecipeRankPredicate key: String ws: { tag: String, values: List Nat }
+RecipeRankBuild = RecipeRankBuild language: RecipeRankLanguage predicates: List RecipeRankPredicate remaining: Nat
+RecipeRankPatternBuild = RecipeRankPatternBuild pat: (Pat Any) predicates: List RecipeRankPredicate remaining: Nat
+RecipeRankWalk = RecipeRankWalk verdict: RecipeConstraintVerdict remaining: Nat emptyStates: RecipeRankMemo
+-- One search's memo: completed empty states (key -> true), a plain lookup.
+RecipeRankMemo = RecipeRankMemo empty: Any
+RecipeRankDomainScan = RecipeRankDomainScan found: Maybe (List Nat) remaining: Nat
+RecipeRankBoundedSet = RecipeRankBoundedSet set: SetExpr remaining: Nat
+RecipeRankBoundedTerms = RecipeRankBoundedTerms sets: List SetExpr remaining: Nat
+RecipeRankDomainPattern = RecipeRankDomainPattern alphabet: List Nat pattern: SetPattern
+
+@category "engine-internal"
+recipeRankNatural : (value: Any) -> Bool
+recipeRankNatural value = isNumber value && numberIsFinite value && floor value == value && value >= 0
+
+@category "engine-internal"
+recipeRankAlphabetValid : (alphabet: List Nat) -> Bool
+recipeRankAlphabetValid alphabet =
+  all alphabet (\rank -> recipeRankNatural rank && rank < 26) && recipeRankIncreasing alphabet
+
+@category "engine-internal"
+recipeRankIncreasing : (ranks: List Nat) -> Bool
+recipeRankIncreasing ranks = case head ranks of
+  Nothing -> true
+  Just first -> case head (restOf ranks) of
+    Nothing -> true
+    Just second -> first < second && recipeRankIncreasing (restOf ranks)
+
+@category "engine-internal"
+recipeRankIncluded : (alphabet: List Nat) -> (rank: Nat) -> Bool
+recipeRankIncluded alphabet rank = std.some alphabet (\candidate -> candidate == rank)
+
+@category "engine-internal"
+recipeRankWordValid : (alphabet: List Nat) -> (ranks: List Nat) -> Bool
+recipeRankWordValid alphabet ranks =
+  all ranks (\rank -> recipeRankNatural rank && recipeRankIncluded alphabet rank) && recipeRankIncreasing ranks
+
+@category "engine-internal"
+recipeRankSymbolValid : (alphabet: List Nat) -> (symbol: Any) -> Bool
+recipeRankSymbolValid alphabet symbol =
+  isString symbol && length symbol == 1 && std.some alphabet (\rank -> symbol == charFromCode (65 + rank))
+
+@category "engine-internal"
+recipeRankEncodeWord : (ranks: List Nat) -> String
+recipeRankEncodeWord ranks = join (map (\rank -> charFromCode (65 + rank)) ranks) ""
+
+@category "engine-internal"
+recipeRankDecodeWord : (alphabet: List Nat) -> (word: String) -> Result RecipeRefusal (List Nat)
+recipeRankDecodeWord alphabet word =
+  if not (recipeRankAlphabetValid alphabet) then Err RecipeInvalidDomain
+  else if not (isString word) then Err RecipeInvalidPreparation
+  else
+    let symbols = chars word
+    if not (all symbols (\symbol -> recipeRankSymbolValid alphabet symbol)) then Err RecipeInvalidPreparation
+    else
+      let ranks = map (\symbol -> charCode symbol - 65) symbols
+      if recipeRankWordValid alphabet ranks then Ok ranks else Err RecipeInvalidPreparation
+
+@category "engine-internal"
+recipeRankCanonicalPattern : (alphabet: List Nat) -> SetPattern
+recipeRankCanonicalPattern alphabet = case head alphabet of
+  Nothing -> SpEps
+  Just rank ->
+    let symbol = charFromCode (65 + rank)
+    let pred = SeEnum { values = [symbol] }
+    let token = SpMatch { pred = pred }
+    let optional = SpRep { child = token, min = 0, max = 1 }
+    let rest = recipeRankCanonicalPattern (restOf alphabet)
+    SpSeq { a = optional, b = rest }
+
+@category "engine-internal"
+recipeRankOr : (left: RecipeRankLanguage) -> (right: RecipeRankLanguage) -> RecipeRankLanguage
+recipeRankOr left right = case left of
+  RrlAll -> RrlAll
+  RrlNone -> right
+  _ -> case right of
+    RrlAll -> RrlAll
+    RrlNone -> left
+    _ -> RrlOr { left = left, right = right }
+
+@category "engine-internal"
+recipeRankAnd : (left: RecipeRankLanguage) -> (right: RecipeRankLanguage) -> RecipeRankLanguage
+recipeRankAnd left right = case left of
+  RrlNone -> RrlNone
+  RrlAll -> right
+  _ -> case right of
+    RrlNone -> RrlNone
+    RrlAll -> left
+    _ -> RrlAnd { left = left, right = right }
+
+@category "engine-internal"
+recipeRankNot : (inner: RecipeRankLanguage) -> RecipeRankLanguage
+recipeRankNot inner = case inner of
+  RrlAll -> RrlNone
+  RrlNone -> RrlAll
+  RrlNot { inner = original } -> original
+  _ -> RrlNot { inner = inner }
+
+@category "engine-internal"
+recipeRankPat : (pat: (Pat Any)) -> RecipeRankLanguage
+recipeRankPat pat = if isPEmpty pat then RrlNone else RrlPat { pat = pat }
+
+@category "engine-internal"
+recipeRankAdaptSet : (alphabet: List Nat) -> (set: SetExpr) -> (fuel: Nat) -> Result RecipeRefusal RecipeRankBuild
+recipeRankAdaptSet alphabet set fuel =
+  if fuel <= 0 then Err RecipeBudgetExhausted
+  else
+    let remaining = fuel - 1
+    case set of
+      SeAll -> Ok (RecipeRankBuild { language = RrlAll, predicates = [], remaining = remaining })
+      SeNone -> Ok (RecipeRankBuild { language = RrlNone, predicates = [], remaining = remaining })
+      SePattern { pattern = pattern } ->
+        -- Recognition rebuilds at most one alphabet-sized pattern per shape;
+        -- it is charged before any recognition work.
+        let recognition = 4 * length alphabet + 3
+        if recognition > remaining then Err RecipeBudgetExhausted
+        else case recipeRankKnownAtom alphabet pattern of
+          Just atom -> Ok (RecipeRankBuild { language = atom, predicates = [], remaining = remaining - recognition })
+          _ -> case recipeRankAdaptPattern alphabet pattern (remaining - recognition) of
+            Err reason -> Err reason
+            Ok built ->
+              let language = recipeRankPat built.pat
+              Ok (RecipeRankBuild { language = language, predicates = built.predicates, remaining = built.remaining })
+      SeUnion { branches = branches } -> recipeRankAdaptBranches alphabet branches false remaining
+      SeIntersect { branches = branches } -> recipeRankAdaptBranches alphabet branches true remaining
+      SeComplement { inner = inner } -> case recipeRankAdaptSet alphabet inner remaining of
+        Err reason -> Err reason
+        Ok built ->
+          let language = recipeRankNot built.language
+          Ok (RecipeRankBuild { language = language, predicates = built.predicates, remaining = built.remaining })
+      SeDiff { left = left, right = right } ->
+        case recipeRankAdaptSet alphabet left remaining of
+          Err reason -> Err reason
+          Ok first -> case recipeRankAdaptSet alphabet right first.remaining of
+            Err reason -> Err reason
+            Ok second ->
+              let language = recipeRankAnd first.language (recipeRankNot second.language)
+              let predicates = concat first.predicates second.predicates
+              Ok (RecipeRankBuild { language = language, predicates = predicates, remaining = second.remaining })
+      _ -> Err RecipeUnsupported
+
+-- A food-membership atom: the pattern equals recipeRankRequiredPattern for
+-- this alphabet and one admitted rank. The rank is read from the middle
+-- token, then the whole pattern must be structurally equal; any other shape
+-- (including host-carrier patterns) is adapted as an ordinary Pat.
+-- Query leaves with an exact canonical-word reading: the canonical domain
+-- pattern itself (All: every asked word is canonical), a food-membership
+-- atom, or a distinct-count atom. Anything else is adapted as a Pat.
+@category "engine-internal"
+recipeRankKnownAtom : (alphabet: List Nat) -> (pattern: SetPattern) -> Maybe RecipeRankLanguage
+recipeRankKnownAtom alphabet pattern = case recipeRankAtom alphabet pattern of
+  Just rank -> Just (RrlHas { rank = rank })
+  _ -> case recipeRankCountAtom alphabet pattern of
+    Just atom -> Just atom
+    _ -> if pattern == recipeRankCanonicalPattern alphabet then Just RrlAll else Nothing
+
+@category "engine-internal"
+recipeRankAtom : (alphabet: List Nat) -> (pattern: SetPattern) -> Maybe Nat
+recipeRankAtom alphabet pattern = case pattern of
+  SpSeq { a = before, b = rest } -> case rest of
+    SpSeq { a = middle, b = after } -> case middle of
+      SpMatch { pred = pred } -> case pred of
+        SeEnum { values = values } ->
+          if length values == 1 then
+            let rank = charCode (fromMaybe "" (head values)) - 65
+            if recipeRankIncluded alphabet rank && pattern == recipeRankRequiredPattern alphabet rank then Just rank else Nothing
+          else Nothing
+        _ -> Nothing
+      _ -> Nothing
+    _ -> Nothing
+  _ -> Nothing
+
+-- A distinct-count atom: the pattern equals recipeRankCountCompact for this
+-- alphabet, its counted ranks (read from the repeated unit) and its bounds.
+@category "engine-internal"
+recipeRankCountAtom : (alphabet: List Nat) -> (pattern: SetPattern) -> Maybe RecipeRankLanguage
+recipeRankCountAtom alphabet pattern = case pattern of
+  SpSeq { a = gap, b = repeated } -> case repeated of
+    SpRep { child = unit, min = lower, max = upper } -> case unit of
+      SpSeq { a = counted, b = unitGap } -> case counted of
+        SpMatch { pred = pred } -> case pred of
+          SeEnum { values = values } ->
+            if length values > length alphabet then Nothing
+            else
+              let ranks = map (\symbol -> charCode symbol - 65) values
+              if recipeRankDistinctRanks alphabet ranks && recipeRankNatural lower && recipeRankNatural upper && lower <= upper && pattern == recipeRankCountCompact alphabet ranks lower upper
+              then Just (RrlCount { ranks = ranks, lower = lower, upper = upper })
+              else Nothing
+          _ -> Nothing
+        _ -> Nothing
+      _ -> Nothing
+    _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+recipeRankAdaptBranches : (alphabet: List Nat) -> (branches: List SetExpr) -> (intersection: Bool) -> (fuel: Nat) -> Result RecipeRefusal RecipeRankBuild
+recipeRankAdaptBranches alphabet branches intersection fuel = case head branches of
+  Nothing ->
+    let language = if intersection then RrlAll else RrlNone
+    Ok (RecipeRankBuild { language = language, predicates = [], remaining = fuel })
+  Just branch -> case recipeRankAdaptSet alphabet branch fuel of
+    Err reason -> Err reason
+    Ok first -> case recipeRankAdaptBranches alphabet (restOf branches) intersection first.remaining of
+      Err reason -> Err reason
+      Ok rest ->
+        let language = if intersection then recipeRankAnd first.language rest.language else recipeRankOr first.language rest.language
+        let predicates = concat first.predicates rest.predicates
+        Ok (RecipeRankBuild { language = language, predicates = predicates, remaining = rest.remaining })
+
+@category "engine-internal"
+recipeRankAdaptPattern : (alphabet: List Nat) -> (pattern: SetPattern) -> (fuel: Nat) -> Result RecipeRefusal RecipeRankPatternBuild
+recipeRankAdaptPattern alphabet pattern fuel =
+  if fuel <= 0 then Err RecipeBudgetExhausted
+  else case recipeRankPatternLayer pattern of
+    Err reason -> Err reason
+    Ok normalized -> recipeRankAdaptPatternLayer alphabet normalized (fuel - 1)
+
+-- setExprToTag's existing Pattern codec supplies host `.t` records. Authored
+-- values supply Sp* constructors. Convert one layer only; the bounded caller
+-- validates every child and predicate. Hybrid registered/host carriers refuse.
+@category "engine-internal"
+recipeRankPatternLayer : (pattern: SetPattern) -> Result RecipeRefusal SetPattern
+recipeRankPatternLayer pattern = case representationValueSnapshot pattern of
+  SnapshotRecord fields ->
+    if length fields > 5 then Err RecipeUnsupported
+    else
+      let snapshot = SnapshotRecord fields
+      case representationSnapshotField snapshot "t" of
+        Nothing -> Ok pattern
+        Just tag -> case representationSnapshotField snapshot "$tag" of
+          Just other -> Err RecipeUnsupported
+          Nothing ->
+            if tag == "empty" then Ok SpEmpty
+            else if tag == "eps" then Ok SpEps
+            else if tag == "match" then Ok (SpMatch { pred = pattern.pred })
+            else if tag == "seq" then Ok (SpSeq { a = pattern.a, b = pattern.b })
+            else if tag == "alt" then Ok (SpAlt { a = pattern.a, b = pattern.b })
+            else if tag == "rep" then Ok (SpRep { child = pattern.child, min = pattern.min, max = pattern.max })
+            else Err RecipeUnsupported
+  _ -> Err RecipeUnsupported
+
+@category "engine-internal"
+recipeRankRegisteredPattern : (pattern: SetPattern) -> Bool
+recipeRankRegisteredPattern pattern = case pattern of
+  SpEmpty -> true
+  SpEps -> true
+  SpMatch {} -> true
+  SpSeq {} -> true
+  SpAlt {} -> true
+  SpRep {} -> true
+  SpGroup {} -> true
+  _ -> false
+
+@category "engine-internal"
+recipeRankAdaptPatternLayer : (alphabet: List Nat) -> (pattern: SetPattern) -> (remaining: Nat) -> Result RecipeRefusal RecipeRankPatternBuild
+recipeRankAdaptPatternLayer alphabet pattern remaining = case pattern of
+      SpEmpty -> Ok (RecipeRankPatternBuild { pat = PEmpty, predicates = [], remaining = remaining })
+      SpEps -> Ok (RecipeRankPatternBuild { pat = PEps, predicates = [], remaining = remaining })
+      SpMatch { pred = pred } -> case pred of
+        SeEnum { values = symbols } ->
+          if length symbols > remaining then Err RecipeBudgetExhausted
+          else if not (all symbols (\symbol -> recipeRankSymbolValid alphabet symbol)) then Err RecipeUnsupported
+          else
+            let values = map charCode symbols
+            let key = concat "rank[" (concat (join (map toString values) ",") "]")
+            let pat = PMatch key
+            let ws = { tag = "WsEnum", values = values }
+            let predicate = RecipeRankPredicate { key = key, ws = ws }
+            let afterSymbols = remaining - length symbols
+            Ok (RecipeRankPatternBuild { pat = pat, predicates = [predicate], remaining = afterSymbols })
+        _ -> Err RecipeUnsupported
+      SpSeq { a = left, b = right } -> recipeRankAdaptPatternPair alphabet left right true remaining
+      SpAlt { a = left, b = right } -> recipeRankAdaptPatternPair alphabet left right false remaining
+      SpRep { child = child, min = lower, max = upper } ->
+        if not (recipeRankNatural lower && recipeRankNatural upper && lower <= upper && upper <= 26) then Err RecipeUnsupported
+        else case recipeRankAdaptPattern alphabet child remaining of
+          Err reason -> Err reason
+          Ok built ->
+            let pat = PRep built.pat lower upper
+            Ok (RecipeRankPatternBuild { pat = pat, predicates = built.predicates, remaining = built.remaining })
+      _ -> Err RecipeUnsupported
+
+@category "engine-internal"
+recipeRankAdaptPatternPair : (alphabet: List Nat) -> (left: SetPattern) -> (right: SetPattern) -> (sequence: Bool) -> (fuel: Nat) -> Result RecipeRefusal RecipeRankPatternBuild
+recipeRankAdaptPatternPair alphabet left right sequence fuel =
+  case recipeRankAdaptPattern alphabet left fuel of
+    Err reason -> Err reason
+    Ok first -> case recipeRankAdaptPattern alphabet right first.remaining of
+      Err reason -> Err reason
+      Ok second ->
+        let pat = if sequence then cSeq first.pat second.pat else cAltC first.pat second.pat
+        let predicates = concat first.predicates second.predicates
+        Ok (RecipeRankPatternBuild { pat = pat, predicates = predicates, remaining = second.remaining })
+
+@category "engine-internal"
+recipeRankNullable : (language: RecipeRankLanguage) -> Bool
+recipeRankNullable language = case language of
+  RrlAll -> true
+  RrlNone -> false
+  RrlPat { pat = pat } -> nullablePat pat
+  RrlHas { rank = rank } -> false
+  RrlCount { ranks = ranks, lower = lower, upper = upper } -> lower == 0
+  RrlOr { left = left, right = right } -> recipeRankNullable left || recipeRankNullable right
+  RrlAnd { left = left, right = right } -> recipeRankNullable left && recipeRankNullable right
+  RrlNot { inner = inner } -> not (recipeRankNullable inner)
+  _ -> false
+
+@category "engine-internal"
+recipeRankDerivative : (info: Any) -> (symbol: Nat) -> (language: RecipeRankLanguage) -> RecipeRankLanguage
+recipeRankDerivative info symbol language = case language of
+  RrlAll -> RrlAll
+  RrlNone -> RrlNone
+  RrlPat { pat = pat } -> recipeRankPat (derivWsPat info symbol pat)
+  RrlHas { rank = rank } -> if symbol == 65 + rank then RrlAll else if symbol > 65 + rank then RrlNone else language
+  RrlCount { ranks = ranks, lower = lower, upper = upper } ->
+    if recipeRankIncluded ranks (symbol - 65) then (if upper == 0 then RrlNone else RrlCount { ranks = ranks, lower = max 0 (lower - 1), upper = upper - 1 })
+    else language
+  RrlOr { left = left, right = right } -> recipeRankOr (recipeRankDerivative info symbol left) (recipeRankDerivative info symbol right)
+  RrlAnd { left = left, right = right } -> recipeRankAnd (recipeRankDerivative info symbol left) (recipeRankDerivative info symbol right)
+  RrlNot { inner = inner } -> recipeRankNot (recipeRankDerivative info symbol inner)
+  _ -> language
+
+@category "engine-internal"
+recipeRankShow : (language: RecipeRankLanguage) -> String
+recipeRankShow language = case language of
+  RrlAll -> "T"
+  RrlNone -> "F"
+  RrlPat { pat = pat } -> concat "P(" (concat (showPat pat) ")")
+  RrlHas { rank = rank } -> concat "H" (toString rank)
+  RrlCount { ranks = ranks, lower = lower, upper = upper } -> concat "C(" (concat (join (map toString ranks) ",") (concat ":" (concat (toString lower) (concat ":" (concat (toString upper) ")")))))
+  RrlOr { left = left, right = right } -> concat "O(" (concat (recipeRankShow left) (concat "," (concat (recipeRankShow right) ")")))
+  RrlAnd { left = left, right = right } -> concat "A(" (concat (recipeRankShow left) (concat "," (concat (recipeRankShow right) ")")))
+  RrlNot { inner = inner } -> concat "N(" (concat (recipeRankShow inner) ")")
+  _ -> "?"
+
+-- Every node of an adapted language is one the walk and the membership fold
+-- know; anything else refuses before a verdict (the defaults above are then
+-- unreachable).
+@category "engine-internal"
+recipeRankLanguageKnown : (language: RecipeRankLanguage) -> Bool
+recipeRankLanguageKnown language = case language of
+  RrlAll -> true
+  RrlNone -> true
+  RrlPat { pat = pat } -> true
+  RrlHas { rank = rank } -> true
+  RrlCount { ranks = ranks, lower = lower, upper = upper } -> true
+  RrlOr { left = left, right = right } -> recipeRankLanguageKnown left && recipeRankLanguageKnown right
+  RrlAnd { left = left, right = right } -> recipeRankLanguageKnown left && recipeRankLanguageKnown right
+  RrlNot { inner = inner } -> recipeRankLanguageKnown inner
+  _ -> false
+
+@category "engine-internal"
+recipeRankWalkResult : (verdict: RecipeConstraintVerdict) -> (remaining: Nat) -> (emptyStates: RecipeRankMemo) -> RecipeRankWalk
+recipeRankWalkResult verdict remaining emptyStates = RecipeRankWalk { verdict = verdict, remaining = remaining, emptyStates = emptyStates }
+
+@category "engine-internal"
+recipeRankWalkAt : (alphabet: List Nat) -> (info: Any) -> (domain: List Nat) -> (query: RecipeRankLanguage) -> (fuel: Nat) -> (emptyStates: RecipeRankMemo) -> RecipeRankWalk
+recipeRankWalkAt alphabet info domain query fuel emptyStates =
+  -- `domain` is the canonical domain's state: the increasing ranks a word may
+  -- still continue with (a suffix of the alphabet). Its derivative by one of
+  -- them is the ranks after it; every other symbol leaves the domain; the
+  -- state always accepts the end of the word (recipe.rank.codec).
+  if fuel <= 0 then recipeRankWalkResult (RecipeConstraintUnknown { reason = RecipeBudgetExhausted }) 0 emptyStates
+  else
+    let remaining = fuel - 1
+    let domainKey = toString (length domain)
+    let key = concat domainKey (concat "#" (recipeRankShow query))
+    let seen = case mapGet emptyStates.empty key of
+                 Just found -> true
+                 _ -> false
+    if seen then recipeRankWalkResult RecipeConstraintEmpty remaining emptyStates
+    else if recipeRankNullable query then recipeRankWalkResult (RecipeConstraintWitness { ranks = [] }) remaining emptyStates
+    else case query of
+      RrlNone -> recipeRankWalkResult RecipeConstraintEmpty remaining emptyStates
+      _ -> recipeRankWalkSymbols alphabet domain info domain query remaining emptyStates key
+
+@category "engine-internal"
+recipeRankWalkSymbols : (alphabet: List Nat) -> (symbols: List Nat) -> (info: Any) -> (domain: List Nat) -> (query: RecipeRankLanguage) -> (fuel: Nat) -> (emptyStates: RecipeRankMemo) -> (key: String) -> RecipeRankWalk
+recipeRankWalkSymbols alphabet symbols info domain query fuel emptyStates key = case head symbols of
+  Nothing -> recipeRankWalkResult RecipeConstraintEmpty fuel (RecipeRankMemo { empty = mapSet emptyStates.empty key true })
+  Just rank ->
+    if fuel <= 0 then recipeRankWalkResult (RecipeConstraintUnknown { reason = RecipeBudgetExhausted }) 0 emptyStates
+    else
+      let remaining = fuel - 1
+      let symbol = 65 + rank
+      let nextDomain = restOf symbols
+      let nextQuery = recipeRankDerivative info symbol query
+      let child = recipeRankWalkAt alphabet info nextDomain nextQuery remaining emptyStates
+      case child.verdict of
+        RecipeConstraintWitness { ranks = suffix } ->
+          let word = concat [rank] suffix
+          recipeRankWalkResult (RecipeConstraintWitness { ranks = word }) child.remaining child.emptyStates
+        RecipeConstraintUnknown { reason = reason } -> child
+        RecipeConstraintEmpty -> recipeRankWalkSymbols alphabet (restOf symbols) info domain query child.remaining child.emptyStates key
+        _ -> child
+
+@category "engine-internal"
+recipeRankLanguageSearch : (alphabet: List Nat) -> (query: SetExpr) -> (budget: Nat) -> RecipeConstraintVerdict
+recipeRankLanguageSearch alphabet query budget =
+  if not (recipeRankAlphabetValid alphabet) then RecipeConstraintUnknown { reason = RecipeInvalidDomain }
+  else if not (recipeRankNatural budget) then RecipeConstraintUnknown { reason = RecipeBudgetExhausted }
+  else
+    -- The walk's own domain is the canonical domain of `alphabet` (the codec's
+    -- ordered optional symbols), carried as the ranks still allowed.
+    let domainCost = 4 * length alphabet + 3
+    if budget <= domainCost then RecipeConstraintUnknown { reason = RecipeBudgetExhausted }
+    else case recipeRankAdaptSet alphabet query (budget - domainCost) of
+      Err reason -> RecipeConstraintUnknown { reason = reason }
+      Ok built ->
+        -- Memo keys render ranks and bounds with toString; refuse if this
+        -- frame's toString is not the std one.
+        if toString 12 != "12" then RecipeConstraintUnknown { reason = RecipeUnsupported }
+        else if not (recipeRankLanguageKnown built.language) then RecipeConstraintUnknown { reason = RecipeUnsupported }
+        else
+          let info = fromEntries (map (\entry -> { key = entry.key, value = entry }) built.predicates)
+          let searched = recipeRankWalkAt alphabet info alphabet built.language built.remaining (RecipeRankMemo { empty = fromEntries [] })
+          searched.verdict
+
+-- Ordinary emptiness may use this fragment only when the ACTUAL claimed set
+-- has a canonical-domain pattern under positive intersection ancestry. The
+-- reconstructed pattern is compared structurally: no name or marker is proof.
+-- A domain found below a union/complement would restrict an unrelated claim,
+-- so those positions deliberately do not contribute a domain.
+-- Compare only a bounded projection of the Pattern codec's semantic fields;
+-- ignored carrier metadata cannot make deepEqValue traverse unrelated data.
+
+@category "engine-internal"
+recipeRankPatternAlphabet : (pattern: SetPattern) -> Maybe (List Nat)
+recipeRankPatternAlphabet pattern = case recipeRankProjectDomainPatternAt pattern 27 of
+  Nothing -> Nothing
+  Just projected ->
+    if recipeRankAlphabetValid projected.alphabet && projected.pattern == recipeRankCanonicalPattern projected.alphabet
+    then Just projected.alphabet
+    else Nothing
+
+@category "engine-internal"
+recipeRankProjectDomainPatternAt : (pattern: SetPattern) -> (fuel: Nat) -> Maybe RecipeRankDomainPattern
+recipeRankProjectDomainPatternAt pattern fuel =
+  if fuel <= 0 then Nothing
+  else case recipeRankPatternLayer pattern of
+    Err reason -> Nothing
+    Ok normalized -> recipeRankProjectDomainPatternLayer normalized fuel
+
+@category "engine-internal"
+recipeRankProjectDomainPatternLayer : (pattern: SetPattern) -> (fuel: Nat) -> Maybe RecipeRankDomainPattern
+recipeRankProjectDomainPatternLayer pattern fuel = case pattern of
+  SpEps -> Just (RecipeRankDomainPattern { alphabet = [], pattern = SpEps })
+  SpSeq { a = rawPiece, b = rest } -> case recipeRankPatternLayer rawPiece of
+    Err reason -> Nothing
+    Ok piece -> case piece of
+      SpRep { child = rawToken, min = lower, max = upper } ->
+        if lower != 0 || upper != 1 then Nothing
+        else case recipeRankPatternLayer rawToken of
+          Err reason -> Nothing
+          Ok token -> recipeRankProjectDomainToken token rest lower upper fuel
+      _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+recipeRankProjectDomainToken : (token: SetPattern) -> (rest: SetPattern) -> (lower: Nat) -> (upper: Nat) -> (fuel: Nat) -> Maybe RecipeRankDomainPattern
+recipeRankProjectDomainToken token rest lower upper fuel = case token of
+  SpMatch { pred = pred } -> case pred of
+    SeEnum { values = symbols } ->
+      if length symbols != 1 then Nothing
+      else case head symbols of
+        Nothing -> Nothing
+        Just symbol ->
+          if not (isString symbol && length symbol == 1) then Nothing
+          else
+            let rank = charCode symbol - 65
+            if not (recipeRankNatural rank && rank < 26) then Nothing
+            else case recipeRankProjectDomainPatternAt rest (fuel - 1) of
+              Nothing -> Nothing
+              Just tail ->
+                let alphabet = concat [rank] tail.alphabet
+                let exactPred = SeEnum { values = [symbol] }
+                let exactToken = SpMatch { pred = exactPred }
+                let exactPiece = SpRep { child = exactToken, min = lower, max = upper }
+                let exactPattern = SpSeq { a = exactPiece, b = tail.pattern }
+                Just (RecipeRankDomainPattern { alphabet = alphabet, pattern = exactPattern })
+    _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+recipeRankExplicitDomain : (set: SetExpr) -> Maybe (List Nat)
+recipeRankExplicitDomain set =
+  let scanned = recipeRankDomainScanAt set 256
+  scanned.found
+
+@category "engine-internal"
+recipeRankDomainScanAt : (set: SetExpr) -> (fuel: Nat) -> RecipeRankDomainScan
+recipeRankDomainScanAt set fuel =
+  if fuel <= 0 then RecipeRankDomainScan { found = Nothing, remaining = 0 }
+  else
+    let remaining = fuel - 1
+    case set of
+      SePattern { pattern = pattern } ->
+        let found = recipeRankPatternAlphabet pattern
+        RecipeRankDomainScan { found = found, remaining = remaining }
+      SeIntersect { branches = branches } -> recipeRankDomainScanBranches branches remaining
+      _ -> RecipeRankDomainScan { found = Nothing, remaining = remaining }
+
+@category "engine-internal"
+recipeRankDomainScanBranches : (branches: List SetExpr) -> (fuel: Nat) -> RecipeRankDomainScan
+recipeRankDomainScanBranches branches fuel = case head branches of
+  Nothing -> RecipeRankDomainScan { found = Nothing, remaining = fuel }
+  Just branch ->
+    let scanned = recipeRankDomainScanAt branch fuel
+    case scanned.found of
+      Just alphabet -> scanned
+      Nothing ->
+        if scanned.remaining <= 0 then scanned
+        else recipeRankDomainScanBranches (restOf branches) scanned.remaining
+
+@category "engine-internal"
+recipeRankDecideEmpty : (set: SetExpr) -> Maybe Bool
+recipeRankDecideEmpty set = case recipeRankExplicitDomain set of
+  Nothing -> Nothing
+  Just alphabet -> case recipeRankLanguageSearch alphabet set 4096 of
+    RecipeConstraintEmpty -> Just true
+    RecipeConstraintUnknown { reason = reason } -> Nothing
+    RecipeConstraintWitness { ranks = ranks } ->
+      let encoded = recipeRankEncodeWord ranks
+      case setAlgebraContains set encoded of
+        Just true -> Just false
+        _ -> Nothing
+
+@category "engine-internal"
+recipeRankMemberFold : (info: Any) -> (language: RecipeRankLanguage) -> (ranks: List Nat) -> (fuel: Nat) -> Result RecipeRefusal Bool
+recipeRankMemberFold info language ranks fuel =
+  if fuel <= 0 then Err RecipeBudgetExhausted
+  else case head ranks of
+    Nothing -> Ok (recipeRankNullable language)
+    Just rank -> recipeRankMemberFold info (recipeRankDerivative info (65 + rank) language) (restOf ranks) (fuel - 1)
+
+@category "engine-internal"
+recipeRankLanguageMember : (alphabet: List Nat) -> (query: SetExpr) -> (ranks: List Nat) -> (budget: Nat) -> Result RecipeRefusal Bool
+recipeRankLanguageMember alphabet query ranks budget =
+  if not (recipeRankAlphabetValid alphabet) then Err RecipeInvalidDomain
+  else if not (recipeRankNatural budget) then Err RecipeBudgetExhausted
+  else case recipeRankAdaptSet alphabet query budget of
+    Err reason -> Err reason
+    Ok built ->
+      if not (recipeRankLanguageKnown built.language) then Err RecipeUnsupported
+      else if not (recipeRankWordValid alphabet ranks) then Ok false
+      else
+        let info = fromEntries (map (\entry -> { key = entry.key, value = entry }) built.predicates)
+        recipeRankMemberFold info built.language ranks built.remaining
+
+-- Lowering supplies ordinary character patterns. A CheckedRecipeDomain is
+-- input data; source/domain admission remains the independent checker's job.
+
+@category "engine-internal"
+recipeConstraintSet : (domain: CheckedRecipeDomain) -> (constraint: RecipeConstraint) -> Result RecipeRefusal SetExpr
+recipeConstraintSet domain constraint = recipeConstraintSetBounded domain constraint 4096
+
+@category "engine-internal"
+recipeConstraintVerdict : (domain: CheckedRecipeDomain) -> (constraint: RecipeConstraint) -> (budget: Nat) -> RecipeConstraintVerdict
+recipeConstraintVerdict domain constraint budget = case recipeRankPrepareConstraint domain constraint budget of
+  Err reason -> RecipeConstraintUnknown { reason = reason }
+  Ok built ->
+    let proposed = recipeRankLanguageSearch (map (\food -> food.rank) domain.foods) built.set built.remaining
+    case proposed of
+      RecipeConstraintUnknown { reason = reason } -> proposed
+      _ -> recipeRankCheckProposedVerdict built.set proposed
+
+@category "engine-internal"
+recipeConstraintProposeVerdict : (domain: CheckedRecipeDomain) -> (constraint: RecipeConstraint) -> (budget: Nat) -> RecipeConstraintVerdict
+recipeConstraintProposeVerdict domain constraint budget = case recipeRankPrepareConstraint domain constraint budget of
+  Err reason -> RecipeConstraintUnknown { reason = reason }
+  Ok built -> recipeRankLanguageSearch (map (\food -> food.rank) domain.foods) built.set built.remaining
+
+@category "engine-internal"
+recipeRankCheckProposedVerdict : (set: SetExpr) -> (proposed: RecipeConstraintVerdict) -> RecipeConstraintVerdict
+recipeRankCheckProposedVerdict set proposed = case setAlgebraDecideEmpty set of
+  Nothing -> RecipeConstraintUnknown { reason = RecipeUnsupported }
+  Just empty -> case proposed of
+    RecipeConstraintEmpty ->
+      if empty then RecipeConstraintEmpty else RecipeConstraintUnknown { reason = RecipeCertificateRejected }
+    RecipeConstraintWitness { ranks = ranks } ->
+      if empty then RecipeConstraintUnknown { reason = RecipeCertificateRejected }
+      else case setAlgebraContains set (recipeRankEncodeWord ranks) of
+        Just true -> proposed
+        _ -> RecipeConstraintUnknown { reason = RecipeCertificateRejected }
+    RecipeConstraintUnknown { reason = reason } -> proposed
+
+@category "engine-internal"
+recipeRankDistinctRanks : (alphabet: List Nat) -> (ranks: List Nat) -> Bool
+recipeRankDistinctRanks alphabet ranks = case head ranks of
+  Nothing -> true
+  Just rank ->
+    recipeRankNatural rank && recipeRankIncluded alphabet rank && not (recipeRankIncluded (restOf ranks) rank) && recipeRankDistinctRanks alphabet (restOf ranks)
+
+@category "engine-internal"
+recipeRankRequiredPattern : (alphabet: List Nat) -> (required: Nat) -> SetPattern
+recipeRankRequiredPattern alphabet required =
+  -- Only canonical (strictly increasing) words are ever asked: the lowered
+  -- set is always intersected with recipeRankCanonicalPattern. On those words
+  -- "lower ranks, then the required rank, then higher ranks" accepts exactly
+  -- the words that contain the required rank, like one optional slot per
+  -- food did, with three pattern nodes instead of one per food.
+  let lower = filter (\rank -> rank < required) alphabet
+  let upper = filter (\rank -> rank > required) alphabet
+  let lowerSymbols = SpMatch { pred = SeEnum { values = map (\rank -> charFromCode (65 + rank)) lower } }
+  let upperSymbols = SpMatch { pred = SeEnum { values = map (\rank -> charFromCode (65 + rank)) upper } }
+  let before = if length lower == 0 then SpEps else SpRep { child = lowerSymbols, min = 0, max = length lower }
+  let after = if length upper == 0 then SpEps else SpRep { child = upperSymbols, min = 0, max = length upper }
+  let token = SpMatch { pred = SeEnum { values = [charFromCode (65 + required)] } }
+  SpSeq { a = before, b = SpSeq { a = token, b = after } }
+
+-- The public budgeted path uses this bounded lowering, before any formula
+-- recursion or counter-language construction. The preliminary worklist has a
+-- 256-node ceiling (independent of a caller's larger budget), so malformed
+-- depth/breadth cannot exhaust the host stack before fuel is checked.
+-- A distinct count lowers to the compact counter (recipeRankCountCompact) at
+-- a fixed charge; there is no counter cache to share.
+
+@category "engine-internal"
+recipeRankFormulaCapacity : (work: List RecipeConstraint) -> (fuel: Nat) -> Result RecipeRefusal Nat
+recipeRankFormulaCapacity work fuel = case head work of
+  Nothing -> Ok fuel
+  Just constraint ->
+    if fuel <= 0 then Err RecipeBudgetExhausted
+    else
+      let remaining = fuel - 1
+      let rest = restOf work
+      case constraint of
+        RcAnd { terms = terms } ->
+          if length terms > remaining then Err RecipeBudgetExhausted
+          else recipeRankFormulaCapacity (concat terms rest) remaining
+        RcOr { terms = terms } ->
+          if length terms > remaining then Err RecipeBudgetExhausted
+          else recipeRankFormulaCapacity (concat terms rest) remaining
+        RcNot { inner = inner } -> recipeRankFormulaCapacity (concat [inner] rest) remaining
+        RcCardinality { ranks = ranks } ->
+          if length ranks > 26 then Err RecipeBudgetExhausted
+          else recipeRankFormulaCapacity rest remaining
+        _ -> recipeRankFormulaCapacity rest remaining
+
+@category "engine-internal"
+recipeConstraintSetBounded : (domain: CheckedRecipeDomain) -> (constraint: RecipeConstraint) -> (budget: Nat) -> Result RecipeRefusal SetExpr
+recipeConstraintSetBounded domain constraint budget = case recipeRankPrepareConstraint domain constraint budget of
+  Err reason -> Err reason
+  Ok built -> Ok built.set
+
+@category "engine-internal"
+recipeRankPrepareConstraint : (domain: CheckedRecipeDomain) -> (constraint: RecipeConstraint) -> (budget: Nat) -> Result RecipeRefusal RecipeRankBoundedSet
+recipeRankPrepareConstraint domain constraint budget =
+  if not (recipeRankNatural budget) || budget <= 0 then Err RecipeBudgetExhausted
+  else if length domain.foods > 26 then Err RecipeInvalidDomain
+  else
+    let alphabet = map (\food -> food.rank) domain.foods
+    if not (recipeRankAlphabetValid alphabet) then Err RecipeInvalidDomain
+    else
+      let scanBudget = min budget 256
+      case recipeRankFormulaCapacity [constraint] scanBudget of
+        Err reason -> Err reason
+        Ok scanRemaining ->
+          let remaining = budget - (scanBudget - scanRemaining)
+          let domainCost = 4 * length alphabet + 3
+          if domainCost >= remaining then Err RecipeBudgetExhausted
+          else case recipeRankLowerBounded alphabet constraint (remaining - domainCost) of
+            Err reason -> Err reason
+            Ok lowered ->
+              let pattern = recipeRankCanonicalPattern alphabet
+              let canonical = SePattern { pattern = pattern }
+              let set = SeIntersect { branches = [canonical, lowered.set] }
+              Ok (RecipeRankBoundedSet { set = set, remaining = lowered.remaining })
+
+@category "engine-internal"
+recipeRankLowerBounded : (alphabet: List Nat) -> (constraint: RecipeConstraint) -> (fuel: Nat) -> Result RecipeRefusal RecipeRankBoundedSet
+recipeRankLowerBounded alphabet constraint fuel =
+  if fuel <= 0 then Err RecipeBudgetExhausted
+  else
+    let remaining = fuel - 1
+    case constraint of
+      RcAll -> Ok (RecipeRankBoundedSet { set = SeAll, remaining = remaining })
+      RcNone -> Ok (RecipeRankBoundedSet { set = SeNone, remaining = remaining })
+      RcHasFood { rank = rank } ->
+        if not (recipeRankIncluded alphabet rank) then Err RecipeInvalidDomain
+        else
+          let cost = 4 * length alphabet + 1
+          if cost > remaining then Err RecipeBudgetExhausted
+          else
+            let pattern = recipeRankRequiredPattern alphabet rank
+            let set = SePattern { pattern = pattern }
+            let afterPattern = remaining - cost
+            Ok (RecipeRankBoundedSet { set = set, remaining = afterPattern })
+      RcAnd { terms = terms } -> case recipeRankLowerTermsBounded alphabet terms remaining of
+        Err reason -> Err reason
+        Ok built ->
+          let set = SeIntersect { branches = built.sets }
+          Ok (RecipeRankBoundedSet { set = set, remaining = built.remaining })
+      RcOr { terms = terms } -> case recipeRankLowerTermsBounded alphabet terms remaining of
+        Err reason -> Err reason
+        Ok built ->
+          let set = SeUnion { branches = built.sets }
+          Ok (RecipeRankBoundedSet { set = set, remaining = built.remaining })
+      RcNot { inner = inner } -> case recipeRankLowerBounded alphabet inner remaining of
+        Err reason -> Err reason
+        Ok built ->
+          let set = SeComplement { inner = built.set }
+          Ok (RecipeRankBoundedSet { set = set, remaining = built.remaining })
+      RcCardinality { ranks = ranks, lower = lower, upper = upper } ->
+        if length ranks > remaining then Err RecipeBudgetExhausted
+        else if not (recipeRankDistinctRanks alphabet ranks && recipeRankNatural lower && recipeRankNatural upper && lower <= upper) then Err RecipeInvalidDomain
+        else
+          -- Compact counter: other foods may sit anywhere, each counted food
+          -- is one repetition of the unit; on canonical words (each rank at
+          -- most once) this is exactly "lower..upper counted foods present".
+          let top = min upper (length ranks)
+          let cost = 6 * length alphabet + 6
+          if cost > remaining - length ranks then Err RecipeBudgetExhausted
+          else
+            let pattern = if lower > top then SpEmpty else recipeRankCountCompact alphabet ranks lower top
+            let set = SePattern { pattern = pattern }
+            Ok (RecipeRankBoundedSet { set = set, remaining = remaining - length ranks - cost })
+      RcUnknown { identity = identity, reason = reason } -> Err reason
+
+@category "engine-internal"
+recipeRankCountCompact : (alphabet: List Nat) -> (ranks: List Nat) -> (lower: Nat) -> (upper: Nat) -> SetPattern
+recipeRankCountCompact alphabet ranks lower upper =
+  let others = filter (\rank -> not (recipeRankIncluded ranks rank)) alphabet
+  let counted = SpMatch { pred = SeEnum { values = map (\rank -> charFromCode (65 + rank)) ranks } }
+  let gap = if length others == 0 then SpEps else SpRep { child = SpMatch { pred = SeEnum { values = map (\rank -> charFromCode (65 + rank)) others } }, min = 0, max = length others }
+  SpSeq { a = gap, b = SpRep { child = SpSeq { a = counted, b = gap }, min = lower, max = upper } }
+
+@category "engine-internal"
+recipeRankLowerTermsBounded : (alphabet: List Nat) -> (terms: List RecipeConstraint) -> (fuel: Nat) -> Result RecipeRefusal RecipeRankBoundedTerms
+recipeRankLowerTermsBounded alphabet terms fuel =
+  if length terms > fuel then Err RecipeBudgetExhausted
+  else case head terms of
+    Nothing -> Ok (RecipeRankBoundedTerms { sets = [], remaining = fuel })
+    Just term -> case recipeRankLowerBounded alphabet term fuel of
+      Err reason -> Err reason
+      Ok first -> case recipeRankLowerTermsBounded alphabet (restOf terms) first.remaining of
+        Err reason -> Err reason
+        Ok rest ->
+          let sets = concat [first.set] rest.sets
+          Ok (RecipeRankBoundedTerms { sets = sets, remaining = rest.remaining })

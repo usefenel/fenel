@@ -1,0 +1,1192 @@
+module view where
+
+using engine (ReifyOutcome, ReifiedCapture)
+using system (Expr)
+
+-- Payloads are the existing authoring/source wire values. The host boundary
+-- supplies their precise types; list editing never interprets their contents.
+-- Definition snapshots come from the shared field-authoring planner.
+
+TabDataState i v r l d = TabDataState tabId: String revision: Nat entries: List (LocusEntry i) values: List (LocusEntry v) representations: List (LocusEntry r) layout: l definitions: d
+
+TabDataCommand i v r l d p q = TabEditEntries commands: List (LocusCommand i) | TabEditValues commands: List (LocusCommand v) | TabEditRepresentations commands: List (LocusCommand r) | TabSetLayout layout: l | TabSetDefinitions definitions: d | TabPatchValue id: String patch: p | TabEditRoot command: q | TabEditList id: String patch: p
+
+@label "Create data in this tab"
+@description "Create an empty identified tab source. Its data is temporary, and the reader supplies its tab identity and admitted layout. No account or authority is created."
+@tags "view" "local-data"
+defaultTabData : (tabId: String) -> (layout: l) -> TabDataState i v r l FieldPersistenceSnapshot
+defaultTabData tabId layout =
+  TabDataState { tabId = tabId, revision = 0, entries = [], values = [], representations = [], layout = layout, definitions = FieldPersistenceSnapshot { owners = [], fields = [], facets = [] } }
+
+@label "Default list presentation"
+@description "Present an ordinary list as a list until the reader chooses another presentation."
+@tags "view" "local-data"
+defaultListLayout : ({ kind: String })
+defaultListLayout = { kind = "list" }
+
+@label "Create local data"
+@description "Create fresh Local data with the ordinary list presentation. Existing stored data keeps its chosen presentation."
+@tags "view" "local-data"
+defaultLocalTabData : String -> TabDataState i v r ({ kind: String }) FieldPersistenceSnapshot
+defaultLocalTabData tabId = defaultTabData tabId (defaultListLayout ())
+
+tabDataWithEntries : TabDataState i v r l d -> List (LocusEntry i) -> TabDataState i v r l d
+tabDataWithEntries state entries =
+  tabDataMerge state (TabDataState { tabId = state.tabId, revision = state.revision, entries = entries, values = state.values, representations = state.representations, layout = state.layout, definitions = state.definitions })
+
+tabDataWithValues : TabDataState i v r l d -> List (LocusEntry v) -> TabDataState i v r l d
+tabDataWithValues state values =
+  tabDataMerge state (TabDataState { tabId = state.tabId, revision = state.revision, entries = state.entries, values = values, representations = state.representations, layout = state.layout, definitions = state.definitions })
+
+tabDataWithRepresentations : TabDataState i v r l d -> List (LocusEntry r) -> TabDataState i v r l d
+tabDataWithRepresentations state representations =
+  tabDataMerge state (TabDataState { tabId = state.tabId, revision = state.revision, entries = state.entries, values = state.values, representations = representations, layout = state.layout, definitions = state.definitions })
+
+tabDataWithLayout : TabDataState i v r l d -> l -> TabDataState i v r l d
+tabDataWithLayout state layout =
+  tabDataMerge state (TabDataState { tabId = state.tabId, revision = state.revision, entries = state.entries, values = state.values, representations = state.representations, layout = layout, definitions = state.definitions })
+
+tabDataWithDefinitions : TabDataState i v r l d -> d -> TabDataState i v r l d
+tabDataWithDefinitions state definitions =
+  tabDataMerge state (TabDataState { tabId = state.tabId, revision = state.revision, entries = state.entries, values = state.values, representations = state.representations, layout = state.layout, definitions = definitions })
+
+tabDataRevisionValid : Number -> Boolean
+tabDataRevisionValid revision = numberIsFinite revision && revision >= 0 && revision <= 9007199254740991 && eq revision (floor revision)
+
+tabDataPayloadIdsValid : List (LocusEntry a) -> Boolean
+tabDataPayloadIdsValid values = fold (\valid entry -> valid && isString entry.id && not (eq entry.id "") && eq entry.value.id entry.id) true values
+
+tabDataLayoutValid : l -> Boolean
+tabDataLayoutValid layout =
+  if eq layout.kind "grid" || eq layout.kind "tree" || eq layout.kind "tabs" then true
+  else if not (eq layout.kind "list") then false
+  else case lookup layout "axis" of
+    Nothing -> true
+    Just axis -> eq axis "horizontal" || eq axis "vertical"
+
+@label "Validate tab data identities"
+@description "Check the source revision and stable occurrence identities. Payloads retain their existing admitted authoring types, expressions and definition snapshot without evaluation."
+@tags "view" "local-data"
+validateTabData : TabDataState i v r l d -> Result String (TabDataState i v r l d)
+validateTabData state =
+  if not (isString state.tabId) || eq state.tabId "" then Err "This tab has no stable source identity."
+  else if not (tabDataRevisionValid state.revision) then Err "This tab has an invalid data revision."
+  else if not (tabDataLayoutValid state.layout) then Err "This tab layout is not recognized."
+  else if not (tabDataPayloadIdsValid state.entries) || not (tabDataPayloadIdsValid state.values) || not (tabDataPayloadIdsValid state.representations) then Err "This tab data has invalid or mismatched identities."
+  else case validateLocusEntries state.entries of
+    Err message -> Err message
+    Ok entries -> case validateLocusEntries state.values of
+      Err message -> Err message
+      Ok values -> case validateLocusEntries state.representations of
+        Err message -> Err message
+        Ok representations -> Ok state
+
+@label "Data in this tab"
+@description "Find a retained authored data row by its stable local identity. Missing data returns Nothing; the authored expression is never evaluated here."
+@tags "view" "local-data"
+tabDataValue : TabDataState i v r l d -> String -> Maybe v
+tabDataValue state identity =
+  case find (\entry -> eq entry.id identity) state.values of
+    Nothing -> Nothing
+    Just entry -> Just entry.value
+
+tabDataValues : TabDataState i v r l d -> List v
+tabDataValues state = map (\entry -> entry.value) state.values
+
+@label "Saved query baseline"
+@description "Select the current authored query without evaluating it. Host transport reattaches this retained value before obtaining its exact comparison key."
+tabDataSavedQueryBaseline : TabDataState i v r l d -> String -> Result String Any
+tabDataSavedQueryBaseline state identity =
+  case tabDataValue state identity of
+    Nothing -> Err "This data is no longer in this tab."
+    Just value -> case lookup value "query" of
+      Nothing -> Err "This data has no saved query."
+      Just query -> Ok query
+
+@label "Check saved query baseline"
+@description "Compare host-captured exact query keys. Unsupported representations and changed baselines refuse; the source's original data and graph observation remain bound through the atomic write."
+tabDataCheckSavedQueryKeys : Result String String -> Result String String -> Result String Boolean
+tabDataCheckSavedQueryKeys expected current =
+  case current of
+    Err message -> Err message
+    Ok currentKey -> case expected of
+      Err message -> Err message
+      Ok expectedKey ->
+        if eq currentKey expectedKey then Ok true
+        else Err "This data changed since this draft was opened. Reload it and try again."
+
+tabDataMerge : a -> b -> a
+tabDataMerge original patch = fold (\value field -> mapSet value field.key field.value) original (entries patch)
+
+tabDataPatchValue : TabDataState i v r l d -> String -> p -> Result String (TabDataState i v r l d)
+tabDataPatchValue state identity patch =
+  case tabDataValue state identity of
+    Nothing -> Err "This data is no longer in this tab."
+    Just value ->
+      let replacement = tabDataMerge value patch
+      case lookup replacement "id" of
+        Just replacementId ->
+          if not (eq replacementId identity) then Err "An edit cannot change a value's identity."
+          else case applyLocusCommands state.values [LocusReplace { id = identity, entry = LocusEntry { id = identity, value = replacement } }] of
+            Err message -> Err message
+            Ok values -> Ok (tabDataWithValues state values)
+        Nothing -> Err "This data has no stable identity."
+
+tabDataApplyValid : TabDataState i v r l d -> TabDataCommand i v r l d p q -> Result String (TabDataState i v r l d)
+tabDataApplyValid state command =
+  case command of
+    TabEditEntries { commands = commands } -> case applyLocusCommands state.entries commands of
+      Err message -> Err message
+      Ok entries -> Ok (tabDataWithEntries state entries)
+    TabEditValues { commands = commands } -> case applyLocusCommands state.values commands of
+      Err message -> Err message
+      Ok values -> Ok (tabDataWithValues state values)
+    TabEditRepresentations { commands = commands } -> case applyLocusCommands state.representations commands of
+      Err message -> Err message
+      Ok representations -> Ok (tabDataWithRepresentations state representations)
+    TabSetLayout { layout = layout } -> Ok (tabDataWithLayout state layout)
+    TabSetDefinitions { definitions = definitions } -> Ok (tabDataWithDefinitions state definitions)
+    TabPatchValue { id = identity, patch = patch } -> tabDataPatchValue state identity patch
+    TabEditRoot { command = command } -> tabDataApplyRoot state command
+    TabEditList { id = identity, patch = patch } -> browserDataApplyList state identity patch
+    _ -> Err "This tab edit is not recognized."
+
+tabDataApplyNext : Result String (TabDataState i v r l d) -> TabDataCommand i v r l d p q -> Result String (TabDataState i v r l d)
+tabDataApplyNext result command =
+  case result of
+    Err message -> Err message
+    Ok state -> tabDataApplyValid state command
+
+tabDataCommit : TabDataState i v r l d -> Result String (TabDataState i v r l d) -> Result String (TabDataState i v r l d)
+tabDataCommit original result =
+  case result of
+    Err message -> Err message
+    Ok state ->
+      if original.revision >= 9007199254740991 then Err "This tab's data revision cannot advance safely."
+      else if not (tabClipboardPreserved original state) then Err "Clipboard stays in This tab. Clear its entries instead."
+      else case validateTabData state of
+        Err message -> Err message
+        Ok valid -> Ok (browserDataRetainProjection (tabDataMerge valid (TabDataState { tabId = valid.tabId, revision = original.revision + 1, entries = valid.entries, values = valid.values, representations = valid.representations, layout = valid.layout, definitions = valid.definitions })))
+
+@label "Edit data in this tab"
+@description "Apply ordinary identified-list, layout or prepared-definition edits atomically at the expected revision. A stale edit or any failing command returns Err and retains the complete previous state. One successful batch advances its revision once; an empty batch only validates."
+@tags "view" "local-data"
+applyTabDataCommands : TabDataState i v r l d -> Number -> List (TabDataCommand i v r l d p q) -> Result String (TabDataState i v r l d)
+applyTabDataCommands state expectedRevision commands =
+  case validateTabData state of
+    Err message -> Err message
+    Ok valid ->
+      if not (tabDataRevisionValid expectedRevision) || not (eq state.revision expectedRevision)
+      then Err "This tab data changed before this edit. Reload it and try again."
+      else if eq (length commands) 0 then Ok valid
+      else tabDataCommit state (fold tabDataApplyNext (Ok valid) commands)
+
+@label "Root edit for this tab"
+@description "Carry an existing LocusRoot edit into the ordinary local command. Its wire form is interpreted by the Fenel transition, not by the browser holder."
+@tags "view" "local-data"
+tabDataRootCommand : q -> TabDataCommand i v r l d p q
+tabDataRootCommand command = TabEditRoot { command = command }
+
+tabDataRootEntryEdit : TabDataState i v r l d -> LocusCommand i -> Result String (TabDataState i v r l d)
+tabDataRootEntryEdit state command =
+  case tabDataApplyValid state (TabEditEntries { commands = [command] }) of
+    Err message -> Err message
+    Ok next -> Ok (browserDataRetainProjection next)
+
+tabDataRootNext : Result String (TabDataState i v r l d) -> q -> Result String (TabDataState i v r l d)
+tabDataRootNext result command =
+  case result of
+    Err message -> Err message
+    Ok state -> tabDataApplyRoot state command
+
+tabDataApplyRoot : TabDataState i v r l d -> q -> Result String (TabDataState i v r l d)
+tabDataApplyRoot state command =
+  case lookup state "rootProjection" of
+    Just root -> browserDataApplyRoot state command
+    Nothing -> tabDataApplyTabRoot state command
+
+tabDataApplyTabRoot : TabDataState i v r l d -> q -> Result String (TabDataState i v r l d)
+tabDataApplyTabRoot state command =
+  if eq command.kind "append" then tabDataRootEntryEdit state (LocusAppend { entry = LocusEntry { id = command.item.id, value = command.item } })
+  else if eq command.kind "replace" then tabDataRootEntryEdit state (LocusReplace { id = command.itemId, entry = LocusEntry { id = command.item.id, value = command.item } })
+  else if eq command.kind "remove" then tabDataRootEntryEdit state (LocusRemove { id = command.itemId })
+  else if eq command.kind "reorder" then tabDataRootEntryEdit state (LocusReorder { ids = command.itemIds })
+  else if eq command.kind "layout" then Ok (tabDataWithLayout state command.layout)
+  else if eq command.kind "batch" then fold tabDataRootNext (Ok state) command.commands
+  else Err "This tab root edit is not recognized."
+
+tabDataRepresentationRows : TabDataState i v r l d -> String -> List r
+tabDataRepresentationRows state typeName =
+  let rows = map (\entry -> entry.value) state.representations
+  if eq typeName "" then rows else filter (\row -> eq row.typeName typeName) rows
+
+tabDataDefinition : TabDataState i v r l d -> String -> String -> Maybe a
+tabDataDefinition state kind name =
+  case find (\owner -> eq owner.kind kind && eq owner.storageName name) state.definitions.owners of
+    Nothing -> Nothing
+    Just owner -> Just owner.definition
+
+tabDataMetadataTarget : LocusEntry r -> Maybe String
+tabDataMetadataTarget entry =
+  let args = entry.value.args
+  if not (isArray args) || eq (length args) 0 then Nothing
+  else let target = at args 0
+       if isString target && not (eq target "") then Just target else Nothing
+
+tabDataMetadataTargetStep : List String -> LocusEntry r -> List String
+tabDataMetadataTargetStep targets entry =
+  case tabDataMetadataTarget entry of
+    Nothing -> targets
+    Just target -> if elem target targets then targets else appendItem target targets
+
+@label "Representation targets in this tab"
+@description "Enumerate retained local representation targets without selecting an instance or evaluating any method. The reader's existing scoped representation resolver selects the methods."
+@tags "view" "local-data"
+tabDataMetadataTargets : TabDataState i v r l d -> List String
+tabDataMetadataTargets state = fold tabDataMetadataTargetStep [] state.representations
+
+tabDataCheckRoot : TabDataState i v r l d -> String -> Result String Boolean
+tabDataCheckRoot state identity =
+  if eq state.tabId identity then Ok true else Err "This data belongs to a different tab source."
+
+tabDataItemExpression : i -> e
+tabDataItemExpression item =
+  case lookup item "source" of
+    Just source ->
+      if eq source.kind "ref" then { kind = "ref", savedExprId = source.ref.id }
+      else if eq source.kind "expr" then source.expr
+      else tabDataLegacyItemExpression item
+    Nothing -> tabDataLegacyItemExpression item
+
+tabDataLegacyItemExpression : i -> e
+tabDataLegacyItemExpression item =
+  case lookup item "expr" of
+    Just expression -> expression
+    Nothing -> { kind = "literal" }
+
+tabDataExpressionMapStep : Map String e -> LocusEntry v -> Map String e
+tabDataExpressionMapStep expressions entry =
+  case lookup entry.value "query" of
+    Nothing -> expressions
+    Just query ->
+      if not (eq query.kind "expression") then expressions
+      else case lookup query "expr" of
+        Nothing -> expressions
+        Just expression -> mapSet expressions entry.id expression
+
+@label "Present this tab's data"
+@description "Project the existing root/source authoring wire. The structural list retains each source expression or reference, never its computed result. Each card is also published under its own reference (tab id, then card id, as an account root's occurrence reference), so data derived from a card follows its edits; a saved value keeps its id. The browser applies its existing admitted wire codec to the returned expression fields."
+@tags "view" "local-data"
+tabDataRoot : TabDataState i v r l d -> Type -> ({ id: String, name: String, type: Type, expr: a, revision: Nat, persisted: Boolean, canEdit: Boolean, layout: l, items: List i, lists: List b, expressions: Map String a, referenceId: String })
+tabDataRoot state rootType =
+  let clipboard = tabClipboardIdentity state
+  let items = map (\entry -> if eq entry.id clipboard then mapSet entry.value "valueType" rootType else entry.value) state.entries
+  let expression = { kind = "literal", value = { __list = map tabDataItemExpression items } }
+  let cards = fold (\published entry -> mapSet published (join [state.tabId, entry.id] ":") (tabDataItemExpression entry.value)) (fromEntries []) state.entries
+  let typed = tabDataTypeInstances state.tabId state.entries cards
+  let expressions = mapSet (fold tabDataExpressionMapStep typed state.values) state.tabId expression
+  { id = state.tabId, name = "Local", type = rootType, expr = expression, revision = state.revision, persisted = false, canEdit = true, layout = state.layout, items = items, lists = [], expressions = expressions, referenceId = state.tabId }
+
+-- Demo 1 (Rom, Nov 8): "See all <Type>" reads a type's data in this tab as one
+-- list. Every card declared with a named type (`{ $ref: handle }`) is published
+-- again, by its reference, in the list `<tab>:instances:<handle>`; a type's own
+-- card (its value is that `{ $ref: handle }`) makes the list exist, empty,
+-- before its first data. Being references, the list follows each card's edits,
+-- and a new card of the type joins it when the tab republishes.
+tabDataReferenceHandle : t -> Maybe String
+tabDataReferenceHandle value =
+  if isNull value || isString value || isNumber value || isBoolean value || isArray value then Nothing
+  else case lookup value "$ref" of
+    Just handle -> if isString handle && not (eq handle "") then Just handle else Nothing
+    Nothing -> Nothing
+
+tabDataInstancesReference : String -> String -> String
+tabDataInstancesReference tabId handle = join [tabId, "instances", handle] ":"
+
+tabDataDeclaredHandle : i -> Maybe String
+tabDataDeclaredHandle item =
+  case lookup item "valueType" of
+    Nothing -> Nothing
+    Just declared -> tabDataReferenceHandle declared
+
+tabDataTypeCardHandle : i -> Maybe String
+tabDataTypeCardHandle item =
+  let expression = tabDataItemExpression item
+  if not (eq expression.kind "literal") then Nothing
+  else case lookup expression "value" of
+    Nothing -> Nothing
+    Just value -> tabDataReferenceHandle value
+
+tabDataInstanceList : List e -> e
+tabDataInstanceList references = { kind = "literal", value = { __list = references } }
+
+tabDataEnsureInstances : String -> Map String e -> i -> Map String e
+tabDataEnsureInstances tabId expressions item =
+  case tabDataTypeCardHandle item of
+    Nothing -> expressions
+    Just handle -> tabDataEnsureList expressions (tabDataInstancesReference tabId handle)
+
+tabDataEnsureList : Map String e -> String -> Map String e
+tabDataEnsureList expressions key =
+  case lookup expressions key of
+    Just existing -> expressions
+    Nothing -> mapSet expressions key (tabDataInstanceList [])
+
+tabDataListedReferences : Map String e -> String -> List e
+tabDataListedReferences expressions key =
+  case lookup expressions key of
+    Nothing -> []
+    Just existing -> existing.value.__list
+
+tabDataInstanceStep : String -> Map String e -> LocusEntry i -> Map String e
+tabDataInstanceStep tabId expressions entry =
+  let ensured = tabDataEnsureInstances tabId expressions entry.value
+  case tabDataDeclaredHandle entry.value of
+    Nothing -> ensured
+    Just handle ->
+      let key = tabDataInstancesReference tabId handle
+      let reference = { kind = "ref", savedExprId = join [tabId, entry.id] ":" }
+      mapSet ensured key (tabDataInstanceList (appendItem reference (tabDataListedReferences ensured key)))
+
+@label "Data of each type in this tab"
+@description "Publish, for each named type declared by this tab's cards, the list of those cards' references (`<tab>:instances:<type>`), in card order. A type's own card publishes its list even before its first data. The list holds references, never computed results, so it follows the cards' edits."
+@tags "view" "local-data"
+tabDataTypeInstances : String -> List (LocusEntry i) -> Map String e -> Map String e
+tabDataTypeInstances tabId cards expressions = fold (tabDataInstanceStep tabId) expressions cards
+
+-- Clipboard is one ordinary saved list in the tab's existing data, not a
+-- second transfer store. Its tagged entries quote copied data, including
+-- objects that resemble executable expressions. The transfer is the existing
+-- checkpoint clipboard wire, retained for receiver-side type validation.
+@label "Clipboard entry"
+ClipboardEntry = ClipboardEntry id: String data: Anything typeName: String transfer: String bytes: Nat copiedAt: Number source: String
+
+@label "Original copied data"
+@description "A Clipboard entry copies its retained interoperable data transfer, keeping source type identities. Other data keeps its normal Copy behavior. Receivers still validate the copied type."
+clipboardEntryTransfer : a -> Maybe String
+clipboardEntryTransfer value =
+  case value of
+    ClipboardEntry { transfer = transfer } -> Just transfer
+    _ -> Nothing
+
+tabClipboardIdentity : TabDataState i v r l d -> String
+tabClipboardIdentity state = join [state.tabId, "clipboard"] ":"
+
+tabClipboardEntries : TabDataState i v r l d -> List e
+tabClipboardEntries state =
+  case tabDataValue state (tabClipboardIdentity state) of
+    Nothing -> []
+    Just row -> tabClipboardExpressionEntries row.query.expr
+
+tabClipboardExpressionEntries : e -> List e
+tabClipboardExpressionEntries expression =
+  if isArray expression.value then map (\value -> { kind = "literal", value = value }) expression.value
+  else expression.value.__list
+
+tabClipboardRow : String -> List e -> v
+tabClipboardRow identity entries =
+  { id = identity, slug = "clipboard", name = "Clipboard", description = "Copied data in this tab. Keeps the latest 20 copies within 10 MiB. Clear entries whenever you like.", query = { kind = "expression", expr = { kind = "literal", value = { __list = entries } } } }
+
+@label "Clipboard in this tab"
+@description "Ensure this tab contains its ordinary identified Clipboard list. The existing list editor can clear entries; the built-in collection itself stays present."
+tabDataWithClipboard : TabDataState i v r l d -> TabDataState i v r l d
+tabDataWithClipboard state =
+  let identity = tabClipboardIdentity state
+  case find (\entry -> eq entry.id identity) state.entries of
+    Just entry -> state
+    Nothing ->
+      let item = { id = identity, caption = "Clipboard", representations = mapSet {} "Codeable" { codeName = "clipboard" }, source = { kind = "ref", ref = { kind = "savedExpr", id = identity } } }
+      let row = tabClipboardRow identity []
+      tabDataWithValues (tabDataWithEntries state (appendItem (LocusEntry { id = identity, value = item }) state.entries)) (appendItem (LocusEntry { id = identity, value = row }) state.values)
+
+tabClipboardPreserved : TabDataState i v r l d -> TabDataState i v r l d -> Boolean
+tabClipboardPreserved original next =
+  let identity = tabClipboardIdentity original
+  case find (\entry -> eq entry.id identity) original.entries of
+    Nothing -> true
+    Just entry ->
+      case find (\candidate -> eq candidate.id identity) next.entries of
+        Nothing -> false
+        Just candidate ->
+          if not (eq candidate.value.source entry.value.source) then false
+          else case tabDataValue next identity of
+            Nothing -> false
+            Just row ->
+              let candidates = tabClipboardExpressionEntries row.query.expr
+              eq row.query.kind "expression" && eq row.query.expr.kind "literal" && isArray candidates && length candidates <= length (tabClipboardEntries original) && tabClipboardBytes candidates <= 10485760 && all candidates (\candidate -> some (tabClipboardEntries original) (\entry -> eq candidate entry) && eq (length (filter (\other -> eq other.value.id candidate.value.id) candidates)) 1)
+
+tabClipboardBytes : List e -> Number
+tabClipboardBytes entries = fold (\total entry -> total + entry.value.bytes) 0 entries
+
+tabClipboardTrim : List e -> List e
+tabClipboardTrim entries =
+  if length entries <= 20 && tabClipboardBytes entries <= 10485760 then entries
+  else tabClipboardTrim (drop 1 entries)
+
+@label "Retain copied data"
+@description "Append one successful copy to the tab's existing Clipboard list. Retain at most 20 entries and 10 MiB of encoded transfers, evicting oldest entries first. A single oversized copy is refused without changing the operating system clipboard."
+tabClipboardCopy : TabDataState i v r l d -> String -> a -> String -> String -> Nat -> Number -> String -> Result String (TabDataState i v r l d)
+tabClipboardCopy state identity data typeName transfer bytes copiedAt source =
+  if bytes > 10485760 then Err "This copy exceeds the 10 MiB Clipboard history limit."
+  else
+    let prepared = tabDataWithClipboard state
+    let entry = ClipboardEntry { id = identity, data = data, typeName = typeName, transfer = transfer, bytes = bytes, copiedAt = copiedAt, source = source }
+    let entries = tabClipboardTrim (appendItem { kind = "literal", value = entry } (tabClipboardEntries prepared))
+    let row = tabClipboardRow (tabClipboardIdentity prepared) entries
+    case tabDataPatchValue prepared row.id row of
+      Err message -> Err message
+      Ok next -> tabDataCommit next (Ok next)
+
+-- Early external ingress consumes only the existing browser decoder's output.
+-- Its image dimensions/RGBA channels and File fields are built at the media IO
+-- boundary, rather than asserted by copied metadata. Structured JSON, rich
+-- text, internal transfers and typed destinations keep the shared authoring
+-- checker. This is no second membership judgment and never executes a value.
+tabExternalTransferCandidate : ({ files: List f, internal: String, html: String, savedExprId: Undefinable String }) -> Boolean
+tabExternalTransferCandidate captured =
+  let saved = case lookup captured "savedExprId" of
+    Nothing -> false
+    Just identity -> isString identity && not (eq identity "")
+  not saved && eq captured.internal "" && (length captured.files > 0 || eq captured.html "")
+
+tabExternalTransferType : ({ source: String, value: a }) -> Maybe ({ owner: String, name: String })
+tabExternalTransferType item =
+  if eq item.source "image" then Just { owner = "std", name = "Image" }
+  else if eq item.source "file" then Just { owner = "std", name = "File" }
+  else if not (eq item.source "text" || eq item.source "json") then Nothing
+  else if isString item.value then Just { owner = "system", name = "String" }
+  else if isBoolean item.value then Just { owner = "system", name = "Boolean" }
+  else if isNumber item.value && numberIsFinite item.value then Just { owner = "system", name = "Number" }
+  else Nothing
+
+tabExternalTransferTypesStep : Maybe (List ({ owner: String, name: String })) -> ({ source: String, value: a }) -> Maybe (List ({ owner: String, name: String }))
+tabExternalTransferTypesStep previous item =
+  case previous of
+    Nothing -> Nothing
+    Just names -> case tabExternalTransferType item of
+      Nothing -> Nothing
+      Just name -> Just (appendItem name names)
+
+tabExternalTransferTypes : List ({ source: String, value: a }) -> Maybe (List ({ owner: String, name: String }))
+tabExternalTransferTypes items =
+  if eq (length items) 0 then Nothing
+  else fold tabExternalTransferTypesStep (Just []) items
+
+-- A filename or inferred type is not an authored name. Only an internal copy
+-- may retain the real optional label that travelled with its data.
+tabExternalTransferCaptions : List ({ source: String, label: Undefinable String }) -> List (Maybe String)
+tabExternalTransferCaptions items =
+  let captionFor = \item ->
+        if not (eq item.source "fenel") then Nothing
+        else case lookup item "label" of
+          Nothing -> Nothing
+          Just label -> if isString label && not (eq label "") then Just label else Nothing
+  map captionFor items
+
+-- Identities come from the browser UUID leaf; types come from the current
+-- projected registry's exact source owner. External labels and filenames are
+-- metadata of the incoming data, never names of its new occurrence.
+tabExternalTransferCommands : List ({ value: a, note: Undefinable String }) -> List String -> List Type -> ({ items: List ({ id: String, source: { kind: String, expr: { kind: String, value: a } }, valueType: Type }), commands: List (TabDataCommand i v r l d p ({ kind: String, item: { id: String, source: { kind: String, expr: { kind: String, value: a } }, valueType: Type } })), notes: List String })
+tabExternalTransferCommands incoming identities types =
+  let typed = zipWith (\identity valueType -> { id = identity, type = valueType }) identities types
+  let items = zipWith (\item declaration -> { id = declaration.id, source = { kind = "expr", expr = { kind = "literal", value = item.value } }, valueType = declaration.type }) incoming typed
+  let commands = map (\item -> TabEditRoot { command = { kind = "append", item = item } }) items
+  let notesFor = \item ->
+        case lookup item "note" of
+          Nothing -> []
+          Just note -> if isString note && not (eq note "") then [note] else []
+  let notes = flatMap notesFor incoming
+  { items = items, commands = commands, notes = notes }
+
+-- A working snapshot may retain an already authorized root projection. This
+-- is ordinary source data; reader frames and checked registries stay at the
+-- existing host lifetime boundary. The temporary tab has no such projection.
+browserDataEntries : List a -> List (LocusEntry a)
+browserDataEntries rows = map (\row -> LocusEntry { id = row.id, value = row }) rows
+
+@label "Retain authorized data source"
+@description "Seed an editable working snapshot from the existing authorized root, saved expressions, representations and prepared definition snapshot. Identities and source expressions are retained without evaluation."
+@tags "view" "source"
+browserDataFromRoot : b -> List v -> List r -> d -> TabDataState i v r l d
+browserDataFromRoot root values representations definitions =
+  let state = TabDataState { tabId = root.id, revision = root.revision, entries = browserDataEntries root.items, values = browserDataEntries values, representations = browserDataEntries representations, layout = root.layout, definitions = definitions }
+  tabDataMerge state { rootProjection = root, expressionValueIds = map (\row -> row.id) values }
+
+browserDataWithExpressionHeads : TabDataState i v r l d -> h -> TabDataState i v r l d
+browserDataWithExpressionHeads state heads = mapSet state "expressionHeads" heads
+
+browserDataListExpression : List i -> e
+browserDataListExpression items = { kind = "literal", value = { __list = map browserDataItemExpression items } }
+
+browserDataItemExpression : i -> e
+browserDataItemExpression item =
+  let own = tabDataItemExpression item
+  case lookup item "children" of
+    Nothing -> own
+    Just children -> { kind = "literal", value = { __record = { fields = [{ name = "value", value = own }, { name = "children", value = browserDataListExpression children }] } } }
+
+browserDataOccurrenceReference : b -> i -> String
+browserDataOccurrenceReference root item =
+  case find (\row -> eq row.id item.id) root.lists of
+    Just row -> row.referenceId
+    Nothing -> join [root.referenceId, item.id] ":"
+
+browserDataClearOccurrence : b -> Map String e -> i -> Map String e
+browserDataClearOccurrence root expressions item =
+  let identity = browserDataOccurrenceReference root item
+  mapDelete (mapDelete (mapDelete expressions identity) (join [identity, "source"] ":")) (join [identity, "entries"] ":")
+
+browserDataEntryExpression : i -> e
+browserDataEntryExpression item =
+  { kind = "literal", value = { __construct = { tag = "LocusEntry", fields = [{ name = "id", value = { kind = "literal", value = item.id } }, { name = "value", value = browserDataItemExpression item }] } } }
+
+browserDataEntriesExpression : List i -> e
+browserDataEntriesExpression items = { kind = "literal", value = { __list = map browserDataEntryExpression items } }
+
+browserDataListReferenceExpressions : Map String e -> b -> Map String e
+browserDataListReferenceExpressions expressions row =
+  let expression = tabDataItemExpression row.rootItem
+  let next = mapSet expressions row.referenceId expression
+  if row.derivedCanvas then mapSet next row.sourceReferenceId (at expression.args 0)
+  else case lookup row "entriesReferenceId" of
+    Nothing -> next
+    Just identity -> mapSet next identity (browserDataEntriesExpression row.view.items)
+
+browserDataProjectList : TabDataState i v r l d -> b -> LocusEntry i -> List b
+browserDataProjectList state root entry =
+  case find (\row -> eq row.id entry.id) root.lists of
+    Nothing -> []
+    Just row -> [tabDataMerge row { rootRevision = state.revision, rootItem = entry.value }]
+
+browserDataRootLists : TabDataState i v r l d -> b -> List a
+browserDataRootLists state root =
+  let rows = flatMap (browserDataProjectList state root) state.entries
+  let activeRemoved = some root.lists (\row -> row.active && not (locusHasEntry state.entries row.id))
+  if not activeRemoved || eq (length rows) 0 then rows
+  else let first = at rows 0
+       map (\row -> mapSet row "active" (eq row.id first.id)) rows
+
+browserDataRootExpressionStep : b -> Map String e -> LocusEntry i -> Map String e
+browserDataRootExpressionStep root expressions entry =
+  mapSet expressions (browserDataOccurrenceReference root entry.value) (browserDataItemExpression entry.value)
+
+@label "Present working data source"
+@description "Project current draft source using the retained account root identities and list references, or the existing temporary-tab projection. Saved bodies remain source and are never evaluated."
+@tags "view" "source"
+browserDataRoot : TabDataState i v r l d -> Type -> b
+browserDataRoot state rootType =
+  case lookup state "rootProjection" of
+    Nothing -> tabDataRoot state rootType
+    Just root -> browserDataProjectedRoot state root
+
+browserDataProjectedRoot : TabDataState i v r l d -> b -> b
+browserDataProjectedRoot state root =
+  let items = map (\entry -> entry.value) state.entries
+  let expression = browserDataListExpression items
+  let rows = browserDataRootLists state root
+  let cleared = fold (browserDataClearOccurrence root) (mapDelete root.expressions root.referenceId) root.items
+  let previousValues = case lookup state "expressionValueIds" of
+        Nothing -> []
+        Just identities -> identities
+  let source = fold (\expressions identity -> mapDelete expressions identity) cleared previousValues
+  let current = fold (browserDataRootExpressionStep root) source state.entries
+  let listExpressions = fold browserDataListReferenceExpressions current rows
+  let expressions = mapSet (fold tabDataExpressionMapStep listExpressions state.values) root.referenceId expression
+  tabDataMerge root { expr = expression, revision = state.revision, layout = state.layout, items = items, lists = map (\row -> mapDelete row "rootItem") rows, expressions = expressions }
+
+browserDataRetainProjection : TabDataState i v r l d -> TabDataState i v r l d
+browserDataRetainProjection state =
+  case lookup state "rootProjection" of
+    Nothing -> state
+    Just root -> tabDataMerge state { rootProjection = browserDataProjectedRoot state root, expressionValueIds = locusEntryIds state.values }
+
+browserDataList : TabDataState i v r l d -> String -> Maybe a
+browserDataList state identity =
+  case lookup state "rootProjection" of
+    Nothing -> Nothing
+    Just root ->
+      let projected = browserDataProjectedRoot state root
+      find (\row -> eq row.id identity) projected.lists
+
+browserDataActiveList : TabDataState i v r l d -> Maybe a
+browserDataActiveList state =
+  case lookup state "rootProjection" of
+    Nothing -> Nothing
+    Just root ->
+      let projected = browserDataProjectedRoot state root
+      find (\row -> row.active) projected.lists
+
+browserDataListCommand : String -> p -> TabDataCommand i v r l d p q
+browserDataListCommand identity patch = TabEditList { id = identity, patch = patch }
+
+browserDataChangedItem : List i -> List i -> List i -> List i -> String -> Boolean
+browserDataChangedItem before after beforeCommon afterCommon identity =
+  case find (\item -> eq item.id identity) before of
+    Nothing -> true
+    Just previous -> case find (\item -> eq item.id identity) after of
+      Nothing -> true
+      Just next -> not (eq previous next) || not (eq (findIndex (\item -> eq item.id identity) beforeCommon) (findIndex (\item -> eq item.id identity) afterCommon))
+
+@label "Changed cards in a data set"
+@description "Identify added, removed, edited or relatively reordered cards in the current retained list before applying its patch. Inserting or removing a neighbor does not mark otherwise unchanged cards."
+@tags "view" "source"
+browserDataListDirtyIds : TabDataState i v r l d -> String -> p -> List String
+browserDataListDirtyIds state identity patch =
+  case lookup patch "view" of
+    Nothing -> []
+    Just view -> case browserDataList state identity of
+      Nothing -> []
+      Just row -> browserDataChangedItems row.view.items view.items
+
+browserDataChangedItems : List i -> List i -> List String
+browserDataChangedItems before after =
+  let beforeIds = map (\item -> item.id) before
+  let afterIds = map (\item -> item.id) after
+  let beforeCommon = filter (\item -> elem item.id afterIds) before
+  let afterCommon = filter (\item -> elem item.id beforeIds) after
+  filter (browserDataChangedItem before after beforeCommon afterCommon) (unique (concat beforeIds afterIds))
+
+browserDataExpressionValid : e -> Boolean
+browserDataExpressionValid expression =
+  if eq expression.kind "literal" then case lookup expression "value" of
+    Nothing -> false
+    Just value -> true
+  else if eq expression.kind "ref" then isString expression.savedExprId
+  else if eq expression.kind "param" then isString expression.name
+  else if eq expression.kind "call" then isString expression.fnId && isArray expression.args && all expression.args browserDataExpressionValid
+  else false
+
+browserDataItemsValid : List i -> Boolean
+browserDataItemsValid items =
+  let entries = browserDataEntries items
+  case validateLocusEntries entries of
+    Err message -> false
+    Ok valid -> tabDataPayloadIdsValid valid && all items browserDataItemValid
+
+browserDataItemValid : i -> Boolean
+browserDataItemValid item =
+  if not (browserDataExpressionValid (tabDataItemExpression item)) then false
+  else case lookup item "children" of
+    Nothing -> true
+    Just children -> isArray children && browserDataItemsValid children
+
+browserDataRootGeometryAbsent : i -> Boolean
+browserDataRootGeometryAbsent item =
+  let absent = \key ->
+    case lookup item key of
+      Nothing -> true
+      Just value -> false
+  all ["x", "y", "w", "h", "date", "ts", "lat", "lng"] absent
+
+browserDataRootReplacementAllowed : TabDataState i v r l d -> q -> Boolean
+browserDataRootReplacementAllowed state command =
+  if not (eq command.kind "replace") then true
+  else case browserDataList state command.itemId of
+    Just row -> false
+    Nothing -> case find (\entry -> eq entry.id command.itemId) state.entries of
+      Nothing -> true
+      Just entry -> case lookup entry.value "children" of
+        Nothing -> true
+        Just children -> case lookup command.item "children" of
+          Nothing -> false
+          Just replacement -> true
+
+browserDataApplyRoot : TabDataState i v r l d -> q -> Result String (TabDataState i v r l d)
+browserDataApplyRoot state command =
+  if eq command.kind "batch" then
+    if not (isArray command.commands) || eq (length command.commands) 0 || length command.commands > 256 || some command.commands (\child -> eq child.kind "batch") then Err "A grouped edit requires 1 to 256 ordinary value edits."
+    else fold tabDataRootNext (Ok state) command.commands
+  else if eq command.kind "append" || eq command.kind "replace" then
+    if not (browserDataItemValid command.item) then Err "This data has an invalid source expression or children."
+    else if not (browserDataRootGeometryAbsent command.item) then Err "Positions and dates belong in typed values or derivation arguments."
+    else if not (browserDataRootReplacementAllowed state command) then Err "Edit this data set from inside it. Replacing it here would drop its items' details."
+    else tabDataApplyTabRoot state command
+  else tabDataApplyTabRoot state command
+
+browserDataGeometryNumber : i -> String -> Number -> Number
+browserDataGeometryNumber item key fallback = case lookup item key of
+  Nothing -> fallback
+  Just value -> value
+
+browserDataGeometryDimension : i -> String -> Maybe Number
+browserDataGeometryDimension item key = lookup item key
+
+browserDataGeometryPresent : i -> Boolean
+browserDataGeometryPresent item =
+  let present = \key ->
+    case lookup item key of
+      Nothing -> false
+      Just value -> true
+  some ["x", "y", "w", "h"] present
+
+browserDataGeometryValid : i -> Boolean
+browserDataGeometryValid item =
+  let valid = \key ->
+    case lookup item key of
+      Nothing -> true
+      Just value -> isNumber value && numberIsFinite value
+  all ["x", "y", "w", "h"] valid
+
+browserDataItemPlacement : i -> Maybe Placement
+browserDataItemPlacement item =
+  if not (browserDataGeometryPresent item) then Nothing
+  else Just (Placement { at = { x = browserDataGeometryNumber item "x" 0.5, y = browserDataGeometryNumber item "y" 0.5 }, width = browserDataGeometryDimension item "w", height = browserDataGeometryDimension item "h" })
+
+browserDataCanvasHead : TabDataState i v r l d -> b -> Maybe String
+browserDataCanvasHead state row =
+  if row.derivedCanvas then
+    let expression = tabDataItemExpression row.rootItem
+    Just expression.fnId
+  else case lookup state "expressionHeads" of
+    Nothing -> Nothing
+    Just heads -> lookup heads "placeAll"
+
+browserDataCanvasType : Boolean -> Type
+browserDataCanvasType unit =
+  let anything = assocRecord {} "$complement" (assocRecord {} "$void" true)
+  let placed = assocRecord {} "$el" (assocRecord {} "call" ["Placed", anything])
+  assocRecord {} "$el" (assocRecord {} "call" ["List", placed])
+
+browserDataPatchListView : TabDataState i v r l d -> b -> a -> Result String b
+browserDataPatchListView state row view =
+  if not (isArray view.items) || not (browserDataItemsValid view.items) then Err "This data set has invalid contents or identities."
+  else if not (all view.items browserDataGeometryValid) then Err "A canvas position or size must be finite."
+  else let placed = row.derivedCanvas || eq view.kind "canvas"
+       let source = browserDataListExpression view.items
+       if not placed then Ok (tabDataMerge row { view = view, valueType = state.rootProjection.type, derivedCanvas = false, sourceReferenceId = row.referenceId, rootItem = mapSet row.rootItem "source" { kind = "expr", expr = source } })
+       else case browserDataCanvasHead state row of
+         Nothing -> Err "This reader has no admitted canvas function."
+         Just head ->
+           let expression = { kind = "call", fnId = head, args = [source, { kind = "literal", value = map browserDataItemPlacement view.items }] }
+           let placedRow = tabDataMerge row { view = view, valueType = browserDataCanvasType false, derivedCanvas = true, sourceReferenceId = join [row.referenceId, "source"] ":", rootItem = mapSet row.rootItem "source" { kind = "expr", expr = expression } }
+           Ok (mapDelete placedRow "entriesReferenceId")
+
+browserDataPatchListName : b -> p -> b
+browserDataPatchListName row patch =
+  case lookup patch "name" of
+    Nothing -> row
+    Just name -> tabDataMerge row { name = name, rootItem = mapSet row.rootItem "caption" name }
+
+browserDataPatchListActive : List b -> String -> p -> List b
+browserDataPatchListActive rows identity patch =
+  case lookup patch "active" of
+    Nothing -> rows
+    Just active -> map (\row -> if active then mapSet row "active" (eq row.id identity) else if eq row.id identity then mapSet row "active" false else row) rows
+
+browserDataPublishList : TabDataState i v r l d -> b -> b -> p -> Result String (TabDataState i v r l d)
+browserDataPublishList state root row patch =
+  let named = browserDataPatchListName row patch
+  let item = mapSet named.rootItem "valueType" named.valueType
+  case applyLocusCommands state.entries [LocusReplace { id = row.id, entry = LocusEntry { id = row.id, value = item } }] of
+    Err message -> Err message
+    Ok entries ->
+      let rows = map (\current -> if eq current.id row.id then mapDelete named "rootItem" else current) root.lists
+      let nextRoot = mapSet root "lists" (browserDataPatchListActive rows row.id patch)
+      Ok (mapSet (tabDataWithEntries state entries) "rootProjection" nextRoot)
+
+browserDataApplyList : TabDataState i v r l d -> String -> p -> Result String (TabDataState i v r l d)
+browserDataApplyList state identity patch =
+  case lookup state "rootProjection" of
+    Nothing -> Err "This source has no retained data sets."
+    Just retained ->
+      let root = browserDataProjectedRoot state retained
+      case find (\row -> eq row.id identity) root.lists of
+        Nothing -> Err "This data set is no longer in the root."
+        Just row -> case find (\entry -> eq entry.id identity) state.entries of
+          Nothing -> Err "This data set is no longer in the root."
+          Just entry ->
+            let current = mapSet row "rootItem" entry.value
+            let result = case lookup patch "view" of
+                  Nothing -> Ok current
+                  Just view -> browserDataPatchListView state current view
+            case result of
+              Err message -> Err message
+              Ok next -> browserDataPublishList state root next patch
+
+-- Read source identity only. Never run a saved body to discover a child,
+-- inspect a quoted payload, or acquire another source on a snapshot miss.
+@label "Read retained expression source"
+@description "Read one saved-expression identity within the captured source snapshot. Missing references and alias chains return Nothing; calls, structural expression slots and quoted data are returned without evaluation."
+@tags "view" "source"
+sourceExpressionFromSnapshot : Map String e -> e -> Maybe e
+sourceExpressionFromSnapshot expressions expression =
+  case lookup expression "kind" of
+    Just kind ->
+      if not (eq kind "ref") then Just expression
+      else case lookup expression "savedExprId" of
+        Nothing -> Nothing
+        Just identity ->
+          if not (isString identity) then Nothing
+          else case lookup expressions identity of
+            Nothing -> Nothing
+            Just body -> case lookup body "kind" of
+              Just bodyKind -> if eq bodyKind "ref" then Nothing else Just body
+              Nothing -> Nothing
+    Nothing -> Nothing
+
+-- GP-57 is ordinary retained source data, not another reactive value kind.
+-- The browser supplies fresh identities, checked callable wire handles and
+-- precise types at the existing ExprNode/source marshalling boundary.
+linkedDemoSavedValue : String -> String -> e -> Type -> ({ id: String, slug: String, name: String, query: { kind: String, expr: e, valueType: Type } })
+linkedDemoSavedValue identity name expression valueType =
+  { id = identity, slug = identity, name = name, query = { kind = "expression", expr = expression, valueType = valueType } }
+
+linkedDemoItem : String -> String -> String -> Type -> ({ id: String, caption: String, source: { kind: String, ref: { kind: String, id: String } }, valueType: Type })
+linkedDemoItem identity name savedIdentity valueType =
+  { id = identity, caption = name, source = { kind = "ref", ref = { kind = "savedExpr", id = savedIdentity } }, valueType = valueType }
+
+linkedDemoTypeField : String -> Type -> ({ name: String, type: Type, label: Maybe String, ui: Maybe String, meta: Map String String })
+linkedDemoTypeField name valueType = { name = name, type = valueType, label = Nothing, ui = Nothing, meta = {} }
+
+-- A finite schema for these existing source wires, not a second AST. It keeps
+-- the saved expression payloads opaque to the tab transition and binds the
+-- command's item/value parameters to their actual concrete shapes.
+linkedDemoCommandsType : Type -> Type -> Type -> Type
+linkedDemoCommandsType numberType listType canvasType =
+  let textType = typeOf ""
+  let universe = assocRecord {} "$type" true
+  let unitType = assocRecord {} "$unit" true
+  let reference = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "savedExprId" textType]
+  let scalar = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "value" numberType]
+  let numericArgument = assocRecord {} "$union" [reference, scalar]
+  let numericArguments = assocRecord {} "$el" (assocRecord {} "call" ["List", numericArgument])
+  let numericCall = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "fnId" textType, linkedDemoTypeField "args" numericArguments]
+  let references = assocRecord {} "$el" (assocRecord {} "call" ["List", reference])
+  let listPayload = recordType [linkedDemoTypeField "__list" references]
+  let listExpression = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "value" listPayload]
+  let point = recordType [linkedDemoTypeField "x" numberType, linkedDemoTypeField "y" numberType]
+  let optionalNumber = assocRecord {} "$el" (assocRecord {} "call" ["Maybe", numberType])
+  let placement = recordType [linkedDemoTypeField "at" point, linkedDemoTypeField "width" optionalNumber, linkedDemoTypeField "height" optionalNumber]
+  let optionalPlacement = assocRecord {} "$el" (assocRecord {} "call" ["Maybe", placement])
+  let placements = assocRecord {} "$el" (assocRecord {} "call" ["List", optionalPlacement])
+  let placementLiteral = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "value" placements]
+  let canvasArgument = assocRecord {} "$union" [reference, placementLiteral]
+  let canvasArguments = assocRecord {} "$el" (assocRecord {} "call" ["List", canvasArgument])
+  let canvasCall = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "fnId" textType, linkedDemoTypeField "args" canvasArguments]
+  let expression = assocRecord {} "$union" [scalar, numericCall, listExpression, canvasCall]
+  let query = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "expr" expression, linkedDemoTypeField "valueType" universe]
+  let saved = recordType [linkedDemoTypeField "id" textType, linkedDemoTypeField "slug" textType, linkedDemoTypeField "name" textType, linkedDemoTypeField "query" query]
+  let savedReference = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "id" textType]
+  let itemSource = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "ref" savedReference]
+  let item = recordType [linkedDemoTypeField "id" textType, linkedDemoTypeField "caption" textType, linkedDemoTypeField "source" itemSource, linkedDemoTypeField "valueType" universe]
+  let command = assocRecord {} "$el" (assocRecord {} "call" ["TabDataCommand", item, saved, unitType, unitType, unitType, unitType, unitType])
+  let commands = assocRecord {} "$el" (assocRecord {} "call" ["List", command])
+  recordType [linkedDemoTypeField "commands" commands, linkedDemoTypeField "canvasItem" item]
+
+@label "Try linked data"
+@description "Append one editable number, its double and the double plus one, their shared number list and a canvas to this temporary tab. Every lens retains the same source references; existing tab data is preserved."
+@tags "view" "local-data" "demo"
+linkedDemoCommands : (ids: { source: String, doubled: String, result: String, list: String, canvas: String, sourceItem: String, doubledItem: String, resultItem: String, listItem: String, canvasItem: String }) -> (heads: { multiply: String, add: String, placeAll: String }) -> (numberType: Type) -> (listType: Type) -> (canvasType: Type) -> linkedDemoCommandsType numberType listType canvasType
+linkedDemoCommands ids heads numberType listType canvasType =
+  let sourceRef = { kind = "ref", savedExprId = ids.source }
+  let doubledRef = { kind = "ref", savedExprId = ids.doubled }
+  let resultRef = { kind = "ref", savedExprId = ids.result }
+  let doubled = { kind = "call", fnId = heads.multiply, args = [sourceRef, { kind = "literal", value = 2 }] }
+  let result = { kind = "call", fnId = heads.add, args = [doubledRef, { kind = "literal", value = 1 }] }
+  let list = { kind = "literal", value = { __list = [sourceRef, doubledRef, resultRef] } }
+  let placements = [Just (Placement { at = { x = 0.05, y = 0.15 }, width = Just 0.28, height = Just 0.5 }), Just (Placement { at = { x = 0.36, y = 0.15 }, width = Just 0.28, height = Just 0.5 }), Just (Placement { at = { x = 0.67, y = 0.15 }, width = Just 0.28, height = Just 0.5 })]
+  let canvas = { kind = "call", fnId = heads.placeAll, args = [{ kind = "ref", savedExprId = ids.list }, { kind = "literal", value = placements }] }
+  let values = [linkedDemoSavedValue ids.source "Source · edit this number" { kind = "literal", value = 10 } numberType, linkedDemoSavedValue ids.doubled "Double the source" doubled numberType, linkedDemoSavedValue ids.result "Double, then add one" result numberType, linkedDemoSavedValue ids.list "Linked number list" list listType, linkedDemoSavedValue ids.canvas "Linked data canvas" canvas canvasType]
+  let canvasItem = linkedDemoItem ids.canvasItem "Linked data canvas" ids.canvas canvasType
+  let items = [linkedDemoItem ids.sourceItem "Source · edit this number" ids.source numberType, linkedDemoItem ids.doubledItem "Double the source" ids.doubled numberType, linkedDemoItem ids.resultItem "Double, then add one" ids.result numberType, linkedDemoItem ids.listItem "Linked number list" ids.list listType, canvasItem]
+  { commands = [TabEditValues { commands = map (\value -> LocusAppend { entry = LocusEntry { id = value.id, value = value } }) values }, TabEditEntries { commands = map (\item -> LocusAppend { entry = LocusEntry { id = item.id, value = item } }) items }], canvasItem = canvasItem }
+
+-- A starter copies the function's own body, ordered parameters and admitted
+-- captures. There is no wrapper-call fallback for an unreadable definition.
+@label "Copy a reflected function"
+@description "Retain a readable function as an ordinary lambda expression. Captures become lexical bindings; constructing this data never executes the function."
+@tags "view" "local-data" "demo"
+recipeDemoFunctionExpression : (outcome: ReifyOutcome) -> Result String Expr
+recipeDemoFunctionExpression outcome = case outcome of
+  Reified { package = package } -> Ok (recipeDemoCapturedExpression package.captures (system.Expr.ELambda { params = package.params, body = package.body }))
+  OpaqueBody {} -> Err "This function has no readable body to copy. No data was added."
+  _ -> Err "This function is unavailable in this reader. No data was added."
+
+recipeDemoCapturedExpression : (captures: List ReifiedCapture) -> (expression: Expr) -> Expr
+recipeDemoCapturedExpression captures expression = case head captures of
+  Nothing -> expression
+  Just capture -> system.Expr.ECall { fnId = "$", args = [
+    system.Expr.ELambda { params = [capture.name], body = recipeDemoCapturedExpression (fromMaybe [] (tail captures)) expression },
+    system.Expr.ELit { value = capture.value }
+  ] }
+
+-- ExprNode's canonical literal payload is an opaque admitted wire here. Its
+-- recursive children are validated by the shared codec before they arrive;
+-- the tab transition never interprets them. Any is truthful for this carrier,
+-- unlike typeOf on a raw object (which currently returns an empty record).
+recipeDemoCopiedExpressionType : Type
+recipeDemoCopiedExpressionType = recordType [
+  linkedDemoTypeField "kind" (typeOf ""),
+  linkedDemoTypeField "value" (assocRecord {} "$ref" "Any")
+]
+
+-- A finite projection of the existing saved-data/source command transport,
+-- not another recursive expression language. Each saved result keeps its
+-- own declared Type, including the criterion's whole-claim result type.
+recipeDemoCommandsType : (copiedExpressionType: Type) -> (pantriesType: Type) -> Type
+recipeDemoCommandsType copiedExpressionType pantriesType =
+  let textType = typeOf ""
+  let universe = assocRecord {} "$type" true
+  let unitType = assocRecord {} "$unit" true
+  let reference = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "savedExprId" textType]
+  let references = assocRecord {} "$el" (assocRecord {} "call" ["List", reference])
+  let pantriesLiteral = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "value" pantriesType]
+  let call = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "fnId" textType, linkedDemoTypeField "args" references]
+  let expression = assocRecord {} "$union" [copiedExpressionType, pantriesLiteral, call]
+  let query = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "expr" expression, linkedDemoTypeField "valueType" universe]
+  let saved = recordType [linkedDemoTypeField "id" textType, linkedDemoTypeField "slug" textType, linkedDemoTypeField "name" textType, linkedDemoTypeField "query" query]
+  let savedReference = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "id" textType]
+  let itemSource = recordType [linkedDemoTypeField "kind" textType, linkedDemoTypeField "ref" savedReference]
+  let item = recordType [linkedDemoTypeField "id" textType, linkedDemoTypeField "caption" textType, linkedDemoTypeField "source" itemSource, linkedDemoTypeField "valueType" universe]
+  let command = assocRecord {} "$el" (assocRecord {} "call" ["TabDataCommand", item, saved, unitType, unitType, unitType, unitType, unitType])
+  let commands = assocRecord {} "$el" (assocRecord {} "call" ["List", command])
+  recordType [linkedDemoTypeField "commands" commands]
+
+recipeDemoRow : (identity: { value: String, item: String }) -> String -> e -> Type -> ({ id: String, itemId: String, name: String, expression: e, valueType: Type })
+recipeDemoRow identity name expression valueType =
+  { id = identity.value, itemId = identity.item, name = name, expression = expression, valueType = valueType }
+
+-- Each criterion is called on the saved recipe and the saved pantry set, so
+-- editing either recomputes every derived item.
+recipeDemoDerivedRows : List i -> List c -> String -> r -> r -> Result String (List a)
+recipeDemoDerivedRows identities criteria recipeName recipeRef pantriesRef = case head criteria of
+  Nothing -> if length identities == 0 then Ok [] else Err "Recipe result identities do not match the source roster."
+  Just criterion -> case head identities of
+    Nothing -> Err "A recipe result has no fresh identity."
+    Just identity -> case recipeDemoDerivedRows (fromMaybe [] (tail identities)) (fromMaybe [] (tail criteria)) recipeName recipeRef pantriesRef of
+      Err message -> Err message
+      Ok rest ->
+        let expression = { kind = "call", fnId = criterion.fnId, args = [recipeRef, pantriesRef] }
+        Ok (concat [recipeDemoRow identity (join [recipeName, criterion.name] " · ") expression criterion.resultType] rest)
+
+recipeDemoExampleRows : i -> e -> List c -> Result String (List r)
+recipeDemoExampleRows identities example criteria =
+  let recipeRef = { kind = "ref", savedExprId = identities.recipe.value }
+  let pantriesRef = { kind = "ref", savedExprId = identities.pantries.value }
+  let rows = [
+    recipeDemoRow identities.recipe example.name example.expression example.recipeType,
+    recipeDemoRow identities.pantries (join [example.name, "foods"] " · ") { kind = "literal", value = example.pantries } example.pantriesType
+  ]
+  case recipeDemoDerivedRows identities.analyses criteria example.name recipeRef pantriesRef of
+    Err message -> Err message
+    Ok derived -> Ok (concat rows derived)
+
+recipeDemoRows : List i -> List e -> List c -> Result String (List r)
+recipeDemoRows identities examples criteria = case head examples of
+  Nothing -> if length identities == 0 then Ok [] else Err "Recipe identities do not match the source examples."
+  Just example -> case head identities of
+    Nothing -> Err "A recipe example has no fresh identities."
+    Just identity -> case recipeDemoExampleRows identity example criteria of
+      Err message -> Err message
+      Ok rows -> case recipeDemoRows (fromMaybe [] (tail identities)) (fromMaybe [] (tail examples)) criteria of
+        Err message -> Err message
+        Ok rest -> Ok (concat rows rest)
+
+@label "Try recipe functions"
+@description "Append editable recipe lambdas, their pantry sets and independently authored criterion calls on both to Local. Existing data and browser storage settings are preserved; the ordinary synchronization setting controls saving."
+@tags "view" "local-data" "demo" "recipes"
+recipeDemoCommands : (identities: List ({ recipe: { value: String, item: String }, pantries: { value: String, item: String }, analyses: List ({ value: String, item: String }) })) -> (examples: List ({ name: String, expression: e, recipeType: Type, pantries: p, pantriesType: Type })) -> (criteria: List ({ name: String, fnId: String, resultType: Type })) -> (copiedExpressionType: Type) -> (pantriesType: Type) -> Result String (recipeDemoCommandsType copiedExpressionType pantriesType)
+recipeDemoCommands identities examples criteria copiedExpressionType pantriesType =
+  case recipeDemoRows identities examples criteria of
+    Err message -> Err message
+    Ok rows ->
+      let values = map (\row -> linkedDemoSavedValue row.id row.name row.expression row.valueType) rows
+      let items = map (\row -> linkedDemoItem row.itemId row.name row.id row.valueType) rows
+      Ok { commands = [
+        TabEditValues { commands = map (\value -> LocusAppend { entry = LocusEntry { id = value.id, value = value } }) values },
+        TabEditEntries { commands = map (\item -> LocusAppend { entry = LocusEntry { id = item.id, value = item } }) items }
+      ] }
+
+-- Browser storage retains authored data only. The host executes one IndexedDB
+-- transaction; admission, projection and generation comparison remain here.
+-- A generation counts successful durable writes independently of draft edits.
+-- Reader registries, frames, workers and derived account projections are never
+-- restored from this record. Definition bodies and literal payloads stay data.
+
+browserDataStorageString : a -> Boolean
+browserDataStorageString value = isString value && not (eq value "")
+
+browserDataStorageRecord : a -> Boolean
+browserDataStorageRecord value = not (isNull value) && not (isArray value) && not (isString value) && not (isNumber value) && not (isBoolean value) && not (isBytes value)
+
+browserDataStorageOptionalString : a -> String -> Boolean
+browserDataStorageOptionalString value key =
+  case lookup value key of
+    Nothing -> true
+    Just text -> isString text
+
+browserDataStorageOptionalPriority : a -> Boolean
+browserDataStorageOptionalPriority value =
+  case lookup value "priority" of
+    Nothing -> true
+    Just priority -> isNumber priority && numberIsFinite priority
+
+browserDataStorageEntry : a -> Boolean
+browserDataStorageEntry entry = browserDataStorageRecord entry && browserDataStorageString entry.id && browserDataStorageRecord entry.value && eq entry.value.id entry.id
+
+browserDataStorageOwner : a -> Boolean
+browserDataStorageOwner owner =
+  if not (browserDataStorageRecord owner && browserDataStorageString owner.ownerKey && browserDataStorageString owner.storageName && browserDataStorageOptionalString owner "storageId" && browserDataStorageRecord owner.definition && browserDataStorageString owner.definition.id) then false
+  else if eq owner.kind "type" then browserDataStorageRecord owner.definition.type
+  else if eq owner.kind "function" then isArray owner.definition.params && browserDataStorageRecord owner.definition.returns
+  else false
+
+browserDataStorageField : a -> Boolean
+browserDataStorageField field =
+  browserDataStorageRecord field && browserDataStorageString field.id && isString field.currentCodeName && (eq field.status "live" || eq field.status "tombstoned") && (eq field.realm "account" || eq field.realm "repository") && (eq field.reuseVisibility "owner" || eq field.reuseVisibility "account" || eq field.reuseVisibility "repository")
+
+browserDataStorageFacet : a -> Boolean
+browserDataStorageFacet facet =
+  browserDataStorageRecord facet && browserDataStorageString facet.fieldId && browserDataStorageString facet.typeName && browserDataStorageRecord facet.methods && eq facet.scope "account" && isNumber facet.priority && numberIsFinite facet.priority && browserDataStorageOptionalString facet "rowId"
+
+browserDataStorageDefinitions : a -> Boolean
+browserDataStorageDefinitions definitions =
+  browserDataStorageRecord definitions && isArray definitions.owners && isArray definitions.fields && isArray definitions.facets && all definitions.owners browserDataStorageOwner && all definitions.fields browserDataStorageField && all definitions.facets browserDataStorageFacet
+
+browserDataStorageRepresentation : a -> Boolean
+browserDataStorageRepresentation entry =
+  let row = entry.value
+  browserDataStorageString row.typeName && isArray row.args && browserDataStorageRecord row.instance && browserDataStorageString row.instance.typeName && isArray row.instance.args && browserDataStorageRecord row.instance.methods && browserDataStorageOptionalPriority row.instance
+
+browserDataStorageValue : a -> Boolean
+browserDataStorageValue entry =
+  browserDataStorageRecord entry.value.query && eq entry.value.query.kind "expression" && browserDataStorageRecord entry.value.query.expr && browserDataExpressionValid entry.value.query.expr
+
+browserDataStorageClipboardEntry : a -> Boolean
+browserDataStorageClipboardEntry expression =
+  if not (browserDataStorageRecord expression) || not (eq expression.kind "literal") || not (browserDataStorageRecord expression.value) then false
+  else case expression.value of
+    ClipboardEntry { id = identity, data = data, typeName = typeName, transfer = transfer, bytes = bytes, copiedAt = copiedAt, source = source } -> browserDataStorageString identity && isString typeName && isString transfer && isString source && isNumber bytes && tabDataRevisionValid bytes && isNumber copiedAt && numberIsFinite copiedAt
+    _ -> false
+
+browserDataStorageClipboard : TabDataState i v r l d -> Boolean
+browserDataStorageClipboard state =
+  let identity = tabClipboardIdentity state
+  case tabDataValue state identity of
+    Nothing -> not (locusHasEntry state.entries identity)
+    Just row ->
+      if not (locusHasEntry state.entries identity) || not (eq row.query.expr.kind "literal") then false
+      else let copies = tabClipboardExpressionEntries row.query.expr
+           isArray copies && length copies <= 20 && all copies browserDataStorageClipboardEntry && tabClipboardBytes copies <= 10485760 && locusIdsValid (map (\copy -> copy.value.id) copies)
+
+browserDataStorageShape : a -> Boolean
+browserDataStorageShape state =
+  browserDataStorageRecord state && isString state.tabId && isNumber state.revision && isArray state.entries && isArray state.values && isArray state.representations && browserDataStorageRecord state.layout && browserDataStorageDefinitions state.definitions && all state.entries browserDataStorageEntry && all state.values browserDataStorageEntry && all state.representations browserDataStorageEntry && all state.entries (\entry -> browserDataItemValid entry.value) && all state.values browserDataStorageValue && all state.representations browserDataStorageRepresentation
+
+@label "Browser data snapshot"
+@description "Keep only the authored local source, revision, entries, saved values, representations, layout and definitions. No reader, frame or computed projection becomes stored authority. Bodies and literal data are retained without execution."
+@tags "view" "local-data" "storage"
+browserDataStorageSnapshot : TabDataState i v r l d -> ({ tabId: String, revision: Nat, entries: List (LocusEntry i), values: List (LocusEntry v), representations: List (LocusEntry r), layout: l, definitions: d })
+browserDataStorageSnapshot state = { tabId = state.tabId, revision = state.revision, entries = state.entries, values = state.values, representations = state.representations, layout = state.layout, definitions = state.definitions }
+
+browserDataStorageCheckState : String -> a -> Result String Any
+browserDataStorageCheckState sourceId state =
+  if not (browserDataStorageShape state) then Err "Local data has a damaged stored shape. Its saved copy was kept."
+  else if not (eq state.tabId sourceId) then Err "Local data belongs to another source. Its saved copy was kept."
+  else case validateTabData state of
+    Err message -> Err message
+    Ok valid -> if browserDataStorageClipboard valid then Ok (browserDataStorageSnapshot valid) else Err "Local Clipboard has damaged stored entries. Its saved copy was kept."
+
+browserDataStorageRecordGeneration : a -> Boolean
+browserDataStorageRecordGeneration record = isNumber record.generation && tabDataRevisionValid record.generation && record.generation >= 1
+
+@label "Read stored browser data"
+@description "Admit an absent or versioned local data snapshot without evaluating any body. Unknown versions, damaged containers or another source identity refuse without replacing the saved record."
+@tags "view" "local-data" "storage"
+browserDataStoredState : String -> Maybe Any -> Result String (Maybe Any)
+browserDataStoredState sourceId record =
+  case record of
+    Nothing -> Ok (Nothing)
+    Just stored ->
+      if not (browserDataStorageRecord stored) then Err "Local data has a damaged storage record. Its saved copy was kept."
+      else if not (eq stored.schema "fenel.local-data.v1") then Err "This Local data storage version is not supported. Its saved copy was kept."
+      else if not (browserDataStorageRecordGeneration stored) then Err "Local data has an invalid storage generation. Its saved copy was kept."
+      else case browserDataStorageCheckState sourceId stored.data of
+        Err message -> Err message
+        Ok state -> Ok (Just state)
+
+@label "Stored browser data generation"
+@description "Read the durable generation from an already admitted storage record. Absence remains Nothing."
+@tags "view" "local-data" "storage"
+browserDataStorageGeneration : Maybe Any -> Maybe Number
+browserDataStorageGeneration record =
+  case record of
+    Nothing -> Nothing
+    Just stored -> if browserDataStorageRecord stored && browserDataStorageRecordGeneration stored then Just stored.generation else Nothing
+
+browserDataStorageExpected : Maybe Any -> Maybe Number -> Boolean
+browserDataStorageExpected record expected =
+  case expected of
+    Nothing -> case record of
+      Nothing -> true
+      Just stored -> false
+    Just generation ->
+      let matchesStoredRecord = \currentRecord ->
+        case currentRecord of
+          Nothing -> false
+          Just stored -> eq stored.generation generation
+      isNumber generation && tabDataRevisionValid generation && matchesStoredRecord record
+
+@label "Plan browser data storage"
+@description "Plan one atomic durable write only if the admitted saved generation matches its captured expectation. Every successful write advances generation once, independently of in-memory edits; conflict, damaged data and exhausted counters retain the saved copy."
+@tags "view" "local-data" "storage"
+browserDataStoragePlan : String -> Maybe Any -> Maybe Number -> TabDataState i v r l d -> Result String ({ schema: String, generation: Nat, data: { tabId: String, revision: Nat, entries: List (LocusEntry i), values: List (LocusEntry v), representations: List (LocusEntry r), layout: l, definitions: d } })
+browserDataStoragePlan sourceId record expectedGeneration state =
+  case browserDataStoredState sourceId record of
+    Err message -> Err message
+    Ok previous ->
+      if not (browserDataStorageExpected record expectedGeneration) then Err "Local data was saved in another tab. Reload it before saving these edits."
+      else case browserDataStorageCheckState sourceId state of
+        Err message -> Err message
+        Ok snapshot ->
+          let generation =
+            case browserDataStorageGeneration record of
+              Nothing -> 0
+              Just current -> current
+          if generation >= 9007199254740991 then Err "Local data's storage generation cannot advance safely. Its saved copy was kept."
+          else Ok { schema = "fenel.local-data.v1", generation = generation + 1, data = snapshot }
+
+@label "Restore synced browser data"
+@description "Discard local drafts by restoring one admitted snapshot of the same source, advancing the current reader revision so older editors cannot change the restored content. Restore the saved Clipboard in full, including entries evicted by an unsaved draft. Saved definitions and representations equal to the current ones keep the current values, so the reader checked from them stays valid. The durable storage generation is unchanged."
+@tags "view" "local-data" "storage"
+browserDataRestoreSnapshot : TabDataState i v r l d -> TabDataState i v r l d -> Result String (TabDataState i v r l d)
+browserDataRestoreSnapshot current restored =
+  if not (browserDataStorageRecord current && browserDataStorageString current.tabId && isNumber current.revision && tabDataRevisionValid current.revision) then Err "Local data has no readable source identity or reader revision. Its saved copy was kept."
+  else if current.revision >= 9007199254740991 then Err "Local data's reader revision cannot advance safely. Its saved copy was kept."
+  else case browserDataStorageCheckState current.tabId restored of
+    Err message -> Err message
+    Ok validRestored ->
+      let withDefinitions = if eq validRestored.definitions current.definitions then mapSet validRestored "definitions" current.definitions else validRestored
+      let shared = if eq withDefinitions.representations current.representations then mapSet withDefinitions "representations" current.representations else withDefinitions
+      Ok (mapSet shared "revision" (current.revision + 1))
+
+-- The Local roster as the catalogue worker observes it: identities, counts and
+-- observed identity sets only. The worker supplies it; definitions are never
+-- interpreted here. The worker reuses its repository rows and adds Local's own
+-- rows only when no Local fact can change a repository row; the refusal names
+-- the first fact that could, and the worker then builds the catalogue live.
+-- `observed` is False when the worker could not read every fact below.
+@label "Admit Local to the repository catalogue"
+@description "Decide whether this Local roster can reuse the build-owned repository authoring catalogue, adding only Local's own declaration rows. Local functions, types, fields, facets and representations are admitted when every Local fact stays on Local identities: the repository shape is unchanged (same fingerprint, so no identity takeover), every Local-visible dispatch row targets a Local declaration or an admitted saved data identity, every facet targets a Local field, every field is an account field, and no Local declaration or used saved identity, type, name or module root collides with the repository. Local type names are the one exception, placed exactly as the type list places them: a repository type row listed before Local's rows with a shape keeps its name, one listed before them without a shape takes the Local type's shape, and one first listed after them yields its name to the Local type; a type name collision the worker could not place refuses. Saved data identities are nonempty strings and never become catalogue declarations. Source modules, another source, duplicate or unmatched owners, or any fact the worker could not observe refuse, so the worker builds the catalogue live."
+@tags "view" "local-data" "catalogue"
+localCatalogueAdmission : ({ sourceId: String, catalogueSourceId: String, observed: Bool, repositoryFingerprint: String, catalogueFingerprint: String, ownerKinds: List String, ownerIds: List String, functionIds: List String, entityIds: List String, fieldIds: List String, fieldRealms: List String, facetFieldIds: List String, localIdentities: List String, localValueIds: List String, localRowTargets: List String, representationCount: Nat, sourceModuleCount: Nat, repositoryMentions: List String, repositoryValueMentions: List String, entityCollisions: List String, nameCollisions: List String, typeNameCollisions: List String, repositoryKeepsTypeNames: List String, localShapesTypeNames: List String, localTakesTypeNames: List String, rootCollisions: List String }) -> Result String Unit
+localCatalogueAdmission roster =
+  if not (eq roster.sourceId roster.catalogueSourceId) then Err "OtherLocalSource"
+  else if roster.sourceModuleCount > 0 then Err "LocalSourceModulesPresent"
+  else if not (eq (length (unique roster.functionIds)) (length roster.functionIds)) then Err "DuplicateLocalFunctions"
+  else if not (eq (length (unique roster.entityIds)) (length roster.entityIds)) then Err "DuplicateLocalTypes"
+  else if not (all roster.ownerKinds (\kind -> eq kind "function" || eq kind "type")) then Err "UnsupportedLocalOwner"
+  else if not (eq (length (unique roster.ownerIds)) (length roster.ownerIds) && eq (length roster.ownerIds) (length roster.functionIds + length roster.entityIds) && all roster.ownerIds (\id -> includes roster.functionIds id || includes roster.entityIds id)) then Err "UnmatchedLocalOwners"
+  else if not (all roster.fieldRealms (\realm -> eq realm "account")) then Err "RepositoryFieldInLocal"
+  else if not (all roster.facetFieldIds (\id -> includes roster.fieldIds id)) then Err "LocalFacetTargetsRepository"
+  else if not roster.observed then Err "LocalFactsUnobserved"
+  else if not (eq roster.repositoryFingerprint roster.catalogueFingerprint) then Err "RepositoryChanged"
+  else if not (isArray roster.localValueIds && all roster.localValueIds browserDataStorageString) then Err "InvalidLocalValueIdentities"
+  else if not (all roster.localRowTargets (\target -> includes roster.localIdentities target || includes roster.localValueIds target)) then Err "LocalRowTargetsRepository"
+  else if not (eq (length roster.repositoryMentions) 0) then Err "LocalIdentityCollides"
+  else if some roster.repositoryValueMentions (\id -> includes roster.localRowTargets id) then Err "LocalValueIdentityCollides"
+  else if not (eq (length roster.entityCollisions) 0) then Err "LocalTypeCollides"
+  else if not (eq (length roster.nameCollisions) 0) then Err "LocalNameCollides"
+  else if not (all roster.typeNameCollisions (\name -> includes roster.repositoryKeepsTypeNames name || includes roster.localShapesTypeNames name || includes roster.localTakesTypeNames name)) then Err "LocalTypeNameCollides"
+  else if not (eq (length roster.rootCollisions) 0) then Err "LocalRootShadowsRepository"
+  else Ok ()

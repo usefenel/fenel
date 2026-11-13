@@ -1,0 +1,516 @@
+module engine where
+
+-- widget-hint — the pure-structural SetExpr readers behind the type→widget
+-- mapping (`widget-hint.ts`'s `numberWidgetFor` / `stringWidgetFor` /
+-- `dateWidgetFor` / `widgetForType` picker policy, which stays TS for now).
+--
+-- set-algebra-to-fenel Phase 3b-3b (the engine-`src` harvest slice, lead =
+-- widget-hint). These four readers are pure traversals of a `SetExpr` — with
+-- the `$`-key barrier gone (3b-2 producer flip + `0085` at-rest flip), a Fenel
+-- body reads the registered `$tag` `Se*` ADT directly. They touch NO `SePattern`
+-- arm (strategy C — zero `patternToRegex` entanglement), so they port with no
+-- new TS. Mirrors the TS oracle at
+-- implementations/typescript/engine/src/widget-hint.ts (the four reader bodies,
+-- now thin `dispatchEngineBody` wrappers).
+--
+-- DUAL-READ (Step-0 decision #5): each reader matches the canonical `$tag` `Se*`
+-- ADT FIRST, then the legacy `$`-key form via `lookup` (the transition
+-- tolerance, mirroring the TS readers' `peelSetExpr` dual-read + the 3b-3a
+-- telegram precedent). The `$`-key arm drops in 3b-3 Step 1 when the codec +
+-- `peelSetExpr`'s `$`-key arm collapse (B2-blocked + capstone-gated — it stays
+-- for now). Live `$`-key INPUT fixtures still reach these readers
+-- (field-meta-unit-phantom / typed-ref-prim-consumers feed `{$interval}` to
+-- `widgetForType`), so dual-read is required for byte-identity.
+--
+-- Branch recursion uses the `case head bs of Nothing/Just … case tail bs of …`
+-- head/tail idiom from `set-algebra-deciders.fenel` (no lambdas / `some`/`all`
+-- arg-order assumptions). All helpers `widget…`-prefixed + engine-internal.
+
+-- ---------------------------------------------------------------------------
+-- impliesInteger — does the set imply integer-valued numbers?
+--   SeRef    → handle ∈ {ℤ, Int, ℕ, Nat}
+--   SeIntersect → SOME branch implies integer
+--   SeEnum   → ALL values are integers (typeof number && Number.isInteger)
+--   else     → false
+-- ---------------------------------------------------------------------------
+
+@label "widget-hint: impliesInteger"
+@description "Phase 3b-3b — does a SetExpr imply integer-valued numbers? SeRef(ℤ/Int/ℕ/Nat) / SeIntersect(some branch) / SeEnum(all values integer) → Bool; else false. Dual-reads the canonical $tag Se* ADT then the legacy $-key form. Mirrors widget-hint.ts:impliesInteger; dispatched from the TS wrapper."
+@tags "engine" "widget-hint" "set-expr" "reader" "phase-3b-3b"
+@category "engine-internal"
+impliesInteger : (set: a) -> Bool
+impliesInteger set =
+  case set of
+    SeRef { handle = h } -> widgetHandleIsInt h
+    SeIntersect { branches = bs } -> widgetSomeImpliesInt bs
+    SeEnum { values = vs } -> widgetAllInt vs
+    _ -> widgetImpliesIntegerLegacy set
+
+-- widgetHandleIsInt — the integer-implying name-handles.
+@category "engine-internal"
+widgetHandleIsInt : (h: String) -> Bool
+widgetHandleIsInt h =
+  if eq h "ℤ" then true
+  else if eq h "Int" then true
+  else if eq h "ℕ" then true
+  else eq h "Nat"
+
+-- widgetSomeImpliesInt — SOME branch implies integer (head/tail recursion).
+@category "engine-internal"
+widgetSomeImpliesInt : (bs: List a) -> Bool
+widgetSomeImpliesInt bs =
+  case head bs of
+    Nothing -> false
+    Just first ->
+      if impliesInteger first
+      then true
+      else
+        case tail bs of
+          Nothing -> false
+          Just rest -> widgetSomeImpliesInt rest
+
+-- widgetAllInt — every value must be positively admitted by the shared Int
+-- membership. Refusal or resource abstention cannot imply an integer widget.
+@category "engine-internal"
+widgetAllInt : (vs: List a) -> Bool
+widgetAllInt vs =
+  case head vs of
+    Nothing -> true
+    Just first ->
+      let admitted = case std.intExactMembership first of
+            Just true -> true
+            _ -> false
+      if admitted
+      then
+        case tail vs of
+          Nothing -> true
+          Just rest -> widgetAllInt rest
+      else false
+
+-- widgetImpliesIntegerLegacy — the `$`-key dual-read fallback (SeRef via
+-- $ref/$named, SeIntersect via $intersect, SeEnum via $enum).
+@category "engine-internal"
+widgetImpliesIntegerLegacy : (set: a) -> Bool
+widgetImpliesIntegerLegacy set =
+  case lookup set "$ref" of
+    Just h -> widgetHandleIsInt h
+    Nothing ->
+      case lookup set "$named" of
+        Just h -> widgetHandleIsInt h
+        Nothing ->
+          case lookup set "$intersect" of
+            Just bs -> widgetSomeImpliesInt bs
+            Nothing ->
+              case lookup set "$enum" of
+                Just vs -> widgetAllInt vs
+                Nothing -> false
+
+-- ---------------------------------------------------------------------------
+-- extractInterval — the interval constraining the set, if any.
+--   SeInterval  → Just interval
+--   SeIntersect → FIRST branch that yields an interval
+--   else        → Nothing
+-- ---------------------------------------------------------------------------
+
+@label "widget-hint: extractInterval"
+@description "Phase 3b-3b — extract the interval constraining a SetExpr. SeInterval → Just interval; SeIntersect → first branch yielding an interval; else Nothing. Dual-reads the canonical $tag Se* ADT then the legacy $-key form. Mirrors widget-hint.ts:extractInterval; the TS wrapper collapses Just/Nothing to interval|null."
+@tags "engine" "widget-hint" "set-expr" "reader" "phase-3b-3b"
+@category "engine-internal"
+extractInterval : (set: a) -> Maybe a
+extractInterval set =
+  case set of
+    SeInterval { interval = iv } -> Just iv
+    SeIntersect { branches = bs } -> widgetFirstInterval bs
+    _ -> widgetExtractIntervalLegacy set
+
+-- widgetFirstInterval — first branch yielding an interval (head/tail recursion).
+@category "engine-internal"
+widgetFirstInterval : (bs: List a) -> Maybe a
+widgetFirstInterval bs =
+  case head bs of
+    Nothing -> Nothing
+    Just first ->
+      case extractInterval first of
+        Just iv -> Just iv
+        Nothing ->
+          case tail bs of
+            Nothing -> Nothing
+            Just rest -> widgetFirstInterval rest
+
+-- widgetExtractIntervalLegacy — the `$`-key dual-read fallback.
+@category "engine-internal"
+widgetExtractIntervalLegacy : (set: a) -> Maybe a
+widgetExtractIntervalLegacy set =
+  case lookup set "$interval" of
+    Just iv -> Just iv
+    Nothing ->
+      case lookup set "$intersect" of
+        Just bs -> widgetFirstInterval bs
+        Nothing -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- extractEnum — the finite value set constraining the set, if any.
+--   SeEnum      → Just values   (an EMPTY list still counts — TS `[]` truthy)
+--   SeIntersect → FIRST branch that yields an enum
+--   else        → Nothing
+-- ---------------------------------------------------------------------------
+
+@label "widget-hint: extractEnum"
+@description "Phase 3b-3b — extract the finite value set constraining a SetExpr. SeEnum → Just values (an empty list still counts, mirroring the TS `[]`-truthy); SeIntersect → first branch yielding an enum; else Nothing. Dual-reads the canonical $tag Se* ADT then the legacy $-key form. Mirrors widget-hint.ts:extractEnum; the TS wrapper collapses Just/Nothing to values|null."
+@tags "engine" "widget-hint" "set-expr" "reader" "phase-3b-3b"
+@category "engine-internal"
+extractEnum : (set: a) -> Maybe a
+extractEnum set =
+  case set of
+    SeEnum { values = vs } -> Just vs
+    SeIntersect { branches = bs } -> widgetFirstEnum bs
+    _ -> widgetExtractEnumLegacy set
+
+-- widgetFirstEnum — first branch yielding an enum (head/tail recursion).
+@category "engine-internal"
+widgetFirstEnum : (bs: List a) -> Maybe a
+widgetFirstEnum bs =
+  case head bs of
+    Nothing -> Nothing
+    Just first ->
+      case extractEnum first of
+        Just e -> Just e
+        Nothing ->
+          case tail bs of
+            Nothing -> Nothing
+            Just rest -> widgetFirstEnum rest
+
+-- widgetExtractEnumLegacy — the `$`-key dual-read fallback.
+@category "engine-internal"
+widgetExtractEnumLegacy : (set: a) -> Maybe a
+widgetExtractEnumLegacy set =
+  case lookup set "$enum" of
+    Just vs -> Just vs
+    Nothing ->
+      case lookup set "$intersect" of
+        Just bs -> widgetFirstEnum bs
+        Nothing -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- hasNamed — is the named handle present in the set?
+--   SeRef       → handle == name
+--   SeIntersect → SOME branch hasNamed
+--   SeUnion     → ALL branches hasNamed
+--   else        → false
+-- ---------------------------------------------------------------------------
+
+@label "widget-hint: hasNamed"
+@description "Phase 3b-3b — is a named handle present in a SetExpr? SeRef → handle == name; SeIntersect → some branch; SeUnion → all branches; else false. Dual-reads the canonical $tag Se* ADT then the legacy $-key form. Mirrors widget-hint.ts:hasNamed; dispatched from the TS wrapper."
+@tags "engine" "widget-hint" "set-expr" "reader" "phase-3b-3b"
+@category "engine-internal"
+hasNamed : (set: a) -> (name: String) -> Bool
+hasNamed set name =
+  case set of
+    SeRef { handle = h } -> eq h name
+    SeIntersect { branches = bs } -> widgetSomeHasNamed bs name
+    SeUnion { branches = bs } -> widgetAllHasNamed bs name
+    _ -> widgetHasNamedLegacy set name
+
+-- widgetSomeHasNamed — SOME branch hasNamed (head/tail recursion).
+@category "engine-internal"
+widgetSomeHasNamed : (bs: List a) -> (name: String) -> Bool
+widgetSomeHasNamed bs name =
+  case head bs of
+    Nothing -> false
+    Just first ->
+      if hasNamed first name
+      then true
+      else
+        case tail bs of
+          Nothing -> false
+          Just rest -> widgetSomeHasNamed rest name
+
+-- widgetAllHasNamed — ALL branches hasNamed (head/tail recursion; [] → true).
+@category "engine-internal"
+widgetAllHasNamed : (bs: List a) -> (name: String) -> Bool
+widgetAllHasNamed bs name =
+  case head bs of
+    Nothing -> true
+    Just first ->
+      if hasNamed first name
+      then
+        case tail bs of
+          Nothing -> true
+          Just rest -> widgetAllHasNamed rest name
+      else false
+
+-- widgetHasNamedLegacy — the `$`-key dual-read fallback (SeRef via $ref/$named,
+-- SeIntersect via $intersect, SeUnion via $union).
+@category "engine-internal"
+widgetHasNamedLegacy : (set: a) -> (name: String) -> Bool
+widgetHasNamedLegacy set name =
+  case lookup set "$ref" of
+    Just h -> eq h name
+    Nothing ->
+      case lookup set "$named" of
+        Just h -> eq h name
+        Nothing ->
+          case lookup set "$intersect" of
+            Just bs -> widgetSomeHasNamed bs name
+            Nothing ->
+              case lookup set "$union" of
+                Just bs -> widgetAllHasNamed bs name
+                Nothing -> false
+
+-- ===========================================================================
+-- The widget PICKER policy — numberWidgetFor / stringWidgetFor / dateWidgetFor.
+--
+-- set-algebra-to-fenel Phase 3b-3d — the 3 per-base-type pickers (SetExpr ->
+-- WidgetHint) that CONSUME the 4 sub-readers above (3b-3b) + the SePattern
+-- serialiser (3b-3c). Completes widget-hint.ts's SetExpr-reader surface; the TS
+-- side keeps only widgetForType (the FenelType $-walk + the phantom-unit lift —
+-- the legitimate $-barrier residual) + widgetForField + the thin dispatch seams
+-- (incl. the `!set` unconstrained guard, kept TS per Step-0 §B). Mirrors the TS
+-- oracle at widget-hint.ts:numberWidgetFor/stringWidgetFor/dateWidgetFor.
+--
+-- WidgetHint = { widget: String, reason: String, config?: Record, alternatives?: [String] }.
+-- The Fenel bodies are TOTAL over a CONCRETE `set` (the TS wrapper handles `!set`).
+--
+-- THE FUNCTION-NAME-KEY HAZARD (3b-3c): a SINGLE-key record `{ k = v }` whose key
+-- is a registered fn/op evaluates as a CALL, not a record. `min`/`max` are
+-- registered fns (math-native), so single-key configs (`{min}`/`{max}`, the
+-- half-bounded + date arms) build via `whRec1` (= `fromEntries [{key,value}]`, the
+-- 3b-3c jscRec1 twin). MULTI-key configs (`{min,max,step}`, …) stay plain (safe).
+-- For uniform safety every SINGLE-key config goes through `whRec1`.
+--
+-- NUMERIC HELPERS (Step-0 §5): whNumBound remodels the TS numLo/numHi to
+-- `{ finite, value, inclusive }` (finite=false for Nothing / non-number / non-finite;
+-- value a 0 placeholder then, NEVER read — every use is gated on finite). Avoids
+-- producing ±Infinity in a .fenel body; observationally identical (±Infinity's only
+-- TS consumer is Number.isFinite ⇒ false). reason-string interpolations port to
+-- `concat (toString n) …` (toString = String(n), matches JS `${n}` for finite n).
+-- ===========================================================================
+
+-- whRec1 — single-key record `{ k = v }` WITHOUT the fn-name-key call collision
+-- (the key is a runtime string value ⇒ fromEntries builds a plain {[k]:v}).
+@category "engine-internal"
+whRec1 : (k: String) -> (v: a) -> b
+whRec1 k v =
+  let entry = { key = k, value = v }
+  fromEntries (appendItem entry [])
+
+-- whEnumHint — the shared enum WidgetHint: { widget, reason = `${count}<suffix>`,
+-- config = { options } }. Used by both number (≤4/15) and string (≤5/20) enums.
+@category "engine-internal"
+whEnumHint : (widget: String) -> (count: Number) -> (suffix: String) -> (enumVals: a) -> b
+whEnumHint widget count suffix enumVals =
+  { widget = widget, reason = concat (toString count) suffix, config = whRec1 "options" enumVals }
+
+-- ---------------------------------------------------------------------------
+-- numberWidgetFor — enum -> radio/dropdown/searchable; interval -> stepper/
+-- slider/percent/bounded/half; else number-input. (set is CONCRETE here.)
+-- ---------------------------------------------------------------------------
+
+@label "widget-hint: numberWidgetFor"
+@description "Phase 3b-3d — pick the UI widget for a number-typed SetExpr. Enum -> radio(≤4)/dropdown(≤15)/searchable-select by count; interval (finite+integer) -> stepper(≤5)/slider-with-stops(≤20)/slider(≤200) via integerCount; [0,1] non-integer -> percentage slider; finite -> bounded slider; half-bounded -> number-input{min?,max?}; else number-input. Returns a WidgetHint. The `!set` unconstrained-number case is handled by the TS wrapper. Mirrors widget-hint.ts:numberWidgetFor."
+@tags "engine" "widget-hint" "set-expr" "picker" "phase-3b-3d"
+numberWidgetFor : (set: a) -> b
+numberWidgetFor set =
+  case extractEnum set of
+    Just enumVals -> whNumberEnum (length enumVals) enumVals
+    Nothing ->
+      case extractInterval set of
+        Just iv -> whNumberInterval iv (impliesInteger set)
+        Nothing -> { widget = "number-input", reason = "numeric type" }
+
+@category "engine-internal"
+whNumberEnum : (count: Number) -> (enumVals: a) -> b
+whNumberEnum count enumVals =
+  if lte count 4 then whEnumHint "radio" count " discrete values" enumVals
+  else if lte count 15 then whEnumHint "dropdown" count " discrete values" enumVals
+  else whEnumHint "searchable-select" count " discrete values" enumVals
+
+@category "engine-internal"
+whNumberInterval : (iv: a) -> (isInt: Bool) -> b
+whNumberInterval iv isInt =
+  let lo = whNumBound iv.lo
+  let hi = whNumBound iv.hi
+  let hasFinite = and lo.finite hi.finite
+  if and hasFinite isInt
+  then whNumberIntArms iv lo hi isInt
+  else whNumberContArms lo hi isInt hasFinite
+
+-- whNumberIntArms — finite + integer: stepper(≤5)/slider-stops(≤20)/slider(≤200),
+-- else fall through to the continuous cascade (hasFinite=true here).
+@category "engine-internal"
+whNumberIntArms : (iv: a) -> (lo: b) -> (hi: c) -> (isInt: Bool) -> d
+whNumberIntArms iv lo hi isInt =
+  case whIntegerCount iv of
+    Nothing -> whNumberContArms lo hi isInt true
+    Just count ->
+      if lte count 5 then whStepperHint count lo hi
+      else if lte count 20 then whSliderStopsHint count lo hi
+      else if lte count 200 then whSliderIntHint lo hi
+      else whNumberContArms lo hi isInt true
+
+@category "engine-internal"
+whStepperHint : (count: Number) -> (lo: a) -> (hi: b) -> c
+whStepperHint count lo hi =
+  { widget = "stepper"
+  , reason = concat (toString count) (concat " integer values in [" (concat (toString lo.value) (concat ", " (concat (toString hi.value) "]"))))
+  , config = { min = lo.value, max = hi.value, step = 1 }
+  , alternatives = ["radio", "slider"]
+  }
+
+@category "engine-internal"
+whSliderStopsHint : (count: Number) -> (lo: a) -> (hi: b) -> c
+whSliderStopsHint count lo hi =
+  { widget = "slider"
+  , reason = concat (toString count) " integer values — slider with stops"
+  , config = { min = lo.value, max = hi.value, step = 1, showStops = true }
+  , alternatives = ["stepper", "number-input"]
+  }
+
+@category "engine-internal"
+whSliderIntHint : (lo: a) -> (hi: b) -> c
+whSliderIntHint lo hi =
+  { widget = "slider"
+  , reason = concat "integer range [" (concat (toString lo.value) (concat ", " (concat (toString hi.value) "]")))
+  , config = { min = lo.value, max = hi.value, step = 1 }
+  , alternatives = ["number-input"]
+  }
+
+-- whNumberContArms — the [0,1]-percent / bounded / half-bounded cascade. The
+-- percent hint is INLINED (a nullary helper would be a function REFERENCE, not its
+-- value — Fenel has no 0-arg call syntax).
+@category "engine-internal"
+whNumberContArms : (lo: a) -> (hi: b) -> (isInt: Bool) -> (hasFinite: Bool) -> c
+whNumberContArms lo hi isInt hasFinite =
+  if and hasFinite (and (eq lo.value 0) (and (eq hi.value 1) (not isInt)))
+  then { widget = "slider", reason = "continuous [0, 1] — percentage/fraction", config = { min = 0, max = 1, step = 0.01, format = "percent" }, alternatives = ["number-input"] }
+  else if hasFinite then whBoundedHint lo hi
+  else whHalfBoundedHint lo hi
+
+@category "engine-internal"
+whBoundedHint : (lo: a) -> (hi: b) -> c
+whBoundedHint lo hi =
+  { widget = "slider"
+  , reason = concat "bounded range [" (concat (toString lo.value) (concat ", " (concat (toString hi.value) "]")))
+  , config = { min = lo.value, max = hi.value }
+  , alternatives = ["number-input"]
+  }
+
+@category "engine-internal"
+whHalfBoundedHint : (lo: a) -> (hi: b) -> c
+whHalfBoundedHint lo hi =
+  { widget = "number-input"
+  , reason = "half-bounded range"
+  , config = mergeRecords (whHalfMin lo) (whHalfMax hi)
+  }
+
+@category "engine-internal"
+whHalfMin : (lo: a) -> b
+whHalfMin lo = if lo.finite then whRec1 "min" lo.value else {}
+
+@category "engine-internal"
+whHalfMax : (hi: a) -> b
+whHalfMax hi = if hi.finite then whRec1 "max" hi.value else {}
+
+-- whNumBound — remodel of TS numLo/numHi: { finite, value, inclusive }. finite=false
+-- for Nothing / non-number / non-finite (value a 0 placeholder then, never read).
+@category "engine-internal"
+whNumBound : (mb: a) -> b
+whNumBound mb =
+  case mb of
+    Nothing -> { finite = false, value = 0, inclusive = false }
+    Just b ->
+      if isNumber b.value
+      then { finite = numberIsFinite b.value, value = b.value, inclusive = b.inclusive }
+      else { finite = false, value = 0, inclusive = false }
+
+-- whIntegerCount — count of integers in [lo, hi] (the TS integerCount): Nothing
+-- when a bound is non-finite; else ceil/floor the bounds per inclusivity.
+@category "engine-internal"
+whIntegerCount : (iv: a) -> Maybe Number
+whIntegerCount iv =
+  let lo = whNumBound iv.lo
+  let hi = whNumBound iv.hi
+  if or (not lo.finite) (not hi.finite)
+  then Nothing
+  else
+    let loStart = if lo.inclusive then ceil lo.value else add (floor lo.value) 1
+    let hiEnd = if hi.inclusive then floor hi.value else sub (ceil hi.value) 1
+    if gte hiEnd loStart then Just (add (sub hiEnd loStart) 1) else Just 0
+
+-- ---------------------------------------------------------------------------
+-- stringWidgetFor — enum -> radio/dropdown/searchable; format:* named -> typed
+-- inputs; SePattern -> pattern-constrained; else text-input. (set CONCRETE.)
+-- ---------------------------------------------------------------------------
+
+@label "widget-hint: stringWidgetFor"
+@description "Phase 3b-3d — pick the UI widget for a string-typed SetExpr. Enum -> radio(≤5)/dropdown(≤20)/searchable-select by count; named format:email/url/phone/uuid -> email/url/phone/text(monospace) inputs; SePattern -> pattern-constrained text-input (regex via rxhPatternToRegex∘rxhReadPat, the 3b-3c serialiser); else text-input. Returns a WidgetHint. The `!set` unconstrained-string case is handled by the TS wrapper. Dual-reads the $tag SePattern then the legacy $-key. Mirrors widget-hint.ts:stringWidgetFor."
+@tags "engine" "widget-hint" "set-expr" "picker" "phase-3b-3d"
+stringWidgetFor : (set: a) -> b
+stringWidgetFor set =
+  case extractEnum set of
+    Just enumVals -> whStringEnum (length enumVals) enumVals
+    Nothing -> whStringNamed set
+
+@category "engine-internal"
+whStringEnum : (count: Number) -> (enumVals: a) -> b
+whStringEnum count enumVals =
+  if lte count 5 then whEnumHint "radio" count " options" enumVals
+  else if lte count 20 then whEnumHint "dropdown" count " options" enumVals
+  else whEnumHint "searchable-select" count " options — too many for dropdown" enumVals
+
+@category "engine-internal"
+whStringNamed : (set: a) -> b
+whStringNamed set =
+  if hasNamed set "format:email" then { widget = "email-input", reason = "email format", config = whRec1 "inputType" "email" }
+  else if hasNamed set "format:url" then { widget = "url-input", reason = "URL format", config = whRec1 "inputType" "url" }
+  else if hasNamed set "format:phone" then { widget = "phone-input", reason = "phone format", config = whRec1 "inputType" "tel" }
+  else if hasNamed set "format:uuid" then { widget = "text-input", reason = "UUID format", config = { inputType = "text", monospace = true } }
+  else whStringPattern set
+
+-- whStringPattern — the SePattern arm (dual-read $tag then legacy $pattern); the
+-- regex serialises via the 3b-3c rxhPatternToRegex ∘ rxhReadPat.
+@category "engine-internal"
+whStringPattern : (set: a) -> b
+whStringPattern set =
+  case set of
+    SePattern { pattern = p } -> whPatternHint p
+    _ ->
+      case lookup set "$pattern" of
+        Just p -> whPatternHint p
+        Nothing -> { widget = "text-input", reason = "string type" }
+
+@category "engine-internal"
+whPatternHint : (p: a) -> b
+whPatternHint p =
+  let r = rxhPatternToRegex (rxhReadPat p)
+  if r.ok
+  then { widget = "text-input", reason = "pattern-constrained", config = { pattern = r.value, showPatternMatch = true } }
+  else { widget = "text-input", reason = "pattern-constrained", config = whRec1 "showPatternMatch" true }
+
+-- ---------------------------------------------------------------------------
+-- dateWidgetFor — date-picker; min/max lifted from an interval's Just bounds
+-- (raw bound values, no isNumber guard — dates store differently). set CONCRETE.
+-- ---------------------------------------------------------------------------
+
+@label "widget-hint: dateWidgetFor"
+@description "Phase 3b-3d — pick the UI widget for a date-typed SetExpr: always date-picker, with config {min?,max?} lifted from an interval's Just bounds (raw bound .value, no isNumber guard — date precision lives in $where). Returns a WidgetHint. The `!set` case (empty config) is handled by the TS wrapper. Mirrors widget-hint.ts:dateWidgetFor."
+@tags "engine" "widget-hint" "set-expr" "picker" "phase-3b-3d"
+dateWidgetFor : (set: a) -> b
+dateWidgetFor set =
+  case extractInterval set of
+    Nothing -> { widget = "date-picker", reason = "date type", config = {} }
+    Just iv -> { widget = "date-picker", reason = "date type", config = mergeRecords (whDateMin iv.lo) (whDateMax iv.hi) }
+
+@category "engine-internal"
+whDateMin : (lo: a) -> b
+whDateMin lo =
+  case lo of
+    Nothing -> {}
+    Just b -> whRec1 "min" b.value
+
+@category "engine-internal"
+whDateMax : (hi: a) -> b
+whDateMax hi =
+  case hi of
+    Nothing -> {}
+    Just b -> whRec1 "max" b.value

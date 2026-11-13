@@ -1,0 +1,254 @@
+-- =========================================================================
+-- module auth where — session lifecycle + password ops + admin bootstrap.
+--
+-- module-substrate Phase 3m (2026-05-31) — the cross-file UNION representative.
+-- THIS file + `cookies.fenel` BOTH carry `module auth where`, so they UNION
+-- into one `auth` module (`loadFenelModuleUnion` groups by header — OQ3). A
+-- top-level name colliding across the two files would be a LOAD-TIME ERROR
+-- (Haskell semantics); the two files are disjoint by construction.
+--
+-- The 6 orchestrators (issueSession + resolveToken + revokeToken + setPassword
+-- + loginWithPassword + bootstrapAdmin) were hand-wrapped TS `defineFunction`
+-- specs in the retired `engine/src/modules/auth.ts`; their identity + the
+-- `@ioAction` IO-handler name now ride @facet directives here. The 9 private
+-- session helpers (resolveFromRow / … / createMembershipForRole) are ordinary
+-- top-level defs — under Phase 3j the directive-free def-path gives them
+-- Codeable ONLY (matching the retired Codeable-only re-registration loop), so
+-- the hand loop is GONE; they ride the module naturally and stay callable for
+-- cross-fn dispatch. The `HasStateIO` requires on the 6 orchestrators are
+-- INFERRED transitively from their `state:*` calls (attachInferredRequires),
+-- not hand-declared (the 3a precedent). No stored @category — the `auth`
+-- category derives at read time from the `auth:` id prefix (Phase 3j).
+--
+-- Phase 12c-core sub-step 3 of the ts-elimination workstream (origin). Lifts
+-- the 6 async orchestrators in core/src/auth.ts behind thin
+-- invokeIOAction("auth:<name>") wrappers.
+--
+-- ts-elimination-completion Phase 3 (2026-06-02) added a 7th orchestrator,
+-- devLogin (the last TS-only auth fn) — same @ioAction wrapper pattern; its
+-- @fenel/db import drained core/auth.ts from DIRECT_DB_LEAF_ALLOW.
+--
+-- ADTs:
+--   IssuedSession   — IssuedSession token sessionId userId
+--   ResolvedSession — ResolvedSession subject sessionId userId accountId
+--
+-- Substrate consumed:
+--   state:createSession / state:getSessionByHash / state:touchSession /
+--   state:deleteSessionByHash / state:getUserByEmail /
+--   state:getOrCreateUserByEmail / state:getMembership /
+--   state:createMembership / state:setUserPasswordHash
+--   crypto:randomTokenHex / crypto:sha256Hex
+--   crypto:hashPassword (codeName "scryptHash") /
+--   crypto:verifyPassword (codeName "scryptVerify")
+--
+-- The Subject `User` constructor (built in resolveFromRow) belongs to the
+-- sibling `module subject where` — it resolves through the kept flat-global
+-- fallback today (an explicit `import subject` decl awaits the lowercase→
+-- PascalCase module rename: a lowercase `import subject` parses as application,
+-- not a decl — OQ4).
+-- =========================================================================
+
+module auth where
+
+IssuedSession = IssuedSession token: String sessionId: String userId: String
+
+-- The signed-in person, distinct from an Account workspace or a customer Profile.
+-- Only these public-facing fields leave the privileged session lookup.
+UserProfile = UserProfile email: EmailStr name: Maybe String
+
+-- Sign-in accepts an existing password, so creation-time strength rules must
+-- not reject a credential that the server already accepts.
+@label "Sign in"
+@fieldLabel "email" "Email"
+@fieldLabel "password" "Password"
+@widget "email" "native"
+@widget "password" "password"
+LoginInput = LoginInput email: EmailStr password: String
+-- Signature-substrate Phase 2 fixed indented constructor-field continuation
+-- in both parser paths. Keep this compact spelling as the one-line
+-- byte-equivalence control; multiline records are now pinned by RecordedMovie,
+-- validate's carrier declarations, and focused layout tests (rights R2a deleted
+-- PolicyView, which used to be the first of those pins).
+-- rights R2b — the resolved session carries the GRANT. `role` and
+-- `membershipId` come from the membership row the session lookup already
+-- inner-joins, so the request door reads the LIVE role on every request with no
+-- extra round-trip and no cache to invalidate: a role change or a deleted
+-- membership takes effect on the next request.
+ResolvedSession = ResolvedSession subject: Subject sessionId: String userId: String accountId: String role: String membershipId: String profile: UserProfile
+
+-- issueSession — random token + hash + persist session row.
+-- Returns IssuedSession; the raw token is shown to the caller ONCE.
+@label "Issue session"
+@description "Phase 12c-core sub-step 3 — random token + hash + persist session row. Returns IssuedSession; the raw token is shown to the caller ONCE. Composes crypto:randomTokenHex + crypto:sha256Hex + state:createSession."
+@tags "auth" "session" "io" "phase-12c"
+@ioAction "auth.issue_session"
+issueSession : {} -> IssuedSession
+issueSession input =
+  let token = randomTokenHex 32
+  let tokenHash = sha256Hex token
+  -- Positional args (not a named record): the named-record→positional desugar
+  -- needs the callee's signature at parse time, which doesn't fire cross-module,
+  -- so `createSession {record}` reaches resolveParams as a SINGLE record bound to
+  -- the first param. Positional maps each arg to its param name correctly.
+  let row = createSession input.userId input.accountId tokenHash input.label input.expiresAt
+  IssuedSession { token = token, sessionId = row.id, userId = input.userId }
+
+-- resolveToken — hash + lookup + touch + Subject construction.
+-- Returns Maybe<ResolvedSession>. Nothing on unknown / malformed token.
+-- The Subject value is constructed Fenel-side directly (sub-step 1's
+-- User constructor) — no round-trip through the TS userSubject shim.
+@label "Resolve token"
+@description "Phase 12c-core sub-step 3 — hash + lookup + touch + Subject construction. Returns Maybe<ResolvedSession>; Nothing on unknown / malformed token. The Subject value is constructed Fenel-side directly using sub-step 1's User constructor — no round-trip through the TS userSubject shim."
+@tags "auth" "session" "io" "phase-12c"
+@ioAction "auth.resolve_token"
+resolveToken : String -> Maybe ResolvedSession
+resolveToken rawToken =
+  let tokenHash = sha256Hex rawToken
+  case getSessionByHash tokenHash of
+    Nothing -> (Nothing)
+    Just row -> resolveFromRow row
+
+-- resolveFromRow — touch the session opportunistically (the IO handler
+-- swallows errors per Decision D — silent-on-fail policy at the handler
+-- boundary, since the Fenel body has no `catch` primitive), then wrap.
+resolveFromRow : { id: String, userId: String, accountId: String, role: String, membershipId: String, email: EmailStr, name: Maybe String } -> Maybe ResolvedSession
+resolveFromRow row =
+  let _touched = touchSession row.id
+  Just (ResolvedSession { subject = User { accountId = row.accountId, userId = row.userId }, sessionId = row.id, userId = row.userId, accountId = row.accountId, role = row.role, membershipId = row.membershipId, profile = UserProfile { email = row.email, name = row.name } })
+
+-- revokeToken — hash + delete.
+@label "Revoke token"
+@description "Phase 12c-core sub-step 3 — hash + delete session row. Composes crypto:sha256Hex + state:deleteSessionByHash."
+@tags "auth" "session" "io" "phase-12c"
+@ioAction "auth.revoke_token"
+revokeToken : String -> Unit
+revokeToken rawToken =
+  let tokenHash = sha256Hex rawToken
+  deleteSessionByHash tokenHash
+
+-- setPassword — Just<password> hashes + writes; Nothing clears.
+-- The TS wrapper maps null -> Nothing, string -> Just at the boundary.
+@label "Set password"
+@description "Phase 12c-core sub-step 3 — set or clear a user's password. Just<password> → crypto:hashPassword + state:setUserPasswordHash with Just hash. Nothing → state:setUserPasswordHash with Nothing (clears the column). The TS wrapper maps null → Nothing, string → Just at the boundary (Decision G)."
+@tags "auth" "password" "io" "phase-12c"
+@ioAction "auth.set_password"
+setPassword : String -> Maybe String -> Unit
+setPassword userId password =
+  case password of
+    Just p -> setHashJust userId p
+    Nothing -> setUserPasswordHash userId (Nothing)
+
+setHashJust : String -> String -> Unit
+setHashJust userId p =
+  let hash = scryptHash p
+  setUserPasswordHash userId (Just hash)
+
+-- loginWithPassword — get user → verify password → issue session.
+-- Returns Maybe<IssuedSession>. Nothing on unknown email OR password
+-- mismatch (intentional — doesn't leak which arm failed; HTTP route
+-- maps Nothing -> 401).
+@label "Login with password"
+@description "Phase 12c-core sub-step 3 — get user → verify password → issue session. Returns Maybe<IssuedSession>; Nothing on unknown email OR password mismatch (intentional — doesn't leak which arm failed; HTTP route maps Nothing → 401). Composes state:getUserByEmail + crypto:verifyPassword + auth:issueSession."
+@tags "auth" "login" "io" "phase-12c"
+@ioAction "auth.login_with_password"
+loginWithPassword : String -> String -> String -> Maybe IssuedSession
+loginWithPassword email password accountId =
+  case getUserByEmail email of
+    Nothing -> (Nothing)
+    Just user -> verifyAndIssue user password accountId
+
+-- verifyAndIssue — passwordHash is Maybe-wrapped by the get_user_by_email
+-- handler (io-leaves contract), so case-match it before verifying. Nothing
+-- (user has no password set) → deny.
+verifyAndIssue : {} -> String -> String -> Maybe IssuedSession
+verifyAndIssue user password accountId =
+  case user.passwordHash of
+    Nothing -> (Nothing)
+    Just hash -> checkAndIssue user password hash accountId
+
+-- Use the STRUCTURAL `if` (not the eager `ifElse` function): the durable
+-- evaluator's `if`-branch path yields IO for an effectful branch, whereas
+-- `ifElse` is a strict function whose branch ARGUMENTS are evaluated by the
+-- pure (IO-blind) evaluator — dropping the issueAndWrap→createSession effect
+-- (session silently not persisted). See the interpreter ANF brief.
+checkAndIssue : {} -> String -> String -> String -> Maybe IssuedSession
+checkAndIssue user password hash accountId =
+  let ok = scryptVerify password hash
+  if ok then (issueAndWrap user accountId) else (Nothing)
+
+issueAndWrap : {} -> String -> Maybe IssuedSession
+issueAndWrap user accountId =
+  case getMembership user.id accountId of
+    Nothing -> (Nothing)
+    Just membership ->
+      let issued = issueSession { userId = user.id, accountId = accountId, label = "password", expiresAt = (Nothing) }
+      Just issued
+
+-- bootstrapAdmin — idempotent admin user + password sync + membership
+-- ensure. Used at server startup when ADMIN_EMAIL + ADMIN_PASSWORD env
+-- vars are set. The env password is the source of truth; bootstrapAdmin
+-- rotates the stored hash to match on every boot.
+@label "Bootstrap admin"
+@description "Phase 12c-core sub-step 3 — idempotent admin user + password sync + membership ensure. Used at server startup when ADMIN_EMAIL + ADMIN_PASSWORD env vars are set. The env password is the source of truth; bootstrapAdmin rotates the stored hash on every boot. Composes state:getUserByEmail + state:getOrCreateUserByEmail + auth:setPassword + state:getMembership + state:createMembership."
+@tags "auth" "admin" "bootstrap" "io" "phase-12c"
+@ioAction "auth.bootstrap_admin"
+bootstrapAdmin : {} -> {}
+bootstrapAdmin input =
+  let user = ensureUser input
+  let _passwordSync = setPassword user.id (Just input.password)
+  let _membershipSync = ensureMembership user.id input.accountId input.role
+  { userId = user.id, created = user.created }
+
+ensureUser : {} -> {}
+ensureUser input =
+  case getUserByEmail input.email of
+    Just u -> { id = u.id, created = false }
+    Nothing -> createNewUser input
+
+createNewUser : {} -> {}
+createNewUser input =
+  let u = getOrCreateUserByEmail { email = input.email, name = input.name }
+  { id = u.id, created = true }
+
+ensureMembership : String -> String -> Maybe String -> Number
+ensureMembership userId accountId role =
+  case getMembership userId accountId of
+    Just _m -> 0
+    Nothing -> createMembershipForRole userId accountId role
+
+-- rights R2b — the Maybe DEFAULT LIVES HERE, not at the handler boundary. The
+-- leaf's `role` is a String because a FieldAxis judges a scalar entry and a
+-- `Maybe` payload is an object the host `elem` matches by reference. This is
+-- the one caller that ever passes Nothing, so it is the one place the default
+-- has to exist.
+createMembershipForRole : String -> String -> Maybe String -> Number
+createMembershipForRole userId accountId role =
+  case role of
+    Just r -> createMembershipWithRole userId accountId r
+    Nothing -> createMembershipWithRole userId accountId "member"
+
+createMembershipWithRole : String -> String -> String -> Number
+createMembershipWithRole userId accountId role =
+  let _row = createMembership userId accountId role
+  1
+
+-- devLogin — admin-convenience login (Phase 3, ts-elimination-completion).
+-- Retires the last TS-only auth fn in core/auth.ts (+ its direct @fenel/db
+-- import — the sole DIRECT_DB_LEAF_ALLOW reason). Get-or-create the user by
+-- email, ensure their account membership (REUSES the bootstrapAdmin
+-- `ensureMembership` helper — its `case getMembership of Nothing -> create`
+-- IS the guard, Watch-out 4; NOT a control-flow `if`), then issue a session.
+-- `label` is `Just "dev-login"` to match the pre-port TS shim's Maybe-wrap
+-- (state:createSession reads label as Maybe — a raw string reads as null).
+-- HasStateIO is INFERRED from the state:* + issueSession calls (the 3a
+-- precedent); not hand-declared. `role` arrives as Maybe from the shim
+-- (`Just (role ?? "owner")`), threaded straight to ensureMembership.
+@label "Dev login"
+@description "Phase 3 (ts-elimination-completion) — admin-convenience login. Get-or-create the user by email, ensure their account membership (reuses the bootstrapAdmin ensureMembership guard), then issue a session. Returns IssuedSession. Composes state:getOrCreateUserByEmail + state:getMembership + state:createMembership + auth:issueSession."
+@tags "auth" "session" "io" "phase-3"
+@ioAction "auth.dev_login"
+devLogin : {} -> IssuedSession
+devLogin input =
+  let user = getOrCreateUserByEmail { email = input.email, name = input.name }
+  let _m = ensureMembership user.id input.accountId input.role
+  issueSession { userId = user.id, accountId = input.accountId, label = (Just "dev-login"), expiresAt = (Nothing) }

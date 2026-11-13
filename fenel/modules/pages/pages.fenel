@@ -1,0 +1,223 @@
+-- =========================================================================
+-- module pages where — POST /p/:accountSlug/:pageSlug/submit orchestration.
+--
+-- module-substrate Phase 3n (2026-05-31) — the AGGREGATION-DISSOLVE
+-- representative. The retired `engine/src/modules/public-surfaces.ts` was a
+-- junk-drawer BUNDLE: it loaded THIS file (under the throwaway internal name
+-- `pages-ingress`) AND `receipt/ingress.fenel` (`receipt-ingress`), hand-
+-- extracted each body by id, re-wrapped every function in a `defineFunction`
+-- spec, re-prefixed to the public `pages:` / `receipt:` namespaces, and
+-- exported ONE `publicSurfacesModule` holding all 6. Nothing consumed the
+-- bundle as a semantic unit (it was imported by name only in the 4 boot
+-- lists), so per the standing steer ("no wrapper modules around already-clean
+-- separate modules — make semantic modules") it is DISSOLVED: `pages` and
+-- `receipt` become their own modules and the lump is deleted.
+--
+-- THIS file is now a `module pages where` source-of-truth: header + the 4
+-- `pages:*` sigs + their @label/@description/@tags identity facets (lifted
+-- from the retired `defineFunction` specs). Bodies are unchanged. No stored
+-- @category — the `pages` category derives at read time from the `pages:` id
+-- prefix (Phase 3j). None of the 4 carried an `@ioAction` (IOInvokable ×0).
+-- The `HasStateIO` requires on submitPage + dispatchPageSubmittedIfFlow are
+-- INFERRED transitively from their `state:*` / event calls
+-- (attachInferredRequires), not hand-declared (the 3a precedent).
+--
+-- Phase 12c-routes sub-step 3 of the ts-elimination workstream (origin). The
+-- TS route is now a THIN HTTP leaf — routing + c.req.param/header/json + the
+-- state:getPageBySlug invoke + formBlock find (wire-shape discrimination) +
+-- HTTP status mapping. Everything ELSE is Fenel (storage-as-effect Phase 4f):
+--   - GET assembly → pages:pageView (resolveType the typeRef + serve the raw
+--     $record `type` so the widget renders via FieldRenderer — mirror of
+--     types:formView; the page widget extracts fields via fieldsOf(form.type))
+--   - typeRef resolution + validation → folded into submitPage via the shared
+--     types:resolveType + account-aware state:validateEntityInstance boundary
+--   - the visitor ip + the page config Maybes → BUILT in the body from the raw
+--     header/JSON values (truthy-gated), not pre-marshalled TS-side
+--
+-- submitPage composes (storage-as-effect Phase 4f):
+--   1. types:resolveType typeRef → Nothing → { error = "Type not found: …" }
+--      (the system-entity arm covers the live `profile` page); Just row →
+--      thread the CANONICAL type name (row.name).
+--   2. state:validateEntityInstance row.name data false — the account's
+--      UUID-identified field registry supplies types/facets and returns the
+--      canonical coerced value. not ok → { error }.
+--   3. state:tryCreateInstanceByName row.name validation.value (storage-as-effect Phase 4a —
+--      the submitted data is an INSTANCE of the resolved type, mirroring
+--      types:submit; NO dedicated page_submissions row). ok false → { error }.
+--   4. appendEvent "submitted" — UNCONDITIONAL, anchored to the PAGE aggregate
+--      (aggregateType = Just "page", aggregateId = Just pageId). The visitor `ip`
+--      (built into a Maybe<String> from the raw header value) rides the PAYLOAD
+--      (durable submission metadata; the event is its source of truth). The
+--      dispatchEventTriggers fan-out stays flow-gated on formBlock.flowId.
+--   5. response: { redirect = url } when config.redirectUrl is present, else
+--      { message = thankYouMessage } with the default magic string verbatim (Risk 5).
+--
+-- storage-as-effect Phase 4a (2026-06-19) — the page-submit lane collapse (D4
+-- slice 1). createPageSubmission + the page_submissions table RETIRED; capture
+-- is the generic state:tryCreateInstanceByName, exactly like types:submit.
+--
+-- Decisions resolved / RETIRED:
+--   Z   RETIRED (storage-as-effect Phase 4f) — resolveFormFields is GONE; the
+--       page GET serves the raw `type` (pages:pageView), not a TS-extracted
+--       fields array. Fenel-first overrides Decision Z's "stays TS".
+--   AA  RETIRED (storage-as-effect Phase 4f / field-identity Phase 2b) —
+--       validation is the account-aware state:validateEntityInstance boundary.
+--       The TS @fenel/core validate() + the recordType rebuild + the
+--       listFunctions/overlayUserFunctions/getSystemEvaluateContext machinery
+--       are DELETED. (D-VALIDATE: one identified registry + coercion boundary.)
+--   BB  (no JSONB-key navigation needed here — config fields are static-keyed)
+--   EE  (pages /submit is profileId-less per pre-12c-3 — no auth context)
+--
+-- parseApp doesn't continue conditionals/arg-lists across newlines ⇒ the
+-- resolve→validate→create→emit pipeline factors into top-level helpers
+-- (the submit.fenel recipe). resolveType is the shared types:* resolver;
+-- truthy/ifElse/find/eq/head are std.
+-- =========================================================================
+
+module pages where
+
+-- pageView — what GET /p/:accountSlug/:pageSlug serves: the page chrome
+-- (slug / name / config) + the resolved type's RAW $record `type` (so the
+-- public page widget renders the fields via fieldsOf(form.type) → FieldRenderer,
+-- exactly like the forms widget). storage-as-effect Phase 4f: PORTS the route's
+-- former resolveFormFields + the {page, form} assembly into Fenel (Decision Z
+-- RETIRED). The TS route resolves the page (state:getPageBySlug — a leaf) +
+-- finds the formBlock (wire-shape), then invokes this with accountId =
+-- page.accountId so resolveType is account-scoped. Nothing (type unresolvable)
+-- → the route maps to 404.
+@label "Page view"
+@description "storage-as-effect Phase 4f / field-identity Phase 2b — GET /p/:accountSlug/:pageSlug's response. types:resolveType typeRef → Nothing (404) | Just row → { page, form = { typeName = row.name, type = row.type, submitLabel, typeRef } }. typeName lets the browser select the registry-local identified definition before planning; raw row.type remains the public wire definition."
+@tags "page" "view" "route" "storage-as-effect"
+pageView : String -> String -> String -> String -> Map String Any -> Maybe ({ page: { slug: String, name: String, config: Map String Any }, form: { typeName: String, type: Type, submitLabel: String, typeRef: String, rootBinding: { origin: String, id: String, name: String } } })
+pageView slug name typeRef submitLabel config =
+  case resolveType typeRef of
+    Nothing -> Nothing
+    Just row -> Just (pageViewOf slug name typeRef submitLabel config row)
+
+-- pageViewOf — assemble the served { page, form } record from the resolved
+-- type row. Pure record transform (the page/form objects are let-bound so
+-- parseApp doesn't fight a multi-line record literal).
+@label "Page view (assemble)"
+@description "storage-as-effect Phase 4f — assemble GET /p/:accountSlug/:pageSlug's { page = { slug, name, config }, form = { type = row.type, submitLabel, typeRef } } from the resolved type row. Pure record transform."
+@tags "page" "view" "pure" "storage-as-effect"
+pageViewOf : String -> String -> String -> String -> Map String Any -> ({ id: String, name: String, type: Type }) -> { page: { slug: String, name: String, config: Map String Any }, form: { typeName: String, type: Type, submitLabel: String, typeRef: String, rootBinding: { origin: String, id: String, name: String } } }
+pageViewOf slug name typeRef submitLabel config row =
+  let pageObj = { slug = slug, name = name, config = config }
+  let formObj = { typeName = row.name, type = row.type, submitLabel = submitLabel, typeRef = typeRef, rootBinding = publicTypeRootBinding row }
+  { page = pageObj, form = formObj }
+
+-- submitPage — the POST /p/:accountSlug/:pageSlug/submit orchestration body.
+-- storage-as-effect Phase 4f: the typeRef resolution + validation are FOLDED
+-- IN (Decisions Z/AA retired) — the SAME resolve → validate → capture → emit
+-- loop the forms lane runs (types:submitValidate), with the page-anchored emit +
+-- redirect/message response as the page lane's distinct tail. Per parseApp's
+-- multi-line rule, each branch factors into a top-level helper.
+--
+-- Inputs:
+--   pageId         — String (page entity id; the appendEvent aggregate)
+--   pageSlug       — String (the submitted event payload)
+--   typeRef        — String (formBlock.typeRef; resolved IN Fenel now)
+--   data           — Record (raw submission data; validated in-body)
+--   ip             — String (raw visitor ip header value, "" when absent;
+--                    the body builds the Maybe<String> for the event payload)
+--   flowConfigured — Boolean (true when formBlock.flowId is set; gates the
+--                    dispatchEventTriggers fan-out per pre-12c-3 semantics)
+--   config         — Record (raw page.config; drives the redirect vs message
+--                    response — the body reads its fields directly, no Maybe
+--                    pre-marshalling)
+@label "Submit page"
+@description "Phase 2b UUID-only field convergence — POST /p/:accountSlug/:pageSlug/submit resolves the public typeRef, validates once through state:validateEntityInstance with the account's identified field registry, persists the coerced validation.value, and emits the page-anchored submitted event."
+@tags "page" "ingress" "route" "storage-as-effect" "field-identity"
+submitPage : String -> String -> String -> {} -> String -> Boolean -> {} -> {}
+submitPage pageId pageSlug typeRef data ip flowConfigured config =
+  case resolveType typeRef of
+    Nothing -> { error = `Type not found: ${typeRef}` }
+    Just row -> submitPageCapture pageId pageSlug row.name data ip flowConfigured config
+
+-- submitPageCapture — the account-aware validation gate. Only the coerced
+-- validation.value can reach persistence and event/flow payloads.
+@label "Submit page (validate)"
+@description "Phase 2b UUID-only field convergence — validate raw public input through state:validateEntityInstance using the canonical type name and account field registry; persist and emit only validation.value."
+@tags "page" "ingress" "validate" "storage-as-effect" "field-identity"
+submitPageCapture : String -> String -> String -> {} -> String -> Boolean -> {} -> {}
+submitPageCapture pageId pageSlug typeName data ip flowConfigured config =
+  let validation = validateEntityInstance typeName data false
+  if validation.ok
+  then submitPageCreate pageId pageSlug typeName validation.value ip flowConfigured config
+  else { error = pageValidationMessage validation.errors }
+
+-- pageValidationMessage — retain the route's string error envelope while the
+-- account-aware validation substrate remains structured.
+pageValidationMessage : List a -> String
+@label "Page validation message"
+@description "Project the first structured state:validateEntityInstance error into the public page error string envelope."
+@tags "page" "ingress" "validate" "field-identity"
+pageValidationMessage errors =
+  case head errors of
+    Nothing -> "Validation failed"
+    Just error -> error.message
+
+-- submitPageCreate — the unverified capture. state:tryCreateInstanceByName of
+-- the CANONICAL type name (mirroring types:submitCreate); ok → emit, not ok →
+-- { error } carrying the insert error.
+@label "Submit page (create)"
+@description "storage-as-effect Phase 4f — the capture arm of submitPage. state:tryCreateInstanceByName typeName data persists an INSTANCE of the resolved type (mirroring types:submit — no dedicated page_submissions row). ok → submitPageEmit, not ok → { error = the insert error }."
+@tags "page" "ingress" "create" "storage-as-effect"
+submitPageCreate : String -> String -> String -> {} -> String -> Boolean -> {} -> {}
+submitPageCreate pageId pageSlug typeName data ip flowConfigured config =
+  let r = tryCreateInstanceByName typeName data
+  if r.ok
+  then submitPageEmit pageId pageSlug typeName data ip flowConfigured config r.value
+  else { error = r.error }
+
+-- submitPageEmit — the successful-capture tail. Builds the visitor ip Maybe
+-- from the raw header value (truthy-gated — absent/"" → Nothing), fires the
+-- `submitted` event (unconditional appendEvent, ip in the payload) anchored to
+-- the page aggregate, runs the flow-gated dispatchEventTriggers fan-out, and
+-- returns the redirect-vs-message response.
+@label "Submit page (emit)"
+@description "storage-as-effect Phase 4a / Phase 4c / Phase 4f — successful-capture tail of submitPage. Builds the visitor ip Maybe<String> from the raw header value (truthy-gated, replacing the retired TS pre-marshalling), then writes the `submitted` event (renamed from page_submitted in Phase 4c — no form/funnel noun; one event unifies the form/page lanes; payload { type = the canonical type name, instanceId, pageSlug, data, ip }; aggregateType = Just \"page\", aggregateId = Just pageId), runs the flow-gated dispatchEventTriggers fan-out, and returns the redirect-vs-message response shape."
+@tags "page" "ingress" "emit" "storage-as-effect"
+submitPageEmit : String -> String -> String -> {} -> String -> Boolean -> {} -> String -> {}
+submitPageEmit pageId pageSlug typeName data ip flowConfigured config instanceId =
+  let ipM = ifElse (truthy ip) (Just ip) Nothing
+  let _appended = appendEvent "submitted" { type = typeName, instanceId = instanceId, pageSlug = pageSlug, data = data, ip = ipM } (Just "page") (Just pageId) Nothing
+  let _dispatched = dispatchPageSubmittedIfFlow flowConfigured pageSlug pageId typeName data
+  pageResponse config
+
+-- dispatchPageSubmittedIfFlow — fires the dispatchEventTriggers fan-out
+-- only when formBlock.flowId is configured (pre-12c-3 semantics: the
+-- appendEvent is unconditional, the trigger fan-out is gated).
+@label "Dispatch page-submitted if flow"
+@description "Phase 12c-routes sub-step 3 / Phase 4c — gates the dispatchEventTriggers fan-out on formBlock.flowId presence (pre-12c-3 semantics: appendEvent unconditional, trigger fan-out gated). Fires the `submitted` trigger event (renamed from page_submitted in Phase 4c)."
+@tags "page" "pure" "phase-12c"
+dispatchPageSubmittedIfFlow : Boolean -> String -> String -> String -> {} -> {}
+dispatchPageSubmittedIfFlow flowConfigured pageSlug pageId typeName data =
+  let payload = { page = data, pageSlug = pageSlug, pageId = pageId, type = typeName }
+  let dispatchArm = dispatchEventTriggers "submitted" payload
+  let skipArm = {}
+  ifElse flowConfigured dispatchArm skipArm
+
+-- pageResponse — decide redirect-vs-message based on config.redirectUrl.
+-- storage-as-effect Phase 4f: reads the RAW page.config (no Maybe pre-marshalling
+-- — the TS configForBody is retired). truthy config.redirectUrl (present + non-
+-- empty) → redirect, else the thank-you message.
+@label "Page response"
+@description "Phase 12c-routes sub-step 3 / storage-as-effect Phase 4f — decide redirect-vs-message from the RAW page.config (the TS configForBody Maybe-marshalling is retired). truthy config.redirectUrl → { redirect = config.redirectUrl }, else { message = pageThankYouMessage config }. Pure record transform."
+@tags "page" "pure" "phase-12c"
+pageResponse : {} -> {}
+pageResponse config =
+  ifElse (truthy config.redirectUrl)
+    { redirect = config.redirectUrl }
+    { message = pageThankYouMessage config }
+
+-- pageThankYouMessage — default to the magic-string "Thank you for your
+-- submission!" when config.thankYouMessage is absent. Risk 5 — preserve
+-- the default verbatim for wire-shape equivalence. Reads the raw config
+-- field directly (storage-as-effect Phase 4f).
+@label "Page thank-you message"
+@description "Phase 12c-routes sub-step 3 / storage-as-effect Phase 4f — default to the magic-string 'Thank you for your submission!' when the raw config.thankYouMessage is absent/empty (truthy-gated). Preserves the pre-12c-3 default verbatim (Risk 5)."
+@tags "page" "pure" "phase-12c"
+pageThankYouMessage : {} -> String
+pageThankYouMessage config =
+  ifElse (truthy config.thankYouMessage) config.thankYouMessage "Thank you for your submission!"

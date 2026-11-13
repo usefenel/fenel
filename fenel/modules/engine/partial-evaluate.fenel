@@ -1,0 +1,1299 @@
+module engine where
+
+-- =========================================================================
+-- partialEvaluate — the residualizing evaluator (partial evaluation) as a
+-- pure `.fenel` walker over the locked 7-case `Expr`. partial-evaluator-
+-- substrate Phase 1 (brief:
+-- `workstreams/partial-evaluator-substrate/briefs/phase-1-faithful-port.md`;
+-- design: `design/partial-evaluation.md`; Step-0 lock:
+-- `workstreams/partial-evaluator-substrate/notes/phase-0-step0.md`).
+--
+-- THE THESIS (Step-0, GO): `partialEval : Expr -> KnownInputs -> ResidualExpr`
+-- is source-to-source REDUCTION — given a program and a static prefix of its
+-- inputs, compute as much as possible and return a residual `Expr` that,
+-- re-evaluated under any extension of the known inputs, yields the same value.
+-- It is the faithful port of the 1181-line TS `partial-evaluator.ts` (the
+-- parity ORACLE) over `Expr` — the SAME IR as reify / symbolize / solve.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- PEResult — the ENTITY-FREE internal record `{ done: Bool, value: a }` (the
+-- P13/P15/P16 cheap-gate precedent — no new ADT, law count +0, entity oracle
+-- untouched). `done = true` ⇒ a CONCRETE runtime value; `done = false` ⇒ a
+-- RESIDUAL `Expr`. The `$tag`-tagged Concrete/Residual discrimination is minted
+-- at the TS boundary only (`dispatchedPartialEvalDetailed`).
+--
+-- WHAT COLLAPSES OVER `Expr` (the Fenel-first win, Step-0 D-B): the TS PE's
+-- per-JSON-Logic-shape walkers (walkVar / walkIf / walkAndOr / walkConstruct /
+-- walkTaggedRecord / walkUserRecord / walkCall / walkKeyAsFnId / walkEagerOp /
+-- walkHigherOrderOp) all funnel into the 7 `Expr` cases. `if`/`and`/`or` are
+-- `ECall "if"|"and"|"or"`; a construct or pre-tagged value is `EConstruct`; a
+-- user record is `ERecord`; every call form (call / |> / apply / key-as-fnId /
+-- built-in op) is ONE `ECall`. **`let`/`do` are NOT arms** — they arrive
+-- desugared (applied-`ELambda` / sequence), so `walkLet`/`walkDo` subsume into
+-- the β-reduce arm (the array-form `{let: [b, body]}` the live PE tolerated is
+-- non-canonical + unliftable — dropped with the TS).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE TWO NATIVE LEAVES (ledgered additions to the evaluator-strategies host-
+-- re-entry class — `design/ts-exceptions-ledger.md`; engine stays
+-- `nativeImplsCtx === {}`):
+--   * `peEval jl` — the CONST-FOLD host-`evaluate` re-entry. The Fenel side
+--     decides fold-readiness (all leaves concrete-or-`ELambda`), egresses the
+--     rebuilt call/construct tree via `exprToJsonLogic`, and hands ONE JL value
+--     to the native, which does `evaluate(jl, {}, ctx)` in a try/catch ⇒
+--     `Result`. This folds HIGHER-ORDER calls for free (the egressed `{fn:…}`
+--     becomes a host closure) with ONE fold native (Step-0 D-4).
+--   * `peFnSpec fnId` — the on-demand fn-spec introspection for β-reduce
+--     (Step-0 D-3): `Nothing | Just {params, body: Nothing | Just Expr}`, the
+--     registry read + the body lift (lift-Err ⇒ body Nothing ⇒ D-inline) done
+--     INSIDE the native against the THREADED ctx (so the oracle's extra test
+--     fns resolve identically on both sides).
+--
+-- THE FOLD GATE (Step-0 D-1 — the POSITIVE/pure-SET option, NOT the brief's
+-- negative lean). The brief's negative gate (`not (isEffectFnId …)`) assumed an
+-- unknown fnId ATTEMPTS the fold and falls to residual on a host THROW. That
+-- premise is FALSE: the host `evaluate` does NOT throw on an unresolved fnId (it
+-- returns a bogus value), so a negative gate would fold an unknown call to a
+-- SPURIOUS concrete value (unsound). So the gate is the POSITIVE
+-- `elem fnId foldableFnIds` — the faithful replication of the TS
+-- `isPureFunctionRef` (spec-exists ∧ `requires` empty) ∨ (built-in op). The
+-- wrapper supplies `foldableFnIds` = every registered fn (by id AND codeName)
+-- with an EMPTY `requires`, which naturally includes the built-in op std fns
+-- (add / mul / eq / …) and EXCLUDES both effectful fns (non-empty `requires` —
+-- stays residual) AND unknown fnIds (not registered — stays residual). This
+-- matches the TS oracle exactly on both edge classes. (The Phase-2 `Symbolic`
+-- mint still rides symbolize's `isEffectFnId` at the β-reduce arm — Steps 3-5.)
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- CONSERVATIVE MODE (Rom 2026-10-16; plan:
+-- `workstreams/partial-evaluator-substrate/notes/2026-10-16-callback-fold-admission-plan.md`
+-- § "Conservative repair", with the Astra round-3 amendments). The output is the
+-- input program with only safe constant folds filled in; tcb-ledger rows
+-- `pe.hof.unknown-callback` (repaired narrowly), `pe.fold.safe-list`,
+-- `pe.residual.known-context`, `pe.normalize.harness-semantics`.
+--   * FOLD only a call whose head is in the caller-supplied foldable set AND the
+--     closed `peSafeFold` list (13 first-order std natives), on concrete
+--     quotable arguments; keep only a quotable non-null result. The TS wrapper
+--     supplies an EMPTY foldable set under any caller frame other than the
+--     exact harness and whenever extraFns are threaded. peEval runs in its own
+--     where-proof frame (a failing fold is Err, never an outer trip).
+--   * SUBSTITUTE only scalar knowns at single-segment reads; wrap the residual
+--     in `$ (\k -> …) v` for each scalar known whose root still occurs
+--     (peWrapKnowns). Arrays and objects are never substituted (sharing, code).
+--   * PRUNE `if` on a concrete condition only (literal, scalar known or safe
+--     fold; peTruthy = json-logic `truthy`); a chain with no live branch and no
+--     else keeps its residual no-value `if`. `and` / `or` are NEVER reduced.
+--   * KEEP as written (args walked): `let` frames, `$dyn` heads, matches,
+--     constructors, records; lambdas verbatim; dotted reads never projected.
+--   * NOT CALLED until the later arc (kept as input): peDynCall, peBetaReduce,
+--     peBindParams, peAllFoldReady / peFoldReady / peIsELambda, peAndOr /
+--     peAndOrFinish, peConstruct, peRecord, peMatchConcrete, peMatchPattern,
+--     peMatchCtor, peMatchCtorFields, peExtendBinds; peFnSpec has no caller.
+--     The divergence ledger below describes the former full mode: in
+--     conservative mode none of D-let, D-λ, D-inline, D-guard's reductions run.
+--   * partialEvaluateData keeps constructor / record / list folding through
+--     its own bounded walker (peDataWalk).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE DIVERGENCE-CLASS LEDGER — FINAL (Phase 1 complete). The ONLY allowed
+-- tag/shape divergences vs the TS oracle; every mismatch lands in one, each
+-- asserted-as-expected in `partial-evaluate-port.test.ts`:
+--   * D-let    — dead applied-`ELambda` frames DROPPED where TS keeps dead
+--                `let`/`do` frames + binding slots (the β-reduce of the
+--                desugared chain consumes them). Tier-1 skipped, tier-2 equal.
+--   * D-λ      — lambda-valued results: TS mints `Concrete(closure)` (walkFn
+--                projects concrete bindings into a closure), Fenel keeps the
+--                structural `Residual(ELambda)`. Equal under APPLICATION.
+--   * D-inline — β-inlining of fns whose bodies don't LIFT (the adapter's
+--                `Err Unsupported` class ⇒ `peFnSpec` body `Nothing`): TS
+--                specialises the raw JL body, Fenel leaves the residual call.
+--                Tier-2 equal (the residual call re-enters the engine).
+--   * D-nolift — the whole-INPUT ingress-lift-fail valve (⊇ the array-form
+--                `let` D-arrform): `|>` / `apply` / eager ops / array-`let` /
+--                plain-record patterns don't lift, so the wrapper returns the
+--                ORIGINAL as residual (identity is always sound). TS may reduce
+--                these ⇒ tag can diverge; re-eval equal by identity. ALSO the
+--                silent class: `{var: [name, fallback]}` lifts LOSSILY (the
+--                adapter DROPS the fallback — flagged platform-wide finding;
+--                fallback forms are excluded from PE corpus coverage).
+--   * D-guard  — a GUARDED arm under a CONCRETE scrutinee: the TS oracle's
+--                matchPatternPE walks `{$guard: …}` as an object key ⇒ never
+--                matches ⇒ TS silently SKIPS guarded arms and can select the
+--                WRONG later arm (a TS-BUG finding, evidence in the port
+--                test). Fenel bails to the SOUND residual rebuild; asserted
+--                against GROUND TRUTH (the original's evaluation), not TS.
+--
+-- STAGED PORT — COMPLETE: Steps 0-2 (pass-through arms + fold seam + control
+-- flow) landed 2026-07-03 (`24921ae2`); Steps 3-5 (β-reduce via `peFnSpec` +
+-- the applied-`ELambda` let/do recovery + `$dyn:` dynamic-callee resolution +
+-- `EMatch` arm-select + the residual-match rebuild) complete the walker.
+-- `ELambda` stays a structural pass-through BY DESIGN (closures are values
+-- until applied — the D-λ class), matching the TS "don't enter lambda bodies"
+-- rule modulo the closure-vs-structural representation.
+--
+-- NO ENTITY DECLS (the cheapest gate class — the P5/P12/P13/P14a/P15/P16 rule):
+-- the walker is structural over the registered `Expr` (7 cases); it declares NO
+-- ADTs (PEResult is a plain record), so the entity oracle + ordered list stay
+-- UNTOUCHED and the law count moves +0. Only the engine fn roster grows.
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The public entry. `knowns` is a `{name, value}` list (the reify-env marshal
+-- precedent — the wrapper builds it); `foldableFnIds` is the POSITIVE fold gate's
+-- set (every registered pure fn by id + codeName — the wrapper builds it);
+-- `budget` bounds recursive inlining; `nullValue` is the JS-null sentinel (Fenel
+-- has no null literal — threaded like jsonLogicToExpr's `nullValue`). Returns the
+-- PEResult `{ done, value }`.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Partial evaluate"
+@description "The residualizing evaluator (partial evaluation) as a pure walker over the locked 7-case Expr. Given an Expr, a static prefix of known inputs (a {name, value} list), the foldable-fnId set (the positive fold gate — every registered pure fn by id + codeName), a recursive-inline budget, and the null sentinel, returns a PEResult `{ done, value }` — done=true ⇒ a concrete quotable value, done=false ⇒ a residual Expr that re-evaluates under any extension of the knowns to the same value. Conservative mode (2026-10-16): folds only the closed safe list of first-order std natives on concrete arguments (via the peEval host re-entry), substitutes scalar knowns at plain reads and wraps the residual in a let frame per scalar known still read, prunes if-branches on concrete conditions; and/or, let frames, matches, constructors, records, lambdas and dynamic calls stay as written. partial-evaluator-substrate Phase 1, conservative repair."
+@tags "engine" "partial-evaluation" "reduction" "futamura" "expr" "partial-evaluator-substrate" "phase-1"
+partialEvaluate : (expr: Expr) -> (knowns: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+partialEvaluate expr knowns foldableFnIds budget nullValue =
+  let r = peWalk expr (peBindingsFromKnowns knowns {}) foldableFnIds budget nullValue
+  if r.done then r else peResidual (peWrapKnowns knowns r.value)
+
+-- peJsonLogicToExpr — the PE's ingress (conservative mode, Astra round 4). The
+-- shared adapter lowers a missing-else `if` / `?:` to `else null`, but ordinary
+-- evaluation of a missing else is a NO-VALUE exit (an enclosing where-proof
+-- sees it). So a program holding any `if` / `?:` with an even argument count
+-- is refused here; the TS wrapper then returns the ORIGINAL program as the
+-- residual (the identity valve, always sound).
+@label "PE: JSON-Logic ingress"
+@description "The partial evaluator's ingress: Err (⇒ the identity valve, original program kept) when the marshalled JSON-Logic holds any `if` / `?:` without an else (an even argument count — ordinary evaluation exits with no value there, the adapter would write `else null`); otherwise jsonLogicToExpr. partial-evaluator-substrate conservative repair."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate"
+@category "engine-internal"
+peJsonLogicToExpr : (node: (JsonLogic Any)) -> (ctorDefs: List ({ name: String, fields: List CompileFieldSlot })) -> (nullValue: a) -> Result a (Expr Any)
+peJsonLogicToExpr node ctorDefs nullValue =
+  if peHasMissingElse node
+  then Err (Unsupported { reason = "partial evaluation keeps a missing-else if as written", node = node })
+  else jsonLogicToExpr node ctorDefs nullValue
+
+@label "PE: has missing-else if"
+@description "True iff a marshalled JSON-Logic tree holds an `if` / `?:` object whose argument array has an even length (no final else), at any depth. partial-evaluator-substrate conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate"
+@category "engine-internal"
+peHasMissingElse : (node: (JsonLogic Any)) -> Bool
+peHasMissingElse node =
+  case node of
+    JlArray { items = items } -> not (all items (\i -> not (peHasMissingElse i)))
+    JlObject { fields = fields } -> not (all fields (\f -> not (or (peIfFieldMissingElse f) (peHasMissingElse f.value))))
+    JlTagged { fields = fields } -> not (all fields (\f -> not (peHasMissingElse f.value)))
+    other -> false
+
+@label "PE: if field without else"
+@description "True iff a JSON-Logic object field is an `if` / `?:` operator whose argument array has an even length. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate"
+@category "engine-internal"
+peIfFieldMissingElse : (f: a) -> Bool
+peIfFieldMissingElse f =
+  if or (eq f.name "if") (eq f.name "?:")
+  then
+    case f.value of
+      JlArray { items = items } -> eq (mod (length items) 2) 0
+      other -> false
+  else false
+
+-- peWrapKnownsJl — the identity valve's known wrapping (Astra round 5). When
+-- the ingress refuses a program (array-form var, missing-else if, an adapter
+-- Err), the ORIGINAL JSON-Logic is the residual; its scalar knowns are bound
+-- outermost by `{call: ["$", {fn: [k, prog]}, v]}`, exactly as the outermost
+-- data binds them in ordinary evaluation. Non-scalar knowns stay reads
+-- (`pe.residual.known-context`).
+@label "PE: wrap scalar knowns (JSON-Logic)"
+@description "Bind every scalar known (number, string, boolean) outermost around an unchanged JSON-Logic program through the `$` application of a one-param fn, for the partial evaluator's identity valve. Non-scalar knowns are left as reads. partial-evaluator-substrate conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate"
+@category "engine-internal"
+peWrapKnownsJl : (prog: a) -> (knowns: b) -> a
+peWrapKnownsJl prog knowns =
+  fold (\acc k -> if peScalar k.value then mapSet {} "call" ["$", mapSet {} "fn" [k.name, acc], k.value] else acc) prog knowns
+
+-- peWrapKnowns — CONSERVATIVE MODE (2026-10-16). A scalar known is substituted
+-- only at a plain single-segment read the walker reaches; its other uses (dotted
+-- reads, reads inside verbatim lambdas and match guards, `$dyn` heads) stay
+-- reads. So the residual is wrapped, outermost, in `$ (\k -> residual) (ELit v)`
+-- for every scalar known whose name is the ROOT (totSpellingRoot) of a spelling
+-- anaSpellingsIn collects (a conservative superset: call heads are listed too,
+-- which only adds a harmless binding). Inner binders shadow the wrapper exactly
+-- as they shadow the outermost data in ordinary evaluation. Non-scalar knowns
+-- (arrays, records, tagged values, callables) are neither substituted nor
+-- wrapped: they stay reads, and the residual needs ctx1 ∪ ctx2
+-- (tcb-ledger `pe.residual.known-context`).
+@label "PE: wrap scalar knowns"
+@description "Conservative-mode egress of known inputs: wrap a residual Expr in an outermost single-param applied lambda per scalar known (number, string or boolean) whose name is the root of a spelling in the residual (anaSpellingsIn, roots via totSpellingRoot), so dotted reads, lambda bodies, guards and $dyn heads that still read the known are bound under re-evaluation with the unknown inputs only. Non-scalar knowns are never wrapped. partial-evaluator-substrate conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate"
+@category "engine-internal"
+peWrapKnowns : (knowns: a) -> (residual: Expr) -> Expr
+peWrapKnowns knowns residual =
+  let roots = map (\s -> totSpellingRoot s) (anaSpellingsIn [] [] residual)
+  fold (\acc k -> if and (peScalar k.value) (elem k.name roots) then ECall { fnId = "$", args = [ELambda { params = [k.name], body = acc }, ELit { value = k.value }] } else acc) residual knowns
+
+@label "PE: scalar value"
+@description "True iff a value is a host number, string or boolean (Rational / bigint carriers are not numbers here): the only knowns the conservative partial evaluator substitutes or wraps. partial-evaluator-substrate conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate"
+@category "engine-internal"
+peScalar : (v: a) -> Bool
+peScalar v = or (isNumber v) (or (isString v) (isBoolean v))
+
+@label "PE: quotable value"
+@description "True iff a value is written back as an ELit that ordinary evaluation returns unchanged: null, a number, string or boolean, or an array whose elements are all quotable. Objects of every shape (records, tagged values, single-key operator objects, references) and callables are not quotable. Every concrete PEResult holds a quotable value. partial-evaluator-substrate conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate"
+@category "engine-internal"
+peQuotable : (v: a) -> Bool
+peQuotable v =
+  if isNull v then true
+  else if peScalar v then true
+  else if isArray v then all v (\item -> peQuotable item)
+  else false
+
+-- peSafeFold — the closed fold list (conservative mode). Each entry is a plain
+-- harness native with no ctx-native, no `requires` and only first-order
+-- scalar/array params (probed 2026-10-16), listed by canonical id AND code
+-- name. Every higher-order function, evaluator re-entry, ctx-native,
+-- Fenel-bodied-only function and user function is excluded by construction.
+@label "PE: safe fold list"
+@description "The closed list of function ids the conservative partial evaluator may fold, by canonical id and code name: std add, sub, mul, div, mod, eq, neq, lt, lte, gt, gte, concat, length. A fold also needs the fnId in the caller-supplied foldable set (empty under any caller frame other than the harness) and all-concrete quotable arguments. partial-evaluator-substrate conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate"
+@category "engine-internal"
+peSafeFold : (fnId: String) -> Bool
+peSafeFold fnId =
+  elem fnId ["std:add", "add", "std:sub", "sub", "std:mul", "mul", "std:div", "div", "std:mod", "mod", "std:eq", "eq", "std:neq", "neq", "std:lt", "lt", "std:lte", "lte", "std:gt", "gt", "std:gte", "gte", "std:concat", "concat", "std:length", "length"]
+
+@label "Partial evaluate data expression"
+@description "Project only literal data, captured constructors, records and source-marked list literals through the existing partial evaluator. Every other expression remains residual; no named function is folded or inlined."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+partialEvaluateData : (node: (JsonLogic Any)) -> (constructorRows: a) -> (nullValue: b) -> c
+partialEvaluateData node constructorRows nullValue =
+  if peDataInput node
+  then
+    let defs = map (\row -> CtorDefEntry { name = row.target, wireName = row.wireName, fields = row.fields, ambiguous = false }) constructorRows
+    case jsonLogicToExpr node defs nullValue of
+      Err error -> peResidual node
+      Ok expr ->
+        if peDataOnly expr (map (\row -> row.target) constructorRows)
+        then peDataWalk expr nullValue else peResidual expr
+  else peResidual node
+
+@label "PE: captured data input"
+@description "Raw tagged carriers remain residual because constructor re-entry may change their opaque representation. Other source shapes are inspected by the existing core data-fragment gate."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peDataInput : (node: (JsonLogic Any)) -> Boolean
+peDataInput node =
+  case node of
+    JlTagged -> false
+    JlObject { fields = fields } -> peDataInputFields fields
+    JlArray { items = items } -> all items (\item -> peDataInput item)
+    other -> true
+
+@label "PE: captured data input children"
+@description "Preserve the raw source observation of every object child before lowering it to the core data fragment."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peDataInputFields : (fields: a) -> Boolean
+peDataInputFields fields =
+  case head fields of
+    Nothing -> true
+    Just field ->
+      if peDataInput field.value then peDataInputFields (tailOr fields) else false
+
+@label "PE: data expression"
+@description "The bounded data-expression fragment, using captured constructor targets and the adapter's existing list-literal provenance. Calls, bindings, projections, lambdas and control forms are outside this fragment."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peDataOnly : (expr: Expr) -> (constructorTargets: List String) -> Boolean
+peDataOnly expr constructorTargets =
+  case expr of
+    ELit { value = value } ->
+      if isNull value then false
+      else if or (isString value) (or (isNumber value) (isBoolean value)) then true
+      else if isArray value then eq (length value) 0 else false
+    EConstruct { ctor = ctor, args = args } ->
+      and (elem ctor constructorTargets) (peDataOnlyList args constructorTargets)
+    ERecord { fields = fields } ->
+      if eq (length fields) 1 then false else peDataOnlyFields fields constructorTargets
+    ECall { fnId = fnId, args = args } ->
+      if and (eq expr.lit true) (and (eq fnId "appendItem") (eq (length args) 2))
+      then peDataOnlyList args constructorTargets else false
+    other -> false
+
+@label "PE: data expression children"
+@description "Every child must remain in the bounded data fragment before the partial evaluator is invoked."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peDataOnlyList : (exprs: a) -> (constructorTargets: List String) -> Boolean
+peDataOnlyList exprs constructorTargets =
+  case head exprs of
+    Nothing -> true
+    Just expr ->
+      if peDataOnly expr constructorTargets then peDataOnlyList (tailOr exprs) constructorTargets else false
+
+@label "PE: data record children"
+@description "Check record child expressions without admitting callable or reference carrier fields as ordinary data construction."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peDataOnlyFields : (fields: a) -> (constructorTargets: List String) -> Boolean
+peDataOnlyFields fields constructorTargets =
+  case head fields of
+    Nothing -> true
+    Just field ->
+      if or (startsWith field.name "__") (startsWith field.name "$") then false
+      else if peDataOnly field.value constructorTargets then peDataOnlyFields (tailOr fields) constructorTargets else false
+
+-- peDataWalk — the data-expression projection (partialEvaluateData). The
+-- conservative general walker no longer folds constructors or records, so the
+-- bounded data fragment (peDataOnly: literals, captured constructors, records,
+-- source list literals) keeps its own small walker with the former folding
+-- behaviour. It reads no bindings and folds no named function; a constructor
+-- runs through peEval in the caller-built execution frame (captured
+-- constructor tables only).
+@label "PE: data walk"
+@description "Project an Expr already admitted by peDataOnly to a concrete value: literals pass, source list literals build the list, records fold field-wise, captured constructors fold through peEval. Any child that stays residual keeps the whole node residual. No bindings, no named-function folds. Internal helper of partialEvaluateData."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peDataWalk : (expr: Expr) -> (nullValue: a) -> a
+peDataWalk expr nullValue =
+  case expr of
+    ELit { value = v } -> peConcrete v
+    ECall { fnId = f, args = args } -> peDataList expr args nullValue
+    EConstruct { ctor = c, args = args, fields = fs } -> peDataConstruct c args fs true nullValue
+    EConstruct { ctor = c, args = args } -> peDataConstruct c args [] false nullValue
+    ERecord { fields = fs } -> peDataRecord fs nullValue [] true {}
+    other -> peResidual expr
+
+@label "PE: data list literal"
+@description "Build a source list literal (the adapter's appendItem marker) from concrete children; otherwise residual. Internal helper of partialEvaluateData."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peDataList : (expr: Expr) -> (args: a) -> (nullValue: a) -> b
+peDataList expr args nullValue =
+  let results = map (\a -> peDataWalk a nullValue) args
+  let residual = peResidual (mapSet expr "args" (peResultsToExprs results []))
+  if and (eq (length results) 2) (peAllConcrete results)
+  then
+    let item = at results 0
+    let items = at results 1
+    if isArray items.value then peConcrete (appendItem item.value items.value) else residual
+  else residual
+
+@label "PE: data construct"
+@description "Fold a captured constructor whose children are all concrete through peEval (egressing the rebuilt EConstruct, named-field metadata preserved); otherwise a residual EConstruct. Internal helper of partialEvaluateData."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peDataConstruct : (ctor: String) -> (args: a) -> (fields: a) -> (hasFields: Bool) -> (nullValue: a) -> a
+peDataConstruct ctor args fields hasFields nullValue =
+  let argResults = map (\a -> peDataWalk a nullValue) args
+  let argExprs = peResultsToExprs argResults []
+  let residualExpr =
+        if hasFields
+        then EConstruct { ctor = ctor, args = argExprs, fields = fields }
+        else EConstruct { ctor = ctor, args = argExprs }
+  if peAllConcrete argResults
+  then
+    case peEval (exprToJsonLogic residualExpr) of
+      Ok v -> peConcrete v
+      Err e -> peResidual residualExpr
+  else peResidual residualExpr
+
+@label "PE: data record"
+@description "Fold a record field-wise when every field value is concrete (a raw record built with mapSet); otherwise a residual ERecord. Internal helper of partialEvaluateData."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peDataRecord : (fields: a) -> (nullValue: a) -> (fieldAcc: a) -> (allConcrete: Bool) -> (concreteAcc: a) -> a
+peDataRecord fields nullValue fieldAcc allConcrete concreteAcc =
+  case head fields of
+    Nothing ->
+      if allConcrete then peConcrete concreteAcc else peResidual (ERecord { fields = fieldAcc })
+    Just f ->
+      let r = peDataWalk f.value nullValue
+      let fieldAcc2 = appendItem { name = f.name, value = resultToExpr r } fieldAcc
+      let concreteAcc2 = if r.done then mapSet concreteAcc f.name r.value else concreteAcc
+      peDataRecord (tailOr fields) nullValue fieldAcc2 (and allConcrete r.done) concreteAcc2
+
+-- peBindingsFromKnowns — fold the `{name, value}` knowns list into the opaque
+-- bindings map (name ⇒ concrete PEResult), the O(1)-read env the walker threads
+-- (the 7h S2 opaque-map perf branch: mapSet/mapGet over the pure assoc list).
+-- CONSERVATIVE MODE: only SCALAR knowns are bound (Astra round 3: substituting
+-- an array loses the sharing `includes` observes); every other known stays an
+-- unbound read.
+@label "PE: bindings from knowns"
+@description "Fold the {name, value} known-inputs list into the opaque bindings map (name ⇒ concrete PEResult), scalar knowns only (number, string, boolean); other knowns stay unbound reads. partial-evaluator-substrate Phase 1, conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peBindingsFromKnowns : (knowns: a) -> (acc: a) -> a
+peBindingsFromKnowns knowns acc =
+  case head knowns of
+    Nothing -> acc
+    Just k ->
+      if peScalar k.value
+      then peBindingsFromKnowns (tailOr knowns) (mapSet acc k.name (peConcrete k.value))
+      else peBindingsFromKnowns (tailOr knowns) acc
+
+-- peConcrete / peResidual — the two PEResult constructors (plain records; NO
+-- entity decl — the cheap-gate class).
+@label "PE: concrete result"
+@description "Build a concrete PEResult `{ done = true, value }` — a fully-reduced value. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peConcrete : (v: a) -> a
+peConcrete v = { done = true, value = v }
+
+@label "PE: residual result"
+@description "Build a residual PEResult `{ done = false, value }` — an unreduced residual Expr. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peResidual : (e: a) -> a
+peResidual e = { done = false, value = e }
+
+-- resultToExpr — project a PEResult back to an `Expr` for residual rebuild /
+-- fold egress: concrete ⇒ `ELit value` (the raw value re-wrapped as a literal,
+-- exactly what the TS `unwrap` embeds into a residual JSON-Logic tree); residual
+-- ⇒ the residual Expr verbatim (an `ELambda` for the fold-ready lambda case).
+@label "PE: result to Expr"
+@description "Project a PEResult back to an Expr for residual rebuild / fold egress: concrete ⇒ `ELit value`; residual ⇒ the residual Expr verbatim (mirrors the TS `unwrap` embedding a concrete value or residual node). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+resultToExpr : (r: a) -> a
+resultToExpr r = if r.done then ELit { value = r.value } else r.value
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- peWalk — the core PE recursion, structural over the 7 `Expr` cases. The TS
+-- `peWalk`'s raw-JSON dispatch (arrays / tagged / single-key / user record)
+-- collapses here: `Expr` already separates the shapes.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "PE: walk"
+@description "The core partial-evaluation recursion, structural over the 7 Expr cases. ELit ⇒ concrete; EVar ⇒ substitute-if-known (dot-path project) / residual; ECall ⇒ if-prune / and-or short-circuit / fold-if-concrete (via peEval) / residual; EConstruct ⇒ fold-if-concrete / residual (fields preserved); ERecord ⇒ field-wise; ELambda / EMatch ⇒ SOUND residual pass-through (β-reduce + arm-select are Steps 3-5). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peWalk : (expr: Expr) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peWalk expr bindings foldableFnIds budget nullValue =
+  case expr of
+    ELit { value = v } -> if peQuotable v then peConcrete v else peResidual (ELit { value = v })
+    EVar { name = n } -> peVar n bindings nullValue
+    ECall { fnId = f, args = args } ->
+      if and (eq expr.lit true) (eq f "appendItem")
+      then peLiteralList expr args bindings foldableFnIds budget nullValue
+      else
+        let controlIf = and (elem f ["if", "?:"]) (not (eq (lookup expr "structural") (Just false)))
+        let ordinaryIf = and (elem f ["if", "?:"]) (eq (lookup expr "structural") (Just false))
+        let result = if ordinaryIf then peGeneralCall f args bindings foldableFnIds budget nullValue else peCall f args bindings foldableFnIds budget nullValue
+        if result.done then result
+        -- Pruning may return a selected branch, whose own call provenance must
+        -- survive. peIf marks only the residual controls it creates.
+        else if controlIf then result
+        else case result.value of
+          ECall { fnId = residualHead } ->
+            if eq f residualHead then peResidual (copyCallMetadata expr result.value) else result
+          other -> result
+    ELambda { params = ps, body = bd } -> peResidual (ELambda { params = ps, body = bd })
+    EMatch { scrutinee = sc, arms = arms } -> peMatch sc arms bindings foldableFnIds budget nullValue
+    EConstruct { ctor = c, args = args, fields = fs } -> peResidual (EConstruct { ctor = c, args = peResultsToExprs (peWalkArgs args bindings foldableFnIds budget nullValue []) [], fields = fs })
+    EConstruct { ctor = c, args = args } -> peResidual (EConstruct { ctor = c, args = peResultsToExprs (peWalkArgs args bindings foldableFnIds budget nullValue []) [] })
+    ERecord { fields = fs } -> peResidual (ERecord { fields = map (\f -> { name = f.name, value = resultToExpr (peWalk f.value bindings foldableFnIds budget nullValue) }) fs })
+
+@label "PE: literal list"
+@description "Consume only the adapter's existing source-list appendItem marker through ordinary list construction. Ordinary appendItem calls retain the function-fold gate."
+@tags "engine" "internal" "partial-evaluation" "authoring"
+@category "engine-internal"
+peLiteralList : (expr: Expr) -> (args: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> b
+peLiteralList expr args bindings foldableFnIds budget nullValue =
+  let results = peWalkArgs args bindings foldableFnIds budget nullValue []
+  let residual = peResidual (mapSet expr "args" (peResultsToExprs results []))
+  if and (eq (length results) 2) (peAllConcrete results)
+  then
+    let item = at results 0
+    let items = at results 1
+    if isArray items.value then peConcrete (appendItem item.value items.value) else residual
+  else residual
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- peVar — variable substitution (walkVar), CONSERVATIVE MODE: a dotted read is
+-- NEVER projected (dotted reads go through the representation machinery, e.g.
+-- `s.length` on a string); it stays a residual EVar and the known wrapper
+-- (peWrapKnowns) binds its root. A single-segment read returns its binding: a
+-- scalar known (concrete) or a binder's residual self-EVar (shadowing).
+-- ─────────────────────────────────────────────────────────────────────────
+@label "PE: var"
+@description "Variable substitution (walkVar), conservative mode: a dotted read stays a residual EVar (no projection); a single-segment read returns its binding (a scalar known, or a binder's residual self-EVar); an unbound read stays a residual EVar. partial-evaluator-substrate Phase 1, conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peVar : (name: String) -> (bindings: a) -> (nullValue: a) -> a
+peVar name bindings nullValue =
+  if gt (length (split name ".")) 1
+  then peResidual (EVar { name = name })
+  else
+    case mapGet bindings name of
+      Nothing -> peResidual (EVar { name = name })
+      Just r -> r
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- peCall — the ECall dispatcher. `if`/`?:` prune, `and`/`or` short-circuit;
+-- everything else (eager ops / higher-order ops / user calls / built-in ops /
+-- key-as-fnId — all ONE ECall over Expr) folds-if-concrete-and-pure else stays
+-- residual.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "PE: call"
+@description "The ECall dispatcher, conservative mode: `if`/`?:` ⇒ prune on a concrete condition only; `and`/`or` ⇒ never reduced (they return an operand VALUE, and a dropped operand may be a read a proof sees), operands walked; `$dyn:<name>` heads ⇒ always residual with walked args (the known wrapper binds a scalar known callee); applied single-param ELambda via `$` ⇒ the let frame is KEPT (peApplyLambda); everything else ⇒ a safe-list fold or a residual call. partial-evaluator-substrate Phase 1, conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peCall : (fnId: String) -> (args: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peCall fnId args bindings foldableFnIds budget nullValue =
+  if or (eq fnId "if") (eq fnId "?:")
+  then peIf args 0 [] bindings foldableFnIds budget nullValue
+  else if or (eq fnId "and") (eq fnId "or")
+  then peResidual (ECall { fnId = fnId, args = peResultsToExprs (peWalkArgs args bindings foldableFnIds budget nullValue []) [] })
+  else if startsWith fnId "$dyn:"
+  then peResidual (ECall { fnId = fnId, args = peResultsToExprs (peWalkArgs args bindings foldableFnIds budget nullValue []) [] })
+  else if peIsAppliedLambda fnId args
+  then peApplyLambda args bindings foldableFnIds budget nullValue
+  else peGeneralCall fnId args bindings foldableFnIds budget nullValue
+
+-- peDynCall — a DYNAMIC callee (`{call: [{var: "f"}, …]}` lifts to
+-- `ECall "$dyn:f" […]`). Mirrors the TS walkCall's var-callee resolution:
+-- the binding for `f` is looked up — a concrete STRING names a function
+-- (re-dispatch as a named call, so inlining/folding apply — TS parity); any
+-- other concrete value (a closure) folds via the `$` application vehicle when
+-- every arg is fold-ready (`{call: ["$", closureValue, …args]}` — the host
+-- curries over-application); an unbound / residual binding keeps the `$dyn:`
+-- head residual (the exprToSyntax egress renders it back to the evaluable
+-- `{call: ["$", {var: f}, …]}` form).
+@label "PE: dynamic call"
+@description "Resolve a `$dyn:<name>` dynamic callee through the bindings (the TS walkCall var-callee path): a concrete string re-dispatches as a named call (inline/fold apply); another concrete value (closure) folds via the `$` application vehicle when all args are fold-ready; unbound/residual keeps the residual `$dyn:` call (egress renders `{call: [\"$\", {var: name}, …]}`). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peDynCall : (fnId: String) -> (name: String) -> (args: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peDynCall fnId name args bindings foldableFnIds budget nullValue =
+  case mapGet bindings name of
+    Nothing ->
+      peResidual (ECall { fnId = fnId, args = peResultsToExprs (peWalkArgs args bindings foldableFnIds budget nullValue []) [] })
+    Just r ->
+      if not r.done
+      then peResidual (ECall { fnId = fnId, args = peResultsToExprs (peWalkArgs args bindings foldableFnIds budget nullValue []) [] })
+      else
+        if isString r.value
+        then peGeneralCall r.value args bindings foldableFnIds budget nullValue
+        else
+          let argResults = peWalkArgs args bindings foldableFnIds budget nullValue []
+          if peAllFoldReady argResults
+          then
+            let applied = ECall { fnId = "$", args = concat (appendItem (ELit { value = r.value }) []) (peResultsToExprs argResults []) }
+            case peEval (exprToJsonLogic applied) of
+              Ok v -> peConcrete v
+              Err e -> peResidual (ECall { fnId = fnId, args = peResultsToExprs argResults [] })
+          else peResidual (ECall { fnId = fnId, args = peResultsToExprs argResults [] })
+
+-- peIsAppliedLambda — recognise the desugared let/do shape: `ECall "$"
+-- [ELambda <1 param>, value]` (desugar emits exactly single-binding chains).
+-- Multi-param lambdas fall through to the normal `$` path (std:$ is a
+-- registered pure fn) — β-reducing a partial lambda application would need
+-- unsupplied-param shadowing; the 1-param form is the only shape desugar mints.
+@label "PE: is applied lambda"
+@description "Recognise the desugared let/do applied-lambda shape `ECall \"$\" [ELambda <exactly 1 param>, value]` — the only shape desugar mints (single-binding chains). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peIsAppliedLambda : (fnId: String) -> (args: a) -> Bool
+peIsAppliedLambda fnId args =
+  if and (eq fnId "$") (eq (length args) 2)
+  then
+    case at args 0 of
+      ELambda { params = ps } -> eq (length ps) 1
+      other -> false
+  else false
+
+-- peApplyLambda — the desugared let/do frame, CONSERVATIVE MODE: the frame is
+-- KEPT. The argument is walked, the body is walked with the param bound as a
+-- residual self-EVar (it shadows any outer known), and the result is
+-- `$ (\p -> body') arg'`: the argument is evaluated exactly once, in order, as
+-- ordinary evaluation does (no read or effect is dropped or duplicated). The
+-- former β-reduction (D-let) is withdrawn until the later arc.
+@label "PE: apply lambda (let/do frame)"
+@description "Conservative mode: keep an applied single-param ELambda (a desugared let/do) as a residual frame — walk the argument, walk the body with the param shadowed as a residual self-EVar, rebuild the applied frame (lambda p -> body') applied to arg'. No read or effect is dropped or duplicated. partial-evaluator-substrate Phase 1, conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peApplyLambda : (args: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peApplyLambda args bindings foldableFnIds budget nullValue =
+  case at args 0 of
+    ELambda { params = ps, body = bd } ->
+      case head ps of
+        Nothing -> peGeneralCall "$" args bindings foldableFnIds budget nullValue
+        Just p ->
+          let argR = peWalk (peAt args 1 nullValue) bindings foldableFnIds budget nullValue
+          let bodyR = peWalk bd (mapSet bindings p (peResidual (EVar { name = p }))) foldableFnIds budget nullValue
+          peResidual (ECall { fnId = "$", args = [ELambda { params = ps, body = resultToExpr bodyR }, resultToExpr argR] })
+    other -> peGeneralCall "$" args bindings foldableFnIds budget nullValue
+
+-- peGeneralCall — CONSERVATIVE MODE: fold a call only when its head is in BOTH
+-- the caller-supplied foldable set (the harness pure set with no caller frame or
+-- the exact harness frame; EMPTY in every other frame and under extraFns) AND
+-- the closed `peSafeFold` list, and every argument is concrete (a quotable
+-- scalar or array). The fold runs through peEval on the call AS WRITTEN; it is
+-- kept only for a quotable, non-null value (null is the no-value signal; a
+-- throw or a tripped peEval proof frame is Err). Otherwise the residual call
+-- with walked args. No β-reduction, no higher-order fold, no callback fold.
+@label "PE: general call (fold / residual)"
+@description "Conservative mode: fold an ECall only if its fnId is in the foldable set AND the closed safe-fold list (std add, sub, mul, div, mod, eq, neq, lt, lte, gt, gte, concat, length) and every argument is concrete; the peEval result is kept only when quotable and not null (Err or null ⇒ the residual call). Every other call stays a residual call with walked args — no inlining, no higher-order or callback fold. partial-evaluator-substrate Phase 1, conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peGeneralCall : (fnId: String) -> (args: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peGeneralCall fnId args bindings foldableFnIds budget nullValue =
+  let argResults = peWalkArgs args bindings foldableFnIds budget nullValue []
+  let residualExpr = ECall { fnId = fnId, args = peResultsToExprs argResults [] }
+  if and (elem fnId foldableFnIds) (peSafeFold fnId)
+  then
+    if peAllConcrete argResults
+    then
+      case peEval (exprToJsonLogic residualExpr) of
+        Ok v -> if and (not (isNull v)) (peQuotable v) then peConcrete v else peResidual residualExpr
+        Err e -> peResidual residualExpr
+    else peResidual residualExpr
+  else peResidual residualExpr
+
+-- peBetaReduce — inline a pure user fn (walkCall/finaliseCallLike's β-reduce):
+-- fetch the spec on demand (`peFnSpec` — Nothing / bodyless / lift-Err ⇒ NOT
+-- inlinable ⇒ residual call; the lift-Err case is divergence class D-inline),
+-- bind known args to params in a FRESH scope (registry fns capture nothing —
+-- unsupplied params stay unbound so their body refs stay residual vars), walk
+-- the body at `budget - 1` (the recursive-inline bound; 0 ⇒ residual call).
+-- args ≥ params ⇒ the body result IS the answer (either kind — extras dropped,
+-- MIRRORING the TS over-application behavior); under-application with a
+-- residual body ⇒ the specialised body; with a concrete body ⇒ the residual
+-- call sentinel (the TS partial-application sentinel — consumers interpret the
+-- leftover arity structurally).
+@label "PE: beta-reduce (user-fn inline)"
+@description "Inline a pure user fn: on-demand spec via peFnSpec (Nothing / bodyless / lift-Err ⇒ residual call — D-inline), FRESH param scope (registry fns capture nothing; unsupplied params stay unbound), body walked at budget-1 (0 ⇒ residual call). args ≥ params ⇒ body result (extras dropped, TS mirror); under-application ⇒ residual body, or the residual-call sentinel when the body reduced concrete. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peBetaReduce : (fnId: String) -> (argResults: a) -> (residualExpr: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peBetaReduce fnId argResults residualExpr foldableFnIds budget nullValue =
+  if not (gt budget 0)
+  then peResidual residualExpr
+  else
+    case peFnSpec fnId of
+      Nothing -> peResidual residualExpr
+      Just spec ->
+        case spec.body of
+          Nothing -> peResidual residualExpr
+          Just bodyExpr ->
+            let inner = peBindParams spec.params argResults {}
+            let bodyR = peWalk bodyExpr inner foldableFnIds (sub budget 1) nullValue
+            if not (lt (length argResults) (length spec.params))
+            then bodyR
+            else if bodyR.done
+                 then peResidual residualExpr
+                 else bodyR
+
+-- peBindParams — zip declared param names with PE'd args into a FRESH bindings
+-- map. Params beyond the supplied args stay UNBOUND (their body refs stay
+-- residual vars — the TS `i < argResults.length` guard); extra args beyond the
+-- params are dropped by the zip (the TS over-application mirror).
+@label "PE: bind params"
+@description "Zip declared param names with PE'd args into a fresh bindings map; unsupplied params stay unbound, extra args drop (TS mirror). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peBindParams : (params: a) -> (argResults: a) -> (acc: a) -> a
+peBindParams params argResults acc =
+  case head params of
+    Nothing -> acc
+    Just p ->
+      case head argResults of
+        Nothing -> acc
+        Just r -> peBindParams (tailOr params) (tailOr argResults) (mapSet acc p r)
+
+-- peWalkArgs — PE a list of Expr children, accumulating PEResults in order
+-- (appendItem appends to the END; the symbolizeList idiom).
+@label "PE: walk args"
+@description "PE a list of Expr children in order, accumulating PEResults (appendItem appends to the end). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peWalkArgs : (args: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> (acc: a) -> a
+peWalkArgs args bindings foldableFnIds budget nullValue acc =
+  case head args of
+    Nothing -> acc
+    Just h -> peWalkArgs (tailOr args) bindings foldableFnIds budget nullValue (appendItem (peWalk h bindings foldableFnIds budget nullValue) acc)
+
+-- peResultsToExprs — map resultToExpr over a PEResult list (residual rebuild).
+@label "PE: results to Exprs"
+@description "Map resultToExpr over a PEResult list — the residual-rebuild / fold-egress arg list. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peResultsToExprs : (results: a) -> (acc: a) -> a
+peResultsToExprs results acc =
+  case head results of
+    Nothing -> acc
+    Just r -> peResultsToExprs (tailOr results) (appendItem (resultToExpr r) acc)
+
+-- peAllFoldReady — every arg is fold-ready: concrete, OR a residual `ELambda`
+-- (the higher-order-fold readiness — the egressed `{fn:…}` becomes a host
+-- closure, Step-0 D-4).
+@label "PE: all fold-ready"
+@description "True iff every PEResult in the list is fold-ready: concrete (done), or a residual ELambda (higher-order fold readiness — the egressed lambda becomes a host closure). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peAllFoldReady : (results: a) -> Bool
+peAllFoldReady results =
+  case head results of
+    Nothing -> true
+    Just r -> if peFoldReady r then peAllFoldReady (tailOr results) else false
+
+@label "PE: fold-ready"
+@description "A single PEResult is fold-ready iff concrete or a residual ELambda. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peFoldReady : (r: a) -> Bool
+peFoldReady r = if r.done then true else peIsELambda r.value
+
+@label "PE: is ELambda"
+@description "Recognise a residual ELambda Expr (the fold-ready lambda-value case). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peIsELambda : (e: a) -> Bool
+peIsELambda e =
+  case e of
+    ELambda { params = ps, body = bd } -> true
+    other -> false
+
+@label "PE: all concrete"
+@description "True iff every PEResult in the list is concrete (done). Used by the strict EConstruct fold. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peAllConcrete : (results: a) -> Bool
+peAllConcrete results =
+  case head results of
+    Nothing -> true
+    Just r -> if r.done then peAllConcrete (tailOr results) else false
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- peIf — dead-branch pruning over the chained `if` arg list (walkIf). Over
+-- `Expr` a source `if` is always 3-arg `[cond, then, else]` (desugar emits
+-- `ECall "if" [c, t, e]`; a multi-arm chain is NESTED `ECall "if"`), but the
+-- port keeps the general chained walk (it degrades to the 3-arg case and stays
+-- byte-faithful to the TS residual shape, which reconciles through
+-- jsonLogicToExpr's SIf re-nesting). Pairs (cond, then) walk left-to-right;
+-- a live known-cond with no accumulated residual collapses to that branch; a
+-- dead cond is skipped; an unknown cond appends a residual pair.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "PE: if-prune"
+@description "Dead-branch pruning over the chained `if` arg list (walkIf): pairs (cond, then) walk left-to-right; a concrete truthy cond with no accumulated residual collapses to the then; a concrete falsy cond is skipped (dead branch); an unknown cond appends a residual (cond, then) pair; the trailing else closes the chain. An empty `out` with no live branch ⇒ concrete nullValue. Rebuilds the smallest residual `ECall \"if\"`. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peIf : (args: a) -> (i: Number) -> (out: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peIf args i out bindings foldableFnIds budget nullValue =
+  let n = length args
+  if not (lt i n)
+  then
+    -- No live branch and no else: ordinary `if` exits with NO value (a proof
+    -- sees it), so the residual `if` is kept (`{if: []}` when every pair was
+    -- pruned — the same no-value exit), never a concrete null.
+    peResidual (mapSet (ECall { fnId = "if", args = out }) "structural" true)
+  else if not (lt (add i 1) n)
+  then
+    -- trailing else at index i (i == n - 1)
+    let elseR = peWalk (peAt args i nullValue) bindings foldableFnIds budget nullValue
+    if eq (length out) 0
+    then elseR
+    else peResidual (mapSet (ECall { fnId = "if", args = appendItem (resultToExpr elseR) out }) "structural" true)
+  else
+    let condR = peWalk (peAt args i nullValue) bindings foldableFnIds budget nullValue
+    if condR.done
+    then
+      if peTruthy condR.value nullValue
+      then
+        let thenR = peWalk (peAt args (add i 1) nullValue) bindings foldableFnIds budget nullValue
+        if eq (length out) 0
+        then thenR
+        else peResidual (mapSet (ECall { fnId = "if", args = appendItem (resultToExpr thenR) (appendItem (ELit { value = condR.value }) out) }) "structural" true)
+      else peIf args (add i 2) out bindings foldableFnIds budget nullValue
+    else
+      let thenR = peWalk (peAt args (add i 1) nullValue) bindings foldableFnIds budget nullValue
+      let out2 = appendItem (resultToExpr thenR) (appendItem (resultToExpr condR) out)
+      peIf args (add i 2) out2 bindings foldableFnIds budget nullValue
+
+-- peAt — index into an Expr list. `std:at` returns the RAW element (or `null`
+-- for an out-of-range index — NOT a `Maybe`, unlike `head`), so the valid-index
+-- peIf callers use it directly; the `nullValue` param is the documented total
+-- fallback contract (peIf's index guards make out-of-range unreachable).
+@label "PE: index arg"
+@description "Index into an Expr list via std:at (which returns the raw element, not a Maybe). peIf's `lt i n` / `lt (i+1) n` guards keep every access in range. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peAt : (xs: a) -> (i: Number) -> (nullValue: a) -> a
+peAt xs i nullValue = at xs i
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- peAndOr — short-circuit-aware and/or pruning (walkAndOr). `and`: a concrete
+-- falsy short-circuits to that value, a truthy is pruned (identity); `or`: a
+-- concrete truthy short-circuits, a falsy is pruned. Surviving residuals are
+-- collected; empty ⇒ the operator identity (`and`→true, `or`→false); a single
+-- survivor is returned bare (not wrapped in a 1-arg op).
+-- ─────────────────────────────────────────────────────────────────────────
+@label "PE: and/or prune"
+@description "Short-circuit-aware and/or pruning (walkAndOr): `and` short-circuits on a concrete falsy (returns it) and prunes a truthy identity; `or` short-circuits on a concrete truthy and prunes a falsy identity; surviving residuals collect — empty ⇒ the operator identity (and→true, or→false), a single survivor returns bare, else a residual `ECall op`. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peAndOr : (op: String) -> (args: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> (remaining: a) -> a
+peAndOr op args bindings foldableFnIds budget nullValue remaining =
+  case head args of
+    Nothing -> peAndOrFinish op remaining
+    Just a ->
+      let r = peWalk a bindings foldableFnIds budget nullValue
+      if r.done
+      then
+        let t = peTruthy r.value nullValue
+        if and (eq op "and") (not t) then peConcrete r.value
+        else if and (eq op "or") t then peConcrete r.value
+        else peAndOr op (tailOr args) bindings foldableFnIds budget nullValue remaining
+      else peAndOr op (tailOr args) bindings foldableFnIds budget nullValue (appendItem r.value remaining)
+
+@label "PE: and/or finish"
+@description "Finish the and/or prune: empty survivors ⇒ the operator identity (and→true, or→false); a single survivor returns bare; else a residual `ECall op survivors`. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peAndOrFinish : (op: String) -> (remaining: a) -> a
+peAndOrFinish op remaining =
+  if eq (length remaining) 0 then peConcrete (eq op "and")
+  else if eq (length remaining) 1
+       then peResidual (at remaining 0)
+       else peResidual (ECall { fnId = op, args = remaining })
+
+-- peTruthy — the PE's OWN truthiness (walkIf/walkAndOr's `truthyJs`), ported
+-- EXACTLY: null / false / 0 / "" / "0" and the EMPTY ARRAY are falsy —
+-- everything else truthy. NOT `std:truthy` (JS `Boolean` coercion — differs on
+-- `"0"` and `[]`, both JS-truthy). STRICTNESS (Steps 3-5 fix): the first cut
+-- compared with bare `eq`, but `std:eq` is JS-LOOSE (`" " == false` and
+-- `[[]] == false` are BOTH true), which flipped whitespace strings + nested
+-- arrays to falsy where `truthyJs` (strict `===`) keeps them truthy. The fix
+-- discriminates by TYPE first (isBoolean / isNumber / isString / isArray) —
+-- loose `eq` is exact WITHIN one type, so each branch is strict-equivalent.
+-- BOOL VALUES (2026-10-17): the evaluator's `truthy` now reads the pure Bool
+-- value `{$tag:"False"}` as false (`maybe-value.ts` `boolValueOf`). This body
+-- needs no such arm because no OBJECT reaches it: a known record value and a
+-- `False` constructor both stay residual (measured), and the residual is
+-- evaluated by `truthy` itself. Should the PE ever fold records, add the
+-- `case v of True -> true | False -> false` arm (the
+-- `membershipBooleanVerdict` precedent); `partial-evaluate-port.test.ts`
+-- rows `if-bound-false-tag` / `and-false-tag` / `or-false-tag` would catch it.
+@label "PE: truthy (walkIf semantics)"
+@description "The PE's own truthiness ported exactly from truthyJs (strict): nullValue / false / 0 / \"\" / \"0\" / the empty array are falsy; everything else truthy. Type-discriminated (isBoolean/isNumber/isString/isArray) because std:eq is JS-loose (\" \" == false) — within one type loose eq is exact. Deliberately NOT std:truthy. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peTruthy : (v: a) -> (nullValue: a) -> Bool
+peTruthy v nullValue =
+  if eq v nullValue then false
+  else if isBoolean v then v
+  else if isNumber v then not (eq v 0)
+  else if isString v then not (or (eq v "") (eq v "0"))
+  else if isArray v then gt (length v) 0
+  else true
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- peConstruct — the ADT constructor arm (walkConstruct + walkTaggedRecord).
+-- PE every arg; if ALL concrete, fold via the `peEval` host re-entry (egressing
+-- the rebuilt `EConstruct` through exprToJsonLogic ⇒ `{construct:[ctor, …vals]}`
+-- ⇒ the engine's named-field-disambiguating construct). Else a residual
+-- `EConstruct`, with the named-field `fields` metadata PRESERVED (dual-arm) so a
+-- nested tagged-record residual (`Just {_0 = <residual>}`) round-trips
+-- byte-faithfully to the TS walkTaggedRecord shape.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "PE: construct"
+@description "The ADT constructor arm (walkConstruct + walkTaggedRecord): PE every arg; all concrete ⇒ fold via the peEval host re-entry (egressing the rebuilt EConstruct); else a residual EConstruct with the named-field `fields` metadata preserved (dual-arm) so a nested tagged-record residual round-trips byte-faithfully. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peConstruct : (ctor: String) -> (args: a) -> (fields: a) -> (hasFields: Bool) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peConstruct ctor args fields hasFields bindings foldableFnIds budget nullValue =
+  let argResults = peWalkArgs args bindings foldableFnIds budget nullValue []
+  let argExprs = peResultsToExprs argResults []
+  let residualExpr =
+        if hasFields
+        then EConstruct { ctor = ctor, args = argExprs, fields = fields }
+        else EConstruct { ctor = ctor, args = argExprs }
+  if peAllConcrete argResults
+  then
+    case peEval (exprToJsonLogic residualExpr) of
+      Ok v -> peConcrete v
+      Err e -> peResidual residualExpr
+  else peResidual residualExpr
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- peRecord — the user-record arm (walkUserRecord). PE every field value; if ALL
+-- concrete, surface a concrete record (the raw `{name: value}` map, built via
+-- mapSet — the TS `walkUserRecord` returns a raw object); else a residual
+-- `ERecord` with PE'd field exprs. Threads BOTH accumulators (the residual
+-- `{name, value}` field list AND the concrete record) so ONE pass covers both.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "PE: record"
+@description "The user-record arm (walkUserRecord): PE every field value; all concrete ⇒ a concrete raw record (built via mapSet); else a residual ERecord with PE'd field exprs. One pass threads both the residual field list and the concrete record. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peRecord : (fields: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> (fieldAcc: a) -> (allConcrete: Bool) -> (concreteAcc: a) -> a
+peRecord fields bindings foldableFnIds budget nullValue fieldAcc allConcrete concreteAcc =
+  case head fields of
+    Nothing ->
+      if allConcrete then peConcrete concreteAcc else peResidual (ERecord { fields = fieldAcc })
+    Just f ->
+      let r = peWalk f.value bindings foldableFnIds budget nullValue
+      let fieldAcc2 = appendItem { name = f.name, value = resultToExpr r } fieldAcc
+      let allConcrete2 = and allConcrete r.done
+      let concreteAcc2 = if r.done then mapSet concreteAcc f.name r.value else concreteAcc
+      peRecord (tailOr fields) bindings foldableFnIds budget nullValue fieldAcc2 allConcrete2 concreteAcc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- peMatch — the EMatch arm, CONSERVATIVE MODE: never reduced. The scrutinee
+-- is walked and the match is rebuilt (peMatchResidual): every arm body is PE'd
+-- under pattern-var SHADOWS (each PatVar name rebinds to a residual self-EVar,
+-- so outer knowns don't leak into positions the runtime will rebind), patterns
+-- and guards preserved VERBATIM (the known wrapper binds a guard's known reads).
+-- The concrete-scrutinee arm selection (peMatchConcrete / peMatchPattern, with
+-- its loose-literal and D-guard caveats) is NOT called until the later arc.
+-- ─────────────────────────────────────────────────────────────────────────
+@label "PE: match"
+@description "The EMatch arm, conservative mode: walk the scrutinee and rebuild the match residually — every arm body PE'd under pattern-var shadows, patterns and guards verbatim. No arm selection. partial-evaluator-substrate Phase 1, conservative repair. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peMatch : (sc: a) -> (arms: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peMatch sc arms bindings foldableFnIds budget nullValue =
+  let scrutR = peWalk sc bindings foldableFnIds budget nullValue
+  peMatchResidual (resultToExpr scrutR) arms bindings foldableFnIds budget nullValue
+
+@label "PE: match (concrete scrutinee)"
+@description "Walk arms in order against a concrete scrutinee: guarded arm ⇒ residual bail (the D-guard sound fence); pattern verdict match ⇒ extend bindings with the concrete captures and PE that body only; no ⇒ next arm; unknown ⇒ residual bail; exhausted ⇒ concrete nullValue. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peMatchConcrete : (scrutVal: a) -> (remaining: a) -> (allArms: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peMatchConcrete scrutVal remaining allArms bindings foldableFnIds budget nullValue =
+  case head remaining of
+    Nothing -> peConcrete nullValue
+    Just arm ->
+      case lookup arm "guard" of
+        Just g -> peMatchResidual (ELit { value = scrutVal }) allArms bindings foldableFnIds budget nullValue
+        Nothing ->
+          let verdict = peMatchPattern scrutVal arm.pattern nullValue
+          if eq verdict.kind "match"
+          then peWalk arm.body (peExtendBinds bindings verdict.binds) foldableFnIds budget nullValue
+          else if eq verdict.kind "no"
+          then peMatchConcrete scrutVal (tailOr remaining) allArms bindings foldableFnIds budget nullValue
+          else peMatchResidual (ELit { value = scrutVal }) allArms bindings foldableFnIds budget nullValue
+
+-- peMatchPattern — the 3-way pure pattern matcher over the Pattern ADT vs a
+-- CONCRETE runtime value. Verdict record `{kind: "match"|"no"|"unknown",
+-- binds: [{name, value}]}`. PatWildcard / PatLit "_" ⇒ match; PatVar ⇒ bind the
+-- whole scrutinee; PatLit ⇒ value equality (std:eq — loose across types, exact
+-- within one; cross-type literal patterns are a documented caveat vs the TS
+-- strict `===`); PatConstruct ⇒ Bool-opaque True/False against JS booleans,
+-- else `$tag` compare (a mapGet READ of the `$`-key — reading is legal, only
+-- authoring is barred) + per-field sub-match: fields-present ⇒ the declared
+-- resolved slots' current wireName; fields-ABSENT ⇒ the positional `_i` convention, where a MISSING key is
+-- verdict `unknown` (the pattern may carry lost source-side names — the
+-- shouldUseNamedFields gate drops them at lift; assuming `_i` there would
+-- wrongly skip arms the runtime matches, so the walker bails to residual).
+@label "PE: match pattern"
+@description "3-way pure pattern matcher (Pattern ADT vs concrete value): {kind: match|no|unknown, binds}. Wildcard/PatLit \"_\" ⇒ match; PatVar ⇒ bind; PatLit ⇒ eq (loose-across-types caveat documented); PatConstruct ⇒ Bool-opaque + $tag compare + per-field recurse (fields-present = resolved CompileFieldSlot metadata projected to wireName only at the concrete-object read; fields-absent = positional _i with missing-key ⇒ unknown — the lost-names sound bail). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peMatchPattern : (scrut: a) -> (pat: a) -> (nullValue: a) -> a
+peMatchPattern scrut pat nullValue =
+  case pat of
+    PatWildcard -> { kind = "match", binds = [] }
+    PatVar { name = n } -> { kind = "match", binds = [{ name = n, value = scrut }] }
+    PatLit { value = v } ->
+      if eq v "_"
+      then { kind = "match", binds = [] }
+      else if eq v scrut then { kind = "match", binds = [] } else { kind = "no", binds = [] }
+    PatConstruct { ctor = c, args = as, fields = fs } -> peMatchCtor scrut c as fs true nullValue
+    PatConstruct { ctor = c, args = as } -> peMatchCtor scrut c as [] false nullValue
+
+@label "PE: match constructor"
+@description "Constructor-pattern match: Bool-opaque True/False against a JS-boolean scrutinee (type-gated first — loose eq would coerce); otherwise mapGet the scrutinee's $tag (a non-record scrutinee reads Nothing ⇒ no), compare to the ctor, then per-field sub-match. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peMatchCtor : (scrut: a) -> (c: String) -> (as: a) -> (fs: a) -> (hasFields: Bool) -> (nullValue: a) -> a
+peMatchCtor scrut c as fs hasFields nullValue =
+  if isBoolean scrut
+  then
+    if eq c "True"
+    then (if eq scrut true then { kind = "match", binds = [] } else { kind = "no", binds = [] })
+    else if eq c "False"
+    then (if eq scrut false then { kind = "match", binds = [] } else { kind = "no", binds = [] })
+    else { kind = "no", binds = [] }
+  else
+    case mapGet scrut "$tag" of
+      Nothing -> { kind = "no", binds = [] }
+      Just t ->
+        if eq t c
+        then peMatchCtorFields scrut as fs hasFields 0 [] nullValue
+        else { kind = "no", binds = [] }
+
+@label "PE: match constructor fields"
+@description "Per-field sub-pattern walk of a tag-matched constructor: fields-present walks resolved CompileFieldSlot metadata in parallel and projects slot.wireName only for mapGet; an invalid/missing semantic slot is UNKNOWN. Fields-absent uses positional `_i` (a missing key there is UNKNOWN, the lost-names sound bail; a missing resolved wire projection is a genuine no). Sub-verdicts propagate; binds accumulate. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peMatchCtorFields : (scrut: a) -> (as: a) -> (fs: a) -> (hasFields: Bool) -> (i: Number) -> (binds: a) -> (nullValue: a) -> a
+peMatchCtorFields scrut as fs hasFields i binds nullValue =
+  case head as of
+    Nothing -> { kind = "match", binds = binds }
+    Just sub ->
+      let projection =
+            if hasFields
+            then
+              case head fs of
+                Nothing -> Nothing
+                Just slot ->
+                  if fieldKeyValid slot.key
+                  then Just { wireName = slot.wireName, rest = tailOr fs }
+                  else Nothing
+            else Just { wireName = concat "_" (toString i), rest = fs }
+      case projection of
+        Nothing -> { kind = "unknown", binds = [] }
+        Just projected ->
+          case mapGet scrut projected.wireName of
+            Nothing ->
+              if hasFields
+              then { kind = "no", binds = [] }
+              else { kind = "unknown", binds = [] }
+            Just sv ->
+              let subV = peMatchPattern sv sub nullValue
+              if eq subV.kind "match"
+              then peMatchCtorFields scrut (tailOr as) projected.rest hasFields (add i 1) (concat binds subV.binds) nullValue
+              else subV
+
+@label "PE: extend bindings"
+@description "Fold a capture-binds list `[{name, value}]` into the bindings map as concrete PEResults. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peExtendBinds : (bindings: a) -> (binds: a) -> a
+peExtendBinds bindings binds =
+  case head binds of
+    Nothing -> bindings
+    Just b -> peExtendBinds (mapSet bindings b.name (peConcrete b.value)) (tailOr binds)
+
+@label "PE: match (residual rebuild)"
+@description "Rebuild a residual EMatch: every arm body PE'd under pattern-var shadows (PatVar names rebound to residual self-EVars so outer knowns don't substitute into runtime-rebound positions), patterns + guards preserved VERBATIM (guards are not PE'd — the TS mirror). partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peMatchResidual : (scrutExpr: a) -> (arms: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> a
+peMatchResidual scrutExpr arms bindings foldableFnIds budget nullValue =
+  peResidual (EMatch { scrutinee = scrutExpr, arms = peMatchArmsResidual arms bindings foldableFnIds budget nullValue [] })
+
+@label "PE: match arms (residual walk)"
+@description "Walk EMatch arms for the residual rebuild: shadow the arm's pattern vars, PE the body, preserve pattern + guard verbatim. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peMatchArmsResidual : (arms: a) -> (bindings: a) -> (foldableFnIds: List String) -> (budget: Number) -> (nullValue: a) -> (acc: a) -> a
+peMatchArmsResidual arms bindings foldableFnIds budget nullValue acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let inner = pePatternShadows arm.pattern bindings
+      let bodyR = peWalk arm.body inner foldableFnIds budget nullValue
+      let armOut =
+            case lookup arm "guard" of
+              Just g -> { pattern = arm.pattern, guard = g, body = resultToExpr bodyR }
+              Nothing -> { pattern = arm.pattern, body = resultToExpr bodyR }
+      peMatchArmsResidual (tailOr arms) bindings foldableFnIds budget nullValue (appendItem armOut acc)
+
+@label "PE: pattern shadows"
+@description "Collect every name a pattern would bind and rebind each to a residual self-EVar in the bindings map (the addPatternVarBindings port) — shadows outer knowns inside a residual match arm's body. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+pePatternShadows : (pat: a) -> (acc: a) -> a
+pePatternShadows pat acc =
+  case pat of
+    PatVar { name = n } -> mapSet acc n (peResidual (EVar { name = n }))
+    PatConstruct { args = as } -> pePatternShadowsList as acc
+    other -> acc
+
+@label "PE: pattern shadows (list)"
+@description "pePatternShadows over a sub-pattern list. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+pePatternShadowsList : (pats: a) -> (acc: a) -> a
+pePatternShadowsList pats acc =
+  case head pats of
+    Nothing -> acc
+    Just p -> pePatternShadowsList (tailOr pats) (pePatternShadows p acc)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- exprToSyntax / exprToJsonLogic — the EGRESS. `Expr`'s 7 cases embed 1:1 into
+-- `Syntax`'s 7 core mirrors; `exprToJsonLogic = syntaxToJsonLogic ∘ exprToSyntax`
+-- renders a residual back to JSON-Logic (the fold-egress + the tier-2 re-eval
+-- surface). Match-arm patterns pass through as raw `Pattern` ADT values (the TS
+-- marshal authors their `$tag`/`$bind` — same discipline as syntaxToJsonLogic).
+-- ─────────────────────────────────────────────────────────────────────────
+@label "PE: is lazy op"
+@description "Recognise a lazy control-flow op head (`if` / `?:` / `and` / `or`) — the ops that must egress as the op-KEY form (`{if:[…]}`) rather than the strict call form, to preserve lazy / short-circuit re-evaluation semantics. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "egress" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peIsLazyOp : (fnId: String) -> Bool
+peIsLazyOp fnId = or (or (eq fnId "if") (eq fnId "?:")) (or (eq fnId "and") (eq fnId "or"))
+
+@label "Expr to Syntax"
+@description "Inject an Expr into Syntax — the trivial 7-case identity mapping (ELit⇒SLit, EVar⇒SVar, ECall⇒SCall, ELambda⇒SLambda, EMatch⇒SMatch, EConstruct⇒SConstruct dual-arm, ERecord⇒SRecord); sub-trees recursed, match-arm patterns + named-field `fields` metadata passed through. The residual-egress front half of exprToJsonLogic. partial-evaluator-substrate Phase 1."
+@tags "engine" "ir" "partial-evaluation" "egress" "partial-evaluator-substrate" "phase-1"
+exprToSyntax : (e: Expr) -> Syntax
+exprToSyntax e =
+  case e of
+    ELit { value = v } -> SLit { value = v }
+    EVar { name = n } -> SVar { name = n }
+    -- `if`/`?:` keep legacy structural egress only without an ordinary-call
+    -- marker. Fresh control calls carry their
+    -- adapter's true/false provenance through SCall, whose inverse distinguishes
+    -- raw lazy controls from ordinary eager calls. Only an absent Boolean
+    -- mark keeps the legacy hand-Expr SOp convention. A residual `if` chain
+    -- may have any arity; every ordinary call keeps the call-form egress.
+    ECall { fnId = f, args = args } ->
+      -- A source list literal (the adapter's `lit` appendItem chain) egresses
+      -- as a JSON array literal of its items' JSON-Logic, IN SOURCE ORDER: the
+      -- former `{call: ["appendItem", last, prefix]}` rendering evaluated the
+      -- last item first (reordering effects) and looked `appendItem` up in the
+      -- re-evaluating frame. (Conservative repair, Astra round 4 effect-trace
+      -- test.) SLit's value passes through syntaxToJsonLogic unchanged.
+      case peLitListItems e of
+        Just items -> SLit { value = map (\item -> exprToJsonLogic item) items }
+        Nothing ->
+          if and (elem f ["if", "?:", "and", "or"]) (not (eq (lookup e "structural") Nothing))
+          then copyCallMetadata e (SCall { fnId = f, args = exprToSyntaxList args [] })
+          else if peIsLazyOp f
+          then SOp { op = f, operands = exprToSyntaxList args [] }
+          -- A `$dyn:<name>` dynamic-callee head (jsonLogicToExpr's lift of
+          -- `{call: [{var: name}, …]}`) is NOT an evaluable fnId — render it back
+          -- through the `$` application vehicle: `{call: ["$", {var: name}, …args]}`
+          -- (std:$ applies; the host curries over-application), which re-evaluates
+          -- to the original dynamic call's semantics.
+          else if startsWith f "$dyn:"
+          then SCall { fnId = "$", args = concat (appendItem (SVar { name = slice f 5 (length f) }) []) (exprToSyntaxList args []) }
+          else copyCallMetadata e (SCall { fnId = f, args = exprToSyntaxList args [] })
+    ELambda { params = ps, body = bd } -> SLambda { params = ps, body = exprToSyntax bd }
+    EMatch { scrutinee = sc, arms = arms } -> SMatch { scrutinee = exprToSyntax sc, arms = exprToSyntaxArms arms [] }
+    -- Named-field EConstruct egress: PositionalField identity in ordinal order
+    -- keeps the positional emission (aligned by definition), but GENUINELY-named
+    -- fields must egress as the single-record-arg form
+    -- `{construct: [ctor, {name: val…}]}` — the positional emission would
+    -- MISALIGN when the named subset skips a declared middle field (the engine
+    -- assigns positionally in declaration order). The record form is probe-
+    -- verified to construct identically for both named and `_0` ctors.
+    EConstruct { ctor = c, args = args, fields = fs } ->
+      if pePositionalFields fs 0
+      then SConstruct { ctor = c, args = exprToSyntaxList args [] }
+      else SConstruct { ctor = c, args = appendItem (SRecord { fields = peZipFields fs args [] }) [] }
+    EConstruct { ctor = c, args = args } -> SConstruct { ctor = c, args = exprToSyntaxList args [] }
+    ERecord { fields = fs } -> SRecord { fields = exprToSyntaxFields fs [] }
+
+@label "PE: list literal items"
+@description "The items, in source order, of a source list literal: the adapter's `lit = true` appendItem chain ending in the empty-list literal or in a folded concrete prefix (each element one item). Nothing for any other shape. Internal helper of the egress."
+@tags "engine" "internal" "partial-evaluation" "egress" "partial-evaluator-substrate"
+@category "engine-internal"
+peLitListItems : (e: Expr) -> Maybe a
+peLitListItems e =
+  case e of
+    -- The tail is the empty source literal or a prefix peLiteralList already
+    -- folded to a concrete quotable array: each element becomes its own item.
+    ELit { value = v } -> if and (isArray v) (peQuotable v) then Just (map (\x -> ELit { value = x }) v) else Nothing
+    ECall { fnId = f, args = args } ->
+      if and (eq (lookup e "lit") (Just true)) (and (eq f "appendItem") (eq (length args) 2))
+      then
+        case peLitListItems (at args 1) of
+          Just items -> Just (appendItem (at args 0) items)
+          Nothing -> Nothing
+      else Nothing
+    other -> Nothing
+
+@label "Expr to Syntax list"
+@description "Inject a list of Expr children into Syntax (ECall.args / EConstruct.args), preserving order. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "egress" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+exprToSyntaxList : (exprs: a) -> (acc: a) -> a
+exprToSyntaxList exprs acc =
+  case head exprs of
+    Nothing -> acc
+    Just h -> exprToSyntaxList (tailOr exprs) (appendItem (exprToSyntax h) acc)
+
+@label "Expr to Syntax arms"
+@description "Inject EMatch arms into SMatch arms — pattern passed through untouched (raw Pattern ADT value for the TS marshal), body injected, guard preserved when present. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "egress" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+exprToSyntaxArms : (arms: a) -> (acc: a) -> a
+exprToSyntaxArms arms acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let armOut =
+            case lookup arm "guard" of
+              Just g -> { pattern = arm.pattern, guard = exprToSyntax g, body = exprToSyntax arm.body }
+              Nothing -> { pattern = arm.pattern, body = exprToSyntax arm.body }
+      exprToSyntaxArms (tailOr arms) (appendItem armOut acc)
+
+@label "Expr to Syntax fields"
+@description "Inject ERecord fields into SRecord fields — field name preserved, value injected. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "egress" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+exprToSyntaxFields : (fields: a) -> (acc: a) -> a
+exprToSyntaxFields fields acc =
+  case head fields of
+    Nothing -> acc
+    Just f -> exprToSyntaxFields (tailOr fields) (appendItem { name = f.name, value = exprToSyntax f.value } acc)
+
+@label "PE: positional fields"
+@description "True iff a resolved fields metadata list is the PositionalField-key prefix 0, 1, … (or empty) — the case where positional construct emission stays aligned. Current wire spelling is irrelevant to structural positional identity. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "egress" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+pePositionalFields : (fs: a) -> (i: Number) -> Bool
+pePositionalFields fs i =
+  case head fs of
+    Nothing -> true
+    Just f ->
+      case f.key of
+        PositionalField { index = fieldIndex } ->
+          if eq fieldIndex i
+          then pePositionalFields (tailOr fs) (add i 1)
+          else false
+        NamedField -> false
+
+@label "PE: zip construct fields"
+@description "Zip an EConstruct's resolved named-field metadata with its args into SRecord `{name, value}` fields, projecting each semantic slot's current wireName only at this source/property egress boundary. partial-evaluator-substrate Phase 1. Internal helper."
+@tags "engine" "internal" "partial-evaluation" "egress" "partial-evaluator-substrate" "phase-1"
+@category "engine-internal"
+peZipFields : (fs: a) -> (args: a) -> (acc: a) -> a
+peZipFields fs args acc =
+  case head fs of
+    Nothing -> acc
+    Just field ->
+      case head args of
+        Nothing -> acc
+        Just a -> peZipFields (tailOr fs) (tailOr args) (appendItem { name = field.wireName, value = exprToSyntax a } acc)
+
+@label "Expr to JSON Logic"
+@description "Render a residual Expr back to JSON-Logic — the composition `syntaxToJsonLogic ∘ exprToSyntax`. The fold-egress (peEval hands the rendered call tree to the host evaluate) + the tier-2 re-eval surface. partial-evaluator-substrate Phase 1."
+@tags "engine" "ir" "partial-evaluation" "egress" "partial-evaluator-substrate" "phase-1"
+exprToJsonLogic : (e: Expr) -> a
+exprToJsonLogic e = syntaxToJsonLogic (exprToSyntax e)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- normalizeForDecide — PE-AS-NORMALIZER (decide-substrate Phase 7). The
+-- reduction half of Curry-Howard, made a pipeline stage: run the Fenel-bodied
+-- `partialEvaluate` over a predicate `Expr` (NO known inputs — the free reads
+-- stay residual calls, Phase-2 D-A) and project the PEResult back to an `Expr`
+-- (`resultToExpr` — a folded concrete value re-wraps as `ELit`). The branching
+-- faces (satSymbolicPaths / solveSymbolicPaths) run this BEFORE the gate / mint
+-- / fork:
+--   • const-folds (`(2+3)*read k == 10` ⇒ `5*read k == 10`, so the P12 affine
+--     inversion witnesses 2 where the un-folded `mul(add(2,3),r)` is opaque);
+--   • prunes concretely-dead if-branches (a folded-false cond kills its arm
+--     BEFORE forking — dead writes no longer poison the reads-only gate);
+--   • collapses a whole-concrete predicate to `ELit false` (⇒ forkResidualFalse
+--     fires ⇒ Just false) or `ELit true` (⇒ no atoms ⇒ Nothing, never Just true).
+-- SOUND + strictly wider: the PE is semantics-preserving (the Phase-1 oracle
+-- contract — the residual re-evaluates to the same value under any extension of
+-- the knowns) and preserves effect sites as residual calls, so gating on the
+-- RESIDUAL is sound (a PE-pruned write sat in a concretely-dead branch that never
+-- executes). `budget` is the fixed DEFAULT_PE_BUDGET literal 8 (the value the
+-- engine-bodies-dispatch.ts PE wrapper threads as `_partialBudget ?? 8`).
+-- `nullValue` = the JS-null sentinel (marshal-supplied, like partialEvaluate).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Normalize for decide"
+@description "PE-as-normalizer (decide-substrate Phase 7): run `partialEvaluate` over a predicate Expr with NO known inputs (free reads stay residual calls) at the fixed PE budget 8, then project the PEResult back to an Expr (resultToExpr — a folded concrete value re-wraps as ELit). Const-folds pure sub-terms, prunes concretely-dead if-branches, and collapses a whole-concrete predicate to a boolean ELit — the reduction half made a pipeline stage the branching faces run before gate/mint/fork. Semantics-preserving (the Phase-1 oracle contract) and effect-site-preserving, so gating on the residual is sound and strictly wider. decide-substrate Phase 7."
+@tags "engine" "partial-evaluation" "normalize" "decide-substrate" "phase-7" "fork-exec"
+normalizeForDecide : (foldableFnIds: List String) -> (nullValue: a) -> (expr: Expr) -> Expr
+normalizeForDecide foldableFnIds nullValue expr =
+  resultToExpr (partialEvaluate expr [] foldableFnIds 8 nullValue)

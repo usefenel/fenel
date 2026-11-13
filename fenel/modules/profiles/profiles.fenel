@@ -1,0 +1,874 @@
+-- =========================================================================
+-- Profiles heavies — merge_profiles + create_or_merge_profile.
+--
+-- Phase 12d sub-step 6 of the ts-elimination workstream. Lifts the two
+-- C-handlers in core/actions/profiles.ts (~270 LOC of TS orchestration)
+-- to Fenel C-bodies behind thin Zod-parse + invokeIOAction + Result-
+-- unwrap wrappers. This is the HEAVIEST single sub-step in 12d:
+--   - 2 new substrate primitives (1 multi-table in-tx cascade)
+--   - 2 main C-bodies + identity-resolution iteration
+--   - 4 dispatchAction composition surfaces (create_profile +
+--     append_handle + merge_profiles + the wrapper's own action surface)
+--
+-- module-substrate Phase 3c (2026-05-30) — tier-1 pure Shape-B migration.
+-- This file is now the SOURCE OF TRUTH for the module's signatures +
+-- identity: it grew the `module profiles where` header, the per-function
+-- `name : Type` sigs, and the `@label`/`@description`/`@tags`/`@ioAction`
+-- facet directives that the loader lifts into the same Codeable/Labelable/
+-- Describable/Categorizable/Taggable/IOInvokable ClassInstances the retired
+-- `engine/src/modules/profiles.ts` defineFunction specs used to emit. The
+-- header keeps the LEGACY lowercase `profiles:` id-prefix + `profiles`
+-- category byte-identical. The TS spec wrapper shrank to a thin
+-- `loadFenelModule` seam. (Old filename `manage.fenel` consolidated into
+-- `profiles.fenel`.)
+--
+-- ADTs declared: none (per brief Decision E — only one merge strategy
+-- implemented today; ConflictResolution/MergeStrategy ADT would be
+-- over-engineered.)
+--
+-- Substrate consumed:
+--   - state:findProfilesByHandles            (batch handle lookup)
+--   - state:cascadeProfileMerge              (multi-table in-tx cascade)
+--   - state:appendEvent                      (profiles_merged + profile_resolved)
+--   - state:updateInstance                   (patch target name fields)
+--   - dispatch:dispatchAction                (create_profile + append_handle +
+--                                              merge_profiles)
+--   - std:head / std:tail / std:length / std:filter / std:eq / std:and /
+--     std:or / std:not / std:truthy / std:mergeRecords / std:ifElse /
+--     std:entries / std:map / std:concat
+--
+-- Decisions resolved (per the brief): A substrate event-emit OUTSIDE;
+-- B-deviation substrate pre-sorts + returns full records; C Result {Err e,
+-- Ok a} sentinel; D time:nowIso reused; E no ProfileMergeStrategy ADT;
+-- F create_profile composes via dispatch:dispatchAction; G append_handle
+-- composes via dispatch:dispatchAction; H body Ok-payload includes profileId
+-- + wasNew + mergedCount; I invokeIOAction async; J per-id getInstance N/A;
+-- K parameterised OR-of-pairs SQL in substrate; L substrate tx scope =
+-- cascades + archive only; M write-only event semantics; N same-id precheck
+-- wrapper-side; O substrate scopes by accountId. handle-list build (13a-2)
+-- LIFTED to the buildHandleList Fenel D helper via std:entries.
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line (12a-3/4/7 surprise pattern; 12d-3/4/5 reaffirmed).
+-- =========================================================================
+
+module profiles where
+
+-- Pure D helpers --------------------------------------------------------
+
+-- mergedCount — for the profile_resolved event + Ok-payload. Pre-port
+-- returns `allMatched.length - 1` (the count of sources merged into the
+-- target). matchedProfiles is the pre-sorted list (target = head); when
+-- empty, the createOrMergeNew arm fires and mergedCount = 0 instead.
+mergedCount : List ({}) -> Number
+@label "Merged count"
+@description "Phase 12d sub-step 6 — pure D helper. Number of source profiles merged into the target = length matchedProfiles − 1 (or 0 when empty). For the profile_resolved event payload + Ok response. Mirrors pre-port `allMatched.length - 1`."
+@tags "profile" "pure" "phase-12d"
+mergedCount matchedProfiles =
+  let n = length matchedProfiles
+  ifElse (n > 0) (n - 1) 0
+
+-- findById — Maybe<Record> lookup by .id from a record list. Used to
+-- check whether a handle's existing-profile-set includes the target
+-- (i.e. handle is already on target → skip append). Sister of
+-- purchases:findStepBySlug + inventory's slug lookup.
+findById : List ({}) -> String -> Maybe ({})
+@label "Find by id"
+@description "Phase 12d sub-step 6 — pure D helper. Maybe<Record> lookup by .id from a record list. Used by appendOneNewHandle to check whether a handle's existing-profile-set includes the target (handle already on target → skip append). Sister of purchases:findStepBySlug."
+@tags "profile" "lookup" "pure" "phase-12d"
+findById profiles targetId =
+  let matches = filter (\p -> eq p.id targetId) profiles
+  head matches
+
+-- maybeOr — Maybe<a> with a default. Just<x> → x; Nothing → defaultV.
+-- Sister of payments:maybeOr; inlined here to keep parseApp single-line.
+maybeOr : Maybe String -> String -> String
+@label "Maybe or default"
+@description "Phase 12d sub-step 6 — pure D helper. Maybe<a> with default: Just<x> → x; Nothing → defaultV. Sister of payments:maybeOr; inlined per module to keep parseApp single-line."
+@tags "profile" "pure" "phase-12d"
+maybeOr m defaultV =
+  case m of
+    Nothing -> defaultV
+    Just v -> v
+
+-- buildHandleList — Phase 13a sub-step 2 lift from wrapper-side TS
+-- Object.entries(handles) iteration to a Fenel D-helper using std:entries
+-- (added in 13a-1). emailM lifts to a single-element list when Just;
+-- handlesRec lifts via entries to {key, value} pairs, filtered for
+-- non-empty handle values, mapped to {platform, handle} records, then
+-- concatenated with the email entry. Retires the 12d-6 Decision K-deviation.
+buildHandleList : Maybe String -> {} -> List ({})
+@label "Build handle list"
+@description "Phase 13a sub-step 2 — pure D helper. Lifts the 12d-6 wrapper-side Object.entries(handles) iteration to Fenel via std:entries (added in 13a-1). Composes the email entry + handle entries: emailM Just<e> contributes {platform=\"email\", handle=e}; handlesRec lifts via entries, filters non-empty values, maps to {platform=key, handle=value}; concatenated."
+@tags "profile" "handle" "pure" "phase-13a"
+buildHandleList emailM handlesRec =
+  let emailEntry = emailEntryList emailM
+  let handleEntries = entries handlesRec
+  let nonEmptyEntries = filter handleEntryIsNonEmpty handleEntries
+  let handleRecords = map handleEntryToRecord nonEmptyEntries
+  concat emailEntry handleRecords
+
+-- emailEntryList — emailM Just<e> → [{platform="email", handle=e}];
+-- Nothing → []. Extracted from buildHandleList for parseApp single-line.
+emailEntryList : Maybe String -> List ({})
+@label "Email entry list"
+@description "Phase 13a sub-step 2 — pure D helper. Maybe<String> emailM → single-element list when Just; [] when Nothing. Extracted from buildHandleList per parseApp single-line constraint."
+@tags "profile" "handle" "pure" "phase-13a"
+emailEntryList emailM =
+  case emailM of
+    Nothing -> []
+    Just e -> [{ platform = "email", handle = e }]
+
+-- handleEntryIsNonEmpty — predicate for std:filter. Pre-port TS guarded
+-- `if (handle)` (truthy non-empty string). Sister of std:truthy.
+handleEntryIsNonEmpty : {} -> Boolean
+@label "Handle entry is non-empty"
+@description "Phase 13a sub-step 2 — pure D helper. Predicate for std:filter over std:entries output; pre-port `if (handle)` truthy check."
+@tags "profile" "handle" "pure" "phase-13a"
+handleEntryIsNonEmpty entry =
+  truthy entry.value
+
+-- handleEntryToRecord — std:entries returns {key, value}; rename keys to
+-- the {platform, handle} shape that state:findProfilesByHandles +
+-- dispatch:append_handle consume.
+handleEntryToRecord : {} -> {}
+@label "Handle entry → record"
+@description "Phase 13a sub-step 2 — pure D helper. Renames std:entries' {key, value} pair to {platform, handle} for the state:findProfilesByHandles + dispatch:append_handle consumers."
+@tags "profile" "handle" "pure" "phase-13a"
+handleEntryToRecord entry =
+  { platform = entry.key, handle = entry.value }
+
+-- Name-patch chain ------------------------------------------------------
+
+-- computeFirstPatch — Maybe<Record>. Just { firstName = n } when
+-- firstNameM is Just AND target.firstName is blank (truthy returns false
+-- for null / undefined / empty string — pre-port `!target.firstName`).
+computeFirstPatch : {} -> Maybe String -> Maybe ({})
+@label "Compute firstName patch"
+@description "Phase 12d sub-step 6 — pure D helper. Maybe<Record>. Just { firstName = n } when firstNameM is Just AND target.firstName is blank (mirrors pre-port `!target.firstName`); Nothing otherwise. Body-side null/empty check via truthy."
+@tags "profile" "pure" "phase-12d"
+computeFirstPatch target firstNameM =
+  case firstNameM of
+    Nothing -> Nothing
+    Just n -> liftFirstNamePatchIfBlank target n
+
+liftFirstNamePatchIfBlank : {} -> String -> Maybe ({})
+@label "Lift firstName patch (if blank)"
+@description "Phase 12d sub-step 6 — pure D helper. Extracted from computeFirstPatch per parseApp single-line constraint on the Just-arm body. Returns Just<patch> when target.firstName is blank; Nothing when set."
+@tags "profile" "pure" "phase-12d"
+liftFirstNamePatchIfBlank target n =
+  if truthy target.firstName
+  then Nothing
+  else Just ({ firstName = n })
+
+-- computeLastPatch — Maybe<Record>. Sister of computeFirstPatch.
+computeLastPatch : {} -> Maybe String -> Maybe ({})
+@label "Compute lastName patch"
+@description "Phase 12d sub-step 6 — pure D helper. Sister of computeFirstPatch for lastName."
+@tags "profile" "pure" "phase-12d"
+computeLastPatch target lastNameM =
+  case lastNameM of
+    Nothing -> Nothing
+    Just n -> liftLastNamePatchIfBlank target n
+
+liftLastNamePatchIfBlank : {} -> String -> Maybe ({})
+@label "Lift lastName patch (if blank)"
+@description "Phase 12d sub-step 6 — pure D helper. Sister of liftFirstNamePatchIfBlank for lastName."
+@tags "profile" "pure" "phase-12d"
+liftLastNamePatchIfBlank target n =
+  if truthy target.lastName
+  then Nothing
+  else Just ({ lastName = n })
+
+-- combinePatches — Maybe<Record> merge of two patch-Maybes. Used to
+-- coalesce the firstName / lastName patches into one updateInstance
+-- call (or skip the update entirely when both are Nothing).
+combinePatches : Maybe ({}) -> Maybe ({}) -> Maybe ({})
+@label "Combine patch Maybes"
+@description "Phase 12d sub-step 6 — pure D helper. Maybe<Record> merge of two patch Maybes. Coalesces firstName / lastName patches into one updateInstance call (skipping the DB write when both are Nothing)."
+@tags "profile" "pure" "phase-12d"
+combinePatches firstM lastM =
+  case firstM of
+    Nothing -> lastM
+    Just f -> combinePatchesWithFirst f lastM
+
+combinePatchesWithFirst : {} -> Maybe ({}) -> Maybe ({})
+@label "Combine patches (first known)"
+@description "Phase 12d sub-step 6 — pure D helper. case-arm extraction from combinePatches per parseApp single-line constraint. When firstM is Just, drives the lastM case-arm to merge or pass-through."
+@tags "profile" "pure" "phase-12d"
+combinePatchesWithFirst f lastM =
+  case lastM of
+    Nothing -> Just f
+    Just l -> Just (mergeRecords f l)
+
+-- mergeProfiles main body -----------------------------------------------
+
+-- mergeProfiles — main C-body. Returns Result {Err {code, message}}
+-- {Ok {sourceProfileId, targetProfileId, movedHandles}}. Heavily
+-- simplified vs pre-port because state:cascadeProfileMerge substrate
+-- eats the entire db.transaction block (7 tables, multi-step). The
+-- body is just: invoke substrate → emit event → wrap Ok.
+-- mergeProfiles — ts-elimination-completion Phase 5 (5a-1): the wrapper's
+-- same-id guard + archivedAt time-stamp are FOLDED INTO the body. source ==
+-- target → ActionErr (pre-port wrapper threw "Cannot merge a profile into
+-- itself"); archivedAtIso → time:nowIso (Decision D — the same clock
+-- archiveProfile/doArchive already use). The TS wrapper drops its
+-- `if (===) throw` + `new Date().toISOString()` and reduces to a pure
+-- validate + invokeIOAction + actionResultAdtToTs delegator, draining
+-- mergeProfilesHandler from ACTION_HANDLER_CONTROL_FLOW_ALLOW.
+-- action-subsumption Phase 3 (2026-06-08) — mergeProfiles IS the public
+-- merge_profiles action now (D1 COLLAPSE; no marshalling to drop). The
+-- `format:uuid` refinements merge_profiles_params mirrored ride the sig
+-- (sourceProfileId / targetProfileId : Uuid). The same-id precheck residual stays
+-- body-side. The TS handler is deleted; `adapter` stays a param (D4).
+mergeProfiles : Uuid -> Uuid -> String -> ActionResult
+@label "Merge profiles"
+@description "Phase 13a sub-step 1 / action-subsumption Phase 3 — the public merge_profiles action (no separate TS handler). Params ARE the public contract (sourceProfileId, targetProfileId, adapter). Folds the wrapper's same-id guard (source == target → ActionErr) + archivedAt time-stamp (time:nowIso) into the body; entry-point lifts the inner Result to the ActionResult ADT."
+@tags "profile" "merge" "phase-13a"
+@ioAction "profiles.merge_profiles"
+mergeProfiles sourceProfileId targetProfileId adapter =
+  if eq sourceProfileId targetProfileId
+  then ActionErr { message = "Cannot merge a profile into itself" }
+  else mergeProfilesProceed sourceProfileId targetProfileId adapter
+
+-- mergeProfilesProceed — else-arm extraction (parseApp single-line). After
+-- the same-id guard passes: runs mergeProfilesInner with archivedAtIso =
+-- time:nowIso, lifts the inner Result to the ActionResult ADT.
+mergeProfilesProceed : String -> String -> String -> ActionResult
+@label "Merge profiles (proceed)"
+@description "ts-elimination-completion Phase 5 (5a-1) — else-arm extraction from mergeProfiles per parseApp single-line. After the same-id guard passes: mergeProfilesInner with archivedAtIso = time:nowIso, then lift the inner Result to the ActionResult ADT."
+@tags "profile" "merge" "ts-elimination"
+mergeProfilesProceed sourceProfileId targetProfileId adapter =
+  let r = mergeProfilesInner sourceProfileId targetProfileId nowIso adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { sourceProfileId = ok.sourceProfileId, targetProfileId = ok.targetProfileId }, aggregateType = Just "profile", aggregateId = Just ok.targetProfileId, profileId = Just ok.targetProfileId }
+
+-- mergeProfilesInner — pre-13a-1 entry-point logic; returns Result.
+mergeProfilesInner : String -> String -> String -> String -> {}
+@label "Merge profiles (inner — Result)"
+@description "Phase 12d sub-step 6 — pre-13a entry-point logic; returns Result. Composes state:cascadeProfileMerge + state:appendEvent."
+@tags "profile" "merge" "phase-13a"
+mergeProfilesInner sourceProfileId targetProfileId archivedAtIso adapter =
+  let cascadeResult = cascadeProfileMerge sourceProfileId targetProfileId archivedAtIso
+  let payload = { sourceProfileId = sourceProfileId, targetProfileId = targetProfileId, movedHandles = cascadeResult.movedHandles, adapter = adapter }
+  let _e = appendEvent "profiles_merged" payload (Just "profile") (Just targetProfileId) (Just targetProfileId)
+  Ok { sourceProfileId = sourceProfileId, targetProfileId = targetProfileId, movedHandles = cascadeResult.movedHandles }
+
+-- createOrMergeProfile main body ----------------------------------------
+
+-- createOrMergeProfile — main C-body. Returns Result {Err {code, message}}
+-- {Ok {profileId, wasNew, mergedCount}}. Identity resolution arc:
+--   1. state:findProfilesByHandles → List<Record> pre-sorted (oldest first)
+--   2. branch on Nothing (head empty) → createOrMergeNew (dispatch
+--      create_profile) vs Just target → resolveExistingProfile
+--   3. resolveExistingProfile: dispatch merge_profiles per source +
+--      dispatch append_handle per missing handle + patch name fields +
+--      emit profile_resolved
+-- action-subsumption Phase 3 (2026-06-08) — createOrMergeProfile IS the public
+-- create_or_merge_profile action now (D1 COLLAPSE): public field names (`email`/
+-- `firstName`/`lastName`, not `…M`; `handles`, not `handlesRec`). The refinements
+-- create_or_merge_profile_params mirrored ride the sig (email : Maybe EmailStr;
+-- handles : Maybe ({}) — the open `Record<String,String>` map, Q3/R3, validated
+-- as an open record). The body defaults the optional handles to {} (the TS
+-- handler's `?? {}`) before threading it as the internal `handlesRec` binder. The
+-- open-map + identity-resolution residuals stay body-side. The TS handler is
+-- deleted; `adapter` stays a param (D4).
+createOrMergeProfile : Maybe EmailStr -> Maybe ({}) -> Maybe String -> Maybe String -> String -> ActionResult
+@label "Create or merge profile"
+@description "Phase 13a sub-step 2 / action-subsumption Phase 3 — the public create_or_merge_profile action (no separate TS handler). Params ARE the public contract (email?, handles?, firstName?, lastName?, adapter). Defaults handles (?? {}), then builds handleList via buildHandleList + std:entries; identity-resolution arc unchanged."
+@tags "profile" "merge" "identity" "phase-13a"
+@ioAction "profiles.create_or_merge_profile"
+createOrMergeProfile email handles firstName lastName adapter =
+  let handlesRec = case handles of
+    Nothing -> {}
+    Just h -> h
+  let r = createOrMergeProfileInner email handlesRec firstName lastName adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { profileId = ok.profileId, wasNew = ok.wasNew, mergedCount = ok.mergedCount }, aggregateType = Just "profile", aggregateId = Just ok.profileId, profileId = Just ok.profileId }
+
+-- createOrMergeProfileInner — pre-13a-1 entry-point logic; returns Result.
+-- Phase 13a sub-step 2: receives handlesRec (Record<String, String>)
+-- instead of handleList; builds handleList internally via buildHandleList
+-- + std:entries (added in 13a-1).
+createOrMergeProfileInner : Maybe String -> {} -> Maybe String -> Maybe String -> String -> {}
+@label "Create or merge profile (inner — Result)"
+@description "Phase 13a sub-step 2 — pre-13a entry-point logic; returns Result. Builds handleList from handlesRec via buildHandleList before invoking the identity resolution arc."
+@tags "profile" "merge" "identity" "phase-13a"
+createOrMergeProfileInner emailM handlesRec firstNameM lastNameM adapter =
+  let handleList = buildHandleList emailM handlesRec
+  let matchedProfiles = findProfilesByHandles handleList
+  case head matchedProfiles of
+    Nothing -> createOrMergeNew emailM handleList firstNameM lastNameM adapter
+    Just target -> resolveExistingProfile target matchedProfiles handleList firstNameM lastNameM adapter
+
+-- createOrMergeNew — no existing profile matches. Dispatches create_profile
+-- via dispatch:dispatchAction (Decision F — keeps the E-handler
+-- authoritative). On dispatch success, unwraps result.data.profileId into
+-- the Ok payload with wasNew=true + mergedCount=0.
+createOrMergeNew : Maybe String -> List ({}) -> Maybe String -> Maybe String -> String -> {}
+@label "Create or merge (new)"
+@description "Phase 12d sub-step 6 — case-arm extraction from createOrMergeProfile (Nothing arm — no matched profiles). Dispatches create_profile via dispatch:dispatchAction (Decision F — keeps E-handler authoritative). On dispatch success, unwraps result.data.profileId into Ok with wasNew=True + mergedCount=0."
+@tags "profile" "create" "phase-12d"
+createOrMergeNew emailM handleList firstNameM lastNameM adapter =
+  let createParams = makeCreateProfileParams emailM handleList firstNameM lastNameM
+  let result = dispatchAction "create_profile" createParams
+  if result.success
+  then Ok { profileId = result.data.profileId, wasNew = True, mergedCount = 0 }
+  else Err { code = "create_failed", message = "create_profile dispatch failed" }
+
+-- makeCreateProfileParams — pack the params record for the create_profile
+-- dispatch. Maybe<String> fields stay as-is on the wrapper side; the
+-- dispatch routes through @fenel/core dispatch() which Zod-parses the
+-- params per createProfileSchema. handles passes through verbatim;
+-- email + firstName + lastName only when their Maybe is Just.
+makeCreateProfileParams : Maybe String -> List ({}) -> Maybe String -> Maybe String -> {}
+@label "Make create_profile params"
+@description "Phase 12d sub-step 6 — pure D helper. Pack the dispatch params record for create_profile. handles passes through; email + firstName + lastName only when their Maybe is Just. Sister of payments:makeCreateParams."
+@tags "profile" "create" "pure" "phase-12d"
+makeCreateProfileParams emailM handleList firstNameM lastNameM =
+  let base = { handles = handleList }
+  let withEmail = case emailM of
+    Nothing -> base
+    Just e -> mergeRecords base { email = e }
+  let withFirst = case firstNameM of
+    Nothing -> withEmail
+    Just n -> mergeRecords withEmail { firstName = n }
+  case lastNameM of
+    Nothing -> withFirst
+    Just n -> mergeRecords withFirst { lastName = n }
+
+-- resolveExistingProfile — existing matched profile found (target =
+-- head, sources = tail). Composes the full resolution arc:
+--   1. iterated mergeProfiles for each source (Risk 12: 3-level dispatch
+--      depth per iteration; acceptable for N ≤ 2 typically)
+--   2. iterated appendHandle for each new handle not on target
+--   3. patch target's firstName / lastName if blank
+--   4. emit profile_resolved
+resolveExistingProfile : {} -> List ({}) -> List ({}) -> Maybe String -> Maybe String -> String -> {}
+@label "Resolve existing profile"
+@description "Phase 12d sub-step 6 — case-arm extraction from createOrMergeProfile (Just target arm). Composes: iterated mergeProfiles via dispatch:dispatchAction per source (Risk 12 — 3-level dispatch depth) + iterated append_handle per new handle + name field patch + state:appendEvent 'profile_resolved' + Ok payload."
+@tags "profile" "merge" "phase-12d"
+resolveExistingProfile target matchedProfiles handleList firstNameM lastNameM adapter =
+  let _merged = mergeAllSources target matchedProfiles
+  let _appended = appendNewHandles target handleList
+  let _patched = patchNamesIfBlank target firstNameM lastNameM
+  let mCount = mergedCount matchedProfiles
+  let payload = { wasNew = False, handles = handleList, mergedCount = mCount, adapter = adapter }
+  let _e = appendEvent "profile_resolved" payload (Just "profile") (Just target.id) (Just target.id)
+  Ok { profileId = target.id, wasNew = False, mergedCount = mCount }
+
+-- Source-merge iteration -------------------------------------------------
+
+-- mergeAllSources — iterate over the matched-profiles list skipping the
+-- head (which is target). Pre-port: `for (const source of allMatched.slice(1))`.
+mergeAllSources : {} -> List ({}) -> Number
+@label "Merge all source profiles"
+@description "Phase 12d sub-step 6 — iteration entry. Skips the matchedProfiles head (target) and iterates the tail via mergeEach. Pre-port: `for (const source of allMatched.slice(1))`. Returns 0 (discarded counter)."
+@tags "profile" "merge" "phase-12d"
+mergeAllSources target matchedProfiles =
+  case tail matchedProfiles of
+    Nothing -> 0
+    Just sources -> mergeEach target sources
+
+mergeEach : {} -> List ({}) -> Number
+@label "Merge each (recursive)"
+@description "Phase 12d sub-step 6 — recursive head/tail iteration over sources. Sister of purchases:grantEach + payments:dispatch iteration patterns. Halts when sources is empty."
+@tags "profile" "merge" "phase-12d"
+mergeEach target sources =
+  case head sources of
+    Nothing -> 0
+    Just source -> mergeOneAndContinue target source sources
+
+mergeOneAndContinue : {} -> {} -> List ({}) -> Number
+@label "Merge one and continue"
+@description "Phase 12d sub-step 6 — head-of-tail recursion driver. Dispatches merge_profiles on the head; recurses on the tail via mergeEach."
+@tags "profile" "merge" "phase-12d"
+mergeOneAndContinue target source sources =
+  let _r = mergeOneSource target source
+  case tail sources of
+    Nothing -> 0
+    Just rest -> mergeEach target rest
+
+mergeOneSource : {} -> {} -> Number
+@label "Merge one source"
+@description "Phase 12d sub-step 6 — per-source dispatch. Calls dispatch:dispatchAction 'merge_profiles' with {sourceProfileId, targetProfileId}. Returns 0 (discarded counter)."
+@tags "profile" "merge" "dispatch" "phase-12d"
+mergeOneSource target source =
+  let params = { sourceProfileId = source.id, targetProfileId = target.id }
+  let _r = dispatchAction "merge_profiles" params
+  0
+
+-- New-handle append iteration --------------------------------------------
+
+-- appendNewHandles — iterate over handleList, dispatching append_handle
+-- for each handle not already on target. The per-handle exists-check
+-- reuses state:findProfilesByHandles with a single-pair list: when the
+-- target is in the result, the handle is already on target → skip;
+-- otherwise dispatch append_handle.
+appendNewHandles : {} -> List ({}) -> Number
+@label "Append new handles"
+@description "Phase 12d sub-step 6 — iteration entry over handleList. Per-handle: check whether target already has the handle (via state:findProfilesByHandles probe + findById on target.id); skip if present, else dispatch append_handle."
+@tags "profile" "handle" "phase-12d"
+appendNewHandles target handleList =
+  case head handleList of
+    Nothing -> 0
+    Just h -> appendOneAndContinue target h handleList
+
+appendOneAndContinue : {} -> {} -> List ({}) -> Number
+@label "Append one handle and continue"
+@description "Phase 12d sub-step 6 — head-of-tail recursion driver for the handle-append loop. Dispatches appendOneNewHandle on the head; recurses on the tail via appendNewHandles."
+@tags "profile" "handle" "phase-12d"
+appendOneAndContinue target h handleList =
+  let _r = appendOneNewHandle target h
+  case tail handleList of
+    Nothing -> 0
+    Just rest -> appendNewHandles target rest
+
+appendOneNewHandle : {} -> {} -> Number
+@label "Append one new handle"
+@description "Phase 12d sub-step 6 — per-handle exists-check + dispatch. Probes state:findProfilesByHandles with the single handle; if the result contains target.id, skip; else dispatch append_handle. Same per-handle DB-call overhead as pre-port's per-handle exists query (Risk 5 — acceptable for N ≤ 3 typically)."
+@tags "profile" "handle" "phase-12d"
+appendOneNewHandle target h =
+  let probe = findProfilesByHandles [h]
+  let targetId = target.id
+  case findById probe targetId of
+    Just _ -> 0
+    Nothing -> dispatchAppendHandle targetId h
+
+dispatchAppendHandle : String -> {} -> Number
+@label "Dispatch append_handle"
+@description "Phase 12d sub-step 6 — per-handle dispatch:dispatchAction 'append_handle' (Decision G). Returns 0 (discarded counter)."
+@tags "profile" "handle" "dispatch" "phase-12d"
+dispatchAppendHandle targetId h =
+  let params = { profileId = targetId, platform = h.platform, handle = h.handle }
+  let _r = dispatchAction "append_handle" params
+  0
+
+-- Name-patch dispatcher --------------------------------------------------
+
+-- patchNamesIfBlank — compose firstName / lastName patches; apply only
+-- if at least one is set (avoids a no-op DB write when both targets
+-- are non-blank or both inputs are Nothing).
+patchNamesIfBlank : {} -> Maybe String -> Maybe String -> Number
+@label "Patch names if blank"
+@description "Phase 12d sub-step 6 — compose firstName / lastName patches via computeFirstPatch + computeLastPatch + combinePatches; apply only if at least one is set (Just). Avoids a no-op DB write when both target name fields are non-blank or both inputs are Nothing."
+@tags "profile" "patch" "phase-12d"
+patchNamesIfBlank target firstNameM lastNameM =
+  let firstM = computeFirstPatch target firstNameM
+  let lastM = computeLastPatch target lastNameM
+  let combined = combinePatches firstM lastM
+  applyNamePatch target.id combined
+
+applyNamePatch : String -> Maybe ({}) -> Number
+@label "Apply name patch (if Just)"
+@description "Phase 12d sub-step 6 — case-arm extraction from patchNamesIfBlank. Nothing → no-op (skip DB write); Just<patch> → state:updateInstance via doApplyNamePatch."
+@tags "profile" "patch" "phase-12d"
+applyNamePatch targetId patchM =
+  case patchM of
+    Nothing -> 0
+    Just patch -> doApplyNamePatch targetId patch
+
+doApplyNamePatch : String -> {} -> Number
+@label "Apply name patch"
+@description "Phase 12d sub-step 6 — state:updateInstance call. Returns 0 (discarded counter)."
+@tags "profile" "patch" "phase-12d"
+doApplyNamePatch targetId patch =
+  let _u = updateInstance targetId patch
+  0
+
+-- =========================================================================
+-- ts-elimination-completion Phase 2 (profiles residual) — the three
+-- entity_instances-backed `(E)` handlers in core/actions/profiles.ts
+-- (createProfileHandler / appendHandleHandler / archiveProfileHandler),
+-- ported from live TS orchestration (createEntityInstance ×N +
+-- getEntityInstance + updateEntityInstance + appendEvent + a `for` loop +
+-- `.some`/`.push` auto-email-handle + `?? "person"`/`|| null` defaulting +
+-- the `toIsoOrUndefined` date canonicalisation) to Fenel bodies over
+-- state:*. The wrappers reduce to thin validateActionParams +
+-- Maybe-marshalling + invokeIOAction + actionResultAdtToTs delegators; the
+-- @fenel/db import (+ the toIsoOrUndefined helper) is gone from profiles.ts.
+--
+-- The handle-list iteration ports to head/tail recursion (sister of
+-- mergeEach/appendNewHandles above); the auto-email-handle `.some` ports to
+-- std:filter; the `new Date(s).toISOString()` ISO canonicalisation ports to
+-- canonIso (time:parseIsoTimestamp + time:formatIsoTimestamp). DIVERGENCES
+-- (documented): `firstName/lastName: x || null` and the optional handle
+-- date/suspected fields are OMIT-when-absent-or-empty (Fenel has no null
+-- literal; a missing key reads back as Nothing at the codec boundary).
+-- canonIso returns the input unchanged on parse failure (lenient) rather
+-- than throwing as `new Date("garbage").toISOString()` would — validated
+-- params are already ISO (Decision G1), so the path shouldn't fire.
+-- =========================================================================
+
+-- canonIso — `new Date(s).toISOString()` canonicalisation: parse the ISO
+-- string into a Timestamp then re-format. Returns the input unchanged on
+-- parse failure (defensive; pre-port would throw — but Decision G1 wire
+-- fields are already ISO).
+canonIso : String -> String
+@label "Canonicalise ISO timestamp"
+@description "ts-elimination-completion Phase 2 — pure helper. Replicates `new Date(s).toISOString()` via time:parseIsoTimestamp + time:formatIsoTimestamp (parse → Timestamp → ISO re-format). Returns the input unchanged on parse failure (lenient; pre-port throws, but Decision G1 wire fields are already ISO)."
+@tags "profile" "handle" "time" "pure" "ts-elimination"
+canonIso s =
+  case parseIsoTimestamp s of
+    Nothing -> s
+    Just t -> formatIsoTimestamp t
+
+-- --- create_profile ----------------------------------------------------
+
+-- addProfileEmail / addProfilePhone / addProfileGender — OMIT-when-absent
+-- optional scalar fields (pre-port stored email/phone/gender as
+-- string|undefined; undefined keys drop from the JSON).
+addProfileEmail : {} -> Maybe String -> {}
+@label "Add profile email (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {email} into the profile data only when emailM is Just (pre-port stored string|undefined)."
+@tags "profile" "pure" "ts-elimination"
+addProfileEmail base emailM =
+  case emailM of
+    Nothing -> base
+    Just e -> mergeRecords base { email = e }
+
+addProfilePhone : {} -> Maybe String -> {}
+@label "Add profile phone (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {phone} into the profile data only when phoneM is Just."
+@tags "profile" "pure" "ts-elimination"
+addProfilePhone base phoneM =
+  case phoneM of
+    Nothing -> base
+    Just p -> mergeRecords base { phone = p }
+
+addProfileGender : {} -> Maybe String -> {}
+@label "Add profile gender (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {gender} into the profile data only when genderM is Just."
+@tags "profile" "pure" "ts-elimination"
+addProfileGender base genderM =
+  case genderM of
+    Nothing -> base
+    Just g -> mergeRecords base { gender = g }
+
+-- addProfileFirstName / addProfileLastName — pre-port `firstName || null`:
+-- store when truthy (non-empty), omit otherwise.
+addProfileFirstName : {} -> Maybe String -> {}
+@label "Add profile firstName (if truthy)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {firstName} only when firstNameM is Just AND non-empty (pre-port `firstName || null`); omit-when-absent-or-empty."
+@tags "profile" "pure" "ts-elimination"
+addProfileFirstName base firstNameM =
+  case firstNameM of
+    Nothing -> base
+    Just n -> mergeFirstNameIfTruthy base n
+
+mergeFirstNameIfTruthy : {} -> String -> {}
+@label "Merge firstName (if truthy)"
+@description "ts-elimination-completion Phase 2 — pure helper. case-arm extraction (parseApp single-line): Just-arm of addProfileFirstName — merge when truthy, else base."
+@tags "profile" "pure" "ts-elimination"
+mergeFirstNameIfTruthy base n =
+  if truthy n
+  then mergeRecords base { firstName = n }
+  else base
+
+addProfileLastName : {} -> Maybe String -> {}
+@label "Add profile lastName (if truthy)"
+@description "ts-elimination-completion Phase 2 — pure helper. Sister of addProfileFirstName for lastName (pre-port `lastName || null`)."
+@tags "profile" "pure" "ts-elimination"
+addProfileLastName base lastNameM =
+  case lastNameM of
+    Nothing -> base
+    Just n -> mergeLastNameIfTruthy base n
+
+mergeLastNameIfTruthy : {} -> String -> {}
+@label "Merge lastName (if truthy)"
+@description "ts-elimination-completion Phase 2 — pure helper. Sister of mergeFirstNameIfTruthy for lastName."
+@tags "profile" "pure" "ts-elimination"
+mergeLastNameIfTruthy base n =
+  if truthy n
+  then mergeRecords base { lastName = n }
+  else base
+
+-- buildProfileData — composes the profile entity_instances data record.
+-- type always present (default "person"); email/phone/gender omit-when-
+-- absent; firstName/lastName omit-when-absent-or-empty.
+buildProfileData : Maybe String -> Maybe String -> Maybe String -> Maybe String -> Maybe String -> Maybe String -> {}
+@label "Build profile data"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the profile data record: {type = typeM ?? 'person'} base + optional email/phone/gender (omit-when-absent) + firstName/lastName (omit-when-absent-or-empty, pre-port `|| null`)."
+@tags "profile" "pure" "ts-elimination"
+buildProfileData emailM phoneM typeM genderM firstNameM lastNameM =
+  let base = { type = maybeOr typeM "person" }
+  let withEmail = addProfileEmail base emailM
+  let withPhone = addProfilePhone withEmail phoneM
+  let withGender = addProfileGender withPhone genderM
+  let withFirst = addProfileFirstName withGender firstNameM
+  addProfileLastName withFirst lastNameM
+
+-- emailHandleMatches — pre-port `h.platform === "email" && h.handle === email`.
+emailHandleMatches : {} -> String -> Boolean
+@label "Email handle matches"
+@description "ts-elimination-completion Phase 2 — pure helper. True when a handle record is {platform='email', handle=email} (pre-port `.some` predicate for the auto-email-handle dedup)."
+@tags "profile" "handle" "pure" "ts-elimination"
+emailHandleMatches h email =
+  let pMatch = eq h.platform "email"
+  let hMatch = eq h.handle email
+  pMatch and hMatch
+
+-- hasEmailHandle — pre-port `allHandles.some(h => …)` via std:filter.
+hasEmailHandle : List ({}) -> String -> Boolean
+@label "Has email handle"
+@description "ts-elimination-completion Phase 2 — pure helper. True when the handle list already contains the email as an email-platform handle. Ports the pre-port `.some` via std:filter + length > 0."
+@tags "profile" "handle" "pure" "ts-elimination"
+hasEmailHandle handles email =
+  let matches = filter (\h -> emailHandleMatches h email) handles
+  length matches > 0
+
+-- appendEmailHandle — auto-add email as a handle when absent (pre-port
+-- `if (email && !some) push {platform:"email", handle:email}`).
+appendEmailHandle : List ({}) -> Maybe String -> List ({})
+@label "Append email handle"
+@description "ts-elimination-completion Phase 2 — pure helper. Auto-adds {platform='email', handle=email} to the handle list when emailM is Just and no such handle already exists (pre-port `if (email && !allHandles.some(...)) push`)."
+@tags "profile" "handle" "pure" "ts-elimination"
+appendEmailHandle handles emailM =
+  case emailM of
+    Nothing -> handles
+    Just email -> appendEmailIfMissing handles email
+
+appendEmailIfMissing : List ({}) -> String -> List ({})
+@label "Append email if missing"
+@description "ts-elimination-completion Phase 2 — pure helper. case-arm extraction from appendEmailHandle (Just email): concat the email handle when not already present, else pass-through."
+@tags "profile" "handle" "pure" "ts-elimination"
+appendEmailIfMissing handles email =
+  if hasEmailHandle handles email
+  then handles
+  else concat handles [{ platform = "email", handle = email }]
+
+-- handleSuspected — pre-port `h.suspected ?? false` (truthy of the raw
+-- optional field; false for undefined / explicit false, true for true).
+handleSuspected : {} -> Boolean
+@label "Handle suspected"
+@description "ts-elimination-completion Phase 2 — pure helper. truthy of a handle record's raw optional `suspected` field (pre-port `h.suspected ?? false`)."
+@tags "profile" "handle" "pure" "ts-elimination"
+handleSuspected h =
+  truthy h.suspected
+
+-- addRawValidFrom / addRawValidTo — for create_profile's RAW handle records
+-- (validFrom/validTo are optional fields directly on the wire record, not
+-- Maybe-wrapped). Include + canonicalise when truthy, omit otherwise.
+addRawValidFrom : {} -> String -> {}
+@label "Add raw validFrom (if truthy)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {validFrom = canonIso v} into a profile_handle data record when the raw optional field is truthy, else base (pre-port `toIsoOrUndefined(h.validFrom)`)."
+@tags "profile" "handle" "pure" "ts-elimination"
+addRawValidFrom base v =
+  if truthy v
+  then mergeRecords base { validFrom = canonIso v }
+  else base
+
+addRawValidTo : {} -> String -> {}
+@label "Add raw validTo (if truthy)"
+@description "ts-elimination-completion Phase 2 — pure helper. Sister of addRawValidFrom for validTo."
+@tags "profile" "handle" "pure" "ts-elimination"
+addRawValidTo base v =
+  if truthy v
+  then mergeRecords base { validTo = canonIso v }
+  else base
+
+-- buildHandleData — profile_handle data record for one wire handle in
+-- create_profile (suspected default false; validFrom/validTo canonicalised
+-- + omit-when-absent).
+buildHandleData : String -> {} -> {}
+@label "Build handle data"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes a profile_handle data record from one create_profile wire handle: {profileId, platform, handle, suspected} + canonicalised validFrom/validTo (omit-when-absent)."
+@tags "profile" "handle" "pure" "ts-elimination"
+buildHandleData profileId h =
+  let base = { profileId = profileId, platform = h.platform, handle = h.handle, suspected = handleSuspected h }
+  let withFrom = addRawValidFrom base h.validFrom
+  addRawValidTo withFrom h.validTo
+
+-- writeHandles — head/tail recursion writing one profile_handle instance
+-- per handle (pre-port `for (const h of allHandles) createEntityInstance`).
+-- Sister of mergeEach / appendNewHandles above.
+writeHandles : String -> List ({}) -> Number
+@label "Write handles"
+@description "ts-elimination-completion Phase 2 — iteration entry. Writes one profile_handle instance per handle via head/tail recursion (pre-port `for (const h of allHandles)`). Returns 0 (discarded counter)."
+@tags "profile" "handle" "ts-elimination"
+writeHandles profileId handles =
+  case head handles of
+    Nothing -> 0
+    Just h -> writeOneAndContinue profileId h handles
+
+writeOneAndContinue : String -> {} -> List ({}) -> Number
+@label "Write one handle and continue"
+@description "ts-elimination-completion Phase 2 — head-of-tail recursion driver for the handle-write loop. Writes the head via writeOneHandle; recurses on the tail via writeHandles."
+@tags "profile" "handle" "ts-elimination"
+writeOneAndContinue profileId h handles =
+  let _w = writeOneHandle profileId h
+  case tail handles of
+    Nothing -> 0
+    Just rest -> writeHandles profileId rest
+
+writeOneHandle : String -> {} -> Number
+@label "Write one handle"
+@description "ts-elimination-completion Phase 2 — per-handle state:tryCreateInstanceByName 'profile_handle' write (buildHandleData). Returns 0 (discarded counter)."
+@tags "profile" "handle" "ts-elimination"
+writeOneHandle profileId h =
+  let data = buildHandleData profileId h
+  let _r = tryCreateInstanceByName "profile_handle" data
+  0
+
+-- buildProfileCreatedPayload — profile_created event payload {email,
+-- handles, adapter}; email included only when Just (pre-port string|undefined).
+buildProfileCreatedPayload : Maybe String -> List ({}) -> String -> {}
+@label "Build profile_created payload"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the profile_created event payload: {handles, adapter} + email when Just (pre-port `{email, handles, adapter}` with undefined email dropped)."
+@tags "profile" "pure" "ts-elimination"
+buildProfileCreatedPayload emailM allHandles adapter =
+  let base = { handles = allHandles, adapter = adapter }
+  case emailM of
+    Nothing -> base
+    Just e -> mergeRecords base { email = e }
+
+-- createProfile — main body. Creates the profile, builds the handle list
+-- (input handles + auto-email-handle), writes N profile_handle instances,
+-- emits profile_created. @codeName avoids the global-codeName clash with
+-- dashboard:createProfile (a distinct route surface).
+-- action-subsumption Phase 3 (2026-06-08) — createProfile IS the public
+-- create_profile action now (D1 COLLAPSE): public field names (drop the `…M`
+-- marshalling) + the refinements create_profile_params mirrored ride the sig
+-- (email : Maybe EmailStr [format:email], type : Maybe ProfileType, gender :
+-- Maybe ProfileGender, handles : Maybe (List ProfileHandleInput) — all reused
+-- byte-identically from fenel/std/entities/{profile,ProfileHandleInput}.fenel).
+-- The auto-email-handle + ISO-canon residuals stay body-side. The TS handler is
+-- deleted; `adapter` stays a param (D4). @codeName avoids the global-codeName
+-- clash with dashboard:createProfile.
+createProfile : Maybe EmailStr -> Maybe String -> Maybe ProfileType -> Maybe ProfileGender -> Maybe String -> Maybe String -> Maybe (List ProfileHandleInput) -> String -> ActionResult
+@codeName "createProfileAction"
+@label "Create profile"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 3 — the public create_profile action (no separate TS handler). Params ARE the public contract (email?, phone?, type?, gender?, firstName?, lastName?, handles?, adapter). Persists the profile (buildProfileData) via state:tryCreateInstanceByName; on success builds the handle list (handles + auto-email-handle), writes N profile_handle instances, emits profile_created, returns ActionOk { data = {profileId} }."
+@tags "profile" "create" "ts-elimination"
+@ioAction "profiles.create_profile"
+createProfile email phone type gender firstName lastName handles adapter =
+  let profileData = buildProfileData email phone type gender firstName lastName
+  let r = tryCreateInstanceByName "profile" profileData
+  if r.ok
+  then createProfileProceed r.value email handles adapter
+  else ActionErr { message = r.error }
+
+-- createProfileProceed — after the profile row landed. Builds allHandles,
+-- writes them, emits the event, returns Ok with the profileId.
+createProfileProceed : String -> Maybe String -> Maybe ({}) -> String -> ActionResult
+@label "Create profile (proceed)"
+@description "ts-elimination-completion Phase 2 — if-arm extraction from createProfile (profile created). Builds allHandles (input + auto-email-handle), writes N profile_handle instances (writeHandles), emits profile_created, returns ActionOk { data = {profileId}, profileId }."
+@tags "profile" "create" "ts-elimination"
+createProfileProceed profileId emailM handlesM adapter =
+  let handles = case handlesM of
+    Nothing -> []
+    Just hs -> hs
+  let allHandles = appendEmailHandle handles emailM
+  let _written = writeHandles profileId allHandles
+  let payload = buildProfileCreatedPayload emailM allHandles adapter
+  let _e = appendEvent "profile_created" payload (Just "profile") (Just profileId) (Just profileId)
+  ActionOk { data = { profileId = profileId }, aggregateType = Just "profile", aggregateId = Just profileId, profileId = Just profileId }
+
+-- --- append_handle -----------------------------------------------------
+
+-- maybeBool — Maybe<Boolean> with False default (pre-port `suspected ??
+-- false` on the top-level Maybe-wrapped param).
+maybeBool : Maybe Boolean -> Boolean
+@label "Maybe bool (False default)"
+@description "ts-elimination-completion Phase 2 — pure helper. Just b → b; Nothing → False (pre-port `suspected ?? false` on the append_handle Maybe param)."
+@tags "profile" "pure" "ts-elimination"
+maybeBool m =
+  case m of
+    Nothing -> False
+    Just b -> b
+
+-- addValidFromM / addValidToM — for append_handle's Maybe-wrapped validFrom/
+-- validTo top-level params (canonicalise when Just, omit otherwise).
+addValidFromM : {} -> Maybe String -> {}
+@label "Add validFrom (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Merges {validFrom = canonIso v} when the Maybe param is Just, else base (pre-port `toIsoOrUndefined(validFromMaybe)`)."
+@tags "profile" "handle" "pure" "ts-elimination"
+addValidFromM base vM =
+  case vM of
+    Nothing -> base
+    Just v -> mergeRecords base { validFrom = canonIso v }
+
+addValidToM : {} -> Maybe String -> {}
+@label "Add validTo (if Just)"
+@description "ts-elimination-completion Phase 2 — pure helper. Sister of addValidFromM for validTo."
+@tags "profile" "handle" "pure" "ts-elimination"
+addValidToM base vM =
+  case vM of
+    Nothing -> base
+    Just v -> mergeRecords base { validTo = canonIso v }
+
+-- buildAppendHandleData — profile_handle data record for append_handle
+-- (Maybe-wrapped optional params).
+buildAppendHandleData : String -> String -> String -> Maybe Boolean -> Maybe String -> Maybe String -> {}
+@label "Build append-handle data"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes a profile_handle data record for append_handle: {profileId, platform, handle, suspected = suspectedM ?? False} + canonicalised validFrom/validTo (omit-when-absent)."
+@tags "profile" "handle" "pure" "ts-elimination"
+buildAppendHandleData profileId platform handle suspectedM validFromM validToM =
+  let base = { profileId = profileId, platform = platform, handle = handle, suspected = maybeBool suspectedM }
+  let withFrom = addValidFromM base validFromM
+  addValidToM withFrom validToM
+
+-- appendHandle — main body. Writes one profile_handle, emits handle_appended.
+-- action-subsumption Phase 3 (2026-06-08) — appendHandle IS the public
+-- append_handle action now (D1 COLLAPSE): public field names (`suspected`/
+-- `validFrom`/`validTo`, not `…M`) + the refinements append_handle_params
+-- mirrored ride the sig (profileId : Uuid, platform / handle : NonEmptyStr). The
+-- ISO-canon residual stays body-side. The TS handler is deleted; `adapter` stays
+-- a param (D4).
+appendHandle : Uuid -> NonEmptyStr -> NonEmptyStr -> Maybe Boolean -> Maybe String -> Maybe String -> String -> ActionResult
+@label "Append handle"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 3 — the public append_handle action (no separate TS handler). Params ARE the public contract (profileId, platform, handle, suspected?, validFrom?, validTo?, adapter). Writes one profile_handle (buildAppendHandleData) via state:tryCreateInstanceByName, emits handle_appended, returns ActionOk { data = {}, profileId }."
+@tags "profile" "handle" "ts-elimination"
+@ioAction "profiles.append_handle"
+appendHandle profileId platform handle suspected validFrom validTo adapter =
+  let data = buildAppendHandleData profileId platform handle suspected validFrom validTo
+  let _r = tryCreateInstanceByName "profile_handle" data
+  let payload = { platform = platform, handle = handle, adapter = adapter }
+  let _e = appendEvent "handle_appended" payload (Just "profile") (Just profileId) (Just profileId)
+  ActionOk { data = {}, aggregateType = Just "profile", aggregateId = Just profileId, profileId = Just profileId }
+
+-- --- archive_profile ---------------------------------------------------
+
+-- doArchive — patch the profile with archivedAt = nowIso. state:update-
+-- Instance patch-merge preserves existing fields (pre-port `{...existing.data,
+-- archivedAt}` full-replace is unnecessary under patch-merge).
+doArchive : String -> Number
+@label "Do archive"
+@description "ts-elimination-completion Phase 2 — pure-ish helper. state:updateInstance patch {archivedAt = nowIso} (patch-merge preserves existing fields). Returns 0 (discarded counter)."
+@tags "profile" "archive" "ts-elimination"
+doArchive profileId =
+  let _u = updateInstance profileId { archivedAt = nowIso }
+  0
+
+-- archiveIfExists — pre-port guards the update on existing && entityType
+-- === 'profile'. state:getInstance 'profile' id returns Nothing for a
+-- non-profile / missing id, so the type-check is implicit.
+archiveIfExists : String -> Number
+@label "Archive if exists"
+@description "ts-elimination-completion Phase 2 — guards the archive update on state:getInstance 'profile' id (Nothing → no-op; the type filter is implicit in the typed lookup). Returns 0."
+@tags "profile" "archive" "ts-elimination"
+archiveIfExists profileId =
+  case getInstance "profile" profileId of
+    Nothing -> 0
+    Just _ -> doArchive profileId
+
+-- archiveProfile — main body. Patches archivedAt when the profile exists,
+-- then ALWAYS emits profile_archived (pre-port emits the event even when the
+-- profile is missing — the `if` only guards the update).
+-- action-subsumption Phase 2 (2026-06-08) — archiveProfile IS the public
+-- archive_profile action now (D1 COLLAPSE; no marshalling to drop). The
+-- `format:uuid` refinement archive_profile_params mirrored rides the sig:
+-- profileId : Uuid. The TS handler is deleted; `adapter` stays a param (D4).
+archiveProfile : Uuid -> String -> ActionResult
+@label "Archive profile"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 2 — the public archive_profile action (no separate TS handler). Patches archivedAt when the profile exists (archiveIfExists), then ALWAYS emits profile_archived (pre-port fires the event even when missing), returns ActionOk { data = {}, profileId }."
+@tags "profile" "archive" "ts-elimination"
+@ioAction "profiles.archive_profile"
+archiveProfile profileId adapter =
+  let _u = archiveIfExists profileId
+  let payload = { adapter = adapter }
+  let _e = appendEvent "profile_archived" payload (Just "profile") (Just profileId) (Just profileId)
+  ActionOk { data = {}, aggregateType = Just "profile", aggregateId = Just profileId, profileId = Just profileId }

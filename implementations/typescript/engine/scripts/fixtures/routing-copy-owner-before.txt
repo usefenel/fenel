@@ -1,0 +1,140 @@
+type BrowserAuthorityCopyState = { sourceFrozen: boolean };
+
+function cloneFrozenBrowserAuthority<T>(
+  value: T,
+  copies = new WeakMap<object, unknown>(),
+  state?: BrowserAuthorityCopyState,
+): T {
+  if (value === null || typeof value !== "object") return value;
+  const prior = copies.get(value);
+  if (prior !== undefined) return prior as T;
+  if (state !== undefined && !Object.isFrozen(value)) state.sourceFrozen = false;
+  if (Object.getPrototypeOf(value) === Uint8Array.prototype) {
+    const bytes = new Uint8Array(value as unknown as Uint8Array);
+    copies.set(value, bytes);
+    return bytes as T;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("browser evaluator authority must be plain transport data");
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new TypeError("browser evaluator authority must not contain symbol properties");
+  }
+  const output = Array.isArray(value)
+    ? new Array(value.length)
+    : Object.create(prototype) as Record<string, unknown>;
+  copies.set(value, output);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const key of Object.keys(descriptors)) {
+    if (Array.isArray(value) && key === "length") continue;
+    const descriptor = descriptors[key]!;
+    if (!Object.hasOwn(descriptor, "value")) {
+      throw new TypeError(
+        `browser evaluator authority: accessor property ${JSON.stringify(key)} is not allowed`,
+      );
+    }
+    if (!descriptor.enumerable) continue;
+    Object.defineProperty(output, key, {
+      __proto__: null,
+      value: cloneFrozenBrowserAuthority(descriptor.value, copies, state),
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    } as PropertyDescriptor);
+  }
+  return Object.freeze(output) as T;
+}
+
+/** The browser's private copy of a routing table, per source getter and
+ * routing version, with the copy's Bytes-bearing nodes (a Bytes leaf and every
+ * node that reaches one). */
+type VersionedRoutingCopy = {
+  readonly version: unknown;
+  readonly copy: unknown;
+  readonly bytesBearing: WeakSet<object>;
+};
+
+/** perf 2026-10-30: the registry's routing table carries Bytes leaves
+ * (Exemplifiable examples of `Bytes`), so it is never deep-frozen and the
+ * registry deep-clones it on EVERY read; this facade then cloned it again.
+ * Keyed exactly as the evaluator's own private cache
+ * (`json-logic.ts:routingTableForEvaluation`): the registry's getter is one
+ * object per registry, and its version moves whenever the table can change.
+ * Each read returns the private copy's frozen nodes that reach no Bytes leaf
+ * as they are (immutable, so shared by every read), and a fresh frozen spine
+ * from the root to each Bytes leaf with a fresh Uint8Array, so a consumer can
+ * mutate only its own bytes. */
+const versionedRoutingCopies = new WeakMap<() => unknown, VersionedRoutingCopy>();
+
+function markBytesBearing(
+  value: unknown,
+  bearing: WeakSet<object>,
+  visiting: WeakSet<object>,
+  done: WeakSet<object>,
+): boolean {
+  if (value === null || typeof value !== "object") return false;
+  if (bearing.has(value)) return true;
+  if (done.has(value)) return false;
+  // A cycle back into a node still being walked: count it as Bytes-bearing,
+  // so a node is shared only when it provably reaches no Bytes leaf.
+  if (visiting.has(value)) return true;
+  if (Object.getPrototypeOf(value) === Uint8Array.prototype) {
+    bearing.add(value);
+    return true;
+  }
+  visiting.add(value);
+  let found = false;
+  for (const child of Object.values(value)) {
+    if (markBytesBearing(child, bearing, visiting, done)) found = true;
+  }
+  visiting.delete(value);
+  if (found) bearing.add(value);
+  else done.add(value);
+  return found;
+}
+
+function freshBytesSpine<T>(value: T, bearing: WeakSet<object>, copies: WeakMap<object, unknown>): T {
+  if (value === null || typeof value !== "object" || !bearing.has(value)) return value;
+  const prior = copies.get(value);
+  if (prior !== undefined) return prior as T;
+  if (Object.getPrototypeOf(value) === Uint8Array.prototype) {
+    const bytes = new Uint8Array(value as unknown as Uint8Array);
+    copies.set(value, bytes);
+    return bytes as T;
+  }
+  const output = Array.isArray(value)
+    ? new Array(value.length)
+    : Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
+  copies.set(value, output);
+  // `value` is this module's own plain copy: enumerable own data slots only.
+  for (const [key, child] of Object.entries(value)) {
+    Object.defineProperty(output, key, {
+      __proto__: null,
+      value: freshBytesSpine(child, bearing, copies),
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    } as PropertyDescriptor);
+  }
+  return Object.freeze(output) as T;
+}
+
+function versionedRoutingTableRead(
+  routingTable: () => unknown,
+  routingTableVersion: () => number,
+): unknown {
+  const version = routingTableVersion();
+  let entry = versionedRoutingCopies.get(routingTable);
+  if (entry === undefined || !Object.is(entry.version, version)) {
+    const current = routingTable();
+    if (current === null || typeof current !== "object") return current;
+    const copy = cloneFrozenBrowserAuthority(current);
+    const bytesBearing = new WeakSet<object>();
+    markBytesBearing(copy, bytesBearing, new WeakSet(), new WeakSet());
+    entry = { version, copy, bytesBearing };
+    versionedRoutingCopies.set(routingTable, entry);
+  }
+  return freshBytesSpine(entry.copy, entry.bytesBearing, new WeakMap());
+}
+

@@ -1,0 +1,279 @@
+module engine where
+
+-- set-expr-sql — the SetExpr → SQL reader behind `db/set-expr-sql.setExprToSQL`
+-- (the universal constraint language compiled to a Drizzle SQL condition on a
+-- column — the SAME SetExpr that validates a value at runtime now filters rows
+-- in Postgres). The Fenel port of `set-expr-sql.ts`'s `setExprToSQL` (the TS
+-- function is now a thin `sqlFragToSql(dispatchEngineBody("engine:setExprToSqlFragment",
+-- [set]), col)` wrapper).
+--
+-- set-algebra-to-fenel Phase 3b-3e — the LAST in-workstream clean-path
+-- structural SetExpr reader (after telegram 3b-3a, the widget-hint sub-readers
+-- 3b-3b/3b-3d, and json-schema 3b-3c). The OTHER remaining readers
+-- (`printSetExpr` / `validation-hints`) are blocked on a Fenel `$where`-Expression
+-- RENDERER; this one has a clean path DESPITE that tail because its `$where` arm
+-- carries the RAW predicate THROUGH the SQL-fragment ADT (`SqlWhere pred`) and
+-- lets the still-TS, ledgered `expressionToSQL` leaf compile it at reconstitution
+-- time — NO marshal-walk, NO new orchestration TS.
+--
+-- THE SQL-FRAGMENT ADT (Step-0 §A). The Fenel body cannot author a Drizzle `sql`
+-- object (a host class — the db-driver tagged-template, the irreducible IO leaf).
+-- So it returns a PURE SQL-fragment marker tree that the db `sqlFragToSql` leaf
+-- interprets into `sql`. Modeled — like the 3b-3c json-schema markers + the
+-- regex-hint `{tag="Pt…"}` markers — as plain `$`-key-FREE records dispatched by a
+-- `tag` STRING field (NOT a registered `$variant` entity: 0 catalog entities ⇒
+-- the module-migrate-engine fail-SET + the `.fenel.lock` stay byte-identical to
+-- HEAD). The markers flow back through `dispatchEngineBody` as plain data — no
+-- marshal arm. `tag` is a safe key (regex-hint emits single-key `{tag="PtEmpty"}`
+-- and round-trips); every marker here is ≥2-key, always a record literal.
+--
+--   { tag = "SqlRaw",   text }        -- TRUE / FALSE (no bound params)
+--   { tag = "SqlCmp",   op, value }   -- col <op> ${value}   (one bound param)
+--   { tag = "SqlIn",    values }      -- col IN (${…})        (n bound params)
+--   { tag = "SqlMatch", regex }       -- col ~ ${regex}
+--   { tag = "SqlNamed", handle }      -- delegate to NAMED_SQL[handle]  (leaf)
+--   { tag = "SqlAnd",   parts }       -- (p1 AND p2 …)
+--   { tag = "SqlOr",    parts }       -- (p1 OR  p2 …)
+--   { tag = "SqlNot",   inner }       -- NOT (…)
+--   { tag = "SqlWhere", pred }        -- carry the raw $where pred THROUGH
+--
+-- `col` IS NOT A BODY PARAM (Step-0 §C). `col` is CONSTANT for one setExprToSQL
+-- call (it threads down unchanged) and the body never INSPECTS it — only positions
+-- it. So the markers are col-FREE; the leaf substitutes the one real `col` at every
+-- position. (The Fenel idiom over a redundant "@col" placeholder.)
+--
+-- SePattern (rides 3b-3c): `rxhPatternToRegex (rxhReadPat p)` — the already-Fenel
+-- legacy-`.t`-Pattern reader + anchored-regex serializer (`regex-hint.fenel`). ok ⇒
+-- SqlMatch regex; else ⇒ SqlRaw "TRUE" (no clean regex form — permissive, like the
+-- TS `patternToRegex(p) ? col~re : TRUE`).
+--
+-- DUAL-READ: live SetExpr data is the canonical `$tag` form (post the `buildSetExpr`
+-- flip), but the codec marshallers still emit the legacy `$`-key form — so the body
+-- matches the `$tag` `Se*` ADT FIRST, then the `$`-key form via `lookup` (sefLegacy).
+-- The `$`-key arm drops with the (blocked) codec delete.
+--
+-- This file is FENCE_FALLBACK'd in the parse-cache (TS-parsed, byte-identical) —
+-- the SAME class as its set-algebra siblings (set-algebra-deciders / json-schema /
+-- regex-hint): the faithful 11-arm `case set of` + the `$`-key dual-read cascade
+-- exceeds the Fenel-bodied parser's layout caps. List members build in-order via an
+-- accumulator + `appendItem` (which appends to the END). Closing the fence is
+-- parser-substrate's job.
+
+-- ---------------------------------------------------------------------------
+-- SqlFrag marker constructors (plain `$`-key-free records).
+-- ---------------------------------------------------------------------------
+
+@category "engine-internal"
+sefRaw : (t: String) -> a
+sefRaw t = { tag = "SqlRaw", text = t }
+
+@category "engine-internal"
+sefCmp : (op: String) -> (v: a) -> b
+sefCmp op v = { tag = "SqlCmp", op = op, value = v }
+
+@category "engine-internal"
+sefNamed : (name: String) -> a
+sefNamed name = { tag = "SqlNamed", handle = name }
+
+@category "engine-internal"
+sefWhere : (pr: a) -> b
+sefWhere pr = { tag = "SqlWhere", pred = pr }
+
+@category "engine-internal"
+sefNot : (inner: a) -> b
+sefNot inner = { tag = "SqlNot", inner = inner }
+
+-- ---------------------------------------------------------------------------
+-- setExprToSqlFragment — canonical 14-case SetExpr → SqlFrag. Eleven SQL-
+-- representable arms are handled; ctor/mu/arrow take the conservative fallback.
+-- ---------------------------------------------------------------------------
+
+@label "set-expr-sql: setExprToSqlFragment"
+@description "Phase 3b-3e / floor-kernel Phase 4 — render a canonical 14-case SetExpr to a pure SQL-fragment marker tree (the col-on-a-row reader behind db setExprToSQL → entity-query / permission-policy filtering). 11 SQL-representable arms: SeAll → SqlRaw TRUE / SeNone → SqlRaw FALSE / SeEnum → SqlRaw FALSE | SqlCmp = | SqlIn / SeInterval → AND-combined SqlCmp >=/>/<=/< (staticBound skips {$expr}) / SeRef → SqlNamed (leaf NAMED_SQL) / SePattern → SqlMatch via rxhPatternToRegex∘rxhReadPat else SqlRaw TRUE / SeWhere → SqlWhere (carry the raw pred through to the leaf expressionToSQL) / SeUnion → SqlRaw FALSE | rec | SqlOr / SeIntersect → SqlRaw TRUE | rec | SqlAnd / SeComplement → SqlNot / SeDiff → SqlAnd [left, SqlNot right]. SeCtor / SeMu / SeArrow use the conservative fallback. col is NOT a param (constant + position-only; the leaf substitutes it). Boundary legacy input is canonicalized before dispatch. The db sqlFragToSql leaf reconstitutes the Drizzle sql object. Mirrors set-expr-sql.ts:setExprToSQL; dispatched from the TS wrapper."
+@tags "engine" "set-expr-sql" "set-expr" "reader" "phase-3b-3e"
+setExprToSqlFragment : (set: a) -> a
+setExprToSqlFragment set =
+  case set of
+    SeAll -> sefRaw "TRUE"
+    SeNone -> sefRaw "FALSE"
+    SeEnum { values = vs } -> sefEnum vs
+    SeInterval { interval = iv } -> sefInterval iv
+    SeRef { handle = name } -> sefNamed name
+    SePattern { pattern = p } -> sefPattern p
+    SeWhere { pred = pr } -> sefWhere pr
+    SeUnion { branches = bs } -> sefUnion bs
+    SeIntersect { branches = bs } -> sefIntersect bs
+    SeComplement { inner = i } -> sefNot (setExprToSqlFragment i)
+    SeDiff { left = l, right = r } -> sefDiff l r
+    -- signature-substrate Phase 4 slice 3a — FAIL CLOSED. A validation rigid has
+    -- no ground extension and must never reach a row filter; if one ever does,
+    -- the honest fragment is FALSE (match nothing), not the `sefLegacy` chain's
+    -- terminal `TRUE`. This reader feeds entity-query AND permission-policy row
+    -- filtering, so the permissive fallback is an authorization bypass, not a
+    -- precision loss. (SeCtor / SeMu / SeArrow still take that legacy chain —
+    -- a pre-existing gap recorded in the slice-3a audit note, out of scope for
+    -- a byte-stable slice.)
+    SeRigid {} -> sefRaw "FALSE"
+    _ -> sefLegacy set
+
+-- sefEnum — [] → FALSE; [x] → col = x; else → col IN (…). Mirrors enumToSQL.
+@category "engine-internal"
+sefEnum : (vs: a) -> b
+sefEnum vs =
+  let n = length vs
+  if eq n 0 then sefRaw "FALSE"
+  else if eq n 1 then
+    case head vs of
+      Nothing -> sefRaw "FALSE"
+      Just x -> sefCmp "=" x
+  else { tag = "SqlIn", values = vs }
+
+-- sefInterval — lo → >= / > ; hi → <= / < ; AND-combined; no static bound → TRUE.
+-- Mirrors intervalToSQL: parts.length 0 → TRUE; 1 → the bare cmp (no parens); else
+-- SqlAnd (the leaf wraps in parens).
+@category "engine-internal"
+sefInterval : (iv: a) -> b
+sefInterval iv =
+  let parts = concat (sefBoundLo iv.lo) (sefBoundHi iv.hi)
+  let n = length parts
+  if eq n 0 then sefRaw "TRUE"
+  else if eq n 1 then
+    case head parts of
+      Nothing -> sefRaw "TRUE"
+      Just x -> x
+  else { tag = "SqlAnd", parts = parts }
+
+-- sefBoundLo / sefBoundHi — a present + static lower/upper bound → a 1-element
+-- [SqlCmp] list (inclusive ⇒ >= / <= ; exclusive ⇒ > / <); absent or {$expr} → [].
+@category "engine-internal"
+sefBoundLo : (lo: a) -> b
+sefBoundLo lo =
+  case lo of
+    Nothing -> []
+    Just b ->
+      case sefStaticBound b of
+        Nothing -> []
+        Just val -> appendItem (sefCmp (if b.inclusive then ">=" else ">") val) []
+
+@category "engine-internal"
+sefBoundHi : (hi: a) -> b
+sefBoundHi hi =
+  case hi of
+    Nothing -> []
+    Just b ->
+      case sefStaticBound b of
+        Nothing -> []
+        Just val -> appendItem (sefCmp (if b.inclusive then "<=" else "<") val) []
+
+-- sefStaticBound — the static-bound extractor (mirrors staticBound): an `{$expr}`
+-- object bound can't become static SQL ⇒ Nothing; any other value (number OR
+-- string literal) passes through as Just. `lookup` on a non-object returns Nothing,
+-- so number/string bounds are kept (NOT an isNumber gate — that would wrongly drop
+-- string bounds the TS keeps).
+@category "engine-internal"
+sefStaticBound : (b: a) -> c
+sefStaticBound b =
+  case lookup b.value "$expr" of
+    Just _ -> Nothing
+    Nothing -> Just b.value
+
+-- sefPattern — the SePattern arm (rides 3b-3c): serialise the legacy `.t` Pattern
+-- to an anchored regex; ok ⇒ SqlMatch regex, else ⇒ SqlRaw TRUE (permissive).
+@category "engine-internal"
+sefPattern : (p: a) -> b
+sefPattern p =
+  let r = rxhPatternToRegex (rxhReadPat p)
+  if r.ok then { tag = "SqlMatch", regex = r.value } else sefRaw "TRUE"
+
+-- sefUnion — [] → FALSE; [x] → rec (unwrapped); else → SqlOr (rec each). Mirrors
+-- the SeUnion arm. `map setExprToSqlFragment bs` recurses per branch.
+@category "engine-internal"
+sefUnion : (bs: a) -> b
+sefUnion bs =
+  let n = length bs
+  if eq n 0 then sefRaw "FALSE"
+  else if eq n 1 then
+    case head bs of
+      Nothing -> sefRaw "FALSE"
+      Just x -> setExprToSqlFragment x
+  else { tag = "SqlOr", parts = map setExprToSqlFragment bs }
+
+-- sefIntersect — [] → TRUE; [x] → rec (unwrapped); else → SqlAnd (rec each).
+@category "engine-internal"
+sefIntersect : (bs: a) -> b
+sefIntersect bs =
+  let n = length bs
+  if eq n 0 then sefRaw "TRUE"
+  else if eq n 1 then
+    case head bs of
+      Nothing -> sefRaw "TRUE"
+      Just x -> setExprToSqlFragment x
+  else { tag = "SqlAnd", parts = map setExprToSqlFragment bs }
+
+-- sefDiff — (left AND NOT (right)) as SqlAnd [left, SqlNot right]; the leaf renders
+-- it byte-identically to the TS `(${a} AND NOT (${b}))`. appendItem appends to the
+-- END, so [left] then append (SqlNot right) preserves the [left, NOT right] order.
+@category "engine-internal"
+sefDiff : (l: a) -> (r: a) -> b
+sefDiff l r =
+  let p0 = appendItem (setExprToSqlFragment l) []
+  let parts = appendItem (sefNot (setExprToSqlFragment r)) p0
+  { tag = "SqlAnd", parts = parts }
+
+-- sefLegacy — the `$`-key dual-read fallback (mirrors peelSetExpr's `$`-key arms as
+-- consumed by setExprToSQL). $ref / $named both → SqlNamed (the refHandle dual-read);
+-- $diff is the legacy 2-element array form. Final default SqlRaw TRUE = the TS
+-- unknown-shape permissive fallback.
+@category "engine-internal"
+sefLegacy : (set: a) -> b
+sefLegacy set =
+  case lookup set "$all" of
+    Just _ -> sefRaw "TRUE"
+    Nothing ->
+      case lookup set "$none" of
+        Just _ -> sefRaw "FALSE"
+        Nothing ->
+          case lookup set "$enum" of
+            Just vs -> sefEnum vs
+            Nothing ->
+              case lookup set "$ref" of
+                Just name -> sefNamed name
+                Nothing ->
+                  case lookup set "$named" of
+                    Just name -> sefNamed name
+                    Nothing ->
+                      case lookup set "$pattern" of
+                        Just p -> sefPattern p
+                        Nothing ->
+                          case lookup set "$interval" of
+                            Just iv -> sefInterval iv
+                            Nothing ->
+                              case lookup set "$where" of
+                                Just pr -> sefWhere pr
+                                Nothing ->
+                                  case lookup set "$union" of
+                                    Just bs -> sefUnion bs
+                                    Nothing ->
+                                      case lookup set "$intersect" of
+                                        Just bs -> sefIntersect bs
+                                        Nothing ->
+                                          case lookup set "$complement" of
+                                            Just i -> sefNot (setExprToSqlFragment i)
+                                            Nothing ->
+                                              case lookup set "$diff" of
+                                                Just d -> sefDiffArr d
+                                                Nothing -> sefRaw "TRUE"
+
+-- sefDiffArr — the legacy `$diff: [left, right]` 2-element array form.
+@category "engine-internal"
+sefDiffArr : (d: a) -> b
+sefDiffArr d =
+  case head d of
+    Nothing -> sefRaw "TRUE"
+    Just l ->
+      case tail d of
+        Nothing -> sefRaw "TRUE"
+        Just rest ->
+          case head rest of
+            Nothing -> sefRaw "TRUE"
+            Just r -> sefDiff l r

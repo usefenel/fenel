@@ -1,0 +1,51 @@
+-- ---------------------------------------------------------------------------
+-- rights Phase C2 — remove the `default:anonymous-form-submit` grant.
+--
+-- Run: bun scripts/run-sql.ts implementations/typescript/db/migrations/010_rights_c3_drop_anonymous_form_submit_grant.sql
+--
+-- WHY THIS IS A MIGRATION AND NOT JUST A CODE CHANGE
+--
+-- The same commit deletes this policy from `DEFAULT_POLICIES` and stops calling
+-- `bootstrapAccountPolicies` at boot. Both are FORWARD-only: they stop the row
+-- being *created* again, and do nothing about the rows already sitting in every
+-- database that ever booted the old server. Leaving those behind would mean the
+-- grant is "deleted" in the source tree and live in production — the worst of
+-- the two states, because the next reader believes the tree.
+--
+-- WHAT THE ROW GRANTED
+--
+--   subjects  : {"$tag":"SeAll"}                       -- EVERY subject, anonymous included
+--   actions   : {"$tag":"SeEnum","values":["submit_form","read"]}
+--   resources : {"$tag":"SeWhere","pred":{"==":[{"var":"kind"},"form"]}}
+--
+-- It is inert today only because `submit_form` was retired by forms-collapse
+-- Phase 3b and `entity_type='form'` rows went with migration 0084 — so nothing
+-- can currently name the verb or match the resource. That is exactly what makes
+-- it worth deleting rather than tolerating: it is a dormant unauthenticated
+-- grant that arms itself the moment anything is called `submit_form` again. Its
+-- resource set is also a `$where` predicate, i.e. inside `mem.where.prov`'s
+-- UNSOUND-KNOWN blast radius (design/tcb-ledger.md) — a decider rule that can
+-- return an incorrect DEFINITE verdict in either polarity. A grant is the last
+-- place that belongs.
+--
+-- SAFE TO RE-RUN. Idempotent by construction: it deletes by exact policy name,
+-- so a second run deletes nothing. Safe on databases that never had the row.
+--
+-- NOT TOUCHED HERE, DELIBERATELY: `default:anonymous-page-read`. It is kept (the
+-- verb and the resource kind both still exist, and anonymous read of published
+-- pages is real product intent), and it is equally unconsulted today —
+-- `dispatch:check` is the only policy evaluator and its only callers are
+-- /api/actions and /api/imports; the public forms lane bypasses dispatch and the
+-- public pages lane performs no permission check at all.
+--
+-- You may also find DUPLICATES of `default:anonymous-page-read` — one per boot,
+-- because the seeder's "idempotent" dedup was broken (it keys on a `name` field
+-- that `state:listPolicies` does not project; see core/src/permissions/
+-- bootstrap.ts). Staging held 22. They are inert and this migration deliberately
+-- does NOT mass-delete them: collapsing rows an operator may consider theirs is
+-- a bigger act than this security fix needs. The boot-time writer is gone, so
+-- the count is now frozen rather than growing.
+-- ---------------------------------------------------------------------------
+
+DELETE FROM permission_policies
+WHERE name = 'default:anonymous-form-submit';

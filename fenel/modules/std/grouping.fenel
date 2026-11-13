@@ -1,0 +1,136 @@
+-- Typed grouping and the ordinary source Map owner (ordinary-maps phase 0, 2026-11-06).
+--
+-- OrdinaryMap is the canonical source owner of a finite typed association: an
+-- ordinary constructor holding a List of { key, value } entries. "OrdinaryMap" is
+-- a temporary, non-reserved binding name: legacy bare `Map K V` still lowers to the
+-- String-keyed `$map` former. Roadmap phase 5 renames this owner to `Map` and
+-- retires `$map` (workstreams/ordinary-maps/roadmap.md).
+--
+-- Key distinctness is NOT a refinement of the type in this first slice: it is an
+-- invariant of the only producer, groupByKey, which emits a Map only when every key
+-- comparison decided. A refined field would make the producer's own signature
+-- unsolvable (a plain value flowing into an arbitrary predicate refinement is
+-- refinement-indeterminate), so the whole-List refinement is a recorded follow-up;
+-- an authored OrdinaryMap literal with duplicate keys is admitted meanwhile.
+--
+-- groupFold is the one grouping traversal. The legacy std.groupBy keeps its id,
+-- signature, `{ }` record result and native fast path (14 executable callers stay
+-- byte-identical); its Fenel body groupByAcc now runs groupFold with the record
+-- insert step below. groupByKey has no native and no certificate row.
+module std where
+
+@label "Map"
+@description "A finite association of typed keys to values, as an ordered list of { key, value } entries. Keys are pairwise distinct as produced by groupByKey (first-encounter order); the type itself does not check distinctness. Temporary name for the ordinary source Map owner while legacy Map K V still lowers to text keys."
+@tags "collection" "map"
+OrdinaryMap k v = OrdinaryMap entries: List ({ key: k, value: v })
+
+-- groupFold and groupByKeyInsert are host-iterated (std fold): one evaluator
+-- frame group per list, never one nested call per item or per group. Their
+-- self-calling bodies nested once per element, and the interpreter has no tail
+-- calls: a browser worker's stack holds under 200 such nestings on a first call
+-- (Nov 11). After an undecided step the fold passes Nothing along without
+-- computing any later key, as the self-call did by stopping.
+@label "Group fold"
+@description "Shared left-to-right grouping traversal for groupBy and groupByKey: computes each element's key exactly once, in list order, and asks the insert step to place the element; stops at the first step that cannot decide (Nothing) without computing later keys. Internal helper."
+@tags "list" "aggregate" "internal"
+groupFold : (key: (a -> k)) -> (insert: ((s, k, a) -> Maybe s)) -> (arr: List a) -> (acc: s) -> Maybe s
+groupFold key insert arr acc = fold (groupFoldStep key insert) (Just acc) arr
+
+@label "Group fold (step)"
+@description "One step of groupFold: compute the element's key and ask the insert step to place it; once a step could not decide, keep Nothing without computing the key. Internal helper."
+@tags "list" "aggregate" "internal"
+groupFoldStep : (key: (a -> k)) -> (insert: ((s, k, a) -> Maybe s)) -> (state: Maybe s) -> (h: a) -> Maybe s
+groupFoldStep key insert state h =
+  case state of
+    Just current ->
+      let k = key h
+      case insert current k h of
+        Just next -> Just next
+        _ -> Nothing
+    _ -> Nothing
+
+@label "Group by (record insert)"
+@description "Legacy text-keyed insert step for groupBy: append the element to the record field named by its key (the record coerces the key to text), keeping first-encounter key order. Always decides. Internal helper."
+@tags "list" "aggregate" "internal"
+groupByRecordInsert : (acc: {  }) -> (k: b) -> (h: a) -> Maybe ({  })
+groupByRecordInsert acc k h = Just (assocRecord acc k (appendItem h (fromMaybe [] (lookup acc k))))
+
+@label "Group by key (insert)"
+@description "Place one element into the typed groups: append it to the first group whose key is exactly equal, else add a new group at the end. Nothing when a key comparison cannot be decided. Internal helper for groupByKey."
+@tags "list" "aggregate" "internal"
+groupByKeyInsert : (entries: List ({ key: k, value: List a })) -> (candidate: k) -> (item: a) -> Maybe (List ({ key: k, value: List a }))
+groupByKeyInsert entries candidate item =
+  let scan = fold (groupByKeyScanStep candidate) { found = false, undecided = false, index = 0 } entries
+  if scan.undecided then Nothing
+  else if not scan.found then Just (appendItem { key = candidate, value = [item] } entries)
+  else
+    case head (drop scan.index entries) of
+      Just entry -> Just (concat (take scan.index entries) (concat [{ key = entry.key, value = appendItem item entry.value }] (drop (scan.index + 1) entries)))
+      _ -> Nothing
+
+@label "Group by key (scan step)"
+@description "One step of groupByKeyInsert's scan of the groups, in order: the first group whose key is exactly equal to the candidate is found at the current index; an undecided comparison stops the scan; any later group is not compared. Internal helper."
+@tags "list" "aggregate" "internal"
+groupByKeyScanStep : (candidate: k) -> (state: { found: Bool, undecided: Bool, index: Number }) -> (entry: { key: k, value: List a }) -> { found: Bool, undecided: Bool, index: Number }
+groupByKeyScanStep candidate state entry =
+  if state.found || state.undecided then state
+  else
+    case exactValueEqual entry.key candidate of
+      Just same -> if same then { found = true, undecided = false, index = state.index } else { found = false, undecided = false, index = state.index + 1 }
+      _ -> { found = false, undecided = true, index = state.index }
+
+@label "Group by key"
+@description "Group elements by a key function, keeping each actual key value (a record, a date, any type) with its members. Keys are compared with the engine's exact value equality: records and variants field by field, callables by identity, $ref handles by their handle text, NaN never equal. Groups and members keep encounter order and each group keeps its first key. Nothing when a key comparison is undecided. ∀a k. (a → k) → List a → Maybe (Map k (List a))"
+@tags "list" "aggregate"
+groupByKey : (key: (a -> k)) -> (arr: List a) -> Maybe (OrdinaryMap k (List a))
+groupByKey key arr =
+  case groupFold key groupByKeyInsert arr [] of
+    Nothing -> Nothing
+    Just entries -> Just (OrdinaryMap { entries = entries })
+    _ -> Nothing
+
+@label "Map values"
+@description "Apply a function to every value of a Map, keeping each key and the entry order. ∀k v w. (v → w) → Map k v → Map k w"
+@tags "collection" "map"
+mapValues : (fn: (v -> w)) -> (m: OrdinaryMap k v) -> OrdinaryMap k w
+mapValues fn m = OrdinaryMap { entries = map (\entry -> { key = entry.key, value = fn entry.value }) m.entries }
+
+@label "Count by key"
+@description "Count the elements of each group of groupByKey: one entry per key (first-encounter order) with its number of elements. Nothing when a key comparison is undecided. ∀a k. (a → k) → List a → Maybe (Map k Number)"
+@tags "list" "aggregate"
+countByKey : (key: (a -> k)) -> (arr: List a) -> Maybe (OrdinaryMap k Number)
+countByKey key arr =
+  case groupByKey key arr of
+    Nothing -> Nothing
+    Just groups -> Just (mapValues (\rows -> count rows) groups)
+    _ -> Nothing
+
+@label "Sum by key"
+@description "Sum a number of each element per group of groupByKey: one entry per key (first-encounter order) with the sum of its elements' amounts. Nothing when a key comparison is undecided. ∀a k. (a → k) → (a → Number) → List a → Maybe (Map k Number)"
+@tags "list" "aggregate"
+sumByKey : (key: (a -> k)) -> (amount: (a -> Number)) -> (arr: List a) -> Maybe (OrdinaryMap k Number)
+sumByKey key amount arr =
+  case groupByKey key arr of
+    Nothing -> Nothing
+    Just groups -> Just (mapValues (\rows -> sum (map amount rows)) groups)
+    _ -> Nothing
+
+@label "Count per key"
+@description "Count the members of each group of a grouping (the result of Group by): one entry per key, in the grouping's order, with its number of members. An undecided grouping (Nothing) stays Nothing. ∀k a. Maybe (Map k (List a)) → Maybe (Map k Number)"
+@tags "list" "aggregate"
+countPerKey : (groups: Maybe (OrdinaryMap k (List a))) -> Maybe (OrdinaryMap k Number)
+countPerKey groups =
+  case groups of
+    Nothing -> Nothing
+    Just grouped -> Just (mapValues (\rows -> count rows) grouped)
+    _ -> Nothing
+
+@label "Sum per key"
+@description "Sum a number of each member, per group of a grouping (the result of Group by): one entry per key, in the grouping's order, with the sum of its members' amounts. An undecided grouping (Nothing) stays Nothing. ∀k a. (a → Number) → Maybe (Map k (List a)) → Maybe (Map k Number)"
+@tags "list" "aggregate"
+sumPerKey : (amount: (a -> Number)) -> (groups: Maybe (OrdinaryMap k (List a))) -> Maybe (OrdinaryMap k Number)
+sumPerKey amount groups =
+  case groups of
+    Nothing -> Nothing
+    Just grouped -> Just (mapValues (\rows -> sum (map amount rows)) grouped)
+    _ -> Nothing

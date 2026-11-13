@@ -1,0 +1,379 @@
+module engine where
+
+-- =========================================================================
+-- desugar : Syntax -> Expr — the compiler front-end lowering pass.
+-- expr-substrate Phase 2 (brief:
+-- `workstreams/expr-substrate/briefs/phase-2-desugar.md`).
+--
+-- Maps the surface `Syntax` ADT (`fenel/std/syntax.fenel`, 14 cases, sugars
+-- intact) to the irreducible core `Expr` ADT (`fenel/std/expr.fenel`, 7
+-- cases). The six surface sugars lower away; the seven mirrors are
+-- structural case-renames with sub-trees recursed. Total — every Syntax case
+-- has a defined mapping, no Result wrap (decision 2). Sibling of the existing
+-- compile passes (`normalise-to-core.fenel` etc.); P4 wires it as pass #0
+-- (`.fenel text → parser → Syntax → desugar → Expr → ce-pass → …`). NOTHING
+-- emits `Syntax` yet (the parser swap is P4 — P1 brief decision 6) and
+-- nothing evaluates desugar's output yet; P2 ships the transform + its
+-- tree-equality tests only.
+--
+-- ENCODING TABLE (the canonical core encodings the workstream inherits —
+-- P4's compiler re-layer consumes them verbatim):
+--
+--   SIf cond t e            ⇒ ECall "if" [c, t, e]
+--   SLet [b1..bn] body      ⇒ right-nested single-binding applied-ELambda:
+--                              ECall "$" [ELambda [b1.name] <rest>, b1.value]
+--                              where <rest> recurses on [b2..bn], bottoming
+--                              at desugar body. One binding per lambda keeps
+--                              sequential scope (binding N sits INSIDE
+--                              lambdas 1..N-1, sees those names).
+--   SDo [e1..en]            ⇒ the SAME applied-ELambda template, discarded-
+--                              binding name "_": ECall "$" [ELambda ["_"]
+--                              <rest>, e1], bottoming at desugar en (the
+--                              chain's value = last expr). Singleton SDo [e]
+--                              ⇒ desugar e bare; empty SDo [] ⇒ ERecord []
+--                              (the unit record — no null literal; both
+--                              parser-unreachable, chosen for totality).
+--   SOp op operands         ⇒ ECall op operands (arity-agnostic — one arm
+--                              covers unary + binary).
+--
+-- THE APPLY VEHICLE IS BARE "$" (decision 3): `ECall.fnId` is `String`, so a
+-- lambda cannot sit in fn position. `f $ x` parses TODAY to {call: ["$", f,
+-- x]}; `($) f x = f x` is std-bodied (`fenel/modules/std/operators.fenel`),
+-- registered `std:$`. `$` IS the application vehicle for SLet/SDo.
+--
+-- SOP RESOLVED-HEAD CONTRACT (decision 7): `SOp.op` carries the RESOLVED
+-- function head — exactly what `applyBinOp` computes at PARSE time today
+-- (`+` → "add", custom-op name verbatim `$`/`.`, qualified-method string
+-- `>>=` → "Monad.bind"). notation→fnId resolution already happens at parse
+-- time (precedence/associativity must be consulted to shape the tree) and
+-- block-scoped fixity exists ONLY at parse time — a desugar-time registry
+-- lookup would MISS file-local operators. CONSEQUENCE: desugar needs NO
+-- operator table and NO dispatch reads — a fully self-contained pure
+-- transform. (Qualified-method heads ride as dotted fnId strings
+-- `ECall "Monad.bind"`; locked `Expr` has no EMethod case — P4 owns proving
+-- their resolution.)
+--
+-- STRICTNESS (decision 6): the engine's `if` op is lazy-armed while the
+-- strict calling convention isn't — arg-strictness of the canonical call
+-- encodings is the EVALUATOR's dimension (P4 re-layer / P8 Strategy), not the
+-- tree's. desugar is a pure tree transform; no laziness special-casing here.
+-- Args evaluate left-to-right and `$` is strict, so under the default eager
+-- strategy SDo's e1 evaluates before its chain body — sequencing preserved.
+--
+-- WHY NOT (>>)-chains for SDo (the roadmap's other sanctioned option):
+-- `(>>)` does NOT exist in std (verified 2026-06-10), and the P1 decision
+-- rule for that probe outcome is "use the structural fallback — no new fn".
+-- Bonus: ONE template covers let + do (do = let with a discarded binding —
+-- subsumption), and `>>` isn't squatted ahead of the Monad story.
+--
+-- BODY STYLE (decision 9): bare `[]` / `[a, …]` list literals (parse +
+-- evaluate + compile in `.fenel` bodies — 5b14); accumulator-threaded
+-- recursion for the list walkers (the passes' proven self-host-friendly
+-- idiom). The `desugar*` helper names are verified collision-free against the
+-- `module engine where` union (duplicate id = LOAD-TIME ERROR).
+-- =========================================================================
+
+-- desugar — the Syntax → Expr transform (14 Syntax cases). SConstruct uses the DUAL-ARM
+-- pattern-match precedent (`convert`'s two CoreConstruct arms in
+-- make-closures-explicit.fenel): with-`fields` arm first (emits
+-- EConstruct {ctor, args, fields}), without-`fields` arm omits the key.
+-- Match arms / record fields / let bindings recurse via the helpers below;
+-- `params` (List String) passes through untouched; patterns pass through
+-- UNTOUCHED (one shared `Pattern` ADT — P1 decision 1).
+@label "Desugar"
+@description "Map the surface Syntax ADT (14 cases, sugars intact) to the irreducible core Expr ADT (7 cases). The 6 sugars lower: SIf ⇒ ECall \"if\", SLet ⇒ right-nested applied-ELambda over single bindings, SDo ⇒ the same template with \"_\" params (singleton ⇒ bare, empty ⇒ unit ERecord), SOp ⇒ ECall of the parse-time-RESOLVED head, SWhere ⇒ the SLet lowering (scoped-let), SMethod ⇒ a dotted-fnId ECall (cls ++ \".\" ++ method) — qualified-method heads ride as dotted fnId strings, no EMethod (compile-path fenced; interpreter evaluates {method} reflectively). SAnn (a type annotation) is transparent, except over an SMethod (the written type selects the instance): that one is kept as ECall \"ann\" and rejected by jsonLogicToExpr. The 7 mirrors are structural case-renames with sub-trees recursed; patterns pass through untouched. Total — no Result wrap. expr-substrate Phase 2; P4's compiler re-layer consumes these encodings as pass #0."
+@tags "engine" "ir" "desugar" "expr-substrate" "phase-2"
+desugar : (node: Syntax) -> Expr
+desugar node =
+  case node of
+    -- A pureData-marked SLit (a list literal of plain data, `syntaxListLiteral`)
+    -- re-expands to the chain Syntax it replaced, so every Expr consumer sees
+    -- the same lit-marked appendItem chain as before.
+    SLit { value = v } -> if eq node.pureData true then desugar (syntaxOfPureData v) else ELit { value = v }
+    SVar { name = n } -> EVar { name = n }
+    SCall { fnId = f, args = args } ->
+      -- Preserve plain call observations while changing constructors and
+      -- children: synthetic list `lit`, Boolean control `structural`, and
+      -- any other metadata already admitted by the source adapter.
+      copyCallMetadata node (ECall { fnId = f, args = desugarList args [] })
+    SLambda { params = ps, body = bd } ->
+      ELambda { params = ps, body = desugar bd }
+    SMatch { scrutinee = scrut, arms = arms } ->
+      EMatch {
+        scrutinee = desugar scrut,
+        arms = desugarArms arms []
+      }
+    SConstruct { ctor = c, args = args, fields = fs } ->
+      EConstruct {
+        ctor = c,
+        args = desugarList args [],
+        fields = fs
+      }
+    SConstruct { ctor = c, args = args } ->
+      EConstruct { ctor = c, args = desugarList args [] }
+    SRecord { fields = fs } ->
+      ERecord { fields = desugarFields fs [] }
+    SIf { cond = c, then = t, else = e } ->
+      mapSet (ECall { fnId = "if", args = [desugar c, desugar t, desugar e] }) "structural" true
+    SLet { bindings = bs, body = bd } -> desugarLetChain bs bd
+    SDo { exprs = es } -> desugarDoChain es
+    SOp { op = op, operands = operands } ->
+      let call = ECall { fnId = op, args = desugarList operands [] }
+      if elem op ["if", "?:", "and", "or"] then mapSet call "structural" true else call
+    -- SWhere (fenel-surface-extensions Phase 4): a function-level `where` is
+    -- scoped-let (the runtime evaluates `{where}` as let — json-logic.ts), so it
+    -- lowers to the SAME Expr as `SLet { bindings, body }` — REUSE the SLet
+    -- lowering (`desugarLetChain bindings body`). UNLIKE guards' compile fence
+    -- (D2): `where` collapses to `let` (a core form), so the compile / self-host
+    -- path is SUPPORTED for free — no fence, no preserved-but-unconsumed field.
+    SWhere { body = bd, bindings = bs } -> desugarLetChain bs bd
+    -- SMethod (fenel-surface-extensions Phase 6): a module-qualified-method head
+    -- rides as a DOTTED-fnId `ECall` (`Foldable.foldr g z` ⇒ `ECall "Foldable.foldr"
+    -- [g, z]`) — the desugar.fenel header's documented stance ("qualified-method
+    -- heads ride as dotted fnId strings; locked Expr has no EMethod case — P4 owns
+    -- proving their resolution"). D2: the PRODUCTION (interpreted) path NEVER enters
+    -- desugar — it evaluates the wire `{method}` reflectively (json-logic.ts
+    -- methodOp). The COMPILE path is a LEDGERED FENCE-for-now (the dotted fnId would
+    -- need a registered `Foldable.foldr` fn to resolve; today the compile front-end
+    -- key-as-fnId's `{method}` to a bogus `ECall "method"` — this arm is strictly
+    -- MORE faithful — but ZERO corpus files compile a `{method}` body, so the
+    -- downstream dotted-fnId resolution is P4/P8's, not a hard error here). The
+    -- guards' D2 precedent (interpreter is production), distinct from `where`'s
+    -- supported compile.
+    SMethod { cls = c, method = m, args = a } ->
+      ECall { fnId = concat c (concat "." m), args = desugarList a [] }
+    -- SAnn (modules-as-values Phase 2d): a type annotation is TRANSPARENT (the
+    -- core has no annotation; the annotated expression's value is the value) —
+    -- EXCEPT over a qualified method call, whose written type selects the
+    -- instance (`(Iso.decode s : Result String Bytes)`): erasing it would change
+    -- which instance runs. That shape is REJECTED at the compiler boundary
+    -- (`jsonLogicToExpr` returns `Err Unsupported` via desugarAnnotationError);
+    -- this total arm never erases it either, it keeps the wire meaning of
+    -- `{ann:[e, T]}` as the call `ECall "ann" [e, T]` (key-as-fnId), which no
+    -- registered function resolves — a loud downstream failure, never a silent
+    -- instance change.
+    SAnn { expr = e, type = t } -> desugarAnn e t
+
+-- desugarAnn — the SAnn lowering (modules-as-values Phase 2d): transparent for
+-- every expression but a qualified method call (see desugar's SAnn arm).
+@label "Desugar annotation"
+@description "Lower a type annotation `(e : T)`: transparent (desugar e) unless e is a qualified method call (SMethod), whose written type selects the instance — that one keeps the wire meaning as `ECall \"ann\" [desugar e, ELit T]` (never erased; no function resolves it, and jsonLogicToExpr rejects the shape first via desugarAnnotationError). modules-as-values Phase 2d."
+@tags "engine" "internal" "expr-substrate" "modules-as-values" "phase-2d"
+@category "engine-internal"
+desugarAnn : (e: a) -> (t: a) -> Expr
+desugarAnn e t =
+  case e of
+    SMethod { cls = c, method = m, args = a } ->
+      ECall { fnId = "ann", args = [desugar e, ELit { value = t }] }
+    other -> desugar e
+
+-- desugarAnnotationError — the compiler-boundary REJECTION (modules-as-values
+-- Phase 2d): the first annotation over a qualified method call anywhere in the
+-- tree, as a readable reason, else Nothing. `jsonLogicToExpr` returns it as
+-- `Err Unsupported` before desugaring (erasing that annotation would change
+-- which instance runs; the interpreter evaluates `{ann}` directly).
+@label "Desugar annotation error"
+@description "Walk a Syntax tree for a runtime form the compiler cannot faithfully lower: a type annotation over a qualified method (the written type selects the instance), or its explicit nullary projection application (the core would erase that application). Return Just a readable reason or Nothing. jsonLogicToExpr turns Just into Err Unsupported before desugaring."
+@tags "engine" "expr-substrate" "modules-as-values" "phase-2d"
+desugarAnnotationError : (node: a) -> Maybe String
+desugarAnnotationError node =
+  case node of
+    SLit { value = v } -> Nothing
+    SVar { name = n } ->
+      if eq node.identity true then Just "identity reference data has no core Expr literal egress in this fragment; retain the original producer"
+      else Nothing
+    SCall { fnId = f, args = a } -> desugarAnnotationErrorList a
+    SLambda { params = ps, body = bd } -> desugarAnnotationError bd
+    SMatch { scrutinee = sc, arms = arms } ->
+      desugarAnnotationErrorList (appendItem sc (desugarArmSyntaxes arms []))
+    SConstruct { ctor = c, args = a } -> desugarAnnotationErrorList a
+    SRecord { fields = fs } -> desugarAnnotationErrorList (map (\f -> f.value) fs)
+    SIf { cond = c, then = t, else = e } -> desugarAnnotationErrorList [c, t, e]
+    SLet { bindings = bs, body = bd } -> desugarAnnotationErrorList (appendItem bd (map (\b -> b.value) bs))
+    SDo { exprs = es } -> desugarAnnotationErrorList es
+    SOp { op = o, operands = os } -> desugarAnnotationErrorList os
+    SWhere { body = bd, bindings = bs } -> desugarAnnotationErrorList (appendItem bd (map (\b -> b.value) bs))
+    SMethod { cls = c, method = m, args = a } ->
+      if eq node.applied true
+      then Just "explicit nullary application of a qualified method requires runtime projection; the compile path does not support it yet"
+      else desugarAnnotationErrorList a
+    SAnn { expr = e, type = t } ->
+      case e of
+        SMethod { cls = c, method = m, args = a } ->
+          Just (concat "a type annotation on the qualified method call `" (concat c (concat "." (concat m "` selects the instance by its written type; the compile path cannot erase it (that would change which instance runs) and does not support it yet — the interpreter evaluates `{ann}` directly"))))
+        other -> desugarAnnotationError e
+
+-- desugarAnnotationErrorList — desugarAnnotationError over a list, first hit.
+@label "Desugar annotation error (list)"
+@description "desugarAnnotationError over a list of Syntax nodes: the first Just reason, else Nothing. modules-as-values Phase 2d."
+@tags "engine" "internal" "expr-substrate" "modules-as-values" "phase-2d"
+@category "engine-internal"
+desugarAnnotationErrorList : (nodes: a) -> Maybe String
+desugarAnnotationErrorList nodes =
+  case head nodes of
+    Nothing -> Nothing
+    Just n ->
+      case desugarAnnotationError n of
+        Just r -> Just r
+        Nothing ->
+          case tail nodes of
+            Nothing -> Nothing
+            Just rest -> desugarAnnotationErrorList rest
+
+-- desugarArmSyntaxes — the Syntax children of match arms (each arm's optional
+-- guard, then its body), for desugarAnnotationError's walk.
+@label "Desugar arm Syntax children"
+@description "Collect the Syntax children of a list of match arms — each arm's optional guard, then its body — onto an accumulator. modules-as-values Phase 2d."
+@tags "engine" "internal" "expr-substrate" "modules-as-values" "phase-2d"
+@category "engine-internal"
+desugarArmSyntaxes : (arms: a) -> (acc: a) -> a
+desugarArmSyntaxes arms acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let withGuard =
+            case lookup arm "guard" of
+              Just g -> appendItem g acc
+              Nothing -> acc
+      let accNext = appendItem arm.body withGuard
+      case tail arms of
+        Nothing -> accNext
+        Just rest -> desugarArmSyntaxes rest accNext
+
+-- desugarList — walk a list of Syntax children (SCall/SOp args, SConstruct
+-- args), desugaring each and appending to the accumulator. `[]` seed passed
+-- at every call site (the convertList idiom).
+@label "Desugar Syntax list"
+@description "Walk a list of Syntax children (SCall.args / SConstruct.args / SOp.operands), desugaring each via `desugar` and appending to the accumulator. Threading helper for the list-carrying Syntax cases."
+@tags "engine" "internal" "expr-substrate" "phase-2"
+@category "engine-internal"
+desugarList : (exprs: a) -> (acc: a) -> a
+desugarList exprs acc =
+  case head exprs of
+    Nothing -> acc
+    Just h ->
+      let dH = desugar h
+      let accNext = appendItem dH acc
+      case tail exprs of
+        Nothing -> accNext
+        Just rest -> desugarList rest accNext
+
+-- desugarArms — walk a list of {pattern, body} match arms; the pattern flows
+-- through UNTOUCHED (one shared Pattern ADT), the body is desugared.
+@label "Desugar match arms"
+@description "Walk a list of {pattern, body} match arms, desugaring each arm body while passing the pattern through UNTOUCHED (one shared Pattern ADT — P1 decision 1). Threading helper for the SMatch case."
+@tags "engine" "internal" "expr-substrate" "phase-2"
+@category "engine-internal"
+desugarArms : (arms: a) -> (acc: a) -> a
+desugarArms arms acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let dBody = desugar arm.body
+      -- A GUARDED arm (fenel-surface-extensions Phase 3) carries a `guard` Syntax
+      -- field; PRESERVE it (desugared) onto the EMatch arm so it is NOT silently
+      -- dropped (D2 — the COMPILE-PATH fence is a LEDGERED NOTE, not a hard error:
+      -- the interpreter evaluates `{$guard}` directly off the JSON-Logic match arm
+      -- — guards' production path never enters desugar — so guard-free arms stay
+      -- byte-identical here, and a guarded `case` is interpreter-only. The
+      -- downstream compile passes (normalise / effects / closures / emit) do NOT
+      -- yet CONSUME this preserved `guard`, so COMPILING a guarded `case` is an
+      -- unsupported-for-now gap — pull-driven, revisited when a compiled program
+      -- first needs one. ZERO corpus files use guards, let alone in compiled code).
+      let armOut =
+            case lookup arm "guard" of
+              Just g -> { pattern = arm.pattern, guard = desugar g, body = dBody }
+              Nothing -> { pattern = arm.pattern, body = dBody }
+      let accNext = appendItem armOut acc
+      case tail arms of
+        Nothing -> accNext
+        Just rest -> desugarArms rest accNext
+
+-- desugarFields — walk a list of {name, value} record fields, desugaring each
+-- field's value while preserving the field name.
+@label "Desugar record fields"
+@description "Walk a list of {name, value} record fields, desugaring each field's value while preserving the field name. Threading helper for the SRecord case."
+@tags "engine" "internal" "expr-substrate" "phase-2"
+@category "engine-internal"
+desugarFields : (fields: a) -> (acc: a) -> a
+desugarFields fields acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let dVal = desugar f.value
+      let accNext = appendItem { name = f.name, value = dVal } acc
+      case tail fields of
+        Nothing -> accNext
+        Just rest -> desugarFields rest accNext
+
+-- desugarLetChain — right-nested applied-ELambda builder over bindings
+-- (decision 4). Each binding becomes a single-param lambda applied via "$" to
+-- its desugared value; binding N's lambda wraps the rest, so its value sees
+-- bindings 0..N-1 (sequential scope). Empty bindings ⇒ desugar body directly
+-- (parser-unreachable totality fallback). NOTE: `tail` returns `Just []` for a
+-- singleton (not Nothing — the std:tail convention), so the singleton routes
+-- through the `Just rest` arm with rest=[]; `desugarLetChain [] body` then
+-- bottoms out at `desugar body` — same shape either arm, the `Nothing` arm
+-- only fires on a (already-excluded) empty list.
+@label "Desugar let chain"
+@description "Right-nested applied-ELambda builder over SLet bindings (decision 4): each binding ⇒ ECall \"$\" [ELambda [name] <rest>, desugar value], <rest> recursing on the remaining bindings and bottoming at desugar body. One binding per lambda preserves sequential scope (binding N's value sits inside lambdas 1..N-1). Empty bindings ⇒ desugar body (totality fallback)."
+@tags "engine" "internal" "expr-substrate" "phase-2"
+@category "engine-internal"
+desugarLetChain : (bindings: a) -> (body: a) -> Expr
+desugarLetChain bindings body =
+  case head bindings of
+    Nothing -> desugar body
+    Just b1 ->
+      case tail bindings of
+        Nothing ->
+          ECall {
+            fnId = "$",
+            args = [ELambda { params = [b1.name], body = desugar body }, desugar b1.value]
+          }
+        Just rest ->
+          ECall {
+            fnId = "$",
+            args = [ELambda { params = [b1.name], body = desugarLetChain rest body }, desugar b1.value]
+          }
+
+-- desugarDoChain — the SAME applied-ELambda template, discarded-binding name
+-- "_" (decision 5). The chain's value is the last expr. Singleton ⇒ desugar
+-- the one expr bare (mirrors lowerDoSequence's unwrapSingleton); empty ⇒
+-- ERecord [] (the unit record — both parser-unreachable). Singleton/empty
+-- discriminated via `head (tail …)`, NOT the tail-Maybe (std:tail returns
+-- `Just []` for singletons — the lastBindingName precedent).
+@label "Desugar do chain"
+@description "Build SDo's sequence as the applied-ELambda template with discarded-binding name \"_\" (decision 5): ECall \"$\" [ELambda [\"_\"] <rest>, desugar e1], bottoming at desugar of the last expr (the chain's value). Singleton ⇒ desugar the one expr bare; empty ⇒ ERecord [] (unit record, totality). Singleton discriminated via head-of-tail (std:tail returns Just [] for singletons)."
+@tags "engine" "internal" "expr-substrate" "phase-2"
+@category "engine-internal"
+desugarDoChain : (exprs: a) -> Expr
+desugarDoChain exprs =
+  case head exprs of
+    Nothing -> ERecord { fields = [] }
+    Just e1 ->
+      case tail exprs of
+        Nothing -> desugar e1
+        Just rest ->
+          case head rest of
+            Nothing -> desugar e1
+            Just h ->
+              ECall {
+                fnId = "$",
+                args = [ELambda { params = ["_"], body = desugarDoChain rest }, desugar e1]
+              }
+
+-- Syntax and Expr have distinct constructors but share plain call metadata.
+-- Copy those observations without replacing either constructor or its children.
+@category "engine-internal"
+copyCallMetadata : (source: a) -> (target: b) -> b
+copyCallMetadata source target = copyCallMetadataEntries (entries source) target
+
+@category "engine-internal"
+copyCallMetadataEntries : (remaining: a) -> (target: b) -> b
+copyCallMetadataEntries remaining target =
+  case head remaining of
+    Nothing -> target
+    Just entry ->
+      let next = if or (startsWith entry.key "$") (elem entry.key ["fnId", "args"])
+                 then target else mapSet target entry.key entry.value
+      copyCallMetadataEntries (tailOr remaining) next

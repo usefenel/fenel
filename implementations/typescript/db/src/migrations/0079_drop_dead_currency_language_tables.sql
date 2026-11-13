@@ -1,0 +1,31 @@
+-- 0079_drop_dead_currency_language_tables.sql
+-- storage-as-effect Phase 3b — dedicated-table collapse, slice 2 (D5).
+--
+-- Phase 3a (`49d7b25a`) moved the country/currency/language/platform reference
+-- ROWS into the unified register as `.fenel` value-decls; `reference-data.ts` is
+-- now the thin `.fenel`-derived view (the engine arrays), and `getStaticData` is
+-- a by-type-query shim over the register. The dedicated Postgres reference tables
+-- `currencies` + `languages` (seeded by migration 0006) are thereby fully
+-- superseded.
+--
+-- These two tables are pure ORPHANS: empty on staging (0 rows), zero TS importers
+-- of the table consts (only `reference-data.ts`'s `.fenel`-derived ARRAY views
+-- share the names — not the tables), and NO foreign key in or out (the
+-- `countries.currency` / `countries.language` columns are soft text references,
+-- NOT FKs to these tables). Dropping them is the D5 reference-fossil collapse.
+--
+-- KEPT (NOT touched here): `countries` (FK target of
+-- `geographical_set_countries.country_code`) + the `geographical_sets` /
+-- `geographical_set_countries` per-account geo-grouping feature tables — a real
+-- capability (not wired up yet, but data is a feature; Rom 2026-06-19). A LATER
+-- slice migrates that feature onto the unified register, after which `countries`
+-- can retire; that is a domain-feature migration, out of 3b's scope.
+--
+-- System-schema migration (CLAUDE.md exception — dropping a runtime reference
+-- table is sanctioned). Tables empty ⇒ no data path. Idempotent + roll-forward.
+-- Mirrors the 0027 (`platforms`) / 0077 (`typeclass_instances`) drop precedent.
+-- To roll back, re-run 0006's CREATE + seed — the orphans held no live-read data.
+
+DROP TABLE IF EXISTS "currencies";
+-->statement-breakpoint
+DROP TABLE IF EXISTS "languages";

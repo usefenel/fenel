@@ -1,0 +1,343 @@
+-- =========================================================================
+-- module email where — send, receive, and track typed email through a
+-- swappable provider.
+--
+-- module-substrate Phase 3k (2026-05-31) — email is the capability+creds
+-- REPRESENTATIVE. This file CONSOLIDATES the 5 pre-migration `.fenel` files
+-- (`types.fenel` [14 data decls] + `address.fenel` + `format-address.fenel`
+-- + `body-text.fenel` + `body-html.fenel`) into one `module email where`
+-- file, mirroring `time` (3b) / `codec` (3d). Source-of-truth split:
+--   - THIS file        — the header + 14 `data` decls + 4 Fenel-bodied fns
+--                        (with @label/@description/@tags facets) + the lone
+--                        `parseAddress` @native FOREIGN DECLARATION;
+--   - `ffi/email-ffi.ts` — the `parseAddress` regex native + the
+--                        addressToFenelView null→Maybe marshaller + the
+--                        AddressValue/BodyValue value types + the
+--                        `emailNatives` map;
+--   - `capability.fenel` — the `EmailService` capability as a record-of-methods
+--                        type → seedFromType → the dispatch seed.
+--   - `instances.fenel`  — the 5 provider instances as Fenel typed values.
+--   - `credentials.fenel` — the 4 provider credential requirements as typed
+--                        ProviderCredentials values (loaded as a sidecar; the
+--                        "creds are data" cash-out).
+--
+-- FULLY FENEL-AUTHORED (the earlier Wrinkle-1 TS-const fallback was RETIRED).
+-- The capability + the 5 providers are Fenel-authored in `capability.fenel` +
+-- `instances.fenel`. The three DOTTED capability method names (`domain.add` /
+-- `domain.verify` / `domain.list`) were a cosmetic faux-namespace — `.fenel`
+-- record keys are plain idents (`.` is field-access) — so they were RENAMED to
+-- `domainAdd` / `domainVerify` / `domainList` across the capability + providers
+-- + the runtime `PROVIDER_IMPLS` map + the tests. The dotted strings were
+-- internal-only (capability method name → IO-handler key → provider lookup,
+-- all self-derived; nothing external/persisted references them), so the rename
+-- is fully behaviour-preserving — NO quoted-field parser feature was needed.
+-- `seedFromType` is dispatch-sufficient for the nominal capability (Wrinkle 2
+-- resolved). Functions/types/native/creds/capability/providers ALL Fenel — the
+-- complete "typeclasses are types" cash-out on a real capability.
+--
+-- Identity parity: each of the 5 functions carried rich `defineFunction`
+-- identity (codeName + label + description + category="email" + tags). The
+-- `module email where` header supplies the `email` category as the read-time
+-- Categorizable default (Phase 3j — derives from the `email:` id prefix), so
+-- NO `@category` directive is authored; `@label` / `@description` / `@tags`
+-- reproduce the rest. No IOInvokable — none declared an ioAction.
+--
+-- Records (single constructor, all named fields) may be compact or use
+-- indented field continuations. Variants use leading `|` for multiline peers.
+-- MessageId is a single-payload positional newtype that parses
+-- as a 1-case variant whose single field is the auto-positional `_0: String`.
+-- References to `Timestamp` resolve lazily through the catalog walk; time
+-- loads before email in SYSTEM_MODULES order. The header keeps the LEGACY
+-- lowercase `email:` id-prefix byte-identical (PascalCase canonicalisation is
+-- a deferred coordinated sweep).
+-- =========================================================================
+
+module email where
+
+-- ----- Data types (14, consolidated from types.fenel) ----------------------
+
+Address = Address local: String domain: String displayName: Maybe<String>
+
+Body = Text String | Html String | Multipart text: String html: String
+
+AssetRef = AssetRef url: String name: String mimeType: String
+
+Attachment = Attachment asset: AssetRef contentId: Maybe<String>
+
+Header = Header name: String value: String
+
+Email = Email from: Address to: [Address] cc: [Address] bcc: [Address] replyTo: Maybe<Address> subject: String body: Body attachments: [Attachment] headers: [Header] inReplyTo: Maybe<String> references: [String]
+
+MessageId = MessageId String
+
+SendError = InvalidAddress String
+  | DomainNotVerified String
+  | RateLimited Number
+  | Suppressed String
+  | ProviderError code: String message: String
+
+SendResult = Sent id: MessageId | Rejected reason: SendError
+
+BounceKind = HardBounce | SoftBounce | BlockBounce
+
+EmailEvent = Queued id: MessageId at: Timestamp
+  | Delivered id: MessageId at: Timestamp
+  | Bounced id: MessageId at: Timestamp kind: BounceKind reason: String
+  | Complained id: MessageId at: Timestamp
+  | Opened id: MessageId at: Timestamp userAgent: Maybe<String>
+  | Clicked id: MessageId at: Timestamp url: String
+  | Unsubscribed id: MessageId at: Timestamp
+  | Failed id: MessageId at: Timestamp reason: String
+
+DnsRecord = DnsRecord kind: String host: String value: String verified: Boolean
+
+DomainStatus = DomainPending | DomainVerified | DomainFailed reason: String
+
+SendingDomain = SendingDomain name: String status: DomainStatus dkimRecords: [DnsRecord] spfRecord: DnsRecord returnPathRecord: DnsRecord inboundMxRecord: Maybe<DnsRecord>
+
+-- ----- Functions -----------------------------------------------------------
+
+-- address — construct a typed Address record. `displayName` is a
+-- `Maybe<String>` — pass `Nothing` to omit, `Just …` to attach. The
+-- constructed value carries `$tag: "Address"` so downstream consumers
+-- (catalog dispatch, pattern matching, formatAddress) identify it via the tag.
+address : String -> String -> Maybe String -> Address
+@label "Address"
+@description "Build an Address record. displayName is optional (pass Nothing to omit)."
+@tags "email" "constructor"
+address local domain displayName =
+  Address { local = local, domain = domain, displayName = displayName }
+
+-- parseAddress — parse an RFC 5322 address string (@native; regex leaf in
+-- ffi/email-ffi.ts, awaits Fenel regex support). Accepts "local@domain" and
+-- "Display <local@domain>" forms; Nothing when no `@` is found.
+@native
+@label "Parse address"
+@description "Parse an RFC 5322 address string. Accepts \"local@domain\" and \"Display <local@domain>\" forms."
+@tags "email" "parser"
+parseAddress : (s: String) -> Maybe Address
+
+-- formatAddress — render an Address as an RFC 5322 string. Wraps the addr in
+-- `< >` and prepends a quoted display name when present; empty string when
+-- either `local` or `domain` is empty. The embedded-`"` strip from displayName
+-- lands via std:replaceAll (defense-in-depth + RFC 5322 correctness).
+formatAddress : Address -> String
+@label "Format address"
+@description "Format an Address as an RFC 5322 string."
+@tags "email" "format"
+formatAddress addr =
+  if eq addr.local ""
+    then ""
+  else if eq addr.domain ""
+    then ""
+  else
+    let addrStr = concat addr.local (concat "@" addr.domain)
+    case addr.displayName of
+      Nothing -> addrStr
+      Just name ->
+        let escaped = replaceAll name "\"" ""
+        concat "\"" (concat escaped (concat "\" <" (concat addrStr ">")))
+
+-- bodyText — extract the plain-text portion of a Body. Just for Text and
+-- Multipart bodies; Nothing for an Html-only body. Pure pattern matching.
+bodyText : Body -> Maybe String
+@label "Body text"
+@description "Extract the text portion of a Body. Nothing if the Body is Html-only."
+@tags "email" "accessor"
+bodyText b = case b of
+  Text { _0 = s } -> Just s
+  Html { _0 = _ } -> Nothing
+  Multipart { text = t } -> Just t
+
+-- bodyHtml — extract the HTML portion of a Body. Just for Html and Multipart
+-- bodies; Nothing for a Text-only body. Pure pattern matching.
+bodyHtml : Body -> Maybe String
+@label "Body HTML"
+@description "Extract the HTML portion of a Body. Nothing if the Body is Text-only."
+@tags "email" "accessor"
+bodyHtml b = case b of
+  Html { _0 = s } -> Just s
+  Text { _0 = _ } -> Nothing
+  Multipart { html = h } -> Just h
+
+-- ----- send_email action (action-subsumption Phase N, 2026-06-10) -----------
+-- The LAST legacy-pattern action ports here. `send_email` was the only action
+-- still on the `registerAction({handler})` + `validateActionParams` +
+-- `send_email_params`-mirror-entity pattern (runtime/src/handlers/email-action.ts,
+-- now DELETED). It becomes the typed Fenel function `email:sendEmail`, exposed
+-- via a `name → fnRef` shell from core (the runtime-residence reason — provider
+-- imports — vanishes with the handler). Home is the email module: it owns
+-- Email / Address / Body / SendResult + parseAddress / address / formatAddress,
+-- which this body composes (the notify:sendTgDm precedent for an action body).
+--
+-- Faithful to the retired TS orchestration (sendEmailHandler): emit
+-- `email_queued` → resolve the profile (no email → ActionOk delivered=False) →
+-- look up the email_template by slug → build the typed Email → pick the
+-- account's configured provider → send → map SendResult to ActionOk.
+--
+-- D-A (the send path): the retired TS chain was per-account-creds-first-wins
+-- (mailgun → postmark → ses → resend, else the fenel managed default). That
+-- selection is PURE LOGIC over the account's integration rows, so it moves
+-- INTO the body (Fenel-first): `pickProvider` folds the priority list against
+-- `state:listIntegrations` (an existing read leaf — no new substrate, no creds
+-- crossing into Fenel/traces). The genuinely-irreducible IO — the per-provider
+-- HTTP send — stays a single thin leaf `email:providerSend` (foreign decl
+-- below; the runtime handler re-fetches that provider's creds + calls the
+-- existing provider impl). `EmailService.send` was NOT reused: it resolves by
+-- static instance priority (fenel @ 100 always wins) → it ignores per-account
+-- integrations, which would be a behaviour regression.
+--
+-- D-B (attachments): the retired param was accepted-but-ignored (the handler
+-- built `attachments: []` unconditionally) and NO caller ever passed it
+-- (payments:emailPaymentLink passes only {profileId, template, include}). So
+-- it's DROPPED — an honest contract beats advertising a field we discard, and
+-- it removes an empty-record placeholder rather than re-adding one.
+--
+-- `include` is typed HONESTLY as `Maybe (Map String String)` (not the retired
+-- `Maybe {$record fields:[]}` placeholder).
+--
+-- interpolate divergence: the TS `interpolateSimple` used a regex
+-- (`/\{\{(\w+)\}\}/g`) replace-with-callback that ALSO stripped unknown
+-- `{{placeholders}}` to "". Fenel has no regex (parseAddress is @native for
+-- exactly this reason), so this body folds `replaceAll` over the known
+-- include-map entries: known keys substitute identically; UNKNOWN `{{foo}}`
+-- placeholders are left literal rather than stripped. Acceptable — templates
+-- reference only the variables they're given, and a leftover placeholder is a
+-- visible authoring error, not silent data loss.
+
+-- interpolate — substitute `{{key}}` with the matching value for each entry of
+-- the include map (see the divergence note above re: unknown placeholders).
+interpolate : String -> Map String String -> String
+interpolate text vars =
+  fold (\acc pair -> replaceAll acc (concat "{{" (concat pair.key "}}")) pair.value) text (entries vars)
+
+-- buildEmail — assemble the typed Email. `tplM` is the resolved email_template
+-- row (Just → interpolate its subject/body as Html; Nothing → the slug subject
+-- + a plain-text placeholder body, matching the pre-port fallback). The From
+-- address defaults from `EMAIL_FROM` (io:envGet, the payments env-default
+-- precedent) with the same hardcoded fallback the TS handler used.
+-- The template row is an explicitly dynamic state/catalog carrier; the
+-- authored helper boundary fences its field projections without inventing a
+-- structural nominal.
+buildEmail : Address -> Maybe ({}) -> String -> Map String String -> Email
+buildEmail toAddr tplM slug includeMap =
+  let fromRaw = fromMaybe "noreply@send.usefenel.com" (envGet "EMAIL_FROM")
+  let fromAddr = case parseAddress fromRaw of
+    Just a -> a
+    Nothing -> Address { local = "noreply", domain = "send.usefenel.com", displayName = Nothing }
+  let subject = case tplM of
+    Just tpl -> interpolate tpl.subject includeMap
+    Nothing -> slug
+  let bodyVal = case tplM of
+    Just tpl -> Html (interpolate tpl.body includeMap)
+    Nothing -> Text (concat "Email template: " slug)
+  Email { from = fromAddr, to = [toAddr], cc = [], bcc = [], replyTo = Nothing, subject = subject, body = bodyVal, attachments = [], headers = [], inReplyTo = Nothing, references = [] }
+
+-- hasEnabledProvider — does the account have an ENABLED integration of this
+-- provider type? (Mirrors the pre-port getCredentials enabled+type filter.)
+hasEnabledProvider : List ({}) -> String -> Boolean
+hasEnabledProvider integrations t =
+  case head (filter (\r -> if eq r.type t then truthy r.enabled else False) integrations) of
+    Nothing -> False
+    Just _ -> True
+
+-- pickProvider — the first provider (by the fixed mailgun>postmark>ses>resend
+-- priority) the account has an enabled integration for; else the fenel managed
+-- default. This is the pure-logic half of the retired dispatchEmailSend chain.
+pickProvider : List ({}) -> String
+pickProvider integrations =
+  if hasEnabledProvider integrations "mailgun" then "mailgun"
+  else if hasEnabledProvider integrations "postmark" then "postmark"
+  else if hasEnabledProvider integrations "ses" then "ses"
+  else if hasEnabledProvider integrations "resend" then "resend"
+  else "fenel"
+
+-- emailNotDelivered — the ActionOk delivered=False shape (no email / bad
+-- address). profileId provenance preserved; no aggregate.
+-- ActionResult deliberately keeps its dynamic `data` payload nominally
+-- `Record`; bounded inference does not equate an arbitrary structural record
+-- literal with that nominal carrier. Author the exact helper boundary instead
+-- of weakening nominal constructor congruence.
+emailNotDelivered : Uuid -> NonEmptyStr -> String -> ActionResult
+emailNotDelivered profileId template reason =
+  ActionOk { data = { profileId = profileId, template = template, delivered = False, reason = reason }, aggregateType = Nothing, aggregateId = Nothing, profileId = Just profileId }
+
+-- messageIdValue — unwrap the MessageId newtype to its String.
+messageIdValue m = case m of
+  MessageId { _0 = s } -> s
+
+-- emailResultToAction — map the provider SendResult to ActionOk. Sent →
+-- delivered=True + messageId; Rejected → delivered=False (the pre-port
+-- success-branch shape; a thrown provider error is returned as a typed
+-- Rejected by the leaf rather than escaping, so this arm subsumes both).
+emailResultToAction : Uuid -> NonEmptyStr -> SendResult -> ActionResult
+emailResultToAction profileId template result =
+  case result of
+    Sent { id = idVal } ->
+      let mid = messageIdValue idVal
+      ActionOk { data = { profileId = profileId, template = template, delivered = True, messageId = mid }, aggregateType = Nothing, aggregateId = Nothing, profileId = Just profileId }
+    Rejected { reason = _ } -> ActionOk { data = { profileId = profileId, template = template, delivered = False }, aggregateType = Nothing, aggregateId = Nothing, profileId = Just profileId }
+
+-- deliverToAddress — recipient address parsed; build the Email, pick the
+-- provider over the account's integrations, send, map the result.
+-- The system/validation registry deliberately omits the state IO module, so
+-- this private helper's active external dependencies are outside that exact
+-- inference graph. Keep its boundary authored rather than guessing a callee.
+deliverToAddress : Uuid -> NonEmptyStr -> Map String String -> String -> ActionResult
+deliverToAddress profileId template includeMap profileEmail =
+  case parseAddress profileEmail of
+    Nothing -> emailNotDelivered profileId template "invalid recipient address"
+    Just toAddr ->
+      let tplM = head (filter (\r -> eq r.slug template) (listInstancesByName "email_template"))
+      let email = buildEmail toAddr tplM template includeMap
+      let provider = pickProvider (listIntegrations ())
+      let result = providerSend provider email
+      emailResultToAction profileId template result
+
+-- deliverToProfile — profile resolved; gate on a non-empty email (matches the
+-- pre-port `if (!profile?.email)` no-email guard).
+-- Exact-record inference deliberately has no structural row-polymorphism, so
+-- the `profile.email` projection needs its source-owned Profile boundary.
+deliverToProfile : Uuid -> NonEmptyStr -> Map String String -> Profile -> ActionResult
+deliverToProfile profileId template includeMap profile =
+  if truthy profile.email
+  then deliverToAddress profileId template includeMap profile.email
+  else emailNotDelivered profileId template "profile has no email"
+
+-- providerSend — FOREIGN DECLARATION (@native): the irreducible per-provider
+-- HTTP send leaf. The impl is a runtime IO handler at `email.provider_send`
+-- (registered in runtime/src/providers.ts alongside the capability handlers —
+-- the provider impls live there); it re-fetches the chosen provider's creds and
+-- calls the existing mailgun/postmark/ses/resend/fenel send. NOT a nativeImpls
+-- entry (the send surface is runtime, not an engine ffi native). The body
+-- supplies the provider name; the leaf reads accountId from ctx.
+@native
+@label "Provider send"
+@description "Send a typed Email through the named provider (mailgun / postmark / ses / resend / fenel). The runtime leaf re-fetches that provider's per-account integration credentials and calls the existing provider impl; the fenel managed default uses Fenel's master credentials. Returns the typed SendResult."
+@tags "email" "io" "send"
+@ioAction "email.provider_send"
+@requires "HasEmail"
+providerSend : (provider: String) -> (email: Email) -> SendResult
+
+-- sendEmail — the public send_email action (action-subsumption Phase N). Params
+-- ARE the contract (D2 — no send_email_params mirror entity): profileId : Uuid,
+-- template : NonEmptyStr, include : Maybe (Map String String); accountId +
+-- adapter are context-injected by dispatch (D4). Emits the `email_queued` event
+-- (provenance: aggregate = profile/profileId), resolves the profile, and
+-- delivers. Returns ActionResult so the generic dispatch fnRef path maps it via
+-- actionResultAdtToTs like every other ported action.
+sendEmail : (profileId: Uuid) -> (template: NonEmptyStr) -> (include: Maybe (Map String String)) -> (accountId: String) -> (adapter: String) -> ActionResult
+@label "Send email"
+@description "action-subsumption Phase N (2026-06-10) — the public send_email action, now a typed Fenel function (the last legacy registerAction handler retired). Emits email_queued, resolves the profile (no email → ActionOk delivered=False), looks up the email_template by slug, builds the typed Email (interpolating {{vars}} from include), picks the account's configured provider (state:listIntegrations, mailgun>postmark>ses>resend priority, else the fenel managed default), sends via email:providerSend, and maps the SendResult to ActionOk."
+@tags "email" "send" "action" "phase-N"
+@ioAction "email.send_email"
+@requires "HasStateIO"
+sendEmail profileId template include accountId adapter =
+  let includeMap = case include of
+    Nothing -> {}
+    Just m -> m
+  let payload = { template = template, include = includeMap, adapter = adapter }
+  let _e = appendEvent "email_queued" payload (Just "profile") (Just profileId) (Just profileId)
+  case findProfileById profileId of
+    Nothing -> emailNotDelivered profileId template "profile has no email"
+    Just profile -> deliverToProfile profileId template includeMap profile

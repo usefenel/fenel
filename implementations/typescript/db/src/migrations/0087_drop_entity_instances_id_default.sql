@@ -1,0 +1,21 @@
+-- storage-as-effect Phase 1 tail (D3) — drop the `entity_instances.id` column
+-- DEFAULT. Completes "id-gen leaves the DB": every inserter now supplies the id
+-- in the app layer —
+--   * the `state:*` domain path mints via the Fenel `crypto:uuidV4` body
+--     (mint-before-store, `runtime/handlers/state.ts`);
+--   * the three direct TS inserters — `createEntityInstance` (fallback),
+--     `bots.ts`, `dispatch-registry.ts` — mint `crypto.randomUUID()` at the
+--     insert site.
+-- No insert relies on `gen_random_uuid()` anymore, so the column DEFAULT is dead.
+--
+-- NOT DESTRUCTIVE: drops ONLY the DEFAULT expression — the `id` column, its
+-- `uuid` type, primary key, and every existing value are untouched. New rows
+-- that (incorrectly) omit `id` would now error rather than silently mint a DB
+-- uuid — which is the intended invariant (id-gen is the app's job).
+--
+-- Reversible:
+--   ALTER TABLE entity_instances ALTER COLUMN id SET DEFAULT gen_random_uuid();
+--
+-- Idempotent: DROP DEFAULT on a column with no default is a no-op.
+
+ALTER TABLE entity_instances ALTER COLUMN id DROP DEFAULT;

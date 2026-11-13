@@ -1,0 +1,108 @@
+-- =========================================================================
+-- module auth where — MEMBER MANAGEMENT, the first grant's product surface.
+--
+-- rights R2b. A membership row IS a grant: a principal, a partition, a policy
+-- name (`role`), and an id. These four orchestrators are how one is introduced,
+-- re-roled, removed and listed, and they are ORCHESTRATION ONLY — every act
+-- they reach is an existing `state:*` leaf.
+--
+-- ⚠ THEY RUN UNDER THE CALLER'S OWN REQUEST AUTHORITY, and that is the whole
+-- design. A member calling `auth:inviteMember` RUNS THIS BODY and is refused at
+-- `state:createMembership`, which lives only in the owner envelope and is
+-- argued there on the account and the role. The refusal is the gate's, one hop
+-- down, not a check written here — so there is no second policy engine to keep
+-- in agreement with the first.
+--
+-- WHAT IS WRITTEN HERE is the one rule the gate CANNOT express, because it is a
+-- question about the CURRENT POPULATION rather than about the argued act: an
+-- account must keep at least one owner. A containment judgment decides whether
+-- an act is inside an envelope; it cannot count the rows that will exist after
+-- it. `design/deciding.md` §9.0 is the general form of that split.
+--
+-- ⚠ AND IT BINDS ONLY CALLERS WHO COME THROUGH HERE, which is a weaker claim
+-- than "the account keeps an owner". The owner envelope grants the LEAVES, not
+-- just these orchestrators, so a body running under owner authority can call
+-- `state:setMembershipRole` or `state:deleteMembership` directly and leave the
+-- account with zero owners — after which no envelope in the system contains a
+-- membership write and no product path restores one. That is not a hole this
+-- file can close: a transactional invariant over the grant store belongs with
+-- the reference monitor's state transitions (rights R6), not with a containment
+-- judgment or with one of its callers. Filed rather than implied.
+--
+-- The third file of the `auth` cross-file UNION (`session.fenel` +
+-- `cookies.fenel` + this one all carry `module auth where`; the loader groups
+-- by header and a colliding top-level name would be a LOAD-TIME error).
+-- =========================================================================
+
+module auth where
+
+@label "Invite member"
+@description "Add a principal to an account with a role. Owner-only, and NOT because this body checks: `state:createMembership` is in the owner envelope alone, argued on the account and the role, so a member running this body is refused one hop down by the gate."
+@tags "auth" "membership" "grant" "io"
+@ioAction "auth.invite_member"
+inviteMember : {} -> Result String ({ })
+inviteMember input =
+  let _row = createMembership input.userId input.accountId input.role
+  Ok { userId = input.userId, accountId = input.accountId, role = input.role }
+
+@label "Change member role"
+@description "Re-role an existing membership. Refuses to demote the account's LAST owner — a rule about the current population, which the containment judgment cannot express — and is otherwise gated by `state:setMembershipRole` being owner-only."
+@tags "auth" "membership" "grant" "io"
+@ioAction "auth.change_member_role"
+changeMemberRole : {} -> Result String ({ })
+changeMemberRole input =
+  let members = listAccountMembers input.accountId
+  if authLastOwnerBlocksRole members input.userId input.role
+  then (Err "the account must keep at least one owner")
+  else authChangeMemberRoleNow input
+
+-- ⚠ THE READ COMES FIRST AND THE REFUSAL IS BEFORE ANY WRITE. Ordering it the
+-- other way would leave an account with zero owners whenever the write
+-- succeeded and the check then failed.
+authChangeMemberRoleNow : {} -> Result String ({ })
+authChangeMemberRoleNow input =
+  case setMembershipRole input.userId input.accountId input.role of
+    Nothing -> (Err "no such membership")
+    Just row -> Ok row
+
+@label "Remove member"
+@description "Remove a membership. Refuses to remove the account's LAST owner. Removing a membership also revokes every session bound to it on the next request, because the session lookup inner-joins the membership row."
+@tags "auth" "membership" "grant" "io"
+@ioAction "auth.remove_member"
+removeMember : {} -> Result String ({ })
+removeMember input =
+  let members = listAccountMembers input.accountId
+  if authSoleOwnerIs members input.userId
+  then (Err "the account must keep at least one owner")
+  else authRemoveMemberNow input
+
+authRemoveMemberNow : {} -> Result String ({ })
+authRemoveMemberNow input =
+  let _gone = deleteMembership input.userId input.accountId
+  Ok { userId = input.userId, accountId = input.accountId }
+
+@label "List members"
+@description "The account's member roster. Every role may read it, argued on the account: a roster is not a secret and the membership row carries no hash."
+@tags "auth" "membership" "grant" "io"
+@ioAction "auth.list_members"
+listMembers : {} -> [{ }]
+listMembers input = listAccountMembers input.accountId
+
+-- Demoting is blocked only when the target is the SOLE owner and the new role
+-- is not owner. Re-roling the sole owner TO owner is a no-op, not a lockout.
+authLastOwnerBlocksRole : [{ }] -> String -> String -> Boolean
+authLastOwnerBlocksRole members userId role =
+  if eq role "owner"
+  then false
+  else authSoleOwnerIs members userId
+
+authSoleOwnerIs : [{ }] -> String -> Boolean
+authSoleOwnerIs members userId =
+  let owners = filter (\m -> eq m.role "owner") members
+  and (eq (length owners) 1) (authFirstOwnerIs owners userId)
+
+authFirstOwnerIs : [{ }] -> String -> Boolean
+authFirstOwnerIs owners userId =
+  case head owners of
+    Nothing -> false
+    Just o -> eq o.userId userId

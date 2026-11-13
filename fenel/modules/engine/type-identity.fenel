@@ -1,0 +1,313 @@
+module engine where
+
+-- type-identity — per-owner type identity (modules-as-values Phase 5, slices
+-- S0 and S2; workstreams/modules-as-values/briefs/
+-- phase-5-per-owner-type-identity.md).
+--
+-- A type's identity is a UUID pinned in `.fenel.lock`. Type rows used to be
+-- keyed by the BARE type name, so two bundles declaring one name shared one
+-- row and one UUID (`Animation`, `File`, `Game`). A type row is keyed by its
+-- OWNER instead: `type/module/<owner>/<Name>`, the field-identity owner codec
+-- (`fieldIdentityOwnerIndexKey` over `fieldIdentityNormalizeTypeOwner`,
+-- field-identity.fenel) applied to the type's declaring owner. System
+-- declarations use the owner `system`, as their field rows do. The codec
+-- percent-encodes owner and name separately, so the key is injective and
+-- disjoint from the `module:name` function rows and the `field:` rows.
+--
+-- Identity is not disjointness: two owners' types keep distinct identities
+-- even where their inhabitant sets overlap or coincide. Nothing here decides
+-- a set relation; it names identities only.
+--
+-- The decisions live here; TypeScript gathers candidates and applies plans:
+--   * the KEEPER TABLE: per two-owner name, the UUID its bare row pinned, the
+--     owner that keeps it and the other owners. Recorded once (Rom's default,
+--     2026-10-02: the owner the deployed bare UUID resolved to in product
+--     registries), never recomputed from module order;
+--   * `typeIdentityLockKey` and its bulk form `typeIdentityLockKeys` (the
+--     registry computes every key of a build in ONE call; no TypeScript copy
+--     of the codec);
+--   * the identity ROSTER (`typeIdentityRequired`): which declarations hold a
+--     type row, including callable parametric system declaration owners and the
+--     spec-only dispatch classes whose rows registration already resolved;
+--   * the RE-KEY PLAN: from the bare rows, the owner census and the keeper
+--     table, rename a bare row in place with its UUID, keep an owner key,
+--     mint a missing key, or refuse.
+
+-- One recorded two-owner name: `oldId` is the UUID its bare row pinned,
+-- `keeper` the owner that keeps it, `others` every other declaring owner.
+TypeIdentityKeeper = TypeIdentityKeeper name: String oldId: String keeper: String others: List String
+
+-- One declaration of a type as the lock generator sees it, with the lock
+-- rows it can claim: `bareId` is the row keyed by the bare name, `keyedId`
+-- the row under this owner's key. `parametric`, `dispatchClass` and
+-- `systemDeclared` (a system declaration carries the same name) select the
+-- roster.
+TypeIdentityCandidate = TypeIdentityCandidate owner: String name: String parametric: Boolean dispatchClass: Boolean systemDeclared: Boolean bareId: Maybe String keyedId: Maybe String
+
+-- One step on the lock: rename a bare row in place, keeping its UUID; mint a
+-- fresh UUID for a key; or keep an existing owner key.
+TypeIdentityAction =
+  TypeIdentityRekey name: String oldKey: String newKey: String id: String
+  | TypeIdentityMint name: String newKey: String
+  | TypeIdentityRetain name: String newKey: String id: String
+
+-- A plan applies only when `refusals` is empty.
+TypeIdentityPlan = TypeIdentityPlan actions: List TypeIdentityAction refusals: List String
+
+-- -------------------------------------------------------------------------
+-- S0 — the keeper table and the retained roster
+-- -------------------------------------------------------------------------
+
+@label "Type identity keepers"
+@description "The keeper table of per-owner type identity: for each type name two bundles declare, the UUID its bare lock row pinned, the owner that keeps that UUID and the other owners (which get new UUIDs). Recorded once, never recomputed from module order."
+@tags "engine" "type-identity" "lock"
+typeIdentityKeepers : List TypeIdentityKeeper
+typeIdentityKeepers =
+  [
+    TypeIdentityKeeper { name = "Animation", oldId = "8d5e3398-7464-4a83-9157-2a80d24fc40a", keeper = "animation", others = ["telegram"] },
+    TypeIdentityKeeper { name = "File", oldId = "a1c8799a-dfdb-480f-b6ca-7c75c9ec3349", keeper = "telegram", others = ["std"] },
+    TypeIdentityKeeper { name = "Game", oldId = "5c40deb3-8398-447d-8b6a-707818e7a294", keeper = "games", others = ["telegram"] }
+  ]
+
+@label "Historically retained system type identities"
+@description "The parametric system declarations whose rows predate general callable-family identity coverage. Kept as historical compatibility data; typeIdentitySystemRequired now admits all parametric declaration owners."
+@tags "engine" "type-identity" "lock"
+typeIdentityRetainedSystemTypes : List String
+typeIdentityRetainedSystemTypes = ["Expr", "Pattern", "Syntax", "Verified"]
+
+@label "Retained system class identities"
+@description "The dispatch classes that keep a type row although dispatch classes are otherwise outside the identity roster: they are registered by the system as classes only (no bundle declares them) and their rows predate the roster; registration already resolved them."
+@tags "engine" "type-identity" "lock"
+typeIdentityRetainedSystemClasses : List String
+typeIdentityRetainedSystemClasses = ["FieldRepresentational", "Submittable"]
+
+-- -------------------------------------------------------------------------
+-- S2 — owner-keyed lock keys
+-- -------------------------------------------------------------------------
+
+@label "Type identity lock key"
+@description "The lock key of a type declared by an owner: type/module/<owner>/<Name>, the field-identity owner codec applied to the normalized type owner (system declarations use the owner system)."
+@tags "engine" "type-identity" "lock"
+typeIdentityLockKey : (owner: Maybe String) -> (name: String) -> String
+typeIdentityLockKey owner name =
+  fieldIdentityOwnerIndexKey (fieldIdentityNormalizeTypeOwner owner name)
+
+@label "Type identity lock keys"
+@description "typeIdentityLockKey for many (owner, name) coordinates in one call, in input order."
+@tags "engine" "type-identity" "lock"
+typeIdentityLockKeys : (owners: List (Maybe String)) -> (names: List String) -> List String
+typeIdentityLockKeys owners names = zipWith typeIdentityLockKey owners names
+
+-- -------------------------------------------------------------------------
+-- S2 — the roster and the re-key plan
+-- -------------------------------------------------------------------------
+
+@label "Type identity roster"
+@description "Whether a declaration holds a type row: a system declaration unless it is parametric or a dispatch class (the retained system types and classes excepted); a bundle declaration unless the system declares the same name (a copy of a system type)."
+@tags "engine" "type-identity" "lock"
+typeIdentityRequired : (candidate: TypeIdentityCandidate) -> Boolean
+typeIdentityRequired candidate =
+  if eq candidate.owner "system"
+  then typeIdentitySystemRequired candidate
+  else not candidate.systemDeclared
+
+@category "engine-internal"
+typeIdentitySystemRequired : TypeIdentityCandidate -> Boolean
+typeIdentitySystemRequired candidate =
+  if candidate.dispatchClass
+  then candidate.parametric or (includes (typeIdentityRetainedSystemClasses ()) candidate.name)
+  else true
+
+
+@category "engine-internal"
+typeIdentityActions : List TypeIdentityAction -> TypeIdentityPlan
+typeIdentityActions actions = TypeIdentityPlan { actions = actions, refusals = [] }
+
+@category "engine-internal"
+typeIdentityRefused : String -> TypeIdentityPlan
+typeIdentityRefused message = TypeIdentityPlan { actions = [], refusals = [message] }
+
+@category "engine-internal"
+typeIdentityMergePlans : List TypeIdentityPlan -> TypeIdentityPlan
+typeIdentityMergePlans plans =
+  TypeIdentityPlan { actions = flatMap (\p -> p.actions) plans, refusals = flatMap (\p -> p.refusals) plans }
+
+@category "engine-internal"
+typeIdentityRekeyed : String -> String -> String -> TypeIdentityPlan
+typeIdentityRekeyed name key id =
+  typeIdentityActions [TypeIdentityRekey { name = name, oldKey = name, newKey = key, id = id }]
+
+@category "engine-internal"
+typeIdentityRetained : String -> String -> String -> TypeIdentityPlan
+typeIdentityRetained name key id =
+  typeIdentityActions [TypeIdentityRetain { name = name, newKey = key, id = id }]
+
+@category "engine-internal"
+typeIdentityMinted : String -> String -> TypeIdentityPlan
+typeIdentityMinted name key = typeIdentityActions [TypeIdentityMint { name = name, newKey = key }]
+
+@category "engine-internal"
+typeIdentityBareId : List TypeIdentityCandidate -> Maybe String
+typeIdentityBareId candidates =
+  case head candidates of
+    Nothing -> Nothing
+    Just c -> c.bareId
+
+@category "engine-internal"
+typeIdentityKeyedId : List TypeIdentityCandidate -> String -> Maybe String
+typeIdentityKeyedId candidates owner =
+  case find (\c -> eq c.owner owner) candidates of
+    Nothing -> Nothing
+    Just c -> c.keyedId
+
+-- Refusal messages, one per refusal kind.
+
+@category "engine-internal"
+typeIdentityRetiredBare : String -> String -> TypeIdentityPlan
+typeIdentityRetiredBare name key =
+  typeIdentityRefused `type identity: the retired bare key ${name} is still a lock row beside ${key}; a type row is keyed by its owner only`
+
+@category "engine-internal"
+typeIdentityMismatch : String -> TypeIdentityKeeper -> String -> TypeIdentityPlan
+typeIdentityMismatch name keeper found =
+  typeIdentityRefused `type identity: keeper UUID mismatch for ${name}: the keeper table pins ${keeper.oldId} to ${keeper.keeper}.${name}, the lock holds ${found}`
+
+@category "engine-internal"
+typeIdentityKeeperMissing : String -> TypeIdentityKeeper -> String -> TypeIdentityPlan
+typeIdentityKeeperMissing name keeper key =
+  typeIdentityRefused `type identity: the keeper identity ${keeper.oldId} of ${keeper.keeper}.${name} is missing: neither the bare row ${name} nor ${key} holds it`
+
+@category "engine-internal"
+typeIdentityUnrecorded : String -> String -> TypeIdentityKeeper -> TypeIdentityPlan
+typeIdentityUnrecorded name owner keeper =
+  let others = join keeper.others ", "
+  typeIdentityRefused `type identity: ${owner}.${name} is not recorded in the keeper table (keeper ${keeper.keeper}, others ${others}); record the owner before it gets an identity`
+
+@category "engine-internal"
+typeIdentityBareOfKeeper : String -> String -> TypeIdentityKeeper -> String -> TypeIdentityPlan
+typeIdentityBareOfKeeper name owner keeper bare =
+  typeIdentityRefused `type identity: the bare row ${name} (${bare}) belongs to the keeper ${keeper.keeper}.${name}, which declares no ${name} here; it is not the row of ${owner}.${name}`
+
+@category "engine-internal"
+typeIdentityNoKeeper : String -> List String -> TypeIdentityPlan
+typeIdentityNoKeeper name owners =
+  let listed = join owners ", "
+  typeIdentityRefused `type identity: ${name} is declared by ${count owners} owners (${listed}) and has no keeper in the keeper table (type-identity.fenel); record which owner keeps the existing identity`
+
+@category "engine-internal"
+typeIdentityKeeperAbsent : String -> TypeIdentityKeeper -> List String -> TypeIdentityPlan
+typeIdentityKeeperAbsent name keeper owners =
+  let listed = join owners ", "
+  typeIdentityRefused `type identity: the keeper ${keeper.keeper}.${name} declares no ${name} (owners ${listed})`
+
+-- A declaration with no keeper entry: rename its bare row, keep its owner
+-- key, or mint.
+@category "engine-internal"
+typeIdentityOwnerAction : String -> String -> Maybe String -> Maybe String -> TypeIdentityPlan
+typeIdentityOwnerAction name key bare keyed =
+  case bare of
+    Just b ->
+      case keyed of
+        Just k -> typeIdentityRetiredBare name key
+        Nothing -> typeIdentityRekeyed name key b
+    Nothing ->
+      case keyed of
+        Just k -> typeIdentityRetained name key k
+        Nothing -> typeIdentityMinted name key
+
+@category "engine-internal"
+typeIdentityKeeperCheck : String -> TypeIdentityKeeper -> String -> TypeIdentityPlan -> TypeIdentityPlan
+typeIdentityKeeperCheck name keeper found plan =
+  if eq found keeper.oldId then plan else typeIdentityMismatch name keeper found
+
+-- The keeper owner of a recorded name ends up holding exactly the recorded
+-- UUID, renamed from the bare row or already under its key.
+@category "engine-internal"
+typeIdentityKeeperAction : String -> TypeIdentityKeeper -> String -> Maybe String -> Maybe String -> TypeIdentityPlan
+typeIdentityKeeperAction name keeper key bare keyed =
+  case bare of
+    Just b ->
+      case keyed of
+        Just k -> typeIdentityRetiredBare name key
+        Nothing -> typeIdentityKeeperCheck name keeper b (typeIdentityRekeyed name key b)
+    Nothing ->
+      case keyed of
+        Just k -> typeIdentityKeeperCheck name keeper k (typeIdentityRetained name key k)
+        Nothing -> typeIdentityKeeperMissing name keeper key
+
+@category "engine-internal"
+typeIdentityOtherKeyed : String -> TypeIdentityKeeper -> String -> Maybe String -> TypeIdentityPlan
+typeIdentityOtherKeyed name keeper key keyed =
+  case keyed of
+    Just k -> if eq k keeper.oldId then typeIdentityMismatch name keeper k else typeIdentityRetained name key k
+    Nothing -> typeIdentityMinted name key
+
+-- Any other owner of a recorded name must be recorded, never takes the
+-- keeper's UUID, and never renames the bare row (it is the keeper's).
+@category "engine-internal"
+typeIdentityOtherAction : String -> String -> TypeIdentityKeeper -> String -> Maybe String -> Maybe String -> TypeIdentityPlan
+typeIdentityOtherAction name owner keeper key bare keyed =
+  if not (includes keeper.others owner)
+  then typeIdentityUnrecorded name owner keeper
+  else
+    case bare of
+      Just b -> typeIdentityBareOfKeeper name owner keeper b
+      Nothing -> typeIdentityOtherKeyed name keeper key keyed
+
+@category "engine-internal"
+typeIdentitySingleOwnerPlan : String -> String -> List TypeIdentityCandidate -> Maybe String -> Maybe TypeIdentityKeeper -> TypeIdentityPlan
+typeIdentitySingleOwnerPlan name owner candidates bare keeper =
+  let key = typeIdentityLockKey (Just owner) name
+  let keyed = typeIdentityKeyedId candidates owner
+  case keeper of
+    Nothing -> typeIdentityOwnerAction name key bare keyed
+    Just k ->
+      if eq k.keeper owner
+      then typeIdentityKeeperAction name k key bare keyed
+      else typeIdentityOtherAction name owner k key bare keyed
+
+@category "engine-internal"
+typeIdentityOtherOwnerPlan : String -> List TypeIdentityCandidate -> TypeIdentityKeeper -> String -> TypeIdentityPlan
+typeIdentityOtherOwnerPlan name candidates keeper owner =
+  let key = typeIdentityLockKey (Just owner) name
+  typeIdentityOtherAction name owner keeper key Nothing (typeIdentityKeyedId candidates owner)
+
+@category "engine-internal"
+typeIdentityKeptPlan : String -> List String -> List TypeIdentityCandidate -> Maybe String -> TypeIdentityKeeper -> TypeIdentityPlan
+typeIdentityKeptPlan name owners candidates bare keeper =
+  let key = typeIdentityLockKey (Just keeper.keeper) name
+  let keeperPlan = typeIdentityKeeperAction name keeper key bare (typeIdentityKeyedId candidates keeper.keeper)
+  let others = filter (\o -> not (eq o keeper.keeper)) owners
+  let otherPlans = map (\o -> typeIdentityOtherOwnerPlan name candidates keeper o) others
+  typeIdentityMergePlans (concat [keeperPlan] otherPlans)
+
+@category "engine-internal"
+typeIdentityMultiOwnerPlan : String -> List String -> List TypeIdentityCandidate -> Maybe String -> Maybe TypeIdentityKeeper -> TypeIdentityPlan
+typeIdentityMultiOwnerPlan name owners candidates bare keeper =
+  case keeper of
+    Nothing -> typeIdentityNoKeeper name owners
+    Just k ->
+      if includes owners k.keeper
+      then typeIdentityKeptPlan name owners candidates bare k
+      else typeIdentityKeeperAbsent name k owners
+
+@category "engine-internal"
+typeIdentityNamePlan : { key: String, value: List TypeIdentityCandidate } -> TypeIdentityPlan
+typeIdentityNamePlan group =
+  let name = group.key
+  let candidates = group.value
+  let owners = sortLex (unique (map (\c -> c.owner) candidates))
+  let bare = typeIdentityBareId candidates
+  let keeper = find (\k -> eq k.name name) (typeIdentityKeepers ())
+  if count owners > 1
+  then typeIdentityMultiOwnerPlan name owners candidates bare keeper
+  else typeIdentitySingleOwnerPlan name (fromMaybe "" (head owners)) candidates bare keeper
+
+@label "Type identity re-key plan"
+@description "The lock plan of per-owner type identity: for every declaration in the identity roster, rename its bare row in place with its UUID, keep its owner key, or mint one; refuse a two-owner name without a keeper, a keeper UUID mismatch, an unrecorded owner and a retired bare key beside an owner key."
+@tags "engine" "type-identity" "lock"
+typeIdentityRekeyPlan : (candidates: List TypeIdentityCandidate) -> TypeIdentityPlan
+typeIdentityRekeyPlan candidates =
+  let required = filter typeIdentityRequired candidates
+  let groups = entries (groupBy (\c -> c.name) required)
+  typeIdentityMergePlans (map typeIdentityNamePlan groups)

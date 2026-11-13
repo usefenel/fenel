@@ -1,0 +1,235 @@
+module engine where
+
+-- Choice conditions are an editing lens over one ordinary outer refinement.
+-- The generated predicate is `case value of C -> if global then condition
+-- else false` for every declared C. Source Syntax/Pattern owns the template;
+-- the boundary reattaches opaque authored predicate bodies to its slots.
+-- Every declared case has an explicit arm (an unset condition is true).
+-- There is NO default arm: a missing owned-name projection reaches the shipped
+-- match no-value path, so where membership abstains instead of inventing Bool.
+
+@category "engine-internal"
+tpSingle : (node: JsonLogic Any) -> (name: String) -> Maybe (JsonLogic Any)
+tpSingle node name = case node of
+  JlObject { fields = fields } ->
+    case head fields of
+      Just field -> if and (eq (length fields) 1) (eq field.name name) then Just field.value else Nothing
+      Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+tpBool : (node: JsonLogic Any) -> (expected: Boolean) -> Boolean
+tpBool node expected = case node of
+  JlBool { value = value } -> eq value expected
+  _ -> false
+
+@category "engine-internal"
+tpTarget : (variantCase: TtVariantCase) -> String
+tpTarget variantCase = case lookup variantCase "constructorFunction" of
+  Just (Just target) -> target
+  _ -> variantCase.name
+
+@category "engine-internal"
+tpTargetValid : (variantCase: TtVariantCase) -> Boolean
+tpTargetValid variantCase = case lookup variantCase "constructorFunction" of
+  Just (Just target) -> fieldIdentityIsUuid target
+  _ -> and (isCtorName variantCase.name) (fold (\valid char -> and valid (isIdentCont char)) true (chars variantCase.name))
+
+@category "engine-internal"
+tpCaseRows : (cases: List TtVariantCase) -> (index: Number) -> (names: List String) -> (targets: List String) -> Result String a
+tpCaseRows cases index names targets = case head cases of
+  Nothing -> Ok []
+  Just variantCase ->
+    let target = tpTarget variantCase
+    if not (tpTargetValid variantCase) then Err "A choice needs a valid owned constructor identity or a source constructor name before its predicate can be authored."
+    else if or (or (eq variantCase.name "") (elem variantCase.name names)) (or (eq target "") (elem target targets)) then Err "Choice predicates require distinct nonempty constructor names and identities."
+    else case tpCaseRows (tailOr cases) (add index 1) (appendItem variantCase.name names) (appendItem target targets) of
+      Err message -> Err message
+      Ok rest -> Ok (concat [{ index = index, name = variantCase.name, target = target, predicatePath = Nothing }] rest)
+
+@category "engine-internal"
+tpCases : (base: TraversalType) -> Result String a
+tpCases base = case base of
+  TtVariant { cases = cases, discriminator = discriminator } ->
+    let conventional =
+      case discriminator of
+        Nothing -> true
+        Just name -> eq name "$tag"
+    if not conventional then Err "Choice predicate sugar requires the ordinary variant discriminator; use the general constraint editor."
+    else case traversalSemanticSlotsErrorWithSourceHandles base of
+      Just message -> Err message
+      Nothing -> tpCaseRows cases 0 [] []
+  TtUnknown -> Err "An incomplete or malformed type cannot supply a predicate scope."
+  _ -> Ok []
+
+@category "engine-internal"
+tpIsValue : (node: JsonLogic Any) -> Boolean
+tpIsValue node = case tpSingle node "var" of
+  Just (JlString { value = name }) -> eq name "value"
+  _ -> false
+
+@category "engine-internal"
+tpPattern : (node: JsonLogic Any) -> (target: String) -> Boolean
+tpPattern node target = case node of
+  JlTagged { tag = tag, fields = fields } -> and (eq tag target) (eq (length fields) 0)
+  _ -> false
+
+@category "engine-internal"
+tpCombinedCases : (items: List (JsonLogic Any)) -> (rows: a) -> (path: List String) -> (offset: Number) -> (global: JsonLogic Any) -> Maybe a
+tpCombinedCases items rows path offset global = case head rows of
+  Nothing -> if eq (length items) 0 then Just [] else Nothing
+  Just row ->
+    if lt (length items) 2 then Nothing
+    else if not (tpPattern (at items 0) row.target) then Nothing
+    else case tpSingle (at items 1) "if" of
+      Just (JlArray { items = branch }) ->
+        if not (eq (length branch) 3) then Nothing
+        else if not (and (eq (at branch 0) global) (tpBool (at branch 2) false)) then Nothing
+        else case tpCombinedCases (tailOr (tailOr items)) (tailOr rows) path (add offset 2) global of
+          Nothing -> Nothing
+          Just rest ->
+            let predicatePath = if tpBool (at branch 1) true then Nothing else Just (concat path [toString (add offset 1), "if", "1"])
+            Just (concat [mapSet row "predicatePath" predicatePath] rest)
+      _ -> Nothing
+
+@category "engine-internal"
+tpCombined : (predicate: JsonLogic Any) -> (rows: a) -> (path: List String) -> Maybe a
+tpCombined predicate rows path = case tpSingle predicate "match" of
+  Just (JlArray { items = matchArgs }) ->
+    if lt (length matchArgs) 3 then Nothing
+    else if not (tpIsValue (at matchArgs 0)) then Nothing
+    else case tpSingle (at matchArgs 2) "if" of
+      Just (JlArray { items = first }) ->
+        if not (eq (length first) 3) then Nothing
+        else case tpCombinedCases (tailOr matchArgs) rows (appendItem "match" path) 1 (at first 0) of
+          Nothing -> Nothing
+          Just cases -> Just { cases = cases, globalPath = if tpBool (at first 0) true then Nothing else Just (concat path ["match", "2", "if", "0"]) }
+      _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+tpProjection : (base: TraversalType) -> (basePath: List String) -> (predicate: JsonLogic Any) -> (hasPredicate: Boolean) -> a
+tpProjection base basePath predicate hasPredicate = case tpCases base of
+  Err message -> { ok = false, message = message }
+  Ok rows ->
+    if not hasPredicate then { ok = true, basePath = basePath, globalPath = Nothing, cases = rows, mode = "bare" }
+    else
+      let predicatePath = ["$refined", "set", "pred"]
+      case tpCombined predicate rows predicatePath of
+        Just combined -> { ok = true, basePath = basePath, globalPath = combined.globalPath, cases = combined.cases, mode = "combined" }
+        Nothing -> { ok = true, basePath = basePath, globalPath = Just predicatePath, cases = rows, mode = "global" }
+
+@label "Inspect type predicate sugar"
+@description "Recognize only the exact global-plus-choice predicate template. Every other ordinary where predicate remains one intact global predicate; non-where constraints retain the general lens."
+@tags "engine" "authoring" "type"
+typePredicateSugarProjection : (type: TraversalType) -> (predicate: JsonLogic Any) -> (hasPredicate: Boolean) -> a
+typePredicateSugarProjection type predicate hasPredicate = case type of
+  TtRefined { base = base, setView = set } -> case set of
+    SeWhere -> if hasPredicate then tpProjection base ["$refined", "base"] predicate true else { ok = false, message = "Use the general constraint editor for this stored refinement representation." }
+    _ -> { ok = false, message = "This constraint uses the general SetExpr editor; it cannot be decomposed into Boolean choice conditions." }
+  _ -> tpProjection type [] predicate false
+
+@category "engine-internal"
+tpTemplateArms : (rows: a) -> a
+tpTemplateArms rows = map (\row -> {
+  pattern = PatConstruct { ctor = row.target, args = [], fields = [] },
+  body = SIf { cond = SLit { value = true }, then = SLit { value = true }, else = SLit { value = false } }
+}) rows
+
+@label "Build type predicate sugar template"
+@description "Build an ordinary Syntax match predicate over declared constructor identities, plus an optional whole-value condition. The boundary only lowers this source template and attaches the unchanged authored predicate bodies."
+@tags "engine" "authoring" "type"
+typePredicateSugarTemplate : (rows: a) -> (hasGlobal: Boolean) -> (activeCases: List Boolean) -> a
+typePredicateSugarTemplate rows hasGlobal activeCases =
+  let anyCase = fold (\active next -> or active next) false activeCases
+  if not (or hasGlobal anyCase) then { mode = "bare" }
+  else if not anyCase then { mode = "global", globalPath = [] }
+  else {
+    mode = "combined",
+    syntax = SMatch { scrutinee = SVar { name = "value" }, arms = tpTemplateArms rows },
+    globalPaths = map (\row -> ["match", toString (add 2 (mul row.index 2)), "if", "0"]) rows,
+    casePaths = map (\row -> ["match", toString (add 2 (mul row.index 2)), "if", "1"]) rows
+  }
+
+@label "Choose a type predicate edit slot"
+@description "Validate the requested whole-value or declared-choice slot before the host attaches the new opaque predicate. Unknown choices refuse without altering the stored constraint."
+@tags "engine" "authoring" "type"
+typePredicateSugarEditPlan : (rows: a) -> (scope: String) -> (index: Number) -> a
+typePredicateSugarEditPlan rows scope index =
+  if eq scope "global" then { ok = true, target = "global", index = 0 }
+  else if eq scope "case" then
+    case find (\row -> eq row.index index) rows of
+      Nothing -> { ok = false, message = "This choice does not belong to the current variant declaration." }
+      Just row -> { ok = true, target = "case", index = index }
+  else { ok = false, message = "Unknown type predicate edit." }
+
+@category "engine-internal"
+tpFieldsRetained : (prior: List a) -> (next: List a) -> Boolean
+tpFieldsRetained prior next = case head prior of
+  Nothing -> true
+  Just field -> case find (\candidate -> eq (fieldKeyToken candidate.semanticKey) (fieldKeyToken field.semanticKey)) next of
+    Nothing -> false
+    Just candidate ->
+      -- Syntactic retention, not a type-equality or subtype judgment. An opaque
+      -- predicate can depend on this exact slot name and authored type.
+      and (and (eq field.name candidate.name) (eq field.raw candidate.raw)) (tpFieldsRetained (tailOr prior) next)
+
+@category "engine-internal"
+tpProtectedCasesRetained : (prior: List TtVariantCase) -> (next: List TtVariantCase) -> (states: a) -> (hasGlobal: Boolean) -> (index: Number) -> Maybe String
+tpProtectedCasesRetained prior next states hasGlobal index = case head prior of
+  Nothing -> Nothing
+  Just variantCase ->
+    let state = find (\row -> eq row.index index) states
+    let protected =
+      if hasGlobal then true
+      else case state of
+        Just row -> row.conditioned
+        Nothing -> false
+    let target = tpTarget variantCase
+    let problem =
+          if not protected then Nothing
+          else case find (\candidate -> eq (tpTarget candidate) target) next of
+            Nothing -> Just "Remove or revise the condition before removing or changing this constructor identity."
+            Just candidate ->
+              if and hasGlobal (not (eq variantCase.name candidate.name)) then Just "Revise the global condition before renaming a constructor in its value scope."
+              else if not (tpFieldsRetained variantCase.fields candidate.fields) then Just "Revise the condition before renaming, removing or changing the type of an existing field in its value scope."
+              else Nothing
+    case problem of
+      Just message -> Just message
+      Nothing -> tpProtectedCasesRetained (tailOr prior) next states hasGlobal (add index 1)
+
+@category "engine-internal"
+tpBaseProtection : (prior: TraversalType) -> (next: TraversalType) -> (states: a) -> (hasGlobal: Boolean) -> Maybe String
+tpBaseProtection prior next states hasGlobal =
+  let conditioned = or hasGlobal (fold (\present row -> or present row.conditioned) false states)
+  if not conditioned then Nothing
+  else case traversalSemanticSlotsErrorWithSourceHandles next of
+    Just message -> Just message
+    Nothing -> case prior of
+      TtVariant { cases = priorCases } -> case next of
+        TtVariant { cases = nextCases } ->
+          if and hasGlobal (not (eq (length priorCases) (length nextCases))) then Just "Revise the global condition before adding or removing choices from its value scope."
+          else tpProtectedCasesRetained priorCases nextCases states hasGlobal 0
+        _ -> Just "Remove or revise the conditions before replacing this variant's shape."
+      TtRecord { fields = priorFields } -> case next of
+        TtRecord { fields = nextFields } -> if tpFieldsRetained priorFields nextFields then Nothing else Just "Revise the condition before renaming, removing or changing the type of an existing field in its value scope."
+        _ -> Just "Remove or revise the global condition before replacing this record's shape."
+      _ -> if eq prior.raw next.raw then Nothing else Just "Revise the global condition before changing its input type."
+
+@label "Retain predicates while editing their base type"
+@description "Map choice conditions only by their existing constructor target, retaining owned identities through reorder/rename. Refuse removal of conditioned targets and changes that could leave opaque predicate field references dangling; adding fields preserves existing slots."
+@tags "engine" "authoring" "type"
+typePredicateSugarBaseEditPlan : (prior: TraversalType) -> (next: TraversalType) -> (states: a) -> (hasGlobal: Boolean) -> a
+typePredicateSugarBaseEditPlan prior next states hasGlobal =
+  case tpCases next of
+    Err message -> { ok = false, message = message }
+    Ok rows -> case tpBaseProtection prior next states hasGlobal of
+      Just message -> { ok = false, message = message }
+      Nothing ->
+        let attachPreviousIndex = \row -> do
+          let matchedPreviousIndex =
+            case find (\previous -> eq previous.target row.target) states of
+              Nothing -> Nothing
+              Just previous -> Just previous.index
+          mapSet row "previousIndex" matchedPreviousIndex
+        { ok = true, rows = map attachPreviousIndex rows }

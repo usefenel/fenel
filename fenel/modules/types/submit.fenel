@@ -1,0 +1,209 @@
+-- =========================================================================
+-- Types — submit (the public-view CAPTURE loop).
+--
+-- forms-collapse Phase 2 (2026-06-08) / storage-as-effect Phase 4c
+-- (2026-06-19 — the funnel/form VOCABULARY retirement). The thesis: there is
+-- NO "funnel" and NO "form" concept, only types, functions, and instances.
+-- **submit = calling the type's function with the typed input.** A type with
+-- no authored function body yet has the minimal one — validate the input
+-- against the type's `$record` schema, then create an *unverified* instance
+-- (the captured lead). That instance IS the submission: submissions are
+-- instances of the submitted type (design/forms-collapse.md Q2). No
+-- `storeFormSubmission` leaf, no `form_submission` row —
+-- `state:tryCreateInstanceByName` of the type.
+--
+-- `submit : String -> {} -> String -> ActionResult` (name, data, adapter):
+--   1. Resolve the public name through types:resolveType → Maybe row.
+--      Nothing → ActionErr "Type not found: <name>".
+--   2. Validate the input through state:validateEntityInstance against the
+--      canonical type name. That IO leaf loads the account's identified field
+--      registry, so UUID facets and named-type expansion participate. Not ok →
+--      ActionErr with the first structured validation message.
+--   3. Dispatch the COERCED validation.value: a same-name function receives it
+--      as input; otherwise the generic capture persists it. Behavior and
+--      capture therefore share one account-aware validation boundary.
+--   4. Create the unverified capture — state:tryCreateInstanceByName name data
+--      (→ { ok, value: Maybe id, error: Maybe String }). This is the instance
+--      (LOCK-2: create-only, NO merge — an anonymous submitter's claimed handles
+--      are unproven, so identity-resolution is gated on proof, later). ok false
+--      → ActionErr.
+--   5. Emit the `submitted` event over the instance aggregate (a visitor
+--      created an instance through a public submit view). Renamed from the
+--      legacy `form_submitted` in Phase 4c — there is no form noun.
+--   6. Return ActionOk { data = { instanceId }, aggregate = the instance }.
+--
+-- NOT registered via registerAction (no core/actions wrapper). The
+-- /forms/:slug/submit route invokes this body DIRECTLY via
+-- invokeIOActionAs(authority, …) — anonymous-OPEN per Rom's 2026-06-08 unblock
+-- (Fenel is private in dev; the rights arc gates anonymous capture later).
+-- rights R2a deleted the action-dispatch check step this used to sidestep; the
+-- public lane now mints an InterimWorker authority for the header account, and
+-- rights R4 replaces that with an authenticated mint. The route leaves a
+-- `forms-collapse: open until the rights arc gates anonymous capture` marker.
+--
+-- HasStateIO is supplied by createRegistry's attachInferredRequires (transitive
+-- from the state:* calls), as on items/register. parseApp doesn't continue arg
+-- lists across newlines — multi-line conditionals → top-level helpers (the
+-- items.fenel / register.fenel recipe).
+-- =========================================================================
+
+module types where
+
+-- submit — rights Phase C3: takes the BOUND canonical type id, never a public
+-- slug. It used to take the caller's slug and re-run the full three-arm
+-- `resolveType` on it, which is what made the embed lane's gate an advisory
+-- rather than a binding: /embed/forms authorised one row and then handed submit
+-- a STRING to re-resolve, so validation, the behavior probe and the capture were
+-- all re-selected by the alias-tolerant resolver afterwards. Now the id from
+-- `types:embedResolve` travels, `getTypeById` re-reads it account-scoped, and
+-- `row.name` for validation + the behavior probe is DERIVED from that read.
+--
+-- The capture is likewise id-keyed (see submitCreate): `tryCreateInstanceByName`
+-- already accepts a UUID and resolves it through the account-scoped `loadType`,
+-- so passing the bound id makes that existence-checked arm the only one this
+-- lane can reach. Its bare-name arm passes any non-UUID string straight through
+-- with no existence check at all — the fossil of that is the account's dead
+-- `contact-form` submitted-events, whose type no longer exists under that name.
+submit : String -> {} -> String -> ActionResult
+@label "Submit"
+@description "Phase 2b UUID-only field convergence / rights Phase C3 — takes the BOUND canonical type-row UUID (from types:embedResolve), re-reads it account-scoped via getTypeById, then validates once through state:validateEntityInstance (account field registry + coercion) against the DERIVED canonical name, and dispatches the validated value to a same-name behavior function or the generic unverified capture (which is itself id-keyed). Invoked DIRECTLY by /embed/forms/:slug/submit AFTER that route's publication gate, NOT via dispatch."
+@tags "type" "submit" "dispatch" "forms-collapse" "field-identity" "rights"
+@ioAction "types.submit"
+-- The Nothing arm is the POST-GATE DISAPPEARANCE case: the route's publication
+-- gate bound this id moments ago and the row is gone (deleted, or moved out of
+-- the account) by the time we re-read it. Its message is a SENTINEL the route
+-- matches literally to answer 404 rather than its usual 422-for-ActionErr, so
+-- this stays indistinguishable from every other gate failure on both verbs.
+--
+-- The sentinel is a RESERVED INTERNAL TOKEN, not the public wording, and that is
+-- deliberate: `ActionErr.message` is an open string, and BOTH other producers
+-- forward text they do not control — `submitValidationMessage` forwards a
+-- validator message, and `submitCreate` forwards a raw backend `Error.message`.
+-- A sentinel spelled like the public copy ("Form not found") would therefore be
+-- one unlucky backend error away from being misread as a gate failure and
+-- answered 404. This token cannot be produced by either path. The route owns
+-- the public wording and maps this token onto it; keep the two spellings in
+-- sync — `api/src/routes/forms.ts` carries the match and points back here.
+submit typeId data adapter =
+  case getTypeById typeId of
+    Nothing -> ActionErr { message = "__embed_gate_not_found__" }
+    Just row -> submitValidate row.name typeId data adapter
+
+-- submitCall — a per-type function exists: call it with the typed input
+-- (it owns capture+behavior+return) and wrap its R1 return record in ActionOk.
+-- The call goes through io:call_function (the body call path — ctx.callFunction →
+-- callUserFunction), passing the submitted record under the type function's
+-- single `input` param. The body did its own capture, so no generic
+-- capture runs here.
+submitCall : String -> {} -> ActionResult
+@label "Submit (call)"
+@description "forms-collapse Phase 3a — the behavior arm of submit. A per-type function exists (state:getFunction Just), so call it via io:call_function name { input = data } (the function owns capture+behavior+return — it does its own state:tryCreateInstanceByName). Wraps the function's R1 transitional return record in ActionOk { data = <the record> } so the route serves it to the widget unchanged. No generic capture runs (no double-create)."
+@tags "type" "submit" "behavior" "forms-collapse"
+submitCall name data =
+  let r = call_function name { input = data }
+  ActionOk { data = r, aggregateType = Just name, aggregateId = Nothing, profileId = Nothing }
+
+-- submitValidate — the single account-aware validation boundary. The native IO
+-- leaf resolves the identified type and facets from the requesting account and
+-- returns a coerced value. Only that value may reach behavior or persistence.
+submitValidate : String -> String -> {} -> String -> ActionResult
+@label "Submit (validate)"
+@description "Phase 2b UUID-only field convergence / rights Phase C3 — validate raw public input through state:validateEntityInstance using the canonical type name DERIVED from the bound id. Success dispatches validation.value (the coerced value); failure maps the structured error list to ActionErr. Carries typeId alongside name so the capture stays id-keyed."
+@tags "type" "submit" "validate" "forms-collapse" "field-identity" "rights"
+submitValidate name typeId data adapter =
+  let validation = validateEntityInstance name data false
+  if validation.ok
+  then submitValidated name typeId validation.value adapter
+  else ActionErr { message = submitValidationMessage validation.errors }
+
+-- submitValidated — dispatch only after account-aware validation. A function
+-- owns capture+behavior+return; otherwise the generic create+emit lane runs.
+-- NOTE (rights C3, recorded not fixed): the behavior arm is where this lane's
+-- binding necessarily stops. `getFunction name` probes by the derived canonical
+-- name, and the authored function it calls performs its own capture inside its
+-- own body with its own name literal — there is no platform seam between an
+-- author's body and its creates. So id-binding covers the generic arm exactly,
+-- and the behavior arm is covered only by the publication grant's declared
+-- scope ("publishing a type publishes its authored submit behavior too").
+-- Narrowing that is **rights Landing 3**'s job ("ingress and persistence"),
+-- whose roadmap section carries the two requirements inherited from Phase C:
+-- (1) thread the already-resolved definition into validation instead of
+-- re-resolving by name, and (2) a publication-time behavior binding that pins
+-- the function identity revision-bound (versioning P1's `DefinitionVersion` is
+-- the carrier). Landing 3 must ship BOTH: a validation-only fix is
+-- non-monotonic — it yields validate-as-published-A / behave-as-substituted-B,
+-- a confusion pair that exists in neither current world. The rule it must keep:
+-- never authorize types:submit and then re-resolve an arbitrary function by the
+-- type's current name.
+submitValidated : String -> String -> {} -> String -> ActionResult
+@label "Submit (validated dispatch)"
+@description "Phase 2b UUID-only field convergence / rights Phase C3 — dispatch a canonical, coerced value after account-aware validation. Same-name behavior function → submitCall; no function → the id-keyed generic submitCreate."
+@tags "type" "submit" "dispatch" "field-identity" "rights"
+submitValidated name typeId data adapter =
+  case getFunction name of
+    Just _ -> submitCall name data
+    Nothing -> submitCreate name typeId data adapter
+
+-- submitValidationMessage — preserve the existing string error envelope while
+-- the validation substrate remains structured and field-addressed.
+submitValidationMessage : List a -> String
+@label "Submit validation message"
+@description "Project the first structured state:validateEntityInstance error into the public ActionErr string envelope."
+@tags "type" "submit" "validate" "field-identity"
+-- Launders the gate token out of a message this module did not author, via the
+-- shared `submitSafeMessage` below.
+submitValidationMessage errors =
+  case head errors of
+    Nothing -> "Validation failed"
+    Just error -> submitSafeMessage error.message
+
+-- submitSafeMessage — the ONE laundering point for the reserved gate token.
+--
+-- `submit`'s not-found arm returns `__embed_gate_not_found__`, which the route
+-- matches literally to answer 404 rather than its usual 422-for-ActionErr. But
+-- `ActionErr.message` is an open string and BOTH other producers forward text
+-- they do not control — `submitValidationMessage` forwards a validator message,
+-- `submitCreate` forwards a raw backend `Error.message` (state.ts's catch). So
+-- "only `submit`'s not-found arm writes the token" was a statement about the
+-- literal source, not about the possible VALUES: a validator or backend that
+-- emitted the token verbatim would have been answered 404. Filtering it at
+-- every forwarding site is what makes the one-producer claim structural.
+--
+-- This used to be INLINED at both forwarding sites, because adding any new
+-- function to this module crashed engine boot (see the note on
+-- `EmbedPublication` in resolve.fenel). That defect is repaired —
+-- module-substrate M1, `workstreams/module-substrate/briefs/phase-m1-module-growth-must-not-crash-boot.md`
+-- — so the guard is a shared helper again and there is one copy to keep right.
+submitSafeMessage : String -> String
+@label "Submit (safe message)"
+@description "rights Phase C3 / module-substrate M1 — the single laundering point for the reserved `__embed_gate_not_found__` gate token. Any message this module forwards but did not author passes through here, so the token has exactly one producer (submit's post-gate-disappearance arm) as a structural property rather than as a claim about literal sources."
+@tags "type" "submit" "rights" "module-substrate"
+submitSafeMessage message =
+  if eq message "__embed_gate_not_found__" then "Submission failed" else message
+
+-- submitCreate — the unverified capture. state:tryCreateInstanceByName of
+-- the type (LOCK-2: create-only, no merge); ok → emit + Ok, not ok →
+-- ActionErr carrying the insert error.
+submitCreate : String -> String -> {} -> String -> ActionResult
+@label "Submit (create)"
+@description "forms-collapse Phase 2 / rights Phase C3 — the capture arm of submit, now ID-KEYED. state:tryCreateInstanceByName takes the BOUND type-row UUID (its EntityRef param accepts a UUID or a bare name; the UUID arm resolves through the account-scoped loadType and fails closed on a miss, while the bare-name arm passes any string through unchecked). Persists an UNVERIFIED instance (LOCK-2: create-only, NO identity merge). ok → submitEmit (emit + ActionOk), not ok → ActionErr { message = the insert error }. The emitted event still carries the canonical NAME as its aggregate type — the wire shape is unchanged."
+@tags "type" "submit" "create" "forms-collapse" "rights"
+submitCreate name typeId data adapter =
+  let r = tryCreateInstanceByName typeId data
+  let safe = submitSafeMessage r.error
+  if r.ok
+  then submitEmit name r.value adapter
+  else ActionErr { message = safe }
+
+-- submitEmit — successful-capture tail. Writes the `submitted` event over the
+-- instance aggregate (aggregateType = the type name, aggregateId = the instance
+-- id, profileId = Nothing — the capture is anonymous + unverified), and returns
+-- ActionOk { data = {instanceId} }.
+submitEmit : String -> String -> String -> ActionResult
+@label "Submit (emit)"
+@description "forms-collapse Phase 2 / storage-as-effect Phase 4c — successful-capture tail of submit. Writes the `submitted` event via state:appendEvent (payload {type, instanceId}; aggregateType = Just the type name, aggregateId = Just the instance id, profileId = Nothing — the capture is anonymous + unverified per LOCK-2). Returns ActionOk { data = {instanceId}, aggregateType = Just name, aggregateId = Just instanceId, profileId = Nothing }. The `submitted` event (renamed from form_submitted in Phase 4c — no form noun) unifies the form/page submit lanes."
+@tags "type" "submit" "emit" "forms-collapse"
+submitEmit name instanceId adapter =
+  let payload = { type = name, instanceId = instanceId }
+  let _e = appendEvent "submitted" payload (Just name) (Just instanceId) Nothing
+  ActionOk { data = { instanceId = instanceId }, aggregateType = Just name, aggregateId = Just instanceId, profileId = Nothing }

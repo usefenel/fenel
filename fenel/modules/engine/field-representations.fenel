@@ -1,0 +1,537 @@
+module engine where
+
+-- UUID-keyed field representation projection (field-identity Phase 2b).
+--
+-- The loader preserves @fieldLabel/@widget/@helpText/@fieldReusable as these
+-- inert source declarations.  This body is the only place that resolves their
+-- dotted source selectors. Runtime instances are always keyed by
+-- FieldRef.handle; reuse visibility is a separate structural field fact.
+
+FieldFacetSourceKind =
+  SourceFieldLabel label: a
+  | SourceFieldWidget widget: String
+  | SourceFieldHelpText helpText: String
+  | SourceFieldRepositoryReusable
+
+FieldFacetSourceProvenance = FieldFacetSourceProvenance module: String declaration: String selector: String
+
+FieldFacetSourceDirective = FieldFacetSourceDirective owner: FieldOwner selector: String source: FieldFacetSourceKind provenance: FieldFacetSourceProvenance
+
+ResolvedFieldFacetDirective = ResolvedFieldFacetDirective field: FieldRef source: FieldFacetSourceKind provenance: FieldFacetSourceProvenance
+
+FieldFacetInstance = FieldFacetInstance typeName: String target: FieldRef methods: a
+
+FieldFacetProjection = FieldFacetProjection codeables: List FieldFacetInstance labelables: List FieldFacetInstance displayables: List FieldFacetInstance repositoryReusable: List FieldRef all: List FieldFacetInstance
+
+FieldFacetResolutionError =
+  MissingFieldFacetSelector message: String owner: FieldOwner selector: String
+  | AmbiguousFieldFacetSelector message: String owner: FieldOwner selector: String
+  | PositionalFieldFacetSelector message: String owner: FieldOwner selector: String
+  | CrossOwnerFieldFacetSelector message: String owner: FieldOwner selector: String
+  | DuplicateFieldFacetSelector message: String owner: FieldOwner selector: String field: FieldRef typeName: String
+  | ConflictingFieldFacetSelector message: String owner: FieldOwner selector: String field: FieldRef typeName: String
+  | ConflictingFieldFacet message: String field: FieldRef typeName: String
+
+FieldPresentationOverride = FieldPresentationOverride label: Maybe a description: Maybe String icon: Maybe String display: Maybe a
+
+FieldPresentation = FieldPresentation label: a description: Maybe String icon: Maybe String display: Maybe a source: String
+
+-- A constructor-only module projection has no function occurrences. Keep the
+-- exact type-owner declarations, in source order, before the ordinary selector
+-- judgment runs; function-owner directives belong to the full function graph.
+-- `raw` is an opaque admitted directive, preserving source/provenance on egress.
+@category "engine-internal"
+fieldFacetEntityDirectiveProjection : (rows: List ({ owner: FieldOwner, raw: Any })) -> List Any
+fieldFacetEntityDirectiveProjection rows =
+  let entityOwned = \row ->
+    case row.owner of
+      TypeFieldOwner -> true
+      _ -> false
+  let selected = filter entityOwned rows
+  map (\row -> row.raw) selected
+
+@category "engine-internal"
+fieldFacetOwnerEq : (left: FieldOwner) -> (right: FieldOwner) -> Bool
+fieldFacetOwnerEq left right = eufValEq left right
+
+@category "engine-internal"
+fieldFacetSelectorAppend : (selector: String) -> (segment: String) -> String
+fieldFacetSelectorAppend selector segment =
+  if eq selector "" then segment else concat selector (concat "." segment)
+
+@category "engine-internal"
+fieldFacetPathSelectorStep : (selector: String) -> (segment: FieldPathSegment) -> String
+fieldFacetPathSelectorStep selector segment =
+  case segment of
+    FieldNamed { name = name } -> fieldFacetSelectorAppend selector name
+    FieldPosition { index = index } -> fieldFacetSelectorAppend selector (concat "_" (toString index))
+    FieldCase { name = name } -> fieldFacetSelectorAppend selector name
+    FieldArrowReturn -> selector
+    FieldTuple -> selector
+    FieldTypeArg -> selector
+    FieldMapValue -> selector
+    FieldRefinedBase -> selector
+    FieldUnion -> selector
+    FieldIntersect -> selector
+    FieldComplement -> selector
+    FieldTaggedValue -> selector
+    FieldTaggedPhantom -> selector
+
+@category "engine-internal"
+fieldFacetOccurrenceSelector : (occurrence: ResolvedFieldOccurrence) -> String
+fieldFacetOccurrenceSelector occurrence = fold fieldFacetPathSelectorStep "" occurrence.path
+
+@category "engine-internal"
+fieldFacetSelectorRosterEntry : (occurrence: ResolvedFieldOccurrence) -> a
+fieldFacetSelectorRosterEntry occurrence = { selector = fieldFacetOccurrenceSelector occurrence, occurrence = occurrence }
+
+@category "engine-internal"
+fieldFacetSelectorRosterMatches : (directive: FieldFacetSourceDirective) -> (entry: a) -> Bool
+fieldFacetSelectorRosterMatches directive entry = eq directive.selector entry.selector
+
+@category "engine-internal"
+fieldFacetSelectorRosterOccurrence : (entry: a) -> ResolvedFieldOccurrence
+fieldFacetSelectorRosterOccurrence entry = entry.occurrence
+
+@category "engine-internal"
+fieldFacetSelectorMatches : (directive: FieldFacetSourceDirective) -> (occurrence: ResolvedFieldOccurrence) -> Bool
+fieldFacetSelectorMatches directive occurrence =
+  and (fieldFacetOwnerEq directive.owner occurrence.owner)
+      (eq directive.selector (fieldFacetOccurrenceSelector occurrence))
+
+@category "engine-internal"
+fieldFacetIsPositionalSelector : (directive: FieldFacetSourceDirective) -> (occurrence: ResolvedFieldOccurrence) -> Bool
+fieldFacetIsPositionalSelector directive occurrence =
+  if not (fieldFacetSelectorMatches directive occurrence)
+  then false
+  else
+    case occurrence.key of
+      PositionalField -> true
+      NamedField -> false
+
+@category "engine-internal"
+fieldFacetIsNamedSelector : (directive: FieldFacetSourceDirective) -> (occurrence: ResolvedFieldOccurrence) -> Bool
+fieldFacetIsNamedSelector directive occurrence =
+  if not (fieldFacetSelectorMatches directive occurrence)
+  then false
+  else
+    case occurrence.key of
+      NamedField -> true
+      PositionalField -> false
+
+@category "engine-internal"
+fieldFacetMatchesOtherOwner : (directive: FieldFacetSourceDirective) -> (occurrence: ResolvedFieldOccurrence) -> Bool
+fieldFacetMatchesOtherOwner directive occurrence =
+  and (not (fieldFacetOwnerEq directive.owner occurrence.owner))
+      (eq directive.selector (fieldFacetOccurrenceSelector occurrence))
+
+@category "engine-internal"
+fieldFacetResolveOne : (selectorRoster: List a) -> (directive: FieldFacetSourceDirective) -> Result FieldFacetResolutionError ResolvedFieldFacetDirective
+fieldFacetResolveOne selectorRoster directive =
+  let candidates = map fieldFacetSelectorRosterOccurrence (filter (fieldFacetSelectorRosterMatches directive) selectorRoster)
+  let named = filter (fieldFacetIsNamedSelector directive) candidates
+  let positional = filter (fieldFacetIsPositionalSelector directive) candidates
+  case head named of
+    Just occurrence ->
+      if or (gt (length named) 1) (gt (length positional) 0)
+      then Err (AmbiguousFieldFacetSelector { message = concat "field-facet: selector resolves to multiple typed occurrences: " directive.selector, owner = directive.owner, selector = directive.selector })
+      else
+        case occurrence.key of
+          NamedField { ref = ref } -> Ok (ResolvedFieldFacetDirective { field = ref, source = directive.source, provenance = directive.provenance })
+          PositionalField -> Err (PositionalFieldFacetSelector { message = concat "field-facet: positional selector cannot carry a global facet: " directive.selector, owner = directive.owner, selector = directive.selector })
+    Nothing ->
+      case head positional of
+        Just _ -> Err (PositionalFieldFacetSelector { message = concat "field-facet: positional selector cannot carry a global facet: " directive.selector, owner = directive.owner, selector = directive.selector })
+        Nothing ->
+          case find (fieldFacetMatchesOtherOwner directive) candidates of
+            Just _ -> Err (CrossOwnerFieldFacetSelector { message = concat "field-facet: selector resolves only outside its typed owner: " directive.selector, owner = directive.owner, selector = directive.selector })
+            Nothing -> Err (MissingFieldFacetSelector { message = concat "field-facet: selector does not resolve in its typed owner: " directive.selector, owner = directive.owner, selector = directive.selector })
+
+@category "engine-internal"
+fieldFacetSourceTypeName : (source: FieldFacetSourceKind) -> String
+fieldFacetSourceTypeName source =
+  case source of
+    SourceFieldLabel -> "Labelable"
+    SourceFieldWidget -> "Displayable.widget"
+    SourceFieldHelpText -> "Displayable.helpText"
+    SourceFieldRepositoryReusable -> "RepositoryReusable"
+
+@category "engine-internal"
+fieldFacetSourceSameSlot : (left: FieldFacetSourceKind) -> (right: FieldFacetSourceKind) -> Bool
+fieldFacetSourceSameSlot left right =
+  case left of
+    SourceFieldLabel ->
+      case right of
+        SourceFieldLabel -> true
+        SourceFieldWidget -> false
+        SourceFieldHelpText -> false
+        SourceFieldRepositoryReusable -> false
+    SourceFieldWidget ->
+      case right of
+        SourceFieldLabel -> false
+        SourceFieldWidget -> true
+        SourceFieldHelpText -> false
+        SourceFieldRepositoryReusable -> false
+    SourceFieldHelpText ->
+      case right of
+        SourceFieldLabel -> false
+        SourceFieldWidget -> false
+        SourceFieldHelpText -> true
+        SourceFieldRepositoryReusable -> false
+    SourceFieldRepositoryReusable ->
+      case right of
+        SourceFieldLabel -> false
+        SourceFieldWidget -> false
+        SourceFieldHelpText -> false
+        SourceFieldRepositoryReusable -> true
+
+@category "engine-internal"
+fieldFacetSourceEq : (left: FieldFacetSourceKind) -> (right: FieldFacetSourceKind) -> Bool
+fieldFacetSourceEq left right = eufValEq left right
+
+@category "engine-internal"
+fieldFacetSameSelectorSlot : (candidate: a) -> (prior: a) -> Bool
+fieldFacetSameSelectorSlot candidate prior =
+  and (fieldFacetOwnerEq candidate.owner prior.owner) (and (eq candidate.selector prior.selector) (fieldFacetSourceSameSlot candidate.source prior.source))
+
+@category "engine-internal"
+fieldFacetResolveStep : (selectorRoster: { }) -> (state: a) -> (directive: FieldFacetSourceDirective) -> a
+fieldFacetResolveStep selectorRoster state directive =
+  case state.error of
+    Just err -> state
+    Nothing ->
+      let matchingRoster = case mapGet selectorRoster directive.selector of
+        Just entries -> entries
+        Nothing -> []
+      case fieldFacetResolveOne matchingRoster directive of
+        Err err -> { resolved = state.resolved, seen = state.seen, error = Just err }
+        Ok resolved ->
+          let seen = { owner = directive.owner, selector = directive.selector, source = directive.source, field = resolved.field }
+          case find (fieldFacetSameSelectorSlot seen) state.seen of
+            Nothing -> { resolved = appendItem resolved state.resolved, seen = appendItem seen state.seen, error = Nothing }
+            Just prior ->
+              let typeName = fieldFacetSourceTypeName directive.source
+              if fieldFacetSourceEq directive.source prior.source
+              then { resolved = state.resolved, seen = state.seen, error = Just (DuplicateFieldFacetSelector {
+                message = concat "field-facet: duplicate source selector for " (concat typeName (concat ": " directive.selector)),
+                owner = directive.owner,
+                selector = directive.selector,
+                field = resolved.field,
+                typeName = typeName
+              }) }
+              else { resolved = state.resolved, seen = state.seen, error = Just (ConflictingFieldFacetSelector {
+                message = concat "field-facet: conflicting source selector for " (concat typeName (concat ": " directive.selector)),
+                owner = directive.owner,
+                selector = directive.selector,
+                field = resolved.field,
+                typeName = typeName
+              }) }
+
+@label "Resolve field facet selectors"
+@description "Resolve retained typed source selectors against a completed field-identity occurrence roster. Missing, positional, cross-owner, ambiguous, duplicate, and conflicting selectors are structured errors; no dotted runtime target is emitted."
+@tags "engine" "field-identity" "representations" "phase-2b"
+resolveFieldFacetSelectors : (occurrences: List ResolvedFieldOccurrence) -> (directives: List FieldFacetSourceDirective) -> Result FieldFacetResolutionError (List ResolvedFieldFacetDirective)
+resolveFieldFacetSelectors occurrences directives =
+  if eq (length directives) 0
+  then Ok []
+  else
+    -- Keep every owner for a selector so cross-owner and ambiguity diagnostics
+    -- retain their meaning, without rescanning the full roster per directive.
+    let selectorRoster = groupBy (\entry -> entry.selector) (map fieldFacetSelectorRosterEntry occurrences)
+    let state = fold (fieldFacetResolveStep selectorRoster) { resolved = [], seen = [], error = Nothing } directives
+    case state.error of
+      Just err -> Err err
+      Nothing -> Ok state.resolved
+
+@category "engine-internal"
+fieldFacetTargetHandle : (facet: FieldFacetInstance) -> String
+fieldFacetTargetHandle facet = facet.target.handle
+
+@category "engine-internal"
+fieldFacetExistingFor : (typeName: String) -> (handle: String) -> (facets: List FieldFacetInstance) -> Maybe FieldFacetInstance
+fieldFacetExistingFor typeName handle facets =
+  find (\facet -> and (eq facet.typeName typeName) (eq facet.target.handle handle)) facets
+
+@category "engine-internal"
+fieldFacetReplaceDisplay : (field: FieldRef) -> (widget: Maybe String) -> (helpText: Maybe String) -> (facets: List FieldFacetInstance) -> List FieldFacetInstance
+fieldFacetReplaceDisplay field widget helpText facets =
+  map (\facet ->
+    if and (eq facet.typeName "Displayable") (eq facet.target.handle field.handle)
+    then FieldFacetInstance { typeName = "Displayable", target = field, methods = { hint = { widget = widget, helpText = helpText } } }
+    else facet
+  ) facets
+
+@category "engine-internal"
+fieldFacetApplyResolved : (state: a) -> (directive: ResolvedFieldFacetDirective) -> a
+fieldFacetApplyResolved state directive =
+  case state.error of
+    Just err -> state
+    Nothing ->
+      case directive.source of
+        SourceFieldLabel { label = label } ->
+          case fieldFacetExistingFor "Labelable" directive.field.handle state.facets of
+            Nothing -> { facets = appendItem (FieldFacetInstance { typeName = "Labelable", target = directive.field, methods = { label = label } }) state.facets, error = Nothing }
+            Just prior ->
+              if eufValEq prior.methods.label label
+              then state
+              else { facets = state.facets, error = Just (ConflictingFieldFacet {
+                message = concat "field-facet: conflicting Labelable values for " directive.field.handle,
+                field = directive.field,
+                typeName = "Labelable"
+              }) }
+        SourceFieldWidget { widget = widget } ->
+          case fieldFacetExistingFor "Displayable" directive.field.handle state.facets of
+            Nothing -> { facets = appendItem (FieldFacetInstance { typeName = "Displayable", target = directive.field, methods = { hint = { widget = Just widget, helpText = Nothing } } }) state.facets, error = Nothing }
+            Just prior ->
+              case prior.methods.hint.widget of
+                Just old ->
+                  if eq old widget
+                  then state
+                  else { facets = state.facets, error = Just (ConflictingFieldFacet { message = concat "field-facet: conflicting Displayable.widget values for " directive.field.handle, field = directive.field, typeName = "Displayable" }) }
+                Nothing -> { facets = fieldFacetReplaceDisplay directive.field (Just widget) prior.methods.hint.helpText state.facets, error = Nothing }
+        SourceFieldHelpText { helpText = helpText } ->
+          case fieldFacetExistingFor "Displayable" directive.field.handle state.facets of
+            Nothing -> { facets = appendItem (FieldFacetInstance { typeName = "Displayable", target = directive.field, methods = { hint = { widget = Nothing, helpText = Just helpText } } }) state.facets, error = Nothing }
+            Just prior ->
+              case prior.methods.hint.helpText of
+                Just old ->
+                  if eq old helpText
+                  then state
+                  else { facets = state.facets, error = Just (ConflictingFieldFacet { message = concat "field-facet: conflicting Displayable.helpText values for " directive.field.handle, field = directive.field, typeName = "Displayable" }) }
+                Nothing -> { facets = fieldFacetReplaceDisplay directive.field prior.methods.hint.widget (Just helpText) state.facets, error = Nothing }
+        SourceFieldRepositoryReusable -> state
+
+@category "engine-internal"
+fieldFacetReusableHas : (field: FieldRef) -> (fields: List FieldRef) -> Bool
+fieldFacetReusableHas field fields =
+  case find (\candidate -> eq candidate.handle field.handle) fields of
+    Just _ -> true
+    Nothing -> false
+
+@category "engine-internal"
+fieldFacetReusableStep : (fields: List FieldRef) -> (directive: ResolvedFieldFacetDirective) -> List FieldRef
+fieldFacetReusableStep fields directive =
+  case directive.source of
+    SourceFieldRepositoryReusable ->
+      if fieldFacetReusableHas directive.field fields
+      then fields
+      else appendItem directive.field fields
+    SourceFieldLabel -> fields
+    SourceFieldWidget -> fields
+    SourceFieldHelpText -> fields
+
+@category "engine-internal"
+fieldFacetRefHandle : (field: FieldRef) -> String
+fieldFacetRefHandle field = field.handle
+
+@category "engine-internal"
+fieldFacetCodeable : (entity: FieldEntity) -> FieldFacetInstance
+fieldFacetCodeable entity = FieldFacetInstance { typeName = "Codeable", target = entity.id, methods = { codeName = entity.currentCodeName } }
+
+@label "Project repository field facets"
+@description "Project exactly one Codeable per live named FieldEntity and UUID-keyed optional source facets. Positional fields never enter the entity input and therefore cannot emit facets."
+@tags "engine" "field-identity" "representations" "projection" "phase-2b"
+projectFieldFacets : (collection: FieldIdentityCollection) -> (directives: List FieldFacetSourceDirective) -> Result FieldFacetResolutionError FieldFacetProjection
+projectFieldFacets collection directives =
+  case resolveFieldFacetSelectors collection.occurrences directives of
+    Err err -> Err err
+    Ok resolved ->
+      let built = fold fieldFacetApplyResolved { facets = [], error = Nothing } resolved
+      case built.error of
+        Just err -> Err err
+        Nothing ->
+          let codeables = map fieldFacetCodeable collection.entities
+          let labelables = filter (\facet -> eq facet.typeName "Labelable") built.facets
+          let displayables = filter (\facet -> eq facet.typeName "Displayable") built.facets
+          let orderedLabels = sort fieldFacetTargetHandle labelables
+          let orderedDisplays = sort fieldFacetTargetHandle displayables
+          let repositoryReusable = sort fieldFacetRefHandle (fold fieldFacetReusableStep [] resolved)
+          Ok (FieldFacetProjection {
+            codeables = codeables,
+            labelables = orderedLabels,
+            displayables = orderedDisplays,
+            repositoryReusable = repositoryReusable,
+            all = concat codeables (concat orderedLabels orderedDisplays)
+          })
+
+-- -------------------------------------------------------------------------
+-- Facets over a repository projection (F1, 2026-11-01)
+--
+-- A Local or account build whose field collection came from the field
+-- identity delta (`collectFieldIdentitiesDelta`, ledger `fi.kernel.delta`)
+-- differs from its repository Base only by Local occurrences and the field
+-- entities they group into. projectFieldFacets over that union equals the
+-- repository projection with the Local Codeables merged in, when:
+--   * no Local directive exists, so the directives are the repository's;
+--   * no Local occurrence has a directive's owner. Selector resolution only
+--     counts occurrences of the directive's own owner (fieldFacetResolveOne:
+--     `named` and `positional` filter on fieldFacetSelectorMatches); other
+--     owners only change which error a failing directive reports, and the
+--     repository projection is Ok, so none fails. The resolved list, and so
+--     every Labelable, Displayable and repository-reusable row, is the
+--     repository's;
+--   * no Local occurrence or Local external field uses a repository entity
+--     handle, so every repository entity, and its Codeable, is unchanged, and
+--     every Local entity is new;
+--   * the host's partition is the union's: the union has exactly the
+--     repository occurrences plus the Local ones and the repository entities
+--     plus the Local ones, and the Local entities are exactly the handle
+--     groups of the Local named occurrences.
+-- Codeables are one per entity in the collection's handle order, so the
+-- union's Codeables are the repository's with the Local ones inserted by
+-- handle (the comparison the kernel's entity sort and the field delta's merges
+-- use). `all` is Codeables, then labels, then displays, as in the kernel.
+-- Every other case is FacetsDeltaFallback, and the caller runs
+-- projectFieldFacets, which stays the specification and reports diagnostics.
+-- Ledger row: design/tcb-ledger.md `fi.facets.delta`.
+-- -------------------------------------------------------------------------
+
+FieldFacetsBase = FieldFacetsBase projection: FieldFacetProjection handles: a directiveOwners: List FieldOwner occurrenceCount: Nat
+
+FieldFacetsDeltaReason =
+  FacetsDeltaLocalDirective
+  | FacetsDeltaPartitionMismatch
+  | FacetsDeltaRepositoryHandle
+  | FacetsDeltaDirectiveOwner
+
+FieldFacetsDeltaOutcome =
+  FacetsDeltaProjected projection: FieldFacetProjection
+  | FacetsDeltaFallback reason: FieldFacetsDeltaReason
+
+@category "engine-internal"
+fieldFacetsAddOwner : (owners: List FieldOwner) -> (owner: FieldOwner) -> List FieldOwner
+fieldFacetsAddOwner owners owner =
+  case find (fieldFacetOwnerEq owner) owners of
+    Just _ -> owners
+    Nothing -> appendItem owner owners
+
+@label "Retain repository field facets"
+@description "Keep a repository facet projection (projectFieldFacets over a build's repository collection and directives) with what projectFieldFacetsDelta checks Local input against: the repository entity handles, the distinct directive owners and the repository occurrence count."
+@tags "engine" "field-identity" "representations" "delta" "f1"
+fieldFacetsBase : (repositoryProjection: FieldFacetProjection) -> (repositoryDirectives: List FieldFacetSourceDirective) -> (repositoryOccurrenceCount: Nat) -> FieldFacetsBase
+fieldFacetsBase repositoryProjection repositoryDirectives repositoryOccurrenceCount =
+  -- Parameters are not named like the record's fields: a constructor literal
+  -- whose field name equals an in-scope parameter evaluates to null.
+  let repositoryHandles = fieldIdentityKeySet (map fieldFacetTargetHandle repositoryProjection.codeables)
+  let distinctOwners = fold fieldFacetsAddOwner [] (map (\directive -> directive.owner) repositoryDirectives)
+  FieldFacetsBase {
+    projection = repositoryProjection,
+    handles = repositoryHandles,
+    directiveOwners = distinctOwners,
+    occurrenceCount = repositoryOccurrenceCount
+  }
+
+@category "engine-internal"
+fieldFacetsOccurrenceHandles : (occurrence: ResolvedFieldOccurrence) -> List String
+fieldFacetsOccurrenceHandles occurrence =
+  case occurrence.key of
+    NamedField { ref = ref } -> [ref.handle]
+    PositionalField -> []
+
+-- The Local entities are exactly the groups of the Local named occurrences:
+-- every Local occurrence handle has its entity and every Local entity has an
+-- occurrence (the kernel builds one entity per named handle group).
+@category "engine-internal"
+fieldFacetsSameHandles : (occurrenceHandles: List String) -> (entityHandles: List String) -> Bool
+fieldFacetsSameHandles occurrenceHandles entityHandles =
+  let named = fieldIdentityKeySet occurrenceHandles
+  let grouped = fieldIdentityKeySet entityHandles
+  and (not (fieldIdentityAnyOf occurrenceHandles (\handle -> not (fieldIdentityIndexHas grouped handle))))
+      (not (fieldIdentityAnyOf entityHandles (\handle -> not (fieldIdentityIndexHas named handle))))
+
+@category "engine-internal"
+fieldFacetsDeltaFallback : (why: FieldFacetsDeltaReason) -> FieldFacetsDeltaOutcome
+fieldFacetsDeltaFallback why = FacetsDeltaFallback { reason = why }
+
+@label "Project field facets over a repository projection"
+@description "Return FacetsDeltaProjected with exactly the projection projectFieldFacets would return over the repository collection plus these Local occurrences and entities, or FacetsDeltaFallback with the reason that does not hold; the caller then runs projectFieldFacets. `occurrences` and `entities` are the Local ones; the counts are the union's."
+@tags "engine" "field-identity" "representations" "delta" "f1"
+projectFieldFacetsDelta : (base: FieldFacetsBase) -> (occurrences: List ResolvedFieldOccurrence) -> (entities: List FieldEntity) -> (externalHandles: List String) -> (directives: List FieldFacetSourceDirective) -> (unionOccurrenceCount: Nat) -> (unionEntityCount: Nat) -> FieldFacetsDeltaOutcome
+projectFieldFacetsDelta base occurrences entities externalHandles directives unionOccurrenceCount unionEntityCount =
+  case base of
+    FieldFacetsBase { projection = repository, handles = handles, directiveOwners = owners, occurrenceCount = repositoryOccurrences } ->
+      if gt (length directives) 0
+      then fieldFacetsDeltaFallback FacetsDeltaLocalDirective
+      else if fieldIdentityAnyOf (flatMap fieldFacetsOccurrenceHandles occurrences) (fieldIdentityIndexHas handles)
+      then fieldFacetsDeltaFallback FacetsDeltaRepositoryHandle
+      else if fieldIdentityAnyOf externalHandles (fieldIdentityIndexHas handles)
+      then fieldFacetsDeltaFallback FacetsDeltaRepositoryHandle
+      else if fieldIdentityAnyOf entities (\entity -> fieldIdentityIndexHas handles entity.id.handle)
+      then fieldFacetsDeltaFallback FacetsDeltaRepositoryHandle
+      else if fieldIdentityAnyOf occurrences (\occurrence -> fieldIdentityAnyOf owners (fieldFacetOwnerEq occurrence.owner))
+      then fieldFacetsDeltaFallback FacetsDeltaDirectiveOwner
+      else if not (eq unionOccurrenceCount (add repositoryOccurrences (length occurrences)))
+      then fieldFacetsDeltaFallback FacetsDeltaPartitionMismatch
+      else if not (eq unionEntityCount (add (length repository.codeables) (length entities)))
+      then fieldFacetsDeltaFallback FacetsDeltaPartitionMismatch
+      else if not (fieldFacetsSameHandles (flatMap fieldFacetsOccurrenceHandles occurrences) (map (\entity -> entity.id.handle) entities))
+      then fieldFacetsDeltaFallback FacetsDeltaPartitionMismatch
+      else
+        let mergedCodeables = fold (fieldIdentityInsertSorted fieldFacetTargetHandle) repository.codeables (map fieldFacetCodeable entities)
+        let merged = FieldFacetProjection {
+          codeables = mergedCodeables,
+          labelables = repository.labelables,
+          displayables = repository.displayables,
+          repositoryReusable = repository.repositoryReusable,
+          all = concat mergedCodeables (concat repository.labelables repository.displayables)
+        }
+        FacetsDeltaProjected { projection = merged }
+
+@category "engine-internal"
+fieldPresentationPrefer : (preferred: Maybe a) -> (fallback: Maybe a) -> Maybe a
+fieldPresentationPrefer preferred fallback =
+  case preferred of
+    Just value -> Just value
+    Nothing -> fallback
+
+@category "engine-internal"
+fieldPresentationMaybePresent : (value: Maybe a) -> Bool
+fieldPresentationMaybePresent value =
+  case value of
+    Just _ -> true
+    Nothing -> false
+
+@category "engine-internal"
+fieldPresentationOverridePresent : (override: FieldPresentationOverride) -> Bool
+fieldPresentationOverridePresent override =
+  let hasLabel = fieldPresentationMaybePresent override.label
+  let hasDescription = fieldPresentationMaybePresent override.description
+  let hasIcon = fieldPresentationMaybePresent override.icon
+  let hasDisplay = fieldPresentationMaybePresent override.display
+  or hasLabel (or hasDescription (or hasIcon hasDisplay))
+
+@category "engine-internal"
+fieldPresentationFacetPresent : (label: Maybe a) -> (description: Maybe String) -> (icon: Maybe String) -> (display: Maybe b) -> Bool
+fieldPresentationFacetPresent label description icon display =
+  let hasLabel = fieldPresentationMaybePresent label
+  let hasDescription = fieldPresentationMaybePresent description
+  let hasIcon = fieldPresentationMaybePresent icon
+  let hasDisplay = fieldPresentationMaybePresent display
+  or hasLabel (or hasDescription (or hasIcon hasDisplay))
+
+@label "Resolve field presentation"
+@description "Per-slot precedence: contextual override, UUID field facet, then humanized current Codeable. The aggregate source tag reports the highest-precedence authority that contributed."
+@tags "engine" "field-identity" "presentation" "phase-2b"
+resolveFieldPresentation : (codeName: String) -> (facetLabel: Maybe a) -> (facetDescription: Maybe String) -> (facetIcon: Maybe String) -> (facetDisplay: Maybe a) -> (override: Maybe FieldPresentationOverride) -> FieldPresentation
+resolveFieldPresentation codeName facetLabel facetDescription facetIcon facetDisplay override =
+  case override of
+    Just contextual ->
+      let labelValue = fieldPresentationPrefer contextual.label facetLabel
+      let descriptionValue = fieldPresentationPrefer contextual.description facetDescription
+      let iconValue = fieldPresentationPrefer contextual.icon facetIcon
+      let displayValue = fieldPresentationPrefer contextual.display facetDisplay
+      let source = if fieldPresentationOverridePresent contextual
+                   then "contextual-override"
+                   else if fieldPresentationFacetPresent facetLabel facetDescription facetIcon facetDisplay
+                        then "uuid-field-facet"
+                        else "humanized-codeable"
+      case labelValue of
+        Just label -> FieldPresentation { label = label, description = descriptionValue, icon = iconValue, display = displayValue, source = source }
+        Nothing -> FieldPresentation { label = humanizeCodeName codeName, description = descriptionValue, icon = iconValue, display = displayValue, source = source }
+    Nothing ->
+      let source = if fieldPresentationFacetPresent facetLabel facetDescription facetIcon facetDisplay
+                   then "uuid-field-facet"
+                   else "humanized-codeable"
+      case facetLabel of
+        Just label -> FieldPresentation { label = label, description = facetDescription, icon = facetIcon, display = facetDisplay, source = source }
+        Nothing -> FieldPresentation { label = humanizeCodeName codeName, description = facetDescription, icon = facetIcon, display = facetDisplay, source = source }

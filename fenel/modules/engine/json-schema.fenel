@@ -1,0 +1,453 @@
+module engine where
+
+-- Reverse JSON-Schema import cannot mint durable identity in a pure
+-- conversion. This small Fenel plan chooses explicit Mint/Reuse authoring
+-- intents from host-supplied reuse facts and validates every adopted key.
+JsonSchemaIdentityIntent =
+  JsonSchemaMintField wireName: String
+  | JsonSchemaReuseField key: FieldKey wireName: String
+
+JsonSchemaIdentityPlan =
+  JsipInvalid code: String wireName: String keyToken: String message: String
+  | JsipReady intents: a
+
+@category "engine-internal"
+jsonSchemaIdentityInvalid : (code: String) -> (wireName: String) -> (keyToken: String) -> (message: String) -> JsonSchemaIdentityPlan
+jsonSchemaIdentityInvalid code wireName keyToken message =
+  JsipInvalid
+    { code = code
+    , wireName = wireName
+    , keyToken = keyToken
+    , message = message
+    }
+
+@category "engine-internal"
+jsonSchemaIdentityContinue : (rows: List a) -> (acc: List a) -> (seenKeys: List String) -> (seenWireNames: List String) -> JsonSchemaIdentityPlan
+jsonSchemaIdentityContinue rows acc seenKeys seenWireNames =
+  case tail rows of
+    Nothing -> JsipReady { intents = acc }
+    Just rest -> jsonSchemaIdentityIntentsGo rest acc seenKeys seenWireNames
+
+@category "engine-internal"
+jsonSchemaIdentityIntentsGo : (rows: List a) -> (acc: List a) -> (seenKeys: List String) -> (seenWireNames: List String) -> JsonSchemaIdentityPlan
+jsonSchemaIdentityIntentsGo rows acc seenKeys seenWireNames = case head rows of
+  Nothing -> JsipReady { intents = acc }
+  Just row ->
+    let intent = case row.reuse of
+          Nothing -> JsonSchemaMintField { wireName = row.wireName }
+          Just key -> JsonSchemaReuseField { key = key, wireName = row.wireName }
+    if eq row.wireName ""
+    then jsonSchemaIdentityInvalid "invalid-wire-name" row.wireName "" "JSON Schema field wire projection must be non-empty"
+    else if elem row.wireName seenWireNames
+      then jsonSchemaIdentityInvalid "duplicate-wire-projection" row.wireName "" (concat "duplicate JSON Schema field wire projection: " row.wireName)
+      else case row.reuse of
+        Nothing ->
+          jsonSchemaIdentityContinue rows (appendItem intent acc) seenKeys (appendItem row.wireName seenWireNames)
+        Just key ->
+          if not (fieldKeyValid key)
+          then jsonSchemaIdentityInvalid "invalid-reused-field" row.wireName "" (concat "invalid explicit JSON Schema field identity for " row.wireName)
+          else case key of
+            PositionalField ->
+              jsonSchemaIdentityInvalid "positional-reuse" row.wireName (fieldKeyToken key) (concat "JSON Schema property cannot reuse positional field identity: " row.wireName)
+            NamedField ->
+              let token = fieldKeyToken key
+              if elem token seenKeys
+              then jsonSchemaIdentityInvalid "duplicate-reused-field" row.wireName token (concat "duplicate reused NamedField identity at JSON Schema property " row.wireName)
+              else jsonSchemaIdentityContinue rows (appendItem intent acc) (appendItem token seenKeys) (appendItem row.wireName seenWireNames)
+
+@label "JSON Schema field identity authoring plan"
+@description "Field-identity Phase 3 — turn JSON Schema property rows into explicit MintField/ReuseField intents. No entropy is created; an explicit reuse key is accepted only after the shared FieldKey validator succeeds."
+@tags "engine" "json-schema" "field-identity" "authoring" "phase-3"
+jsonSchemaIdentityIntents : (rows: List a) -> JsonSchemaIdentityPlan
+jsonSchemaIdentityIntents rows = jsonSchemaIdentityIntentsGo rows [] [] []
+
+-- ---------------------------------------------------------------------------
+-- FenelType -> JSON Schema forward semantic plan
+--
+-- The shared TraversalType is the sole mechanical `$`-key barrier. The
+-- validation elaborator owns recursive constructor policy, named resolution,
+-- canonical Maybe/List/map/tagged recognition, and identity auditing. This
+-- module consumes that Fenel-owned semantic plan and TypeScript only serialises
+-- JSON-schema keys plus current-wire field projections.
+-- ---------------------------------------------------------------------------
+
+JsonSchemaForwardPlan =
+  JsfInvalid message: String
+  | JsfMaybe inner: a
+  | JsfList item: a
+  | JsfRecord fields: a
+  | JsfVariant discriminator: String cases: a
+  | JsfMap keys: a value: a
+  | JsfLocaleMap value: a
+  | JsfString set: a
+  | JsfNumber set: a
+  | JsfRational
+  | JsfTagged inner: a unit: a
+  | JsfBoolean
+  | JsfDate set: a
+  | JsfFile
+  | JsfMarkup
+  | JsfGeo level: a
+  | JsfEntityRef entityType: String
+  | JsfId
+  | JsfNamed name: String
+  | JsfEmpty
+
+JsonSchemaForwardFields =
+  JsffInvalid message: String
+  | JsffReady fields: a
+
+JsonSchemaForwardCases =
+  JsfcInvalid message: String
+  | JsfcReady cases: a
+
+@category "engine-internal"
+jsonSchemaForwardRows : (rows: List a) -> (acc: List a) -> JsonSchemaForwardFields
+jsonSchemaForwardRows rows acc = case head rows of
+  Nothing -> JsffReady { fields = acc }
+  Just row ->
+    case jsonSchemaPlannedTypeWithSet row.occurrenceType Nothing of
+      JsfInvalid { message = message } -> JsffInvalid { message = message }
+      child ->
+        let planned =
+              { wireName = row.wireName
+              , required = row.required
+              , rawField = row.rawField
+              , plan = child
+              }
+        case tail rows of
+          Nothing -> JsffReady { fields = appendItem planned acc }
+          Just rest -> jsonSchemaForwardRows rest (appendItem planned acc)
+
+@category "engine-internal"
+jsonSchemaForwardFields : (fields: List a) -> JsonSchemaForwardFields
+jsonSchemaForwardFields fields =
+  case validationAccessPlan fields "" "" of
+    VapInvalid { message = message } -> JsffInvalid { message = message }
+    VapReady { fields = rows } -> jsonSchemaForwardRows rows []
+
+@category "engine-internal"
+jsonSchemaForwardCasesGo : (cases: List a) -> (acc: List a) -> JsonSchemaForwardCases
+jsonSchemaForwardCasesGo cases acc = case head cases of
+  Nothing -> JsfcReady { cases = acc }
+  Just variantCase ->
+    case jsonSchemaForwardFields variantCase.fields of
+      JsffInvalid { message = message } -> JsfcInvalid { message = message }
+      JsffReady { fields = fields } ->
+        let planned = { name = variantCase.name, fields = fields }
+        case tail cases of
+          Nothing -> JsfcReady { cases = appendItem planned acc }
+          Just rest -> jsonSchemaForwardCasesGo rest (appendItem planned acc)
+
+@category "engine-internal"
+jsonSchemaForwardStringKeys : (values: List a) -> (acc: List String) -> List String
+jsonSchemaForwardStringKeys values acc = case head values of
+  Nothing -> acc
+  Just value ->
+    let next = if isString value then appendItem value acc else acc
+    case tail values of
+      Nothing -> next
+      Just rest -> jsonSchemaForwardStringKeys rest next
+
+@category "engine-internal"
+jsonSchemaPlannedTypeWithSet : (t: ValidationType) -> (pendingSet: Maybe a) -> JsonSchemaForwardPlan
+jsonSchemaPlannedTypeWithSet t pendingSet = case t of
+  VtRefined { base = base, set = set } ->
+    let nextSet = case pendingSet of
+          Just existing -> Just existing
+          Nothing -> Just set
+    jsonSchemaPlannedTypeWithSet base nextSet
+  VtOpaque { representationName = representationName, pure = pure } ->
+    if eq representationName "Rational" then JsfRational
+    else jsonSchemaPlannedTypeWithSet pure pendingSet
+  VtMaybe { value = value } ->
+    case jsonSchemaPlannedTypeWithSet value Nothing of
+      JsfInvalid { message = message } -> JsfInvalid { message = message }
+      inner -> JsfMaybe { inner = inner }
+  VtList { elem = elem } ->
+    case jsonSchemaPlannedTypeWithSet elem Nothing of
+      JsfInvalid { message = message } -> JsfInvalid { message = message }
+      item -> JsfList { item = item }
+  VtRecord { fields = fields } ->
+    case jsonSchemaForwardFields fields of
+      JsffInvalid { message = message } -> JsfInvalid { message = message }
+      JsffReady { fields = planned } -> JsfRecord { fields = planned }
+  VtVariant { cases = cases, discriminator = discriminator } ->
+    case jsonSchemaForwardCasesGo cases [] of
+      JsfcInvalid { message = message } -> JsfInvalid { message = message }
+      JsfcReady { cases = planned } -> JsfVariant { discriminator = discriminator, cases = planned }
+  VtMap { keys = keys, values = values } ->
+    case jsonSchemaPlannedTypeWithSet values Nothing of
+      JsfInvalid { message = message } -> JsfInvalid { message = message }
+      valuePlan -> case keys of
+        SeEnum { values = enumValues } ->
+          JsfMap { keys = jsonSchemaForwardStringKeys enumValues [], value = valuePlan }
+        other -> JsfLocaleMap { value = valuePlan }
+  VtTagged { value = value, valueName = valueName, phantomTypeName = phantomTypeName, phantomValue = phantomValue, phantomName = phantomName } ->
+    if eq valueName "GeoPath"
+    then JsfGeo { level = phantomValue }
+    else if eq valueName "Id"
+      then
+        let entityType = case phantomName of
+              Just name -> name
+              Nothing -> "entity"
+        JsfEntityRef { entityType = entityType }
+    else case jsonSchemaPlannedTypeWithSet value pendingSet of
+      JsfInvalid { message = message } -> JsfInvalid { message = message }
+      inner -> JsfTagged { inner = inner, unit = if eq phantomTypeName "MeasureExpr" then phantomValue else Nothing }
+  VtNamed { name = name, representationName = representationName, resolved = resolved } ->
+    if eq representationName "Rational" then JsfRational
+    else if eq name "String" then JsfString { set = pendingSet }
+    else if eq name "Number" then JsfNumber { set = pendingSet }
+    else if eq name "Boolean" then JsfBoolean
+    else if eq name "Date" then JsfDate { set = pendingSet }
+    else if eq name "File" then JsfFile
+    else if eq name "Markup" then JsfMarkup
+    else if eq name "Id" then JsfId
+    else case resolved of
+      Just resolvedType -> jsonSchemaPlannedTypeWithSet resolvedType Nothing
+      Nothing -> JsfNamed { name = name }
+  VtCycle { name = name } -> JsfNamed { name = name }
+  VtVar {} -> JsfEmpty
+  VtInvalid { message = message } -> JsfInvalid { message = message }
+  other -> JsfEmpty
+
+@label "JSON Schema forward semantic plan"
+@description "Field-identity Phase 3 repair — audit the shared identity-total TraversalType, elaborate schema-mode validation semantics in Fenel, then recursively select record, variant, map, list, Maybe, tagged and atomic JSON Schema semantics. TypeScript only marshals the `$` barrier and serialises current-wire JSON keys."
+@tags "engine" "json-schema" "field-identity" "forward" "phase-3"
+jsonSchemaForwardPlan : (t: TraversalType) -> (seenNames: List String) -> JsonSchemaForwardPlan
+jsonSchemaForwardPlan t seenNames =
+  case traversalSemanticSlotsError t of
+    Just message -> JsfInvalid { message = message }
+    Nothing -> jsonSchemaPlannedTypeWithSet (validationElaborateType t "schema" seenNames) Nothing
+
+-- json-schema — the SetExpr → JSON-schema-constraint reader behind
+-- `fenelTypeToJsonSchema` (forms / FieldRenderer). The Fenel port of
+-- `json-schema.ts`'s `setExprToConstraints` (the TS body is now a thin
+-- `dispatchEngineBody("engine:setExprToConstraints", [set, baseType])` wrapper).
+-- The forward FenelType branch/recursion plan above consumes the shared
+-- `$`-free TraversalType marker; TS only marshals the boundary and serialises
+-- plain JSON Schema / current-wire property keys.
+--
+-- set-algebra-to-fenel Phase 3b-3c — the first `SePattern`-serializing reader
+-- harvested to `.fenel`, and the lead of the three `patternToRegex` readers
+-- (`setExprToConstraints` / `stringWidgetFor` / `setExprToSQL`). The output is
+-- `$`-barrier-FREE — plain JSON-schema keys (`enum` / `minimum` / `maximum` /
+-- `exclusiveMinimum` / `exclusiveMaximum` / `format` / `pattern` / `anyOf` /
+-- `not` / `allOf` / `type`).
+--
+-- THE FUNCTION-NAME-KEY HAZARD (Step-0 §B / verify-script finding). A SINGLE-key
+-- record literal `{ k = v }` whose key `k` is a registered op/function is
+-- evaluated by json-logic.ts (l.740-765) as a key-as-fnId CALL, NOT a record:
+-- `not` (a KNOWN_OP), `format` / `minimum` / `maximum` (registered fns) all
+-- collide. MULTI-key non-`$` records are always safe (l.768). So every SINGLE-key
+-- emission goes through `jscRec1` (= `fromEntries [{ key, value }]`) — the key is
+-- a runtime STRING VALUE, so there is no syntactic-key ambiguity; `fromEntries`
+-- returns a plain `{[k]: v}` object, byte-identical to a record literal. The one
+-- MULTI-key emission (ℕ → `{ type = "integer", minimum = 0 }`) stays a plain
+-- literal (safe, and keeps the byte shape).
+--
+-- THE `SePattern` ARM (Step-0 §B, OPTION (i) — pure Fenel, zero new TS): the
+-- inner `pattern` is the LEGACY `.t`-discriminated `Pattern` (NOT the `$tag`
+-- SetPattern ADT — no data uses that yet). The arm serialises it via
+-- `rxhPatternToRegex (rxhReadPat p)` — the already-Fenel regex serialiser
+-- (`regex-hint.fenel`) plus its new legacy-Pattern→marker reader. Exact
+-- `patternToRegex` semantics, end-to-end in Fenel. SePattern can NEST (inside
+-- SeUnion / SeIntersect / …) so the per-node recursion threads through
+-- `setExprToConstraints` itself.
+--
+-- DUAL-READ (Step-0 §C): live `$`-key SetExpr INPUT fixtures still reach this
+-- reader via the same `fenelTypeToJsonSchema` `$refined.set` peel path
+-- (typed-ref-prim-consumers feeds `{$interval}` / `{$union:[…,{$named}]}`), so
+-- the body matches the canonical `$tag` `Se*` ADT FIRST, then the legacy `$`-key
+-- form via `lookup`. The `$`-key arm drops with the (blocked) codec delete.
+--
+-- This file is in the parse-cache FENCE_FALLBACK (TS-parsed, byte-identical) —
+-- same class as its set-algebra siblings set-algebra-deciders.fenel /
+-- regex-hint.fenel. List members build in-order via an accumulator + `appendItem`
+-- (which appends to the END), NOT head-recursion + appendItem (that reverses).
+
+-- jscRec1 — author a SINGLE-key record `{ k = v }` WITHOUT the function-name-key
+-- call collision: the key is a runtime string value, so `fromEntries` builds a
+-- plain `{[k]: v}` object (no key-as-fnId dispatch). Used for every single-key
+-- JSON-schema fragment (not / format / minimum / … / anyOf / allOf / pattern).
+@category "engine-internal"
+jscRec1 : (k: String) -> (v: a) -> b
+jscRec1 k v =
+  let entry = { key = k, value = v }
+  fromEntries (appendItem entry [])
+
+-- ---------------------------------------------------------------------------
+-- setExprToConstraints — canonical 14-case SetExpr → Partial<JsonSchema>.
+-- Eleven JSON-Schema-representable arms are handled; ctor/mu/arrow fall back.
+-- ---------------------------------------------------------------------------
+
+@label "json-schema: setExprToConstraints"
+@description "Phase 3b-3c / floor-kernel Phase 4 — render a canonical 14-case SetExpr to a partial JSON-schema constraint fragment (the cheap-structural reader behind fenelTypeToJsonSchema → forms / FieldRenderer). 11 JSON-Schema-representable arms: SeAll → {} / SeNone → {not:{}} / SeEnum → {enum} / SeRef → format-or-integer / SePattern → {pattern} via rxhPatternToRegex∘rxhReadPat / SeInterval → numeric bounds / SeIntersect → merged branches / SeUnion → {anyOf} / SeComplement → {not} / SeDiff → {allOf} / SeWhere → {} (skip). baseType (\"string\"|\"number\") threads into the union/complement/diff arms. Single-key records build via fromEntries (the function-name-key call hazard). SeCtor / SeMu / SeArrow conservatively contribute no JSON-Schema constraint. Boundary legacy input is canonicalized before dispatch. Mirrors json-schema.ts:setExprToConstraints; dispatched from the TS wrapper."
+@tags "engine" "json-schema" "set-expr" "reader" "phase-3b-3c"
+setExprToConstraints : (set: a) -> (baseType: String) -> a
+setExprToConstraints set baseType =
+  case set of
+    SeAll -> {}
+    SeNone -> jscRec1 "not" {}
+    SeEnum { values = vs } -> jscRec1 "enum" vs
+    SeRef { handle = name } -> jscRefConstraints name
+    SePattern { pattern = p } -> jscPatternConstraints p
+    SeInterval { interval = iv } -> jscIntervalConstraints iv
+    SeIntersect { branches = bs } -> jscIntersectMerge bs baseType {}
+    SeUnion { branches = bs } -> jscRec1 "anyOf" (jscUnionBranches bs baseType [])
+    SeComplement { inner = i } -> jscRec1 "not" (jscWithType baseType i)
+    SeDiff { left = l, right = r } -> jscDiffConstraints l r baseType
+    SeWhere -> {}
+    -- signature-substrate Phase 4 slice 3a — FAIL CLOSED, matching the SeNone
+    -- arm. `jscLegacy`'s terminal is `{}` — the empty JSON Schema, which
+    -- ACCEPTS EVERY VALUE, so an unrecognized constraint silently disables
+    -- client-side validation. A validation rigid denotes no ground extension a
+    -- form can submit, so `{not: {}}` (accepts nothing) is the honest fragment.
+    SeRigid {} -> jscRec1 "not" {}
+    _ -> jscLegacy set baseType
+
+-- jscRefConstraints — the named-set handle → format / integer table. The ℤ/ℕ
+-- special branch returns the integer constraint (+ minimum:0 for ℕ) and NEVER a
+-- `format` key (the TS formatMap's ℤ/ℕ entries are dead for the return). ℕ is the
+-- one MULTI-key record (safe as a plain literal); the rest go via jscRec1.
+@category "engine-internal"
+jscRefConstraints : (name: String) -> a
+jscRefConstraints name =
+  if eq name "ℤ" then jscRec1 "type" "integer"
+  else if eq name "ℕ" then { type = "integer", minimum = 0 }
+  else if eq name "format:email" then jscRec1 "format" "email"
+  else if eq name "format:phone" then jscRec1 "format" "phone"
+  else if eq name "format:url" then jscRec1 "format" "uri"
+  else if eq name "format:uuid" then jscRec1 "format" "uuid"
+  else if eq name "format:handle" then jscRec1 "format" "hostname"
+  else {}
+
+-- jscPatternConstraints — serialise the legacy `.t` Pattern to an anchored regex
+-- via the Fenel serialiser; ok ⇒ { pattern = re }, else {} (Step-0 §B option i).
+@category "engine-internal"
+jscPatternConstraints : (p: a) -> a
+jscPatternConstraints p =
+  let r = rxhPatternToRegex (rxhReadPat p)
+  if r.ok then jscRec1 "pattern" r.value else {}
+
+-- jscWithType — the `{ type = baseType, …rec inner }` spread (right-biased: an
+-- inner `type` from e.g. a ℤ ref overrides baseType). `{ type = baseType }` is a
+-- safe single-key record (`type` is not a registered fn). Used by union /
+-- complement / diff.
+@category "engine-internal"
+jscWithType : (baseType: String) -> (s: a) -> a
+jscWithType baseType s = mergeRecords { type = baseType } (setExprToConstraints s baseType)
+
+-- jscIntervalConstraints — numeric interval bounds. lo sets minimum |
+-- exclusiveMinimum; hi sets maximum | exclusiveMaximum; both only when the bound
+-- value is a number (disjoint keys, so mergeRecords is exact).
+@category "engine-internal"
+jscIntervalConstraints : (iv: a) -> a
+jscIntervalConstraints iv = mergeRecords (jscIntervalLo iv.lo) (jscIntervalHi iv.hi)
+
+@category "engine-internal"
+jscIntervalLo : (lo: a) -> a
+jscIntervalLo lo =
+  case lo of
+    Nothing -> {}
+    Just b ->
+      if isNumber b.value
+      then (if b.inclusive then jscRec1 "minimum" b.value else jscRec1 "exclusiveMinimum" b.value)
+      else {}
+
+@category "engine-internal"
+jscIntervalHi : (hi: a) -> a
+jscIntervalHi hi =
+  case hi of
+    Nothing -> {}
+    Just b ->
+      if isNumber b.value
+      then (if b.inclusive then jscRec1 "maximum" b.value else jscRec1 "exclusiveMaximum" b.value)
+      else {}
+
+-- jscIntersectMerge — Object.assign({}, …branches.map(rec)): fold mergeRecords
+-- left-to-right (later branches override earlier on key conflict).
+@category "engine-internal"
+jscIntersectMerge : (bs: a) -> (baseType: String) -> (acc: b) -> b
+jscIntersectMerge bs baseType acc =
+  case head bs of
+    Nothing -> acc
+    Just first ->
+      let merged = mergeRecords acc (setExprToConstraints first baseType)
+      case tail bs of
+        Nothing -> merged
+        Just rest -> jscIntersectMerge rest baseType merged
+
+-- jscUnionBranches — build the anyOf member list IN ORDER (accumulator + the
+-- append-to-end appendItem): each branch → { type = baseType, …rec branch }.
+@category "engine-internal"
+jscUnionBranches : (bs: a) -> (baseType: String) -> (acc: b) -> b
+jscUnionBranches bs baseType acc =
+  case head bs of
+    Nothing -> acc
+    Just first ->
+      let acc2 = appendItem (jscWithType baseType first) acc
+      case tail bs of
+        Nothing -> acc2
+        Just rest -> jscUnionBranches rest baseType acc2
+
+-- jscDiffConstraints — { allOf = [{ type, …rec left }, { not = { type, …rec right } }] }.
+-- The 2-element list literal preserves order; the inner `not` goes via jscRec1.
+@category "engine-internal"
+jscDiffConstraints : (l: a) -> (r: a) -> (baseType: String) -> b
+jscDiffConstraints l r baseType =
+  jscRec1 "allOf" [jscWithType baseType l, jscRec1 "not" (jscWithType baseType r)]
+
+-- jscDiffArr — the legacy `$diff: [left, right]` 2-element array form.
+@category "engine-internal"
+jscDiffArr : (d: a) -> (baseType: String) -> b
+jscDiffArr d baseType =
+  case head d of
+    Nothing -> {}
+    Just l ->
+      case tail d of
+        Nothing -> {}
+        Just rest ->
+          case head rest of
+            Nothing -> {}
+            Just r -> jscDiffConstraints l r baseType
+
+-- jscLegacy — the `$`-key dual-read fallback (mirrors peelSetExpr's $-key arms
+-- as consumed by setExprToConstraints). $where falls through to the final {}.
+@category "engine-internal"
+jscLegacy : (set: a) -> (baseType: String) -> b
+jscLegacy set baseType =
+  case lookup set "$all" of
+    Just _ -> {}
+    Nothing ->
+      case lookup set "$none" of
+        Just _ -> jscRec1 "not" {}
+        Nothing ->
+          case lookup set "$enum" of
+            Just vs -> jscRec1 "enum" vs
+            Nothing ->
+              case lookup set "$ref" of
+                Just name -> jscRefConstraints name
+                Nothing ->
+                  case lookup set "$named" of
+                    Just name -> jscRefConstraints name
+                    Nothing ->
+                      case lookup set "$pattern" of
+                        Just p -> jscPatternConstraints p
+                        Nothing ->
+                          case lookup set "$interval" of
+                            Just iv -> jscIntervalConstraints iv
+                            Nothing ->
+                              case lookup set "$intersect" of
+                                Just bs -> jscIntersectMerge bs baseType {}
+                                Nothing ->
+                                  case lookup set "$union" of
+                                    Just bs -> jscRec1 "anyOf" (jscUnionBranches bs baseType [])
+                                    Nothing ->
+                                      case lookup set "$complement" of
+                                        Just i -> jscRec1 "not" (jscWithType baseType i)
+                                        Nothing ->
+                                          case lookup set "$diff" of
+                                            Just d -> jscDiffArr d baseType
+                                            Nothing -> {}

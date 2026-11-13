@@ -1,0 +1,105 @@
+-- =========================================================================
+-- Telegram polling deployment — Fenel-bodied long-poll dispatch.
+--
+-- Phase 13c sub-step 1 of the ts-elimination workstream. Retires the
+-- grammY library entirely. The bot/ TS surface collapses to a thin
+-- driver that loops over `pollUpdatesOnce` and a NotifyTransport
+-- adapter that delegates to `telegram:sendNotification`. No grammy
+-- import survives.
+--
+-- The webhook deployment (api/src/routes/telegram-webhook.ts) and the
+-- polling deployment now feed the SAME Fenel-bodied dispatch chain:
+-- telegramWebhookDispatch + handleTelegramUpdate (which decodes the
+-- typed Update and routes through stepConversation +
+-- dispatchEventTriggers).
+--
+-- Architectural surprise: the polling deployment now supports form-fill
+-- conversations for the first time. The prior grammy callbacks.ts only
+-- registered a `callback_query:data` handler; plain text messages were
+-- silently dropped. Routing every update through the same Fenel chain
+-- the webhook uses fixes that gap as a side-effect of unification.
+--
+-- module-substrate Phase 3o (2026-05-31) — carries `module telegram where`, so
+-- the 3 poll fns UNION into the `telegram` module. Their hand-wrapped
+-- defineFunction specs + POLL_*_BODY extraction + the duplicate
+-- `telegram-bodies:dispatchOnePollingUpdate`/`computeNextPollingOffset` helper
+-- surfacing all RETIRE. HasStateIO is INFERRED transitively (pollUpdatesOnce →
+-- getUpdatesPoll which declares HasStateIO), not hand-declared. Bodies UNCHANGED.
+-- =========================================================================
+
+module telegram where
+
+-- ---------------------------------------------------------------------------
+-- pollUpdatesOnce — one iteration of the long-poll loop. The TS driver
+-- in bot/src/index.ts calls this in a `while (running)` loop, threading
+-- the offset through. Each iteration:
+--   1. long-polls getUpdates with the current offset (HTTP yields IO)
+--   2. dispatches each Update through the unified ingress chain
+--   3. computes nextOffset = max(updateId) + 1 (or `offset` if empty)
+--   4. returns { nextOffset } to the TS driver
+--
+-- Telegram's getUpdates blocks up to `timeout` seconds when no updates
+-- are pending — 30s is the conventional long-poll duration. Empty
+-- responses are normal; nextOffset stays at `offset` so the next
+-- iteration repeats the request.
+-- ---------------------------------------------------------------------------
+
+@label "Poll Telegram updates (one iteration)"
+@description "Phase 13c sub-step 1 — one iteration of the long-poll loop. Calls getUpdatesPoll with the current offset, dispatches each Update through telegramWebhookDispatch + handleTelegramUpdate (sister of api/src/routes/telegram-webhook.ts post-verify dispatch), and returns { nextOffset } for the next iteration. The TS driver in bot/src/index.ts loops over this until shutdown. The Fenel-bodied implementation supports form-fill conversations in the polling deployment for the first time (the prior grammy callbacks.ts silently dropped plain messages)."
+@tags "telegram" "io" "poll" "lifecycle" "phase-13c"
+@ioAction "telegram.poll_updates_once"
+pollUpdatesOnce : (botId: BotId) -> (accountId: String) -> (offset: Int) -> ({ nextOffset : Int })
+pollUpdatesOnce botId accountId offset =
+  let updates = getUpdatesPoll botId (Just offset) Nothing (Just 30) []
+  -- effect-visibility Phase 4 — partial application BY NAME, not an inline
+  -- lambda: the per-update dispatch is EFFECTFUL, and an effectful closure
+  -- applied inside the durable std:map body is not steppable (the P3 honest
+  -- fence would fail loudly; pre-P3 the native silently null-dropped the
+  -- per-update IO). A named partial unwraps at the turn's var-head
+  -- normalization to call-by-name — each update dispatches as its own
+  -- durable child, correctly, for the first time.
+  let _dispatched = map (dispatchOnePollingUpdate botId accountId) updates
+  let nextOffset = computeNextPollingOffset offset updates
+  { nextOffset = nextOffset }
+
+-- ---------------------------------------------------------------------------
+-- dispatchOnePollingUpdate — per-update dispatch. Sister of the post-verify
+-- dispatch in api/src/routes/telegram-webhook.ts lines 83-93. Two parallel
+-- pipelines fan out:
+--   1. telegramWebhookDispatch — fires the umbrella `telegram.update`
+--      event so user-defined triggers binding on it run.
+--   2. handleTelegramUpdate — decodes the typed Update + dispatches to
+--      stepConversation (collector form-fill engine) + dispatchEventTriggers
+--      (per-event user-trigger fan-out).
+--
+-- The raw camel-shaped JSON from getUpdates is passed through verbatim;
+-- handleTelegramUpdate's body wraps it as JsonValue and decodes via
+-- codec:decodeUpdate internally.
+-- ---------------------------------------------------------------------------
+
+@label "Dispatch one polling update"
+@description "Phase 13c sub-step 1 helper — per-update fan-out. Fires the umbrella telegram.update event via telegramWebhookDispatch then dispatches typed Update through handleTelegramUpdate (which decodes + routes via stepConversation + dispatchEventTriggers). Identical shape to the webhook route's post-verify dispatch."
+@tags "telegram" "dispatch" "poll" "phase-13c"
+dispatchOnePollingUpdate : (botId: BotId) -> (accountId: String) -> (update: {}) -> Unit
+dispatchOnePollingUpdate botId accountId u =
+  let _emitted = telegramWebhookDispatch botId u
+  handleTelegramUpdate botId u accountId
+
+-- ---------------------------------------------------------------------------
+-- computeNextPollingOffset — fold over the update list extracting the
+-- maximum updateId + 1. Empty list returns the start offset unchanged
+-- (the next iteration repeats the same long-poll request with no
+-- progress — this is the normal empty-response case).
+--
+-- The `u.updateId` field access works on the raw camel JSON because
+-- getUpdates' runtime returns plain records (no $tag); pattern matching
+-- against typed Update variants would fail without $tag, but plain field
+-- access is well-defined on JS records.
+-- ---------------------------------------------------------------------------
+
+@label "Compute next polling offset"
+@description "Phase 13c sub-step 1 helper — fold over a polling update list extracting max(updateId) + 1. Returns the start offset unchanged for empty input (normal long-poll empty-response case)."
+@tags "telegram" "pure" "poll" "phase-13c"
+computeNextPollingOffset : (start: Int) -> (updates: List ({})) -> Int
+computeNextPollingOffset start updates =
+  fold (\u acc -> if (u.updateId + 1) > acc then (u.updateId + 1) else acc) start updates

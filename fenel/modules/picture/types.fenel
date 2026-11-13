@@ -1,0 +1,226 @@
+-- =========================================================================
+-- Picture — vector graphics as math. Tagged union with two cases
+-- (Raster Image / Field (Point -> RgbaPixel)) plus a small `Point` record and
+-- the inline closure-construction helpers (solid / circle / over / dist /
+-- rectangle / ellipse / linearGradient / radialGradient / checkerboard /
+-- inBox / lerpColor / clamp01). Higher-level shapes are ordinary Fenel
+-- functions that build Field-shaped Pictures whose body is the math.
+--
+-- Phase 4g of ts-elimination: this body was previously the inline
+-- `const PICTURE_SRC = \`…\`` template literal at
+-- engine/src/modules/picture.ts; extracted verbatim with JS template-
+-- literal `\\p` lambda escapes collapsed to single-backslash `\p`.
+--
+-- Records (single constructor, all named fields) may be compact or use
+-- indented field continuations. Variants use leading `|` for multiline
+-- peers. Field lambdas can span lines as long as the
+-- body itself stays an expression (operator continuation needs paren-
+-- grouping, which the ellipse / linearGradient / etc. helpers use).
+--
+-- module-substrate Phase 3f (2026-05-30) — picture is the Phase-3e-designated
+-- REPRESENTATIVE CTX-NATIVE. The 5 TS natives (sample / render / point /
+-- color / alphaBlend), previously hand-assembled as `defineFunction` specs in
+-- `engine/src/modules/picture.ts`, are now @native FOREIGN DECLARATIONS here;
+-- their impls live in the `ffi/picture-ffi.ts` leaf. `sample` / `render` are
+-- CTX natives (they re-enter the evaluator to run Field closures), so their
+-- impls land in the seam's `nativeImplsCtx` map; `point` / `color` /
+-- `alphaBlend` are plain (`nativeImpls`). Plain-vs-ctx is decided ENTIRELY by
+-- which seam map an impl lands in — the @native decl is uniform, no marker
+-- needed (axis #4 settled: seam-routing suffices). The 12 Fenel-bodied
+-- helpers below + the 2 entities are unchanged. The lowercase `picture` name +
+-- `picture:` id-prefix + `picture` category stay byte-identical.
+-- =========================================================================
+
+module picture where
+
+using std (imageSourceOverPixel)
+
+Picture = Raster Image | Field (Point -> RgbaPixel)
+
+Point = Point x: Number y: Number
+
+-- ----- Foreign declarations (native-backed; impl in ffi/picture-ffi.ts) ----
+-- The bridge primitives + constructor helpers that touch runtime
+-- representation records source can't construct directly today. `sample` /
+-- `render` re-enter the evaluator (CTX natives → nativeImplsCtx); `point` /
+-- `color` is a representation-record builder (plain
+-- natives → nativeImpls). No Fenel body: the registry resolves each call to
+-- the ffi leaf keyed by codeName. (Several are pure-logic F-permanent-revisit
+-- candidates parked at the leaf for parity — see the ffi file header.)
+-- alphaBlend now delegates to std's source-owned raster pixel algorithm;
+-- its explicitly approved performance entry shares the image pixel mirror.
+
+-- effect-visibility Phase 4 — sample/render are now Fenel-BODIED (the
+-- hof-body-floor: every ctx-native must be the perf branch of a Fenel body;
+-- the Phase-3 std pattern applied here). The ffi ctx-natives are KEPT and
+-- still serve the pure evaluator + all-pure durable steps; these bodies are
+-- the source of truth and the direct-dispatch path. NOTE (residual (c),
+-- effect-visibility roadmap): the callable rides INSIDE the Picture value
+-- (Field's payload), not as an `$arrow`-typed argument, so the durable
+-- selector cannot see an effectful Field — one sampled through the native
+-- still inline-drops (demo-surface-only today; the embedded-callable
+-- selector is future work).
+
+@codeName "pictureSample"
+@label "Sample"
+@description "Sample a Picture at a Point, returning the color the Picture has at that point. The bridge primitive — every higher-level Picture operation reduces to this."
+@tags "picture" "primitive"
+sample : (picture: Picture, pt: Point) -> RgbaPixel
+sample picture pt =
+  case picture of
+    Field f -> f pt
+    Raster img -> rasterAt img pt
+
+@label "Raster sample (nearest)"
+@description "Nearest-neighbour pixel read: clamp the point to the image bounds, floor to integers, index the row-major pixel buffer. Transparent for empty images or missing pixels. Internal helper for sample's Raster arm."
+@tags "picture" "primitive" "internal"
+rasterAt : Image -> Point -> RgbaPixel
+rasterAt img pt =
+  if (img.width == 0) or (img.height == 0)
+    then color 0 0 0 0
+    else
+      let x = clamp (floor pt.x) 0 (img.width - 1)
+      let y = clamp (floor pt.y) 0 (img.height - 1)
+      let px = at img.pixels (y * img.width + x)
+      if isNull px then color 0 0 0 0 else px
+
+@codeName "pictureRender"
+@label "Render"
+@description "Rasterise a Picture into a width × height Image by sampling at each pixel."
+@tags "picture" "primitive"
+render : (picture: Picture, w: Number, h: Number) -> Image
+render picture w h =
+  let ww = max 1 (floor w)
+  let hh = max 1 (floor h)
+  let pixels = renderRows picture ww hh 0 []
+  { width = ww, height = hh, pixels = pixels }
+
+@label "Render rows"
+@description "Row loop of render: recurse rows y = 0..h-1, appending each row's samples in row-major order. Internal helper."
+@tags "picture" "primitive" "internal"
+renderRows : Picture -> Number -> Number -> Number -> List RgbaPixel -> List RgbaPixel
+renderRows picture w h y acc =
+  if y >= h then acc else renderRows picture w h (y + 1) (renderRow picture w y 0 acc)
+
+@label "Render row"
+@description "Pixel loop of one render row: sample at (x, y) for x = 0..w-1, appending left to right. Internal helper."
+@tags "picture" "primitive" "internal"
+renderRow : Picture -> Number -> Number -> Number -> List RgbaPixel -> List RgbaPixel
+renderRow picture w y x acc =
+  if x >= w
+    then acc
+    else renderRow picture w y (x + 1) (appendItem (sample picture (point x y)) acc)
+
+@native
+@label "Point"
+@description "Build a Point record from x and y coordinates."
+@tags "picture" "constructor"
+point : (x: Number, y: Number) -> Point
+
+@native
+@label "RGBA pixel"
+@description "Build a RgbaPixel record from r, g, b, a byte components (0–255, clamped)."
+@tags "picture" "constructor"
+color : (r: Number, g: Number, b: Number, a: Number) -> RgbaPixel
+
+@label "Alpha blend"
+@description "Source-over compositing of straight RGBA pixels using both alpha channels. Shared raster math retains translucent coverage; a fully transparent result is transparent black."
+@tags "picture" "compositing"
+alphaBlend : (top: RgbaPixel, bot: RgbaPixel) -> RgbaPixel
+alphaBlend top bot = imageSourceOverPixel top bot
+
+solid : RgbaPixel -> Picture
+solid c = Field (\p -> c)
+
+circle : Point -> Number -> RgbaPixel -> Picture
+circle c r col = Field (\p -> if dist p c <= r then col else color 0 0 0 0)
+
+over : Picture -> Picture -> Picture
+over top bot = Field (\p -> alphaBlend (sample top p) (sample bot p))
+
+dist : Point -> Point -> Number
+dist a b = sqrt ((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y))
+
+-- Axis-aligned rectangle bounded by two opposite corners. The Field is
+-- coloured col inside the box [p1.x..p2.x] x [p1.y..p2.y], transparent outside.
+rectangle : Point -> Point -> RgbaPixel -> Picture
+rectangle p1 p2 col = Field (\p -> if inBox p p1 p2 then col else color 0 0 0 0)
+
+-- Ellipse with axis-aligned radii (rx, ry). Standard equation
+-- (dx/rx)^2 + (dy/ry)^2 <= 1, plus a colour fill.
+ellipse : Point -> Number -> Number -> RgbaPixel -> Picture
+ellipse c rx ry col = Field (\p ->
+  if (p.x - c.x) * (p.x - c.x) / (rx * rx) + (p.y - c.y) * (p.y - c.y) / (ry * ry) <= 1
+  then col else color 0 0 0 0)
+
+-- Linear gradient between two colours along a horizontal axis from x=x0
+-- to x=x1. Outside the band the colour clamps to the closer endpoint.
+linearGradient : RgbaPixel -> RgbaPixel -> Number -> Number -> Picture
+linearGradient c1 c2 x0 x1 = Field (\p -> lerpColor c1 c2 (clamp01 ((p.x - x0) / (x1 - x0))))
+
+-- Radial gradient from c1 (centre) outward to c2 at radius r. Beyond
+-- the radius the colour stays at c2.
+radialGradient : RgbaPixel -> RgbaPixel -> Point -> Number -> Picture
+radialGradient c1 c2 c r = Field (\p -> lerpColor c1 c2 (clamp01 (dist p c / r)))
+
+-- Checkerboard with tile-pixel cells. Two-colour alternation by
+-- floor(x / tile) + floor(y / tile) parity.
+checkerboard : Number -> RgbaPixel -> RgbaPixel -> Picture
+checkerboard tile a b = Field (\p ->
+  if mod (floor (p.x / tile) + floor (p.y / tile)) 2 < 1 then a else b)
+
+-- Bounded helper used by rectangle. (Defined as source so the math
+-- shows up in the catalog.)
+inBox : Point -> Point -> Point -> Boolean
+inBox p p1 p2 = p.x >= p1.x && p.x <= p2.x && p.y >= p1.y && p.y <= p2.y
+
+-- Linear interpolation between colours. t in [0, 1].
+lerpColor : RgbaPixel -> RgbaPixel -> Number -> RgbaPixel
+lerpColor c1 c2 t = color (lerp c1.r c2.r t) (lerp c1.g c2.g t) (lerp c1.b c2.b t) (lerp c1.a c2.a t)
+
+-- Clamp a number to [0, 1].
+clamp01 : Number -> Number
+clamp01 x = if x < 0 then 0 else if x > 1 then 1 else x
+
+-- Original sample artwork. The bundled image at imageSample(0) is a rendered
+-- snapshot of this source, so filters keep a stable input without a borrowed
+-- photograph or a runtime rendering cost at every sample lookup.
+@label "Sample landscape"
+@description "An original small landscape drawn with ordinary Picture functions. Its 96 by 56 pixel rendering is the first bundled image sample."
+@tags "picture" "sample"
+sampleLandscape : Image
+sampleLandscape =
+  let flowerA = circle (point 67 47) 2 (color 233 132 107 255)
+  let flowerB = circle (point 75 50) 2 (color 247 213 113 255)
+  render (over flowerB (over flowerA (sampleLandscapeTree ()))) 96 56
+
+sampleLandscapeBackground : Picture
+sampleLandscapeBackground =
+  let sky = Field (\p -> lerpColor (color 133 201 219 255) (color 228 232 201 255) (clamp01 (p.y / 56)))
+  let sun = circle (point 73 13) 7 (color 249 198 78 255)
+  let hills = Field (\p -> if p.y >= 28 + 4 * sin (p.x / 17) then color 86 130 87 255 else color 0 0 0 0)
+  over hills (over sun sky)
+
+sampleLandscapeGround : Picture
+sampleLandscapeGround =
+  let grass = rectangle (point 0 41) (point 95 55) (color 47 94 71 255)
+  let path = Field (\p -> if p.y >= 37 && abs (p.x - 47) <= (p.y - 30) / 3 then color 216 184 139 255 else color 0 0 0 0)
+  over path (over grass (sampleLandscapeBackground ()))
+
+sampleLandscapeHouse : Picture
+sampleLandscapeHouse =
+  let wall = rectangle (point 39 29) (point 56 40) (color 235 207 168 255)
+  let roof = Field (\p -> if p.y >= 19 && p.y <= 29 && abs (p.x - 47) <= p.y - 18 then color 172 83 59 255 else color 0 0 0 0)
+  over roof (over wall (sampleLandscapeGround ()))
+
+sampleLandscapeWindows : Picture
+sampleLandscapeWindows =
+  let door = rectangle (point 46 33) (point 50 40) (color 78 67 48 255)
+  let window = rectangle (point 40 32) (point 43 35) (color 101 169 191 255)
+  over window (over door (sampleLandscapeHouse ()))
+
+sampleLandscapeTree : Picture
+sampleLandscapeTree =
+  let trunk = rectangle (point 20 27) (point 23 47) (color 106 76 46 255)
+  let leaves = over (ellipse (point 19 26) 9 12 (color 35 99 70 255)) (ellipse (point 26 23) 8 10 (color 73 137 79 255))
+  over leaves (over trunk (sampleLandscapeWindows ()))

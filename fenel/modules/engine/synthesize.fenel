@@ -1,0 +1,2555 @@
+module engine where
+
+-- =========================================================================
+-- synthesize — goal-directed term synthesis over the core `Expr` (the Djinn
+-- lineage: intro / var / ctor / base). decide-substrate Phase 8λ.3 (brief:
+-- `workstreams/decide-substrate/briefs/phase-8lambda-3-synthesize.md`;
+-- design: `design/arrow-synthesis.md` §0.3/§0.4/§5 — "inhabiting an exponential
+-- IS program synthesis; certificates by construction").
+--
+-- THE CAPABILITY: past the const/vacuous witnesses (8λ.1), inhabiting `⟦A→B⟧`
+-- is a fuel-bounded, goal-directed term SEARCH whose LAMBDA WITNESS the EXISTING
+-- kernel witness rule re-checks (`verifyWitnessMembership → decideSubset {closure}
+-- ⊆ SeArrow → arrowClosureContains → checkExpr`, the 8λ.2 route). ZERO new kernel
+-- rules, ZERO new evidence kinds: the synthesizer is an UNTRUSTED proposer; only
+-- what the kernel re-certifies counts (`search.fenel` header, the Phase-4
+-- discipline generalized from value-space to TERM-space). The headline gain is
+-- the VAR tactic: `witnessOf ⟦(Int)→Int⟧` was `Nothing` (the return `ℤ` has no
+-- cheap point witness — SeRef ⇒ seWitnessNone), NOW `Just (\x -> x)` — the
+-- identity, synthesized + kernel-certified.
+--
+-- THE HOOK (8λ.6 — the pre-8λ.6 text here said "fast-path-first: the adapter
+-- keeps its const/vacuous DECIDABLE fast path and calls synthesizeArrow only on
+-- the Nothing tail". That is now FALSE and was the first of six
+-- point-pre-emption surfaces): `seWitnessArrow` (inhabit.fenel) keeps NO
+-- vacuity branch and NO const branch. Every valid SeArrow goal routes through
+-- `synthesizeArrow`'s preference-ordered candidate search, which owns root
+-- vacuity, the admitted window and the ONE bare point reserve. A constant is
+-- still reachable — it is simply no longer preferred over an admitted
+-- base-free term.
+--
+-- THE TACTIC PIPELINE (fixed order, v1 — each a plain fn; §2):
+--   • intro   — goal `SeArrow ps r` ⇒ VACUOUS first (some param decidably ∅ ⇒
+--               any body — the nested mirror of the face's fast path, 8λ.3-r),
+--               else the goal's declared param names FRESHENED against Γ
+--               (collision ⇒ `'`-append — shadow-free by construction, 8λ.3-r),
+--               Γ′ = Γ + (names × param sets), synthesize the BODY against `r`
+--               under Γ′, wrap in `ELambda`.
+--   • base    — `inhabit goal` decides a ground witness ⇒ `ELit w` (subsumes the
+--               enum/interval/atom leaves; IS the const-lambda body when reached
+--               under intro).
+--   • var     — some Γ binding's set decidably `⊆ goal` (`decideSubset`,
+--               accept-only) ⇒ `EVar name`. The identity/projection tactic.
+--   • ctor    — goal `SeCtor c fields` ⇒ `EConstruct c` over per-field synthesis
+--               (recurse, fuel-decremented); `SeUnion` ⇒ the first branch that
+--               synthesizes (fuel split — the search.fenel branch discipline).
+--   • case    — (8λ.4) a non-shadowed Γ binding whose set decomposes to ctor
+--               branches (`checkMatchBranches` — the check arm's validator) ⇒
+--               `EMatch (EVar x)` with one TAG-ONLY arm per branch (the
+--               round-trip-exact shape; payloads reach bodies as FIELD-PATH
+--               vars `x._0` via the check arm's path bindings), each body
+--               synthesized under the `checkArmClassify`-built narrowed env
+--               (the re-check's env BY CONSTRUCTION); ALL branches must
+--               synthesize (coverage). Runs on the ctor Nothing tail. The
+--               eliminator tactic — `⟦(Either ℤ ℤ)→ℤ⟧` ⇒
+--               `\e -> case e of Left -> e._0 | Right -> e._0`.
+--
+-- Γ-APPLY v2 SHIPS (8λ.4 — the 8λ.3 fence LIFTED): the 8λ.3 verdict reasoned
+-- from `ECall`'s string head without the ALREADY-SHIPPED `$dyn:<name>`
+-- dynamic-callee convention (jsonLogicToExpr lifts `{call:[{var:f},…]}` to
+-- `ECall "$dyn:f"`; exprToSyntax renders it back through the `$` application
+-- vehicle — partial-evaluate.fenel's egress). Probe 1 (8λ.4) confirmed the
+-- round-trip EXISTS but is NOT an identity — the egressed witness lifts to
+-- `ECall "$" [EVar f, …]` — so check.fenel's synth mode carries BOTH
+-- spellings (synthDynName for the `$dyn:` head the self-re-check sees;
+-- synthDollar for the `$` vehicle the kernel-side bodyToExpr lift produces):
+-- one semantics, two spellings, both deciding the arrow's RETURN set when
+-- the head is env-bound to a SeArrow with exact arity and every arg's synth
+-- set decidably ⊆ its param set. The `apply` TACTIC emits `ECall "$dyn:f"
+-- args` for a Γ arrow whose returns ⊆ goal decides — DEPTH-1 (args via
+-- base/var only; nested apply chains + lambda-valued args are the flagged v2
+-- widening; registry-wide apply stays the §4 candidate-pool decision). The
+-- classic gain: `⟦((String→Int), String) → Int⟧ ∋ \f x -> f x` — the row
+-- 8λ.3 pinned as the honest fence, now synthesized + kernel-re-certified.
+--
+-- THE HONEST-VERDICT BAR (the search.fenel §0 discipline, verbatim): `TvEmpty`
+-- ONLY from a decidable emptiness certificate (`setAlgebraDecideEmpty goal =
+-- Just true`); fuel exhaustion / fragment misses ⇒ `TvUnknown`, NEVER `TvEmpty`.
+-- Every `TvFound` is SELF-RE-CHECKED before being returned (`checkExpr e [] goal`
+-- — emit only what passes; the kernel re-check is the OUTER net, not the only
+-- net) ⇒ `TvFound ⇒ kernel-certifiable` BY CONSTRUCTION (the kernel runs the same
+-- `checkExpr` judgment).
+--
+-- THE WITNESS VALUE boundary: `TvFound (ELambda ps b)` → `exprToJsonLogic b`
+-- (`syntaxToJsonLogic ∘ exprToSyntax`, the partial-evaluate.fenel EGRESS — REUSED,
+-- NOT re-authored: the brief's "exprToSyntax is the new 7-arm injection" was a
+-- MISS, it shipped at partial-evaluator-substrate Phase 1) → `mkArrowClosure`-
+-- assembled `{__fenelFn:true, params, body:<rawBody>, closure:{}}` (inhabit.fenel;
+-- the `mapSet` closure-sentinel assembly — a `{__fenelFn:true,…}` LITERAL would
+-- leave the fields unevaluated). `body` = the JSON-Logic of the lambda BODY only;
+-- the params live in the closure envelope (probe 4). A CASE-SPLIT body's match
+-- arms leave raw `Pattern` ADT values in the pattern slots (a Fenel body cannot
+-- author the wire `$bind`/`$tag` shapes — the permanent `$`-key barrier); the
+-- WITNESS-EGRESS wrappers (dispatchedInhabit / dispatchedSearch / the prover
+-- markerToPropose) apply the ledgered `marshalPatterns` so the value both RUNS
+-- and LIFTS BACK for the kernel re-check (8λ.4 probe 2f — a raw
+-- `{$tag:"PatVar"}` in pattern position matches nothing at runtime).
+--
+-- PURE TERMS ONLY; STRUCTURAL RECURSION SHIPS (8λ.5 — the fix-intro tactic on
+-- the plain search's Nothing tail + the DIRECT `synthesizeFixArrow` face; the
+-- chk.fix kernel rule re-checks every recursive witness — see the fix-intro
+-- section below; measure/permuted/mutual recursion stay named fences); NO
+-- registry-wide `apply` (v2 — a candidate-pool DECISION, §6); rank-1 goals only.
+--
+-- TACTICS-AS-INSTANCES — the HONEST v1 posture (§3): the roadmap row says
+-- "tactics as strategy INSTANCES" (the prover-P8 Strategy-entity precedent). The
+-- 6D note documents the blocker: instance-izing an ENGINE-INTERNAL pipeline needs
+-- fn-by-ref calls from engine bodies (the structuralPropose closed-case
+-- precedent; typed-fn-refs owns the unblock). So v1: the four tactics are plain
+-- fns in a fixed pipeline; the catalog is exposed DECLARATIVELY as
+-- `synthTacticCatalog` (a plain-record list the editor's tactic browser reads) —
+-- catalog-visible, dispatch-inert. The flip to a `Tactic` ENTITY + real
+-- instance-dispatch is gated on typed-fn-refs (documented, not faked, not skipped).
+--
+-- NO named-field PATTERNS over SetExpr (the goal is read via `seTag` + `.field`
+-- accessors — the search.fenel idiom); the Expr witnesses are CONSTRUCTED (never
+-- pattern-matched, except termWitnessValue's ELambda/ELit split — the check.fenel
+-- named-field-pattern idiom), so synthesize.fenel JOINS FENCE_FALLBACK alongside
+-- its check.fenel sibling. ONE new entity: `TermVerdict` (module-migrate-engine
+-- +1), mirroring `SearchVerdict` EXACTLY.
+-- =========================================================================
+
+-- TermVerdict — the synthesizer's untrusted verdict, mirroring SearchVerdict
+-- EXACTLY (all three cases FIELDED — empty-record audit +0): TvFound carries the
+-- WITNESS VALUE (the kernel re-checks it via {w} ⊆ goal); TvEmpty / TvUnknown
+-- carry a diagnostic note/reason string.
+TermVerdict a = TvFound value: a | TvEmpty note: String | TvUnknown reason: String
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The entries.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Synthesize"
+@description "decide-substrate Phase 8λ.3 — goal-directed term synthesis over the core `Expr`: `synthesize fuel goal` searches for a term inhabiting `goal`, emitting a WITNESS VALUE the kernel re-checks. A decidably-EMPTY goal ⇒ TvEmpty (the honest bar — `setAlgebraDecideEmptyCore = Just true`; the CORE, not the widened public entry — the Phase 4T D′ / search.fenel cycle-break BY CONSTRUCTION: inhabit→synthesizeArrow→decideEmpty is a back-edge on the SAME term, and the public entry's search arm re-enters inhabit — 8λ.3-r). A SeArrow goal ⇒ `synthesizeArrow` (the vacuous/intro/base/var/ctor tactic search whose lambda witness `checkExpr` self-re-checks + the kernel re-certifies); any other (ground) goal ⇒ `inhabit` (the const/leaf witness). Verdict: `TvFound w` (a witness kernel-certifiable BY CONSTRUCTION), `TvEmpty` (a decidable emptiness refutation), or `TvUnknown` (fuel-out / a fragment miss — Γ-apply, higher-rank, non-var-head application). The proposer half of `inhabit ∘ comprehend`; only what the kernel re-checks counts."
+@tags "engine" "solve" "synthesize" "inhabit" "arrow" "prover" "decide-substrate" "phase-8lambda"
+synthesize : (fuel: Number) -> (goal: SetExpr) -> TermVerdict Any
+synthesize fuel goal = synthesizeBudget fuel 8 goal
+
+@label "Synthesize arrow"
+@description "decide-substrate Phase 8λ.3 / 8λ.6 — the SeArrow specialization `seWitnessArrow` delegates to. NOT fast-path-first any more: the adapter has no const or vacuity probe left, so EVERY valid arrow goal arrives here. A decidably-EMPTY arrow ⇒ TvEmpty (the honest bar — `setAlgebraDecideEmptyCore`, the D′ cycle-break by construction, 8λ.3-r). Else run the PREFERENCE-ORDERED candidate search: the uncharged root-spine vacuous candidate first, then the admitted window sorted base-free before point-dependent, then the ONE uncharged bare point reserve — each candidate SELF-RE-CHECKED against the whole goal via `checkExpr`, with a miss charged and skipped rather than terminal. The first acceptance is `TvFound` (the `mkArrowClosure`-assembled witness value); no acceptance hands off to the unchanged fixed-point tail. The two-argument name is a real wrapper passing the literal 8."
+@tags "engine" "solve" "synthesize" "inhabit" "arrow" "decide-substrate" "phase-8lambda"
+synthesizeArrow : (fuel: Number) -> (s: SetExpr) -> TermVerdict Any
+synthesizeArrow fuel s = synthesizeArrowBudget fuel 8 s
+
+@label "Synthesize (budgeted)"
+@description "decide-substrate Phase 8λ.6 — the width-carrying entry behind `synthesize`. `admissionBudget` counts complete chargeable SHAPES, not successful expressions: a FuelOut, an unavailable Point, a build miss, duplicate syntax, a failed self-check and a law rejection all consume the same stable slot and none refills it. A decidably-EMPTY goal still yields TvEmpty on the honest bar; a SeArrow goal runs the PREFERENCE-ORDERED candidate search (fair `R` admission, then `P` inside that finite window, then the unchanged fixed-point tail); any other goal delegates unchanged to the ground witness, with the budget ignored. The old two-argument name is a real wrapper passing the literal 8, not a curried partial."
+@tags "engine" "solve" "synthesize" "inhabit" "arrow" "budget" "decide-substrate" "phase-8lambda"
+synthesizeBudget : (fuel: Number) -> (admissionBudget: Number) -> (goal: SetExpr) -> TermVerdict Any
+synthesizeBudget fuel admissionBudget goal =
+  case setAlgebraDecideEmptyCore goal of
+    Just true -> TvEmpty "decided-empty"
+    _ ->
+      if eq (seTag goal) "SeArrow" then synEngineArrow fuel admissionBudget goal
+      else synGroundGo goal
+
+@label "Synthesize arrow (budgeted)"
+@description "decide-substrate Phase 8λ.6 — the width-carrying entry behind `synthesizeArrow`. A valid SeArrow goal routes through the ordered search, which owns root vacuity, the admitted window and the ONE bare reserve; the fixed-point tail runs unchanged after any bounded ordinary miss. A NON-arrow goal is NOT refused — the live face runs the legacy first-success route and may return a ground witness, so that behaviour is preserved byte-for-byte under its own name with the budget ignored."
+@tags "engine" "solve" "synthesize" "inhabit" "arrow" "budget" "decide-substrate" "phase-8lambda"
+synthesizeArrowBudget : (fuel: Number) -> (admissionBudget: Number) -> (s: SetExpr) -> TermVerdict Any
+synthesizeArrowBudget fuel admissionBudget s =
+  case setAlgebraDecideEmptyCore s of
+    Just true -> TvEmpty "decided-empty"
+    _ ->
+      if eq (seTag s) "SeArrow" then synEngineArrow fuel admissionBudget s
+      else synLegacyNonArrow fuel s
+
+@label "Synthesize with law (budgeted)"
+@description "decide-substrate Phase 8λ.6 — the width-carrying entry behind `synthesizeWithLaw`. It drives the ticket engine DIRECTLY in law-consumer mode — screening at the Expr level BEFORE conversion — rather than wrapping the value-level result, which is what makes law continuation possible at all: a rejected candidate charges its slot and the search moves to the next one. Option A is the boundary: only match-free expressions whose literal leaves are primitive scalars reach the predicate, an excluded candidate never invokes it, and exhaustion reports TvUnknown, never TvEmpty. A non-arrow goal applies the same scalar screen to the ground witness value."
+@tags "engine" "solve" "synthesize" "law" "prover" "budget" "decide-substrate" "phase-8lambda"
+synthesizeWithLawBudget : (fuel: Number) -> (admissionBudget: Number) -> (goal: SetExpr) -> (lawPred: Any) -> TermVerdict Any
+synthesizeWithLawBudget fuel admissionBudget goal lawPred =
+  case setAlgebraDecideEmptyCore goal of
+    Just true -> TvEmpty "decided-empty"
+    _ ->
+      if eq (seTag goal) "SeArrow" then synConsumeLaw (synCands fuel (synBudgetNorm admissionBudget) [] goal) goal lawPred 0 0
+      else synGroundLaw goal lawPred
+
+@label "synthesize: synGroundGo"
+@description "decide-substrate Phase 8λ.3 — a non-arrow (ground) goal synthesizes via `inhabit` (the const/leaf witness IS the ground synthesizer, built with correct value shape): Just w ⇒ TvFound w; Nothing ⇒ TvUnknown \"no-ground-witness\" (the decidably-empty case was already caught by the honest bar). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGroundGo : (goal: SetExpr) -> TermVerdict Any
+synGroundGo goal =
+  case inhabit goal of
+    Just w -> TvFound w
+    Nothing -> TvUnknown "no-ground-witness"
+
+@label "Synthesize with law"
+@description "decide-substrate Phase 8λ.4 — the LAW-CONSTRAINED filter (the smallest honest slice; Commit D): `synthesizeWithLaw fuel goal lawPred` = synthesize, then on `TvFound w` evaluate `lawPred w` (probe 5's route — DIRECT param application, the var-callee invokeCallable path; no new ctx native) — truthy ⇒ the TvFound passes through, falsy ⇒ `TvUnknown \"law-rejected\"` (an honest abstention: the goal may hold lawful inhabitants the single candidate missed). TvEmpty / TvUnknown pass through untouched. SINGLE-CANDIDATE v1 — multi-candidate enumeration is the FLAGGED v2 (do not build a candidate queue speculatively; the brief's D note). The predicate contract: `lawPred : ⟦goal⟧ → Bool` (truthiness-coerced). KNOWN v1 CONSTRAINT (flagged): the law runs INSIDE the Fenel body, BEFORE the witness-egress pattern marshal — a CASE-SPLIT witness reaches an INVOKING law with raw arm patterns, so its match falls through to host-null and the law REJECTS (⇒ TvUnknown — the safe direction; a law that passes on null is out of contract). Match-free witness classes (const / vacuous / identity / ctor / apply) are marshal-clean and judge exactly. The editor's future \"suggest a LAWFUL body\" consumes this face."
+@tags "engine" "solve" "synthesize" "law" "prover" "decide-substrate" "phase-8lambda"
+synthesizeWithLaw : (fuel: Number) -> (goal: SetExpr) -> (lawPred: Any) -> TermVerdict Any
+synthesizeWithLaw fuel goal lawPred = synthesizeWithLawBudget fuel 8 goal lawPred
+
+@label "synthesize: tvToMaybe"
+@description "decide-substrate Phase 8λ.3 — project a TermVerdict onto the `Maybe witness` the inhabit faces return: TvFound w ⇒ Just w; TvEmpty / TvUnknown ⇒ Nothing. The adapter `seWitnessArrow` uses (tvToMaybe ∘ synthesizeArrow) on its const/vacuous Nothing tail. Mirrors search.fenel's svToMaybe. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+tvToMaybe : (v: TermVerdict a) -> Maybe a
+tvToMaybe v =
+  case v of
+    TvFound w -> Just w
+    TvEmpty n -> Nothing
+    TvUnknown r -> Nothing
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- termWitnessValue — the Expr → runtime-value boundary. An ELambda becomes the
+-- closure VALUE (`{__fenelFn, params, body:<rawBody>, closure:{}}` via
+-- mkArrowClosure — body = the JSON-Logic of the lambda BODY only, params in the
+-- envelope). An ELit is its own value. The arrow consumer always hands an
+-- ELambda; the ELit/`_` arms keep the fn total (the kernel re-check is the net).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: termWitnessValue"
+@description "decide-substrate Phase 8λ.3 — the Expr witness → runtime VALUE boundary: an ELambda ⇒ the closure value `mkArrowClosure params (exprToJsonLogic body)` (the Ref-substrate callable rep; body = the egress-rendered JSON-Logic of the lambda BODY, params in the closure envelope — probe 4); an ELit ⇒ its literal value; any other shape ⇒ exprToJsonLogic (a total degrade — the arrow consumer only ever hands an ELambda; the kernel {w}⊆goal re-check is the net). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+termWitnessValue : (e: (Expr Any)) -> Any
+termWitnessValue e =
+  case e of
+    ELambda { params = ps, body = b } -> mkArrowClosure ps (exprToJsonLogic b)
+    ELit { value = v } -> v
+    other -> exprToJsonLogic e
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- synTerm — the fuel-guarded, goal-directed term search (returns Maybe Expr).
+-- A SeArrow goal ⇒ intro (the λ-analogue of Park's per-ctor obligation); every
+-- other goal ⇒ the leaf tactics (base / var / ctor, in that fixed order).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: synTerm"
+@description "decide-substrate Phase 8λ.3 — the fuel-guarded term-search core: `lte fuel 0` ⇒ Nothing (\"fuel\"); a SeArrow goal ⇒ synIntro (fresh params + body search + ELambda wrap); every other goal ⇒ synLeaf (base/var/ctor). Fuel strictly decreases at every re-entry (each intro descent, each ctor field, each union branch) ⇒ terminates. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTerm : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synTerm fuel env goal =
+  if lte fuel 0 then Nothing
+  else if eq (seTag goal) "SeArrow" then synIntro fuel env goal
+  else synLeaf fuel env goal
+
+@label "synthesize: synLeaf"
+@description "decide-substrate Phase 8λ.3 / 8λ.4 — the leaf-tactic cascade for a non-arrow goal, in the fixed order (§2): base (inhabit ⇒ ELit) first, then var (a Γ binding ⊆ goal ⇒ EVar), then ctor (SeCtor ⇒ EConstruct over field synthesis; SeUnion ⇒ first branch), then case (8λ.4 — a splittable Γ binding ⇒ EMatch over its ctor decomposition), then apply (8λ.4 — a Γ-bound arrow whose returns ⊆ goal ⇒ `ECall \"$dyn:f\" args`, depth-1). The 8λ.4 tactics run on the earlier tactics' Nothing tails only, so every pre-8λ.4 witness is byte-preserved. First tactic that produces a term wins; none ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synLeaf : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synLeaf fuel env goal =
+  case synBase goal of
+    Just e -> Just e
+    Nothing ->
+      case synVar env goal of
+        Just e -> Just e
+        Nothing ->
+          case synCtor fuel env goal of
+            Just e -> Just e
+            Nothing ->
+              case synCase fuel env goal of
+                Just e -> Just e
+                Nothing -> synApply env goal
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- intro — the VACUOUS witness first (some goal param decidably EMPTY ⇒ ANY
+-- lambda of that shape is a member — `∀x∈∅`; mirror of the face's own vacuous
+-- fast path, which only covers the TOP level: nested arrow positions reach
+-- intro directly, and dropping the vacuous case here was the 8λ.3-r
+-- probe-confirmed Just→Nothing REGRESSION vs the pre-8λ.3 const-wrap route).
+-- Else bind the goal's params under FRESHENED names and synthesize the body.
+--
+-- NAMING (8λ.3-r): start from the goal's DECLARED param names (the
+-- mkArrowClosure convention) but FRESHEN each against the enclosing env by
+-- appending `'` until collision-free (a PURE STRING op — no arithmetic: the
+-- first `?syn<n>` scheme needed `length`/`add`, which return BOXED
+-- numeric-tower values under the decider dispatch ctx ⇒ `toString` renders
+-- `[object Object]`, the euf Phase-5 landmine). Freshening matters because
+-- nested arrows REUSE declared names (`(String p0)→((Int p0)→String)` — the
+-- projection emits whatever the `$arrow` declares): under raw declared names
+-- the inner binding SHADOWS the outer (checkExpr's prepend/head-first
+-- scoping), so synVar either picks a shadow-inconsistent entry (self-re-check
+-- kills it) or the cross-level projection `\x -> \y -> x` is UNREACHABLE —
+-- the 8λ.3-r probe-confirmed incompleteness. With collision-freshening the
+-- env is SHADOW-FREE by construction, so every EVar the var tactic emits
+-- resolves identically in the re-check.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: synIntro"
+@description "decide-substrate Phase 8λ.3 / 8λ.3-r — the intro tactic for a SeArrow goal: (1) VACUOUS first — some goal param decidably EMPTY ⇒ `ELambda names (ELit false)` (∀x∈∅ holds for any body; the nested mirror of the face's top-level vacuous fast path — its omission was the 8λ.3-r Just→Nothing regression); (2) else bind the goal's params under collision-FRESHENED names (declared name + `'` until free — pure string freshening, no arithmetic: the `?syn<n>` scheme hit the decider-ctx boxed-Number `toString` landmine; freshening keeps the env SHADOW-FREE so synVar picks are re-check-consistent — same-name nested params made cross-level projections unreachable), synthesize the BODY against `goal.returns` under Γ′ (fuel−1), wrap in `ELambda { params = names, body }`. Nothing ⇒ the body wasn't synthesizable. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synIntro : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synIntro fuel env goal =
+  let ps = goal.params
+  let r = goal.returns
+  let bound = synIntroBind ps env
+  if not (fieldSemanticSlotsValid ps) then Nothing
+  else if arrowSomeParamEmpty ps
+  then Just (ELambda { params = bound.names, body = ELit { value = false } })
+  else
+    case synTerm (sub fuel 1) bound.env r of
+      Just body -> Just (ELambda { params = bound.names, body = body })
+      Nothing -> Nothing
+
+@label "synthesize: synIntroBind"
+@description "decide-substrate Phase 8λ.3-r — bind the goal params for intro in ONE threading fold: for each param, FRESHEN its declared name against the accumulated env (synFreshenName — collision ⇒ append `'`), PREPEND `{name, set}` (envLookup scans head-first — the checkBindParams newest-front convention), and collect the freshened names in param order. Returns `{ names, env }`. Per-level duplicates freshen too (the env accumulates within the fold). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synIntroBind : (ps: List SetArrowParam) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> { names: List String, env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) }
+synIntroBind ps env =
+  case head ps of
+    Nothing -> { names = [], env = env }
+    Just p ->
+      let nm = synFreshenName p.wireName env
+      let entry = { name = nm, semanticKey = Just p.key, wirePath = p.wireName, set = p.set }
+      let one = appendItem entry []
+      let env2 = concat one env
+      let rest = synIntroBind (eufRest ps) env2
+      let nmOne = appendItem nm []
+      { names = concat nmOne rest.names, env = rest.env }
+
+@label "synthesize: synFreshenName"
+@description "decide-substrate Phase 8λ.3-r — freshen a param name against the env: while some env entry already binds it, append `'` (a pure string op — deterministic, arithmetic-free; the decider ctx boxes Numbers so `toString`-based schemes render `[object Object]`). Collision-free ⇒ the name itself. Internal helper to synIntroBind."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFreshenName : (n: String) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> String
+synFreshenName n env =
+  if synEnvHasName n env then synFreshenName (concat n "'") env else n
+
+@label "synthesize: synEnvHasName"
+@description "decide-substrate Phase 8λ.3-r — does some env entry bind this name? (envLookup returns the SET, which can be any shape — a plain Bool scan is the unambiguous form.) Internal helper to synFreshenName."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synEnvHasName : (n: String) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> Boolean
+synEnvHasName n env =
+  case head env of
+    Nothing -> false
+    Just b -> if eq b.name n then true else synEnvHasName n (eufRest env)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- base — the const/leaf tactic: inhabit the goal directly ⇒ ELit. Reached only
+-- for NON-arrow goals (synTerm dispatches arrows to intro first), so `inhabit`
+-- here never re-enters seWitnessArrow via an arrow goal.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: synBase"
+@description "decide-substrate Phase 8λ.3 — the base tactic: `inhabit goal` ⇒ `ELit w` (the ground/const witness — subsumes the enum/interval/atom leaves; IS the const-lambda body when reached under intro). Nothing ⇒ no cheap witness. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synBase : (goal: SetExpr) -> Maybe (Expr Any)
+synBase goal =
+  case inhabit goal of
+    Just w -> Just (ELit { value = w })
+    Nothing -> Nothing
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- var — the identity/projection tactic: some Γ binding whose set decidably
+-- `⊆ goal` (accept-only — decideSubset over-approximates neither, so Just true
+-- IS the sound accept) ⇒ EVar. The tactic that gives `\x -> x` for a domain
+-- with no cheap point witness (`(Int)→Int`).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: synVar"
+@description "decide-substrate Phase 8λ.3 — the var tactic: scan Γ (head-first) for the first binding whose set `decideSubset goal = Just true` ⇒ `EVar name` (a bound variable of a set ⊆ the goal IS a member of the goal). The identity/projection tactic — synthesizes `\\x -> x` where the domain has no cheap point witness. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synVar : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synVar env goal =
+  case head env of
+    Nothing -> Nothing
+    Just b ->
+      case decideSubset b.set goal of
+        Just true -> Just (EVar { name = b.name })
+        _ -> synVar (eufRest env) goal
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- ctor — the datatype tactic: SeCtor ⇒ EConstruct over per-field synthesis;
+-- SeUnion ⇒ the first branch that synthesizes (fuel split). Reached only when
+-- base (inhabit) already failed, so it fires exactly when a field needs a Γ var
+-- the const path can't supply (`\x -> Just x` for a non-cheaply-witnessable x).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: synCtor"
+@description "decide-substrate Phase 8λ.3 — the ctor tactic: a SeCtor goal ⇒ synCtorBuild (EConstruct over per-field synthesis); a SeUnion goal ⇒ synUnion (the first branch that synthesizes); any other shape ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ctor" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCtor : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synCtor fuel env goal =
+  let t = seTag goal
+  if eq t "SeCtor" then synCtorBuild fuel env goal
+  else if eq t "SeUnion" then synUnion fuel env goal.branches
+  else Nothing
+
+@label "synthesize: synCtorBuild"
+@description "decide-substrate Phase 8λ.3 — build an `EConstruct c` for a SeCtor goal: a coercing ctor (True/False) ⇒ Nothing (the ledger-B5 exclusion — inhabit's base tactic already handles those via the coercion); else synthesize each field's set positionally (synFields, fuel−1) ⇒ `EConstruct { ctor = c, args, fields = [] }` (positional args pair with the SeCtor fields in checkCtorSeCtor). Any field un-synthesizable ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ctor" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCtorBuild : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synCtorBuild fuel env goal =
+  let c = goal.ctor
+  if not (fieldSemanticSlotsValid goal.fields) then Nothing
+  else if seCtorCoercing c then Nothing
+  else
+    case synFields (sub fuel 1) env goal.fields of
+      Just args -> Just (EConstruct { ctor = c, args = args, fields = [] })
+      Nothing -> Nothing
+
+@label "synthesize: synFields"
+@description "decide-substrate Phase 8λ.3 — synthesize each SeCtor field's set into a positional arg (synTerm per field.set; any Nothing ⇒ Nothing), collected in field order (aligns with checkCtorSeCtor's positional pairing). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ctor" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFields : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (fields: List SetCtorField) -> Maybe (List (Expr Any))
+synFields fuel env fields =
+  case head fields of
+    Nothing -> Just []
+    Just f ->
+      case synTerm fuel env f.set of
+        Nothing -> Nothing
+        Just a ->
+          case synFields fuel env (eufRest fields) of
+            Nothing -> Nothing
+            Just rest ->
+              let one = appendItem a []
+              Just (concat one rest)
+
+@label "synthesize: synUnion"
+@description "decide-substrate Phase 8λ.3 — synthesize a term for a SeUnion goal: the first branch that synthesizes wins (a member of some branch is a member of the union); fuel-decremented per branch (the search.fenel branch discipline); none ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synUnion : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (branches: List SetExpr) -> Maybe (Expr Any)
+synUnion fuel env branches =
+  case head branches of
+    Nothing -> Nothing
+    Just br ->
+      case synTerm (sub fuel 1) env br of
+        Just e -> Just e
+        Nothing -> synUnion fuel env (eufRest branches)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- case — the CASE-SPLIT tactic (8λ.4, the §0.4 `case` tactic): the first
+-- non-shadowed Γ binding whose set decomposes to ctor branches (the SAME
+-- `checkMatchBranches` validator the check arm uses — SeCtor /
+-- SeUnion-of-SeCtor, non-coercing, non-"") splits into an
+-- `EMatch (EVar x) [one arm per branch]`. Each arm: the TAG-ONLY pattern
+-- `PatConstruct { ctor, args = [], fields = [] }` — chosen over PatVar
+-- binders because it ROUND-TRIPS: the jlsTaggedPattern lift drops fields
+-- metadata for unregistered ctors (shouldUseNamedFields ⇒ false; bodyToExpr
+-- passes no ctorDefs), so a binder emission self-checks but fails the kernel
+-- re-check (the cross-face inconsistency class the -r probes hunt). The arm
+-- body reaches the payload through the check arm's FIELD-PATH bindings
+-- (`x._0` ↦ the field set — the runtime's dotted var-path resolution), built
+-- by `checkArmClassify` ITSELF (the check arm's classification+narrowing fn,
+-- called on the emitted pattern) — so the synthesis env and the
+-- self-/kernel-re-check env agree BY CONSTRUCTION, not by convention. ALL
+-- branches must synthesize (the coverage requirement — an uncovered branch is
+-- the runtime null path the check arm refuses); fuel decrements per arm body
+-- (the search.fenel branch discipline).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: synCase"
+@description "decide-substrate Phase 8λ.4 — the case-split tactic: scan Γ head-first (FIRST entry per name — a shadowed outer entry is unreachable by EVar resolution, so splitting it would emit a match the re-check narrows differently) for a binding whose set decomposes to ctor branches (checkMatchBranches — the check arm's own validator), and emit `EMatch (EVar x) [one arm per branch]` with every arm body synthesized under the checkArmClassify-built narrowed env. First splittable binding that yields ALL arm bodies wins; none ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCase : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synCase fuel env goal = synCaseScan fuel env goal env []
+
+@label "synthesize: synCaseScan"
+@description "decide-substrate Phase 8λ.4 — the Γ scan for synCase: walk the remaining env entries threading the seen-names list; skip entries whose name was already passed (shadowed — EVar resolves head-first); a splittable set (checkMatchBranches ⇒ Just non-empty branches) tries synCaseArms — success ⇒ the EMatch, failure ⇒ keep scanning. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCaseScan : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> (rem: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (seen: List String) -> Maybe (Expr Any)
+synCaseScan fuel env goal rem seen =
+  case head rem of
+    Nothing -> Nothing
+    Just b ->
+      if synCaseSeen b.name seen then synCaseScan fuel env goal (eufRest rem) seen
+      else
+        let seen2 = appendItem b.name seen
+        case checkMatchBranches b.set of
+          Nothing -> synCaseScan fuel env goal (eufRest rem) seen2
+          Just bs ->
+            case head bs of
+              Nothing -> synCaseScan fuel env goal (eufRest rem) seen2
+              Just b0 ->
+                let sc = EVar { name = b.name }
+                case synCaseArms fuel env sc bs goal of
+                  Just arms -> Just (EMatch { scrutinee = sc, arms = arms })
+                  Nothing -> synCaseScan fuel env goal (eufRest rem) seen2
+
+@label "synthesize: synCaseSeen"
+@description "decide-substrate Phase 8λ.4 — has this name already been passed in the Γ scan? (A plain string-list membership scan.) Internal helper to synCaseScan."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCaseSeen : (n: String) -> (seen: List String) -> Boolean
+synCaseSeen n seen =
+  case head seen of
+    Nothing -> false
+    Just s -> if eq s n then true else synCaseSeen n (eufRest seen)
+
+@label "synthesize: synCaseArms"
+@description "decide-substrate Phase 8λ.4 — build one match arm per ctor branch: every branch MUST synthesize (coverage — an uncovered branch is the runtime null path); any arm failure ⇒ Nothing (the split is abandoned, the scan continues). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCaseArms : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (sc: (Expr Any)) -> (bs: List SetExpr) -> (goal: SetExpr) -> Maybe (List ({ pattern: (Pattern Any), body: (Expr Any) }))
+synCaseArms fuel env sc bs goal =
+  case head bs of
+    Nothing -> Just []
+    Just b ->
+      case synCaseArm fuel env sc b goal of
+        Nothing -> Nothing
+        Just arm ->
+          case synCaseArms fuel env sc (eufRest bs) goal of
+            Nothing -> Nothing
+            Just rest ->
+              let one = appendItem arm []
+              Just (concat one rest)
+
+@label "synthesize: synCaseArm"
+@description "decide-substrate Phase 8λ.4 — ONE case-split arm: emit the TAG-ONLY pattern `PatConstruct { ctor, args = [], fields = [] }` (probe-verified: a tag-only wire pattern `{$tag:C}` matches any C-value — AND it round-trips the jlsTaggedPattern lift byte-identically, which PatVar binders do NOT: the lift drops fields metadata for unregistered ctors, so a binder-style emission would self-check but fail the kernel re-check — the cross-face inconsistency class), hand it to checkArmClassify (the CHECK arm's classification+narrowing — the arm env is the re-check's env BY CONSTRUCTION; a non-\"always\" classification ⇒ Nothing, defensive), and synthesize the body against the goal under that env (fuel−1). The env carries the check arm's FIELD-PATH bindings (`x._0` ↦ the field set), so the var tactic reaches the payload as a dotted path var — no minted binder names, no freshening needed. Returns `{ pattern, body }`. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCaseArm : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (sc: (Expr Any)) -> (b: SetExpr) -> (goal: SetExpr) -> Maybe ({ pattern: (Pattern Any), body: (Expr Any) })
+synCaseArm fuel env sc b goal =
+  let pat = PatConstruct { ctor = b.ctor, args = [], fields = [] }
+  let cls = checkArmClassify sc pat b env
+  if not (eq cls.kind "always") then Nothing
+  else
+    case synTerm (sub fuel 1) cls.env goal of
+      Just body -> Just { pattern = pat, body = body }
+      Nothing -> Nothing
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- apply — the Γ-APPLY tactic (8λ.4 v2; the 8λ.3 fence LIFTED): a non-shadowed
+-- Γ binding `f` whose set is a SeArrow with `returns ⊆ goal` decidable ⇒
+-- synthesize each arg against its param set (DEPTH-1: base/var ONLY — no
+-- nested apply chains, no intro'd lambda args; the flagged v2 widening) and
+-- emit `ECall "$dyn:f" args`. The `$dyn:` head is the SHIPPED dynamic-callee
+-- convention (jsonLogicToExpr lifts `{call:[{var:f},…]}` to it; exprToSyntax
+-- renders it back through the `$` application vehicle) — the 8λ.3 fence
+-- reasoned from the string-fnId limitation without the convention; probe 1
+-- confirmed the round-trip EXISTS but is NOT an identity (the egressed form
+-- lifts to `ECall "$" [EVar f, …]`), so checkExpr's synth mode carries BOTH
+-- spellings (synthDynName + synthDollar, check.fenel) — the self-re-check
+-- sees the `$dyn:` head, the kernel re-check sees the `$` vehicle, both
+-- decide the same set.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: synApply"
+@description "decide-substrate Phase 8λ.4 — the Γ-apply tactic: scan Γ head-first (first entry per name — the synCase shadow discipline) for a SeArrow binding whose RETURN set decidably ⊆ the goal; synthesize each arg against its param set (depth-1 — synApplyArg: base/var only) and emit `ECall \"$dyn:<name>\" args`. The classic gain: `⟦((String→Int), String) → Int⟧` ⇒ `\\f x -> f x` (the row 8λ.3 documented as unreachable). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synApply : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synApply env goal = synApplyScan env goal env []
+
+@label "synthesize: synApplyScan"
+@description "decide-substrate Phase 8λ.4 / 8λ.5 — the Γ scan for synApply: skip shadowed names (EVar resolves head-first — applying a shadowed outer arrow would re-check against the WRONG binding); a SeArrow entry with `decideSubset returns goal = Just true` tries the args — success ⇒ the dynamic call, failure ⇒ keep scanning. 8λ.5: a RECURSION-marked entry (the fix binding — carries `fixDescend`, read tolerantly via lookup; plain entries lack it) may be selected ONLY with a descent-position variable at its descend slot (synApplyArgsFix — the chk.fix side condition enforced at PROPOSAL time, so every candidate is re-checkable by construction). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synApplyScan : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> (rem: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (seen: List String) -> Maybe (Expr Any)
+synApplyScan env goal rem seen =
+  case head rem of
+    Nothing -> Nothing
+    Just b ->
+      if synCaseSeen b.name seen then synApplyScan env goal (eufRest rem) seen
+      else
+        let seen2 = appendItem b.name seen
+        if not (eq (seTag b.set) "SeArrow") then synApplyScan env goal (eufRest rem) seen2
+        else
+          case decideSubset b.set.returns goal of
+            Just true ->
+              case synApplyEntryArgs env b of
+                Just args -> Just (ECall { fnId = concat "$dyn:" b.name, args = args })
+                Nothing -> synApplyScan env goal (eufRest rem) seen2
+            _ -> synApplyScan env goal (eufRest rem) seen2
+
+@label "synthesize: synApplyEntryArgs"
+@description "decide-substrate Phase 8λ.5 — build the args for ONE Γ-apply candidate entry: a RECURSION-marked entry (lookup \"fixDescend\" ⇒ Just — the fix binding synFixGo installs) routes through synApplyArgsFix (descent-constrained at its descend slot); a plain entry keeps the 8λ.4 synApplyArgs path byte-identically. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synApplyEntryArgs : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (b: { name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) -> Maybe (List (Expr Any))
+synApplyEntryArgs env b =
+  case lookup b "fixDescend" of
+    Just dname ->
+      case lookup b "fixParams" of
+        Just fparams -> synApplyArgsFix env b.set.params fparams dname
+        Nothing -> Nothing
+    Nothing -> synApplyArgs env b.set.params
+
+@label "synthesize: synApplyArgsFix"
+@description "decide-substrate Phase 8λ.5 — the descent-constrained arg builder for a recursion-marked arrow: walk the arrow's param sets ∥ the fix binder names; at the descend name's slot the arg MUST be a strict-component path var (synApplyArgDescent — an env binding named `<dname>.…` whose set decidably ⊆ the slot set); every other slot uses the ordinary depth-1 synApplyArg. Any slot unfillable ⇒ Nothing (the recursive call is abandoned — never a non-descending emission). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synApplyArgsFix : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (params: List SetArrowParam) -> (fparams: List String) -> (dname: String) -> Maybe (List (Expr Any))
+synApplyArgsFix env params fparams dname =
+  case head params of
+    Nothing -> Just []
+    Just p ->
+      case head fparams of
+        Nothing -> Nothing
+        Just fp ->
+          let argM = if eq fp dname then synApplyArgDescent env dname p.set else synApplyArg env p.set
+          case argM of
+            Nothing -> Nothing
+            Just a ->
+              case synApplyArgsFix env (eufRest params) (eufRest fparams) dname of
+                Nothing -> Nothing
+                Just rest -> Just (concat (appendItem a []) rest)
+
+@label "synthesize: synApplyArgDescent"
+@description "decide-substrate Phase 8λ.5 — the DESCENT arg selector: scan Γ head-first for a binding whose name starts with `<dname>.` (a machinery-minted strict-component path bind — exists only under a match arm that proved the branch tag) and whose set decidably ⊆ the slot set. The first hit wins (head-first = the innermost narrowing). None ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synApplyArgDescent : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (dname: String) -> (pset: SetExpr) -> Maybe (Expr Any)
+synApplyArgDescent env dname pset =
+  case head env of
+    Nothing -> Nothing
+    Just b ->
+      if startsWith b.name (concat dname ".") then synApplyArgDescentTry b env dname pset
+      else synApplyArgDescent (eufRest env) dname pset
+
+@label "synthesize: synApplyArgDescentTry"
+@description "decide-substrate Phase 8λ.5 — test ONE prefix-matched candidate: its set decidably ⊆ the slot set ⇒ the EVar; else keep scanning. Internal helper to synApplyArgDescent."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synApplyArgDescentTry : (b: { name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (dname: String) -> (pset: SetExpr) -> Maybe (Expr Any)
+synApplyArgDescentTry b env dname pset =
+  case decideSubset b.set pset of
+    Just true -> Just (EVar { name = b.name })
+    _ -> synApplyArgDescent (eufRest env) dname pset
+
+@label "synthesize: synApplyArgs"
+@description "decide-substrate Phase 8λ.4 — synthesize one arg per arrow param (depth-1), in param order; any un-synthesizable arg ⇒ Nothing (the whole application is abandoned). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synApplyArgs : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (params: List SetArrowParam) -> Maybe (List (Expr Any))
+synApplyArgs env params =
+  case head params of
+    Nothing -> Just []
+    Just p ->
+      case synApplyArg env p.set of
+        Nothing -> Nothing
+        Just a ->
+          case synApplyArgs env (eufRest params) of
+            Nothing -> Nothing
+            Just rest ->
+              let one = appendItem a []
+              Just (concat one rest)
+
+@label "synthesize: synApplyArg"
+@description "decide-substrate Phase 8λ.4 — ONE application argument, DEPTH-1: base (inhabit the param set ⇒ ELit) then var (a Γ binding ⊆ the param set ⇒ EVar). An ARROW-typed param skips base and goes var-ONLY: `inhabit(arrow)` returns a CLOSURE VALUE, and an ELit-embedded closure is exactly the 8λ.3-r nested-closure class — it self-checks (the singleton membership face reaches arrowClosureContains) but the EGRESSED literal lifts back as an ERecord, so the kernel re-check would soften to Nothing (the cross-face inconsistency the -r probes hunt); an intro'd lambda arg is the flagged v2 widening. NO ctor/case/intro/apply recursion — nested apply chains (`f (g x)`) are v2 (§4 NOT-in-scope: registry-wide apply rides the candidate-pool decision). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synApplyArg : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (pset: SetExpr) -> Maybe (Expr Any)
+synApplyArg env pset =
+  if eq (seTag pset) "SeArrow" then synVar env pset
+  else
+    case synBase pset of
+      Just e -> Just e
+      Nothing -> synVar env pset
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- fix-intro — STRUCTURAL RECURSION as a tactic (8λ.5, the final λ-rung). A
+-- SeArrow goal some param of which decomposes over a POSITIVE recursive type
+-- (SeMu — the checkMatchBranchesMu face-ok unfold is the decomposition oracle,
+-- so negative μ NEVER triggers) binds a FRESH self-name `f ↦ goal` in Γ as a
+-- RECURSION-marked entry ({…, fixParams, fixDescend} — the mark synApplyScan
+-- honors: f is selectable ONLY with a descent-position path var, the chk.fix
+-- side condition enforced at proposal time so candidates are re-checkable BY
+-- CONSTRUCTION), FORCES the case split on that param (the brief's "run the
+-- existing case-split tactic on that param" — same checkMatchBranches +
+-- checkArmClassify machinery as synCase), and inside each arm tries the
+-- RECURSIVE call FIRST (synFixRecCall — descent-position path var at the
+-- descend slot, ordinary depth-1 args elsewhere), falling back to the generic
+-- synTerm cascade (the base branch — Nil/Z — closes there). The emitted
+-- witness is the STRUCTURAL-RECURSOR skeleton (`\x -> case x of Nil -> w |
+-- Cons -> f x.tail`), self-re-checked via checkExprFix (the chk.fix rule) and
+-- egressed as a FIX-MARKED closure ({__fenelFn, params, body, closure,
+-- fix: f} — termFixWitnessValue; arrowClosureContains routes the mark to
+-- checkExprFix for the kernel re-certification, and the evaluator's invoke
+-- self-bind makes the value EXECUTABLE).
+--
+-- HONEST REACHABILITY (documented, not hidden): on the ordinary entries the
+-- fix tail is nearly unreachable IN-FRAGMENT — any goal whose base-branch arm
+-- closes also closes const/projection-style without recursion (arm envs are
+-- monotone extensions of the top env, and inhabit(returns) fires at the
+-- seWitnessArrow face before synthesis), so witnessOf keeps every existing
+-- witness byte-identical. The DIRECT face `synthesizeFixArrow` is the live
+-- consumer: it FORCES the recursion-shaped derivation (the editor's "suggest a
+-- RECURSIVE body" seam; the checkExprFix rule is what makes user-WRITTEN
+-- recursive lambdas kernel-checkable at all).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Synthesize fix arrow"
+@description "decide-substrate Phase 8λ.5 — the DIRECT recursion-synthesis face: `synthesizeFixArrow fuel s` forces the fix-intro derivation for a SeArrow goal (bind a fresh recursion-marked `f ↦ s` in Γ, case-split the first μ-decomposable param, recursive-call-first arm bodies, generic fallback), self-re-checks the lambda via `checkExprFix` (the chk.fix premise + structural-descent side condition), and returns `TvFound` with the FIX-MARKED closure value ({__fenelFn, …, fix} — kernel-re-certifiable through arrowClosureContains and runnable through the evaluator's invoke self-bind). A decidably-EMPTY goal ⇒ TvEmpty (the honest bar); no μ-decomposable param / an arm that won't synthesize / a failed self-re-check ⇒ TvUnknown. The consumer-facing 'suggest a RECURSIVE body' seam — witnessOf's ordinary route keeps every pre-8λ.5 witness byte-identical (fix rides only the plain search's Nothing tail there)."
+@tags "engine" "solve" "synthesize" "fix" "recursion" "arrow" "mu" "decide-substrate" "phase-8lambda"
+synthesizeFixArrow : (fuel: Number) -> (s: SetExpr) -> TermVerdict Any
+synthesizeFixArrow fuel s =
+  case setAlgebraDecideEmptyCore s of
+    Just true -> TvEmpty "decided-empty"
+    _ ->
+      if eq (seTag s) "SeArrow" then synFixGo fuel s
+      else TvUnknown "not-an-arrow"
+
+@label "synthesize: synFixGo"
+@description "decide-substrate Phase 8λ.5 — the fix-intro core: validate the goal params (fieldSemanticSlotsValid); pick the FIRST SeMu param that checkMatchBranches-decomposes (positive + guarded — the checkMatchBranchesMu gate; none ⇒ TvUnknown \"no-term\"); bind params (synIntroBind — collision-freshened), mint a fresh self-name (synFreshenName \"f\"), install the RECURSION-marked Γ entry ({name, …, set = goal, fixParams, fixDescend}); force the case split on the descend param with recursive-call-first arm bodies (synFixArms); wrap `ELambda`; SELF-RE-CHECK via checkExprFix (the chk.fix rule — premise + descent); Just true ⇒ TvFound (termFixWitnessValue — the fix-marked closure), else TvUnknown \"self-recheck-failed\". Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "fix" "recursion" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFixGo : (fuel: Number) -> (s: SetExpr) -> TermVerdict Any
+synFixGo fuel s =
+  let ps = s.params
+  if not (fieldSemanticSlotsValid ps) then TvUnknown "no-term"
+  else
+    let bound = synIntroBind ps []
+    case synFixPick ps bound.names of
+      Nothing -> TvUnknown "no-term"
+      Just pick ->
+        let fname = synFreshenName "f" bound.env
+        let fentry = { name = fname, semanticKey = Nothing, wirePath = fname, set = s, fixParams = bound.names, fixDescend = pick.dname }
+        let env2 = concat (appendItem fentry []) bound.env
+        case synFixSplit fuel env2 s fname bound.names pick of
+          Nothing -> TvUnknown "no-term"
+          Just body ->
+            let lam = ELambda { params = bound.names, body = body }
+            if fixMentions fname body then synFixCertify fname bound.names body lam s
+            else synFixPlain lam s
+
+@label "synthesize: synFixCertify"
+@description "decide-substrate Phase 8λ.5 — certify a genuinely RECURSIVE fix candidate: self-re-check via checkExprFix (the chk.fix premise + descent); Just true ⇒ TvFound (the fix-marked closure), else TvUnknown \"self-recheck-failed\". Internal helper to synFixGo."
+@tags "engine" "internal" "solve" "synthesize" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFixCertify : (fname: String) -> (names: List String) -> (body: (Expr Any)) -> (lam: (Expr Any)) -> (s: SetExpr) -> TermVerdict Any
+synFixCertify fname names body lam s =
+  case checkExprFix fname lam [] s of
+    Just true -> TvFound (termFixWitnessValue fname names body)
+    _ -> TvUnknown "self-recheck-failed"
+
+@label "synthesize: synFixPlain"
+@description "decide-substrate Phase 8λ.5 — a fix derivation whose arms all closed WITHOUT the recursive call (the fix binding went unused): certify through the ORDINARY checkExpr and emit the UNMARKED plain witness (no `fix` slot — the value is an ordinary lambda; marking it would be noise). Internal helper to synFixGo."
+@tags "engine" "internal" "solve" "synthesize" "fix" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFixPlain : (lam: (Expr Any)) -> (s: SetExpr) -> TermVerdict Any
+synFixPlain lam s =
+  case checkExpr lam [] s of
+    Just true -> TvFound (termWitnessValue lam)
+    _ -> TvUnknown "self-recheck-failed"
+
+@label "synthesize: synFixPick"
+@description "decide-substrate Phase 8λ.5 — pick the descent param: walk the goal params ∥ the freshened binder names; the FIRST param whose set is a SeMu that checkMatchBranches decomposes (Just, non-empty — the positive+guarded unfold) wins, returning `{ dname, dset }` (the freshened binder name + the μ set). None ⇒ Nothing (fix-intro inapplicable — the honest v1 trigger is μ-typed params only). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "fix" "mu" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFixPick : (ps: List SetArrowParam) -> (names: List String) -> Maybe ({ dname: String, dset: SetExpr })
+synFixPick ps names =
+  case head ps of
+    Nothing -> Nothing
+    Just p ->
+      case head names of
+        Nothing -> Nothing
+        Just nm ->
+          if eq (seTag p.set) "SeMu" then synFixPickMu p nm ps names
+          else synFixPick (eufRest ps) (eufRest names)
+
+@label "synthesize: synFixPickMu"
+@description "decide-substrate Phase 8λ.5 — probe ONE μ param as the descent candidate: checkMatchBranches must decompose it (Just, non-empty — the positive+guarded unfold); success ⇒ `{ dname, dset }`, else keep scanning the rest. Internal helper to synFixPick."
+@tags "engine" "internal" "solve" "synthesize" "fix" "mu" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFixPickMu : (p: SetArrowParam) -> (nm: String) -> (ps: List SetArrowParam) -> (names: List String) -> Maybe ({ dname: String, dset: SetExpr })
+synFixPickMu p nm ps names =
+  case checkMatchBranches p.set of
+    Just bs ->
+      case head bs of
+        Just b0 -> Just { dname = nm, dset = p.set }
+        Nothing -> synFixPick (eufRest ps) (eufRest names)
+    Nothing -> synFixPick (eufRest ps) (eufRest names)
+
+@label "synthesize: synFixSplit"
+@description "decide-substrate Phase 8λ.5 — the FORCED case split on the descent param: decompose its μ set (checkMatchBranches — the same oracle synFixPick consulted), emit `EMatch (EVar dname)` with one tag-only arm per branch, every arm body via synFixArm (recursive-call-first). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "fix" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFixSplit : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (s: SetExpr) -> (fname: String) -> (names: List String) -> (pick: { dname: String, dset: SetExpr }) -> Maybe (Expr Any)
+synFixSplit fuel env s fname names pick =
+  case checkMatchBranches pick.dset of
+    Nothing -> Nothing
+    Just bs ->
+      let sc = EVar { name = pick.dname }
+      case synFixArms fuel env sc bs s fname names pick.dname of
+        Just arms -> Just (EMatch { scrutinee = sc, arms = arms })
+        Nothing -> Nothing
+
+@label "synthesize: synFixArms"
+@description "decide-substrate Phase 8λ.5 — one tag-only arm per μ branch, ALL must synthesize (coverage — the check arm's requirement); fuel decrements per arm (the branch discipline). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "fix" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFixArms : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (sc: (Expr Any)) -> (bs: List SetExpr) -> (s: SetExpr) -> (fname: String) -> (names: List String) -> (dname: String) -> Maybe (List ({ pattern: (Pattern Any), body: (Expr Any) }))
+synFixArms fuel env sc bs s fname names dname =
+  case head bs of
+    Nothing -> Just []
+    Just b ->
+      case synFixArm fuel env sc b s fname names dname of
+        Nothing -> Nothing
+        Just arm ->
+          case synFixArms fuel env sc (eufRest bs) s fname names dname of
+            Nothing -> Nothing
+            Just rest -> Just (concat (appendItem arm []) rest)
+
+@label "synthesize: synFixArm"
+@description "decide-substrate Phase 8λ.5 — ONE fix-split arm: the tag-only pattern (the synCaseArm round-trip shape), checkArmClassify for the narrowed env (the re-check's env by construction — path binds included), then the arm BODY: the RECURSIVE call FIRST (synFixRecCall — this is what makes the emitted witness recursion-shaped instead of collapsing to the base tactic's constant), the generic synTerm cascade as the fallback (the base branch closes there). A non-\"always\" classification ⇒ Nothing (defensive — tag-only patterns always classify \"always\"). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "fix" "match" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFixArm : (fuel: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (sc: (Expr Any)) -> (b: SetExpr) -> (s: SetExpr) -> (fname: String) -> (names: List String) -> (dname: String) -> Maybe ({ pattern: (Pattern Any), body: (Expr Any) })
+synFixArm fuel env sc b s fname names dname =
+  let pat = PatConstruct { ctor = b.ctor, args = [], fields = [] }
+  let cls = checkArmClassify sc pat b env
+  if not (eq cls.kind "always") then Nothing
+  else
+    case synFixRecCall cls.env s fname names dname of
+      Just call -> Just { pattern = pat, body = call }
+      Nothing ->
+        case synTerm (sub fuel 1) cls.env s.returns of
+          Just body -> Just { pattern = pat, body = body }
+          Nothing -> Nothing
+
+@label "synthesize: synFixRecCall"
+@description "decide-substrate Phase 8λ.5 — build the arm's recursive call `ECall \"$dyn:<fname>\" args` under the NARROWED arm env: the goal's RETURN set must cover the goal returns (trivially — f returns the goal's own codomain), and the args build via synApplyArgsFix (the descent-constrained walk: the descend slot takes a `<dname>.…` path bind ⊆ its param set — present only in RECURSIVE branches, so base branches fail here and fall back). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "fix" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFixRecCall : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (s: SetExpr) -> (fname: String) -> (names: List String) -> (dname: String) -> Maybe (Expr Any)
+synFixRecCall env s fname names dname =
+  case synApplyArgsFix env s.params names dname of
+    Just args -> Just (ECall { fnId = concat "$dyn:" fname, args = args })
+    Nothing -> Nothing
+
+@label "synthesize: termFixWitnessValue"
+@description "decide-substrate Phase 8λ.5 — the FIX-MARKED witness value: the ordinary mkArrowClosure envelope + the `fix` slot (mapSet — the seWitnessCtor dynamic-key precedent) carrying the self-name. arrowClosureContains reads the slot tolerantly (absent ⇒ the plain route); the evaluator's invoke self-bind binds it to the closure itself at call time, making the recursive witness EXECUTABLE; marshalPatterns preserves unknown envelope keys, so the mark survives the witness egress. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "fix" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+termFixWitnessValue : (fname: String) -> (pnames: List String) -> (body: (Expr Any)) -> Any
+termFixWitnessValue fname pnames body =
+  mapSet (mkArrowClosure pnames (exprToJsonLogic body)) "fix" fname
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The DECLARATIVE tactic catalog (§3) — catalog-visible, dispatch-inert. v1
+-- exposes the tactics as plain `{name, fnId, note}` records (the editor's
+-- tactic browser reads this); real per-tactic instance-DISPATCH is gated on
+-- fn-by-ref calls from engine bodies (the 6D structuralPropose blocker;
+-- typed-fn-refs owns the unblock — do NOT fake dynamic dispatch here). The
+-- Tactic-AS-ENTITY + instance flip lands with that unblock.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Synthesize tactic catalog"
+@description "decide-substrate Phase 8λ.3 / 8λ.3-r / 8λ.4 — the DECLARATIVE tactic catalog (§3, dispatch-inert): the synthesis tactics as `{name, fnId, note}` records (intro/vacuous/base/var/ctor + the 8λ.4 case — vacuous rides inside synIntro but is its OWN tactic row for honesty). Catalog-visible for the editor's tactic browser; the real per-tactic instance-dispatch flip is gated on typed-fn-refs (fn-by-ref from engine bodies — the 6D blocker), so v1 keeps a fixed pipeline + this declarative list rather than faking dynamic dispatch. `q` is an ignored query placeholder (a single-arg fn — avoids the CAF/value-decl ambiguity; the browser passes `{}`)."
+@tags "engine" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+synthTacticCatalog : (q: a) -> b
+synthTacticCatalog q =
+  let intro = { name = "intro", fnId = "engine:synIntro", note = "SeArrow ⇒ freshened params + body search + ELambda" }
+  let vac = { name = "vacuous", fnId = "engine:synIntro", note = "some goal param decidably ∅ ⇒ any-body lambda (∀x∈∅)" }
+  let base = { name = "base", fnId = "engine:synBase", note = "inhabit goal ⇒ ELit (const/leaf witness)" }
+  let var = { name = "var", fnId = "engine:synVar", note = "a Γ binding ⊆ goal ⇒ EVar (identity/projection)" }
+  let ctor = { name = "ctor", fnId = "engine:synCtor", note = "SeCtor/SeUnion ⇒ EConstruct / first branch" }
+  let caseT = { name = "case", fnId = "engine:synCase", note = "a splittable Γ binding ⇒ EMatch over its ctor branches (8λ.4)" }
+  let app = { name = "apply", fnId = "engine:synApply", note = "a Γ arrow with returns ⊆ goal ⇒ ECall \"$dyn:f\" args, depth-1 (8λ.4)" }
+  let fixT = { name = "fix", fnId = "engine:synFixGo", note = "a μ-decomposable param ⇒ recursion-marked f + forced case split, descent-first arms; chk.fix re-checks (8λ.5)" }
+  appendItem fixT (appendItem app (appendItem caseT (appendItem ctor (appendItem var (appendItem base (appendItem vac (appendItem intro [])))))))
+
+-- =========================================================================
+-- THE 8λ.6 TICKET ENGINE — a preference-ordered candidate search over COMPLETE
+-- derivations. Normative: `design/arrow-synthesis.md` §5.1 AS AMENDED by §10 and
+-- §11 (amendment 2's executable-formation pins), plus the Step-D contract note
+-- §§1–9. Nothing here is a trusted rule: tactics remain UNTRUSTED PROPOSERS and
+-- every candidate is self-re-checked by `checkExpr` before it is returned, so a
+-- `TvFound` is kernel-CERTIFIABLE by construction (not "kernel-certified" — the
+-- `witnessOf`/editor consumers do not always take the kernel round-trip).
+--
+-- TWO ORDERS, NOT ONE (§3.2/§3.3). Admission `R = (nodeCount, structuralAddress)`
+-- is a FAIR structural well-order deciding WHICH finite window of complete tickets
+-- is considered; preference `P = (baseFree < pointDependent, var < ctor < apply <
+-- case, primarySourceOrdinal, unique R-rank)` sorts only that admitted window. The
+-- two must never collapse: a global base-free-first prefix STARVES later tiers in
+-- an infinite recursive-Case grammar, and per-scan reordering preserves scan order
+-- (concatenating per-binding streams still returns `f false` before `g x`).
+--
+-- WHY TICKETS ARE FUEL-INDEPENDENT. Topology is built from point/fuel-independent
+-- facts only: goal tags, the live Γ vector, schema/union ordinals, field-slot
+-- validity, `checkMatchBranches`, and fixed subset decisions. Realization is the
+-- fuel-dependent step, and a failed realization CHARGES its stable slot rather
+-- than renumbering the window. `req` (pin 23) is the static required fuel, so
+-- realization needs exactly ONE root comparison: a node at depth d needs
+-- (subtree height) ≤ fuel − d, and the root height bound implies all of them.
+--
+-- BOUNDED BY CONSTRUCTION. Fenel arrays are EAGER and the search assumes no TCO,
+-- so nothing here materializes an unbounded stream: every generator level returns
+-- at most `b+1` tickets and every Cartesian fold truncates to `b+1` after each
+-- coordinate. That truncation is SOUND for the root's top-(b+1): if a child (or a
+-- tuple suffix) is ranked past `b+1` in its own R order, swapping in each of the
+-- `b+1` better ones — everything else fixed — yields `b+1` root tickets strictly
+-- smaller in R, so the excluded root ticket is itself past `b+1`.
+--
+-- PARSER-FENCE DISCIPLINE (the floor-isos/floor-axioms header): single-line arms,
+-- comment-free in-chain, head/tail accumulator folds, helpers split liberally,
+-- and NEVER an inline multi-element list literal in a record-field or case-arm
+-- position (it parses as an APPLICATION there) — hence the synL2/synL3/synL4
+-- builders and the `let`-bound list fields below.
+-- =========================================================================
+
+@label "synthesize: 2-list"
+@description "decide-substrate Phase 8λ.6 — build a two-number list without an inline multi-element literal (which parses as an APPLICATION in record-field and case-arm positions — the floor-axioms Phase-1 surprise). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synL2 : (a: Number) -> (b: Number) -> List Number
+synL2 a b = appendItem b (appendItem a [])
+
+@label "synthesize: 3-list"
+@description "decide-substrate Phase 8λ.6 — build a three-number list through the appendItem idiom. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synL3 : (a: Number) -> (b: Number) -> (c: Number) -> List Number
+synL3 a b c = appendItem c (synL2 a b)
+
+@label "synthesize: 4-list"
+@description "decide-substrate Phase 8λ.6 — build a four-number list through the appendItem idiom. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synL4 : (a: Number) -> (b: Number) -> (c: Number) -> (d: Number) -> List Number
+synL4 a b c d = appendItem d (synL3 a b c)
+
+-- SynTicket — ONE complete derivation blueprint. Single-constructor by design:
+-- `rule` IS the normative node alphabet of `design/arrow-synthesis.md` §5.1.1
+-- (0 Intro, 1 Var, 2 Ctor, 3 Apply, 4 Case, 5 Point, 6 Vacuous), not an ad-hoc
+-- code, and one uniform shape keeps construction and access free of per-case
+-- pattern matching in a file that already reads its ADTs through `seTag`-style
+-- accessors. `kind` is the Ctor sourceKind (0 direct / 1 union branch); `ord` the
+-- live-Γ ordinal or union branch ordinal; `req` pin 23's static fuel requirement;
+-- `pt` the TRANSITIVE containsPoint provenance; `prule`/`sord` the P key's
+-- principal rule (0 var, 1 ctor, 2 apply, 3 case, 4 point, 5 vacuous) and
+-- primarySourceOrdinal; `addr` the canonical structural address; `kids` the Intro
+-- body / Ctor fields / Apply arguments / Case arms in leftmost-major order.
+-- Ticket identity and topology are independent of caller fuel, current Point
+-- success, self-check and consumer — exactly what makes admission `R` a stable
+-- well-order and the fuel/budget monotonicity theorem provable. Declared the
+-- way TermVerdict is, matching this file (no directive facets).
+SynTicket = Tk rule: Number kind: Number ord: Number nodes: Number req: Number pt: Boolean prule: Number sord: Number addr: List Number names: List String name: String ctor: String ctors: List String goal: SetExpr kids: List SynTicket
+
+@label "synthesize: ticket (var)"
+@description "decide-substrate Phase 8λ.6 — the Var ticket for live-Γ ordinal `ord`: one node, required fuel 1, BASE-FREE, address `[1, ord]`, principal rule `var` with the Γ ordinal as its primary source. Internal helper to the ticket generator."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTkVar : (ord: Number) -> (nm: String) -> (g: SetExpr) -> SynTicket
+synTkVar ord nm g =
+  let a = synL2 1 ord
+  Tk { rule = 1, kind = 0, ord = ord, nodes = 1, req = 1, pt = false, prule = 0, sord = ord, addr = a, names = [], name = nm, ctor = "", ctors = [], goal = g, kids = [] }
+
+@label "synthesize: ticket (point)"
+@description "decide-substrate Phase 8λ.6 — the Point ticket: ONE opaque canonical `inhabit(subgoal)` request, one node, required fuel 1, point-DEPENDENT, address `[5]`. Arbitrary literal values are never separate tickets, which is what keeps the alphabet locally finite. Its principal rule sorts after `case`, so a bare Point is last among paid candidates when one exists (at a public arrow entry the root-spine Point is the count-free reserve instead). Internal helper to the ticket generator."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTkPoint : (g: SetExpr) -> SynTicket
+synTkPoint g =
+  let a = appendItem 5 []
+  Tk { rule = 5, kind = 0, ord = 0, nodes = 1, req = 1, pt = true, prule = 4, sord = 0, addr = a, names = [], name = "", ctor = "", ctors = [], goal = g, kids = [] }
+
+@label "synthesize: ticket (vacuous)"
+@description "decide-substrate Phase 8λ.6 — the Vacuous terminal: at an arrow whose parameter product is decidably empty it EMITS the existing false-bodied lambda (∀x∈∅ — the shipped 8λ.3-r witness), one node, required fuel 1, and BASE-FREE (the `false` body is not a Point). Pin 3 makes it the SOLE production at such an arrow, so Intro and Vacuous never compete at one node. Internal helper to the ticket generator."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTkVacuous : (names: List String) -> (g: SetExpr) -> SynTicket
+synTkVacuous names g =
+  let a = appendItem 6 []
+  Tk { rule = 6, kind = 0, ord = 0, nodes = 1, req = 1, pt = false, prule = 5, sord = 0, addr = a, names = names, name = "", ctor = "", ctors = [], goal = g, kids = [] }
+
+@label "synthesize: ticket (intro)"
+@description "decide-substrate Phase 8λ.6 — the forced Intro node wrapping ONE complete body ticket: address `[0, paramCount] ++ bodyAddress`, one extra node, required fuel `1 + body`, and TRANSPARENT to preference (provenance, principal rule and primary source pass straight through from the body). Internal helper to the ticket generator."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTkIntro : (names: List String) -> (kid: SynTicket) -> (g: SetExpr) -> SynTicket
+synTkIntro names kid g =
+  let a = concat (synL2 0 (length names)) kid.addr
+  let ks = appendItem kid []
+  Tk { rule = 0, kind = 0, ord = 0, nodes = add 1 kid.nodes, req = add 1 kid.req, pt = kid.pt, prule = kid.prule, sord = kid.sord, addr = a, names = names, name = "", ctor = "", ctors = [], goal = g, kids = ks }
+
+@label "synthesize: ticket (direct ctor)"
+@description "decide-substrate Phase 8λ.6 — the direct-Ctor node: one child ticket per DECLARED field in source order, address `[2,0,0,childCount] ++ children`, required fuel `1 + max(children)` — so a nullary Ctor requires fuel 1, pin 23's `max([]) = 0`. Principal rule `ctor`, primary source 0. Internal helper to the ticket generator."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTkCtorD : (c: String) -> (tup: { kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number }) -> (g: SetExpr) -> SynTicket
+synTkCtorD c tup g =
+  let a = concat (synL4 2 0 0 (length tup.kids)) tup.addr
+  Tk { rule = 2, kind = 0, ord = 0, nodes = add 1 tup.nodes, req = add 1 tup.req, pt = tup.pt, prule = 1, sord = 0, addr = a, names = [], name = "", ctor = c, ctors = [], goal = g, kids = tup.kids }
+
+@label "synthesize: ticket (union-branch ctor)"
+@description "decide-substrate Phase 8λ.6 — the union-branch Ctor node (pin 1): a COUNTED node selecting original zero-based branch ordinal `j` and wrapping exactly ONE complete child ticket for that branch's payload, address `[2,1,j,1] ++ child`. Its principal rule is `ctor` and its primary source is the BRANCH ordinal, so branch order — not Γ order — breaks ties between two base-free branches. A nullary direct Ctor payload is NOT flattened away: the union node still wraps it. Internal helper to the ticket generator."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTkCtorU : (j: Number) -> (kid: SynTicket) -> (g: SetExpr) -> SynTicket
+synTkCtorU j kid g =
+  let a = concat (synL4 2 1 j 1) kid.addr
+  let ks = appendItem kid []
+  Tk { rule = 2, kind = 1, ord = j, nodes = add 1 kid.nodes, req = add 1 kid.req, pt = kid.pt, prule = 1, sord = j, addr = a, names = [], name = "", ctor = "", ctors = [], goal = g, kids = ks }
+
+@label "synthesize: ticket (apply)"
+@description "decide-substrate Phase 8λ.6 — the depth-1 Apply node (pin 2): a live Γ arrow whose return set decidably ⊆ the goal, one child per parameter coordinate, address `[3, ordinal, argCount] ++ children`, required fuel 1 because its depth-1 arguments (a Var or a Point) add nothing. Deepening argument positions is a NAMED follow-up, never implementer discretion. Principal rule `apply`, primary source the Γ ordinal. Internal helper to the ticket generator."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "apply" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTkApply : (ord: Number) -> (nm: String) -> (tup: { kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number }) -> (g: SetExpr) -> SynTicket
+synTkApply ord nm tup g =
+  let a = concat (synL3 3 ord (length tup.kids)) tup.addr
+  Tk { rule = 3, kind = 0, ord = ord, nodes = add 1 tup.nodes, req = 1, pt = tup.pt, prule = 2, sord = ord, addr = a, names = [], name = nm, ctor = "", ctors = [], goal = g, kids = tup.kids }
+
+@label "synthesize: ticket (case)"
+@description "decide-substrate Phase 8λ.6 — the recursive Case node: a live Γ binding whose set decomposes into ctor branches, one complete arm ticket per branch in `checkMatchBranches` order, address `[4, ordinal, branchCount] ++ arms`, required fuel `1 + max(arms)`. Nested Case inside an arm STAYS in the grammar — capping it at depth one would delete finite eliminators (the X/Y counterexample of the Step-D note §2). Principal rule `case`, primary source the Γ ordinal. Internal helper to the ticket generator."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTkCase : (ord: Number) -> (nm: String) -> (cs: List String) -> (tup: { kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number }) -> (g: SetExpr) -> SynTicket
+synTkCase ord nm cs tup g =
+  let a = concat (synL3 4 ord (length tup.kids)) tup.addr
+  Tk { rule = 4, kind = 0, ord = ord, nodes = add 1 tup.nodes, req = add 1 tup.req, pt = tup.pt, prule = 3, sord = ord, addr = a, names = [], name = nm, ctor = "", ctors = cs, goal = g, kids = tup.kids }
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Ordering. `R` decides admission, `P` decides preference; they never mix.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: compare addresses"
+@description "decide-substrate Phase 8λ.6 — lexicographic comparison of two canonical structural addresses, PROPER PREFIX FIRST (-1 / 0 / 1). Each token encodes its node's arity, so a complete address is a prefix-free code and comparing the flattened preorder concatenation IS comparing children in leftmost-major order. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCmpAddr : (xs: List Number) -> (ys: List Number) -> Number
+synCmpAddr xs ys =
+  case head xs of
+    Nothing -> if eq (length ys) 0 then 0 else sub 0 1
+    Just x -> synCmpAddrGo x xs ys
+
+@label "synthesize: compare addresses (step)"
+@description "decide-substrate Phase 8λ.6 — one step of the address comparison with the left head in hand: an exhausted right side is SMALLER (proper prefix first), otherwise compare heads and recurse on equality. Internal helper to synCmpAddr."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCmpAddrGo : (x: Number) -> (xs: List Number) -> (ys: List Number) -> Number
+synCmpAddrGo x xs ys =
+  case head ys of
+    Nothing -> 1
+    Just y ->
+      if lt x y then sub 0 1
+      else if gt x y then 1
+      else synCmpAddr (eufRest xs) (eufRest ys)
+
+@label "synthesize: compare admission rank"
+@description "decide-substrate Phase 8λ.6 — the FAIR admission order `R = (nodeCount, structuralAddress)`. Node count is PRIMARY, so every address tier is finite and this alphabet cannot create a starvation-producing recursive-lex descent; the result is a total effective well-order giving every paid ticket one natural rank. Admission is coverage mechanics, NOT witness quality. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCmpR : (a: SynTicket) -> (b: SynTicket) -> Number
+synCmpR a b =
+  if lt a.nodes b.nodes then sub 0 1
+  else if gt a.nodes b.nodes then 1
+  else synCmpAddr a.addr b.addr
+
+@label "synthesize: merge (admission order)"
+@description "decide-substrate Phase 8λ.6 — the STABLE merge step of the pure-Fenel merge sort over `R`; ties keep the left run's element, so equal keys never reorder. Search ordering stays in Fenel rather than moving into `std:sort`'s sanctioned TypeScript hot path. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synMergeR : (xs: List SynTicket) -> (ys: List SynTicket) -> List SynTicket
+synMergeR xs ys =
+  case head xs of
+    Nothing -> ys
+    Just x -> synMergeRGo x xs ys
+
+@label "synthesize: merge step (admission order)"
+@description "decide-substrate Phase 8λ.6 — one comparison of the `R` merge, with the left head in hand. Internal helper to synMergeR."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synMergeRGo : (x: SynTicket) -> (xs: List SynTicket) -> (ys: List SynTicket) -> List SynTicket
+synMergeRGo x xs ys =
+  case head ys of
+    Nothing -> xs
+    Just y ->
+      if gt (synCmpR x y) 0 then concat (appendItem y []) (synMergeR xs (eufRest ys))
+      else concat (appendItem x []) (synMergeR (eufRest xs) ys)
+
+@label "synthesize: sort (admission order)"
+@description "decide-substrate Phase 8λ.6 — a pure-Fenel STABLE merge sort of a ticket list into `R` order. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synSortR : (ts: List SynTicket) -> List SynTicket
+synSortR ts =
+  if lte (length ts) 1 then ts
+  else
+    let n = floor (div (length ts) 2)
+    synMergeR (synSortR (synTake n ts)) (synSortR (synDrop n ts))
+
+@label "synthesize: compare preference"
+@description "decide-substrate Phase 8λ.6 — the SEMANTIC preference key `P = (baseFree < pointDependent, var < ctor < apply < case, primarySourceOrdinal, unique R-rank)`, applied ONLY to the finite admitted window. Provenance DOMINATES position: `g x` beats `f false` however early `f` sits in Γ, and a future Point for Boolean cannot displace a previously returned `g x`. The final component is the ticket's `R` rank, whose address already encodes every leftmost-major child coordinate, so `P` is total and well-founded with no second pairing function. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCmpP : (a: SynTicket) -> (b: SynTicket) -> Number
+synCmpP a b =
+  if and a.pt (not b.pt) then 1
+  else if and b.pt (not a.pt) then sub 0 1
+  else if neq a.prule b.prule then (if lt a.prule b.prule then sub 0 1 else 1)
+  else if neq a.sord b.sord then (if lt a.sord b.sord then sub 0 1 else 1)
+  else synCmpR a b
+
+@label "synthesize: merge (preference order)"
+@description "decide-substrate Phase 8λ.6 — the STABLE merge step over `P` for realized candidate pairs (ticket + its Expr). Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synMergeP : (xs: List ({ tk: SynTicket, ex: (Expr Any) })) -> (ys: List ({ tk: SynTicket, ex: (Expr Any) })) -> List ({ tk: SynTicket, ex: (Expr Any) })
+synMergeP xs ys =
+  case head xs of
+    Nothing -> ys
+    Just x -> synMergePGo x xs ys
+
+@label "synthesize: merge step (preference order)"
+@description "decide-substrate Phase 8λ.6 — one comparison of the `P` merge, with the left head in hand. Internal helper to synMergeP."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synMergePGo : (x: { tk: SynTicket, ex: (Expr Any) }) -> (xs: List ({ tk: SynTicket, ex: (Expr Any) })) -> (ys: List ({ tk: SynTicket, ex: (Expr Any) })) -> List ({ tk: SynTicket, ex: (Expr Any) })
+synMergePGo x xs ys =
+  case head ys of
+    Nothing -> xs
+    Just y ->
+      if gt (synCmpP x.tk y.tk) 0 then concat (appendItem y []) (synMergeP xs (eufRest ys))
+      else concat (appendItem x []) (synMergeP (eufRest xs) ys)
+
+@label "synthesize: sort (preference order)"
+@description "decide-substrate Phase 8λ.6 — stable-sort the realized admitted batch into `P` order. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synSortP : (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> List ({ tk: SynTicket, ex: (Expr Any) })
+synSortP ps =
+  if lte (length ps) 1 then ps
+  else
+    let n = floor (div (length ps) 2)
+    synMergeP (synSortP (synTake n ps)) (synSortP (synDrop n ps))
+
+@label "synthesize: take"
+@description "decide-substrate Phase 8λ.6 — the first `n` elements of a list: the admission-window truncation. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTake : (n: Number) -> (xs: List a) -> List a
+synTake n xs =
+  if lte n 0 then []
+  else case head xs of
+    Nothing -> []
+    Just x -> concat (appendItem x []) (synTake (sub n 1) (eufRest xs))
+
+@label "synthesize: drop"
+@description "decide-substrate Phase 8λ.6 — a list minus its first `n` elements. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synDrop : (n: Number) -> (xs: List a) -> List a
+synDrop n xs =
+  if lte n 0 then xs
+  else case head xs of
+    Nothing -> []
+    Just x -> synDrop (sub n 1) (eufRest xs)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The live Γ vector (pin 6). Scan head-to-tail; shadowing is by EXACT emitted
+-- binder name with first occurrence winning; zero-based live ordinals are
+-- assigned on that shadow-filtered vector BEFORE any rule-specific filtering,
+-- and the SAME vector serves Var, Apply and Case.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: live env"
+@description "decide-substrate Phase 8λ.6 — the shadow-filtered live Γ vector (pin 6): head-to-tail, first occurrence of each emitted binder name wins. Var, Apply and Case all index THIS vector, so a binding's live ordinal is one fact rather than three per-scan positions. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synLive : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })
+synLive env = synLiveGo env []
+
+@label "synthesize: live env (fold)"
+@description "decide-substrate Phase 8λ.6 — the head/tail accumulator behind synLive: keep a binding when its emitted name has not been seen, else skip it. Internal helper to synLive."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synLiveGo : (rem: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (seen: List String) -> List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })
+synLiveGo rem seen =
+  case head rem of
+    Nothing -> []
+    Just b ->
+      if synCaseSeen b.name seen then synLiveGo (eufRest rem) seen
+      else concat (appendItem b []) (synLiveGo (eufRest rem) (appendItem b.name seen))
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The bounded Cartesian product. One tuple — every child choice included — is
+-- ONE root ticket; the leftmost coordinate varies SLOWEST. The accumulator
+-- carries the tuple aggregate `R` inputs so the comparator never re-walks it.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: empty tuple"
+@description "decide-substrate Phase 8λ.6 — the empty child tuple: zero nodes, zero required fuel (pin 23 max-of-empty is 0, which is why a nullary Ctor requires fuel 1), base-free, empty address. Takes an ignored argument because a bodyless nullary declaration resolves to a reference handle rather than its value. Internal helper to the Cartesian fold."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTupNil : (q: Number) -> { kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number }
+synTupNil q = { kids = [], nodes = 0, req = 0, pt = false, addr = [] }
+
+@label "synthesize: extend tuple"
+@description "decide-substrate Phase 8λ.6 — prepend one child ticket to a tuple, aggregating the `R` inputs: node counts SUM, required fuel takes the MAX, provenance is the transitive OR (any internal Point makes the whole derivation point-dependent), and addresses CONCATENATE in leftmost-major order. Internal helper to the Cartesian fold."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTupCons : (t: SynTicket) -> (r: { kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number }) -> { kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number }
+synTupCons t r =
+  let ks = concat (appendItem t []) r.kids
+  let ad = concat t.addr r.addr
+  { kids = ks, nodes = add t.nodes r.nodes, req = max t.req r.req, pt = or t.pt r.pt, addr = ad }
+
+@label "synthesize: compare tuples"
+@description "decide-substrate Phase 8λ.6 — the `R` order over child tuples: total node count first, then the concatenated address. Internal helper to the Cartesian fold."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCmpTup : (a: { kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number }) -> (b: { kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number }) -> Number
+synCmpTup a b =
+  if lt a.nodes b.nodes then sub 0 1
+  else if gt a.nodes b.nodes then 1
+  else synCmpAddr a.addr b.addr
+
+@label "synthesize: merge tuples"
+@description "decide-substrate Phase 8λ.6 — the STABLE merge step of the pure-Fenel tuple sort. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synMergeTup : (xs: List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })) -> (ys: List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })) -> List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })
+synMergeTup xs ys =
+  case head xs of
+    Nothing -> ys
+    Just x -> synMergeTupGo x xs ys
+
+@label "synthesize: merge tuples (step)"
+@description "decide-substrate Phase 8λ.6 — one comparison of the tuple merge, with the left head in hand. Internal helper to synMergeTup."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synMergeTupGo : (x: { kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number }) -> (xs: List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })) -> (ys: List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })) -> List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })
+synMergeTupGo x xs ys =
+  case head ys of
+    Nothing -> xs
+    Just y ->
+      if gt (synCmpTup x y) 0 then concat (appendItem y []) (synMergeTup xs (eufRest ys))
+      else concat (appendItem x []) (synMergeTup (eufRest xs) ys)
+
+@label "synthesize: sort tuples"
+@description "decide-substrate Phase 8λ.6 — stable merge sort of child tuples into `R` order before truncation. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synSortTup : (ts: List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })) -> List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })
+synSortTup ts =
+  if lte (length ts) 1 then ts
+  else
+    let n = floor (div (length ts) 2)
+    synMergeTup (synSortTup (synTake n ts)) (synSortTup (synDrop n ts))
+
+@label "synthesize: cross one coordinate"
+@description "decide-substrate Phase 8λ.6 — extend every suffix tuple with every candidate of ONE coordinate, leftmost varying slowest. Internal helper to the Cartesian fold."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCross : (c: List SynTicket) -> (rest: List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })) -> List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })
+synCross c rest =
+  case head c of
+    Nothing -> []
+    Just x -> concat (map (\r -> synTupCons x r) rest) (synCross (eufRest c) rest)
+
+@label "synthesize: bounded Cartesian product"
+@description "decide-substrate Phase 8λ.6 — the COMPLETE leftmost-major product over a list of coordinate candidate lists, truncated to `b+1` after each coordinate. Truncation is sound for the root top-(b+1): a tuple suffix ranked past `b+1` has `b+1` better suffixes, each of which — with the prefix held fixed — yields a strictly smaller root ticket. This is what makes `Pair x y` reachable where first-child-per-field could only ever build `Pair y y`. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synProd : (b: Number) -> (cols: List (List SynTicket)) -> List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })
+synProd b cols =
+  case head cols of
+    Nothing -> appendItem (synTupNil 0) []
+    Just c -> synTake (add b 1) (synSortTup (synCross c (synProd b (eufRest cols))))
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The GENERATOR. `synGen cap b env goal` returns every complete ticket with at
+-- most `cap` nodes, in `R` order, truncated to `b+1`, plus `more` = "a
+-- production was pruned by the node cap". `more` tracks the CAP only: if the
+-- root list is short then no truncation can have fired anywhere that matters
+-- (a truncated child would have produced `b+1` root tickets by itself), so a
+-- short list with `more = false` is a PROVEN generator end — pin 10's
+-- structural, non-realizing, uncharged successor peek.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: generate tickets"
+@description "decide-substrate Phase 8λ.6 — the complete-ticket generator: at most `cap` nodes, `R`-ordered, truncated to `b+1`, with `more` reporting node-cap pruning. Consults NO fuel, NO current `inhabit` success, NO self-check and NO consumer, which is what keeps the admitted window `A_b` stable under all four. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGen : (cap: Number) -> (b: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGen cap b env goal =
+  if lte cap 0 then { list = [], more = true }
+  else if eq (seTag goal) "SeArrow" then synGenArrow cap b env goal
+  else synGenGround cap b env goal
+
+@label "synthesize: generate (arrow goal)"
+@description "decide-substrate Phase 8λ.6 — arrow-production exclusivity (pin 3): invalid field slots produce NOTHING (fail-closed, the generation-failure class); a decidably-empty parameter product makes Vacuous the SOLE production; otherwise Intro is. They never compete at one node. Internal helper to synGen."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenArrow : (cap: Number) -> (b: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenArrow cap b env goal =
+  if not (fieldSemanticSlotsValid goal.params) then { list = [], more = false }
+  else if arrowSomeParamEmpty goal.params then synGenVacuous env goal
+  else synGenIntro cap b env goal
+
+@label "synthesize: generate (vacuous)"
+@description "decide-substrate Phase 8λ.6 — the sole production at an arrow whose parameter product is decidably empty: one Vacuous ticket carrying the freshened binder names of that arrow. Internal helper to synGenArrow."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenVacuous : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenVacuous env goal =
+  let bound = synIntroBind goal.params env
+  { list = appendItem (synTkVacuous bound.names goal) [], more = false }
+
+@label "synthesize: generate (intro)"
+@description "decide-substrate Phase 8λ.6 — the forced Intro production: bind the freshened parameter names into Γ (the existing shadow-free synIntroBind) and wrap EVERY body ticket, not only the first. Wrapping preserves the body order because it adds a constant address prefix and one node. Internal helper to synGenArrow."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenIntro : (cap: Number) -> (b: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenIntro cap b env goal =
+  let bound = synIntroBind goal.params env
+  let inner = synGen (sub cap 1) b bound.env goal.returns
+  { list = map (\t -> synTkIntro bound.names t goal) inner.list, more = inner.more }
+
+@label "synthesize: generate (ground goal)"
+@description "decide-substrate Phase 8λ.6 — the non-arrow productions merged into ONE `R`-ordered window: Var, Ctor (direct or union-branch), Apply, Case and the one opaque Point. Every production is offered; nothing is skipped because an earlier one succeeded, which is precisely the first-success behaviour this phase replaces. Internal helper to synGen."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenGround : (cap: Number) -> (b: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenGround cap b env goal =
+  let lv = synLive env
+  let ct = synGenCtor cap b lv goal
+  let ap = synGenApply cap b lv goal
+  let cs = synGenCase cap b lv goal
+  let all = concat (concat (synGenVar lv goal) ct.list) (concat ap.list (concat cs.list (appendItem (synTkPoint goal) [])))
+  { list = synTake (add b 1) (synSortR all), more = or ct.more (or ap.more cs.more) }
+
+@label "synthesize: generate (var scan)"
+@description "decide-substrate Phase 8λ.6 — one Var ticket for EVERY live binding whose set is decidably ⊆ the goal, in live-Γ ordinal order. The live scan resumes after each choice instead of committing to the first success. Internal helper to synGenGround."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenVar : (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> List SynTicket
+synGenVar lv goal = synGenVarGo lv 0 goal
+
+@label "synthesize: generate (var scan, fold)"
+@description "decide-substrate Phase 8λ.6 — the head/tail accumulator behind synGenVar, carrying the zero-based live ordinal. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenVarGo : (rem: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (i: Number) -> (goal: SetExpr) -> List SynTicket
+synGenVarGo rem i goal =
+  case head rem of
+    Nothing -> []
+    Just bd ->
+      let rest = synGenVarGo (eufRest rem) (add i 1) goal
+      case decideSubset bd.set goal of
+        Just true -> concat (appendItem (synTkVar i bd.name goal) []) rest
+        _ -> rest
+
+@label "synthesize: any pruned"
+@description "decide-substrate Phase 8λ.6 — did any child generation report node-cap pruning? Internal helper to the compound productions."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synAnyMore : (cs: List ({ list: List SynTicket, more: Boolean })) -> Boolean
+synAnyMore cs =
+  case head cs of
+    Nothing -> false
+    Just c -> if c.more then true else synAnyMore (eufRest cs)
+
+@label "synthesize: bound tuples by node cap"
+@description "decide-substrate Phase 8λ.6 — keep only the child tuples whose TOTAL node count fits the remaining cap. Children are generated with the whole remaining cap each, so this is where the shared budget is enforced; a dropped tuple means a larger ticket exists and is reported as node-cap pruning. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFilterTup : (cap: Number) -> (ts: List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })) -> List ({ kids: List SynTicket, nodes: Number, req: Number, pt: Boolean, addr: List Number })
+synFilterTup cap ts =
+  case head ts of
+    Nothing -> []
+    Just t ->
+      let rest = synFilterTup cap (eufRest ts)
+      if lte t.nodes cap then concat (appendItem t []) rest else rest
+
+@label "synthesize: generate (ctor)"
+@description "decide-substrate Phase 8λ.6 — the Ctor productions: a `SeCtor` goal takes the direct arm, a `SeUnion` goal enumerates branch-selecting nodes, anything else forms NO Ctor ticket (pin 4 — that position is covered by Point). Internal helper to synGenGround."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenCtor : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenCtor cap b lv goal =
+  if eq (seTag goal) "SeCtor" then synGenCtorD cap b lv goal
+  else if eq (seTag goal) "SeUnion" then synGenUnion cap b lv goal.branches 0 goal
+  else { list = [], more = false }
+
+@label "synthesize: generate (direct ctor)"
+@description "decide-substrate Phase 8λ.6 — the direct-Ctor production over the COMPLETE Cartesian product of its declared field slots. Invalid semantic slots and a COERCING constructor (True/False, whose construct coerces to a host boolean) form no ticket — pin 4, preserving the live faces exclusion; those positions are covered by Point. Internal helper to synGenCtor."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenCtorD : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenCtorD cap b lv goal =
+  if not (fieldSemanticSlotsValid goal.fields) then { list = [], more = false }
+  else if seCtorCoercing goal.ctor then { list = [], more = false }
+  else synGenCtorBuild cap b lv goal
+
+@label "synthesize: generate (direct ctor, build)"
+@description "decide-substrate Phase 8λ.6 — generate each field slot, take the bounded leftmost-major product, and bound it by the remaining node cap. Internal helper to synGenCtorD."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenCtorBuild : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenCtorBuild cap b lv goal =
+  let kid = sub cap (length goal.fields)
+  if lt kid 1 then { list = [], more = true }
+  else
+    let cols = map (\f -> synGen kid b lv f.set) goal.fields
+    let tups = synProd b (map (\c -> c.list) cols)
+    let ok = synFilterTup (sub cap 1) tups
+    let ts = map (\tp -> synTkCtorD goal.ctor tp goal) ok
+    { list = ts, more = or (synAnyMore cols) (lt (length ok) (length tups)) }
+
+@label "synthesize: generate (union branches)"
+@description "decide-substrate Phase 8λ.6 — one branch-selecting Ctor node per ORIGINAL zero-based branch ordinal, each wrapping one complete child ticket for that branch payload. Every branch is enumerated: the union scan no longer stops at the first branch that synthesizes, which is what lets a later base-free branch beat an earlier point-dependent one. Internal helper to synGenCtor."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenUnion : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (brs: List SetExpr) -> (j: Number) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenUnion cap b lv brs j goal =
+  case head brs of
+    Nothing -> { list = [], more = false }
+    Just br -> synGenUnionGo cap b lv br brs j goal
+
+@label "synthesize: generate (union branches, step)"
+@description "decide-substrate Phase 8λ.6 — one branch of the union enumeration, with the branch in hand. Internal helper to synGenUnion."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenUnionGo : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (br: SetExpr) -> (brs: List SetExpr) -> (j: Number) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenUnionGo cap b lv br brs j goal =
+  let inner = synGen (sub cap 1) b lv br
+  let rest = synGenUnion cap b lv (eufRest brs) (add j 1) goal
+  let mine = map (\t -> synTkCtorU j t goal) inner.list
+  { list = concat mine rest.list, more = or inner.more rest.more }
+
+@label "synthesize: generate (apply scan)"
+@description "decide-substrate Phase 8λ.6 — the depth-1 Apply productions over EVERY live Γ arrow whose return set is decidably ⊆ the goal. The scan resumes after each choice, so the first applicable binding no longer wins by position. Internal helper to synGenGround."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "apply" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenApply : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenApply cap b lv goal = synGenApplyGo cap b lv lv 0 goal
+
+@label "synthesize: generate (apply scan, fold)"
+@description "decide-substrate Phase 8λ.6 — the head/tail accumulator behind synGenApply, carrying the zero-based live ordinal. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "apply" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenApplyGo : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (rem: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (i: Number) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenApplyGo cap b lv rem i goal =
+  case head rem of
+    Nothing -> { list = [], more = false }
+    Just bd -> synGenApplyOne cap b lv bd rem i goal
+
+@label "synthesize: generate (apply, one binding)"
+@description "decide-substrate Phase 8λ.6 — admit one live binding as an Apply head when its set is a `SeArrow` whose return is decidably ⊆ the goal, then continue the scan. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "apply" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenApplyOne : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (bd: { name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) -> (rem: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (i: Number) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenApplyOne cap b lv bd rem i goal =
+  let rest = synGenApplyGo cap b lv (eufRest rem) (add i 1) goal
+  if not (eq (seTag bd.set) "SeArrow") then rest
+  else synGenApplyGuard cap b lv bd i goal rest
+
+@label "synthesize: generate (apply, return guard)"
+@description "decide-substrate Phase 8λ.6 — the FIXED static guard: the head binding return set must decide ⊆ the goal. A dynamic outcome never erases a ticket, but this subset decision is fuel- and point-independent, so a miss forms no ticket at all. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "apply" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenApplyGuard : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (bd: { name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) -> (i: Number) -> (goal: SetExpr) -> (rest: { list: List SynTicket, more: Boolean }) -> { list: List SynTicket, more: Boolean }
+synGenApplyGuard cap b lv bd i goal rest =
+  case decideSubset bd.set.returns goal of
+    Just true -> synGenApplyBuild cap b lv bd i goal rest
+    _ -> rest
+
+@label "synthesize: generate (apply, arguments)"
+@description "decide-substrate Phase 8λ.6 — the COMPLETE argument product for one Apply head: every coordinate independently, leftmost-major, bounded by the remaining node cap. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "apply" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenApplyBuild : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (bd: { name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) -> (i: Number) -> (goal: SetExpr) -> (rest: { list: List SynTicket, more: Boolean }) -> { list: List SynTicket, more: Boolean }
+synGenApplyBuild cap b lv bd i goal rest =
+  if lt (sub cap 1) (length bd.set.params) then { list = rest.list, more = true }
+  else
+    let cols = map (\p -> synGenArgOne lv p.set) bd.set.params
+    let tups = synProd b cols
+    let ok = synFilterTup (sub cap 1) tups
+    let mine = map (\tp -> synTkApply i bd.name tp goal) ok
+    { list = concat mine rest.list, more = or rest.more (lt (length ok) (length tups)) }
+
+@label "synthesize: generate (apply, one argument coordinate)"
+@description "decide-substrate Phase 8λ.6 — pin 2: an argument coordinate ranges over every eligible live `Var` (set decidably ⊆ the parameter set) PLUS the one `Point`, in address order so a projection precedes the canonical point; an ARROW-typed coordinate keeps the existing var-only fence. This is the seam where the live code tried its base first. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "apply" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenArgOne : (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (pset: SetExpr) -> List SynTicket
+synGenArgOne lv pset =
+  let vars = synGenVar lv pset
+  if eq (seTag pset) "SeArrow" then vars
+  else concat vars (appendItem (synTkPoint pset) [])
+
+@label "synthesize: generate (case scan)"
+@description "decide-substrate Phase 8λ.6 — the Case productions over EVERY live Γ binding whose set decomposes into ctor branches. The scan resumes after each split, so an early all-points split no longer wins by position over a later payload split. Internal helper to synGenGround."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenCase : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenCase cap b lv goal = synGenCaseGo cap b lv lv 0 goal
+
+@label "synthesize: generate (case scan, fold)"
+@description "decide-substrate Phase 8λ.6 — the head/tail accumulator behind synGenCase, carrying the zero-based live ordinal. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenCaseGo : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (rem: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (i: Number) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenCaseGo cap b lv rem i goal =
+  case head rem of
+    Nothing -> { list = [], more = false }
+    Just bd -> synGenCaseOne cap b lv bd rem i goal
+
+@label "synthesize: generate (case, one scrutinee)"
+@description "decide-substrate Phase 8λ.6 — admit one live binding as a Case scrutinee when `checkMatchBranches` decomposes it into a NONEMPTY branch list, then continue the scan. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenCaseOne : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (bd: { name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) -> (rem: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (i: Number) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenCaseOne cap b lv bd rem i goal =
+  let rest = synGenCaseGo cap b lv (eufRest rem) (add i 1) goal
+  if lte cap 1 then { list = rest.list, more = or rest.more (synCaseShape bd.set) }
+  else
+    case checkMatchBranches bd.set of
+      Nothing -> rest
+      Just bs -> synGenCaseBuild cap b lv bd i bs goal rest
+
+@label "synthesize: case-shaped scrutinee"
+@description "decide-substrate Phase 8λ.6 — the CHEAP structural precondition of a Case: only a `SeCtor`, `SeUnion` or `SeMu` scrutinee can decompose into branches. It exists so that a node whose cap cannot fit any Case (a Case needs at least its own node plus one arm) can report node-cap pruning WITHOUT paying for the full `checkMatchBranches` decomposition, which is one of the two ~second-scale primitives in this search. Conservative in the safe direction: a shape that would decompose to Nothing at a larger cap merely delays the Exhausted proof by one round. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCaseShape : (s: SetExpr) -> Boolean
+synCaseShape s =
+  or (eq (seTag s) "SeCtor") (or (eq (seTag s) "SeUnion") (eq (seTag s) "SeMu"))
+
+@label "synthesize: generate (case, arms)"
+@description "decide-substrate Phase 8λ.6 — the COMPLETE arm product for one scrutinee: every arm body is a full recursive term search under that arm narrowed environment, and the arms are combined leftmost-major. Nested eliminators therefore remain candidates. An empty branch list forms no ticket. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenCaseBuild : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (bd: { name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) -> (i: Number) -> (bs: List SetExpr) -> (goal: SetExpr) -> (rest: { list: List SynTicket, more: Boolean }) -> { list: List SynTicket, more: Boolean }
+synGenCaseBuild cap b lv bd i bs goal rest =
+  case head bs of
+    Nothing -> rest
+    Just b0 -> synGenCaseArms cap b lv bd i bs goal rest
+
+@label "synthesize: generate (case, arm product)"
+@description "decide-substrate Phase 8λ.6 — build one Case ticket per complete arm tuple, bounded by the remaining node cap; the arm constructor names are carried in branch order for realization. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenCaseArms : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (bd: { name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr }) -> (i: Number) -> (bs: List SetExpr) -> (goal: SetExpr) -> (rest: { list: List SynTicket, more: Boolean }) -> { list: List SynTicket, more: Boolean }
+synGenCaseArms cap b lv bd i bs goal rest =
+  let kid = sub cap (length bs)
+  if lt kid 1 then { list = rest.list, more = true }
+  else
+    let sc = EVar { name = bd.name }
+    let cols = map (\br -> synGenArm kid b lv sc br goal) bs
+    let tups = synProd b (map (\c -> c.list) cols)
+    let ok = synFilterTup (sub cap 1) tups
+    let cs = map (\br -> br.ctor) bs
+    let mine = map (\tp -> synTkCase i bd.name cs tp goal) ok
+    { list = concat mine rest.list, more = or rest.more (or (synAnyMore cols) (lt (length ok) (length tups))) }
+
+@label "synthesize: generate (case, one arm)"
+@description "decide-substrate Phase 8λ.6 — one arm coordinate: build the tag-only pattern, take the check arm classifier narrowed environment (the re-check environment BY CONSTRUCTION), and run a full recursive term search for the goal under it. A branch the classifier does not accept as `always` forms no ticket — that fact is fuel- and point-independent. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGenArm : (cap: Number) -> (b: Number) -> (lv: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (sc: (Expr Any)) -> (br: SetExpr) -> (goal: SetExpr) -> { list: List SynTicket, more: Boolean }
+synGenArm cap b lv sc br goal =
+  let pat = PatConstruct { ctor = br.ctor, args = [], fields = [] }
+  let cls = checkArmClassify sc pat br lv
+  if not (eq cls.kind "always") then { list = [], more = false }
+  else synGen cap b cls.env goal
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- REALIZATION. Fuel bounds realization DEPTH, never ticket identity: one root
+-- comparison against the ticket static requirement decides FuelOut, and the
+-- remaining failures are a missing Point or a build guard. The persistence law
+-- is load-bearing — a ticket that realizes at fuel f realizes BYTE-IDENTICALLY
+-- at every larger fuel, because nothing below re-reads the fuel.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: realize a ticket"
+@description "decide-substrate Phase 8λ.6 — realize a complete ticket at a given fuel: `Nothing` when the ticket static requirement exceeds the fuel (FuelOut), otherwise the structural build, which can still miss on an unavailable or non-embeddable Point. Every one of those outcomes CHARGES the ticket stable admission slot rather than renumbering the window. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synReal : (fuel: Number) -> (t: SynTicket) -> Maybe (Expr Any)
+synReal fuel t =
+  if gt t.req fuel then Nothing else synRealGo t
+
+@label "synthesize: realize (dispatch)"
+@description "decide-substrate Phase 8λ.6 — the fuel-free structural build over the normative node alphabet. Internal helper to synReal."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealGo : (t: SynTicket) -> Maybe (Expr Any)
+synRealGo t =
+  if eq t.rule 0 then synRealIntro t
+  else if eq t.rule 1 then Just (EVar { name = t.name })
+  else if eq t.rule 2 then synRealCtor t
+  else if eq t.rule 3 then synRealApply t
+  else if eq t.rule 4 then synRealCase t
+  else if eq t.rule 5 then synRealPoint t.goal
+  else if eq t.rule 6 then Just (ELambda { params = t.names, body = ELit { value = false } })
+  else Nothing
+
+@label "synthesize: realize (intro)"
+@description "decide-substrate Phase 8λ.6 — wrap the realized body in the lambda whose parameters are the ticket freshened binder names. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealIntro : (t: SynTicket) -> Maybe (Expr Any)
+synRealIntro t =
+  case head t.kids of
+    Nothing -> Nothing
+    Just k -> synRealIntroGo t.names (synRealGo k)
+
+@label "synthesize: realize (intro, wrap)"
+@description "decide-substrate Phase 8λ.6 — the lambda wrap once the body outcome is known. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealIntroGo : (ns: List String) -> (m: Maybe (Expr Any)) -> Maybe (Expr Any)
+synRealIntroGo ns m =
+  case m of
+    Nothing -> Nothing
+    Just e -> Just (ELambda { params = ns, body = e })
+
+@label "synthesize: realize (ctor)"
+@description "decide-substrate Phase 8λ.6 — a direct Ctor builds `EConstruct` over its realized field children; a union-branch node emits its child expression directly, because a set-level union needs no injection. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealCtor : (t: SynTicket) -> Maybe (Expr Any)
+synRealCtor t =
+  if eq t.kind 1 then synRealUnion t
+  else synRealCtorGo t.ctor (synRealKids t.kids)
+
+@label "synthesize: realize (ctor, build)"
+@description "decide-substrate Phase 8λ.6 — assemble the constructor once every field child has realized. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealCtorGo : (c: String) -> (m: Maybe (List (Expr Any))) -> Maybe (Expr Any)
+synRealCtorGo c m =
+  case m of
+    Nothing -> Nothing
+    Just args -> Just (EConstruct { ctor = c, args = args, fields = [] })
+
+@label "synthesize: realize (union branch)"
+@description "decide-substrate Phase 8λ.6 — a union-branch node emits its single child expression. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealUnion : (t: SynTicket) -> Maybe (Expr Any)
+synRealUnion t =
+  case head t.kids of
+    Nothing -> Nothing
+    Just k -> synRealGo k
+
+@label "synthesize: realize (apply)"
+@description "decide-substrate Phase 8λ.6 — the dynamic-callee application over the Γ binding, through the shipped `$dyn:` convention. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "apply" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealApply : (t: SynTicket) -> Maybe (Expr Any)
+synRealApply t = synRealApplyGo t.name (synRealKids t.kids)
+
+@label "synthesize: realize (apply, build)"
+@description "decide-substrate Phase 8λ.6 — assemble the call once every argument has realized. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "apply" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealApplyGo : (nm: String) -> (m: Maybe (List (Expr Any))) -> Maybe (Expr Any)
+synRealApplyGo nm m =
+  case m of
+    Nothing -> Nothing
+    Just args -> Just (ECall { fnId = concat "$dyn:" nm, args = args })
+
+@label "synthesize: realize (case)"
+@description "decide-substrate Phase 8λ.6 — the eliminator: one tag-only arm per branch in branch order, payloads reaching the bodies as field-path variables. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealCase : (t: SynTicket) -> Maybe (Expr Any)
+synRealCase t = synRealCaseGo t.name (synRealArms t.ctors t.kids)
+
+@label "synthesize: realize (case, build)"
+@description "decide-substrate Phase 8λ.6 — assemble the match once every arm has realized. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealCaseGo : (nm: String) -> (m: Maybe (List ({ pattern: (Pattern Any), body: (Expr Any) }))) -> Maybe (Expr Any)
+synRealCaseGo nm m =
+  case m of
+    Nothing -> Nothing
+    Just arms -> Just (EMatch { scrutinee = EVar { name = nm }, arms = arms })
+
+@label "synthesize: realize (arms)"
+@description "decide-substrate Phase 8λ.6 — realize every arm body in branch order; any miss fails the whole eliminator, which is the coverage rule. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealArms : (cs: List String) -> (ks: List SynTicket) -> Maybe (List ({ pattern: (Pattern Any), body: (Expr Any) }))
+synRealArms cs ks =
+  case head cs of
+    Nothing -> Just []
+    Just c -> synRealArmsGo c cs ks
+
+@label "synthesize: realize (arms, step)"
+@description "decide-substrate Phase 8λ.6 — one arm of the eliminator, with its constructor name in hand. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealArmsGo : (c: String) -> (cs: List String) -> (ks: List SynTicket) -> Maybe (List ({ pattern: (Pattern Any), body: (Expr Any) }))
+synRealArmsGo c cs ks =
+  case head ks of
+    Nothing -> Nothing
+    Just k -> synRealArmsCons c (synRealGo k) (synRealArms (eufRest cs) (eufRest ks))
+
+@label "synthesize: realize (arms, cons)"
+@description "decide-substrate Phase 8λ.6 — prepend one realized arm to the realized tail; either miss fails the eliminator. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealArmsCons : (c: String) -> (bm: Maybe (Expr Any)) -> (rm: Maybe (List ({ pattern: (Pattern Any), body: (Expr Any) }))) -> Maybe (List ({ pattern: (Pattern Any), body: (Expr Any) }))
+synRealArmsCons c bm rm =
+  case bm of
+    Nothing -> Nothing
+    Just bdy -> synRealArmsCons2 c bdy rm
+
+@label "synthesize: realize (arms, cons step)"
+@description "decide-substrate Phase 8λ.6 — the arm record assembly once both the body and the tail are known. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "case" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealArmsCons2 : (c: String) -> (bdy: (Expr Any)) -> (rm: Maybe (List ({ pattern: (Pattern Any), body: (Expr Any) }))) -> Maybe (List ({ pattern: (Pattern Any), body: (Expr Any) }))
+synRealArmsCons2 c bdy rm =
+  case rm of
+    Nothing -> Nothing
+    Just rs ->
+      let one = { pattern = PatConstruct { ctor = c, args = [], fields = [] }, body = bdy }
+      Just (concat (appendItem one []) rs)
+
+@label "synthesize: realize (children)"
+@description "decide-substrate Phase 8λ.6 — realize a child list leftmost-major; the FIRST miss fails the whole tuple. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealKids : (ks: List SynTicket) -> Maybe (List (Expr Any))
+synRealKids ks =
+  case head ks of
+    Nothing -> Just []
+    Just k -> synRealKidsCons (synRealGo k) (synRealKids (eufRest ks))
+
+@label "synthesize: realize (children, cons)"
+@description "decide-substrate Phase 8λ.6 — prepend one realized child to the realized tail; either miss fails the tuple. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealKidsCons : (em: Maybe (Expr Any)) -> (rm: Maybe (List (Expr Any))) -> Maybe (List (Expr Any))
+synRealKidsCons em rm =
+  case em of
+    Nothing -> Nothing
+    Just e -> synRealKidsCons2 e rm
+
+@label "synthesize: realize (children, cons step)"
+@description "decide-substrate Phase 8λ.6 — the child list assembly once both the head and the tail are known. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealKidsCons2 : (e: (Expr Any)) -> (rm: Maybe (List (Expr Any))) -> Maybe (List (Expr Any))
+synRealKidsCons2 e rm =
+  case rm of
+    Nothing -> Nothing
+    Just rs -> Just (concat (appendItem e []) rs)
+
+@label "synthesize: realize (point)"
+@description "decide-substrate Phase 8λ.6 — ask `inhabit` for the subgoal canonical point and embed it as a literal, but ONLY when the value is embeddable data (pin 16). A non-embeddable point realizes as a charged miss; no path ever embeds a closure in a literal, which is the nested-closure round-trip bug this fence exists to prevent. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealPoint : (g: SetExpr) -> Maybe (Expr Any)
+synRealPoint g =
+  case inhabit g of
+    Just w -> if synEmbeddable w then Just (ELit { value = w }) else Nothing
+    Nothing -> Nothing
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Embeddability (pin 16) and the scalar literal test (§6.2). A Point may only
+-- become a literal when its value is DATA all the way down: no closure, no
+-- partial, no host callable. The empty-entry case is FAIL-CLOSED because Fenel
+-- reflection cannot distinguish an empty record from a host callable.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: scalar literal"
+@description "decide-substrate Phase 8λ.6 — the §6.2 scalar/null literal test, EXACTLY `isNull ∨ isBoolean ∨ isNumber ∨ isString`. When all four are false the value is refused WITHOUT `isArray`, `typeOf`, `entries`, `mapGet` or any property read, so no getter or proxy trap can run first. This is a deliberate completeness fence, not an approximation. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synScalarLit : (v: Any) -> Boolean
+synScalarLit v = or (or (isNull v) (isBoolean v)) (or (isNumber v) (isString v))
+
+@label "synthesize: embeddable value"
+@description "decide-substrate Phase 8λ.6 — pin 16 recursive embeddability: a scalar/null value, or an array of embeddables, or structural record data carrying no callable anywhere beneath it. A non-embeddable Point realizes as a CHARGED miss; ticket topology never depends on this, because the guard is dynamic. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synEmbeddable : (v: Any) -> Boolean
+synEmbeddable v = synEmbedGo 12 v
+
+@label "synthesize: embeddable (depth-bounded)"
+@description "decide-substrate Phase 8λ.6 — the depth-bounded worker behind pin 16's recursive embeddability check. The bound is what makes the predicate TOTAL: a canonical point may be an arbitrary host value (a `SeEnum` carries whatever the caller put in it), and a self-referencing value would otherwise recurse until the host stack gives out. Exceeding the bound is NOT embeddable — fail-closed like every other refusal here, so a pathological value costs a charged PointOut rather than a crash. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synEmbedGo : (d: Number) -> (v: Any) -> Boolean
+synEmbedGo d v =
+  if synScalarLit v then true
+  else if lte d 0 then false
+  else if isArray v then synEmbedAll (sub d 1) v
+  else synEmbedRec (sub d 1) v
+
+@label "synthesize: embeddable list"
+@description "decide-substrate Phase 8λ.6 — every element of a list must be embeddable. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synEmbedAll : (d: Number) -> (xs: List Any) -> Boolean
+synEmbedAll d xs =
+  case head xs of
+    Nothing -> true
+    Just x -> if synEmbedGo d x then synEmbedAll d (eufRest xs) else false
+
+@label "synthesize: embeddable record"
+@description "decide-substrate Phase 8λ.6 — a record is embeddable when it is not a closure or partial and every entry value is embeddable. A closure witness (the arrow face callable rep) is refused here, which is what stops a non-arrow union with an arrow branch from embedding a closure in a literal and breaking its own round-trip. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synEmbedRec : (d: Number) -> (v: Any) -> Boolean
+synEmbedRec d v =
+  case mapGet v "__fenelFn" of
+    Just c -> false
+    Nothing -> synEmbedRec2 d v
+
+@label "synthesize: embeddable record (partial guard)"
+@description "decide-substrate Phase 8λ.6 — the partial-application rep is refused for the same reason as a closure; otherwise fall through to the entry walk. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synEmbedRec2 : (d: Number) -> (v: Any) -> Boolean
+synEmbedRec2 d v =
+  case mapGet v "__fenelPartial" of
+    Just c -> false
+    Nothing -> synEmbedAll d (map (\x -> x.value) (entries v))
+
+-- An EMPTY entry list is EMBEDDABLE. The first reading refused it, reasoning
+-- that Fenel reflection cannot distinguish `{}` from a host callable — but that
+-- refusal has a MEASURED cost and the risk it buys is already covered: the
+-- closure and partial sentinels are tested FIRST, and `SeCtor "" []` (the
+-- anonymous-record former) has `inhabit = Just {}`, so refusing `{}` deleted the
+-- count-free reserve for every anonymous-record return and turned a shipped
+-- witness into `TvUnknown "no-term"` at budget zero. The residual is stated
+-- rather than hidden: a BARE host callable placed in a `SeEnum` by a caller is
+-- indistinguishable from `{}` under any reflection-free rule and would be
+-- embedded; it is unreachable from `inhabit`'s own constructions.
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Option A: the law/value boundary. Before `termWitnessValue` and before any
+-- `lawPred` call, walk the WHOLE source Expr. Codes: 0 safe, 1 unsafe because
+-- of a match, 2 unsafe for any other reason. The distinction is what makes the
+-- law reason total (pin 21): a match-ONLY exclusion profile is named, anything
+-- mixed uses the general reason.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: law safety (worse of two)"
+@description "decide-substrate Phase 8λ.6 — combine two law-safety codes by taking the WORSE: safe < match-excluded < otherwise-excluded. A candidate carrying both a match and a non-scalar literal is therefore NOT a pure match exclusion. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+lawSafeWorse : (a: Number) -> (b: Number) -> Number
+lawSafeWorse a b = max a b
+
+@label "synthesize: law safety"
+@description "decide-substrate Phase 8λ.6 — Option A's EXHAUSTIVE seven-case `Expr` classifier: `EVar` is safe; `ECall`/`ELambda`/`EConstruct`/`ERecord` recurse over every expression child; `EMatch` is ALWAYS unsafe; `ELit` is safe only for a null/Boolean/Number/String value. An unknown or malformed future case is unsafe — the wildcard arm returns the UNSAFE code, so a new `Expr` constructor fails closed instead of falling through to a permissive host null. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+lawEvalSafe : (e: (Expr Any)) -> Number
+lawEvalSafe e =
+  case e of
+    ELit { value = v } -> if synScalarLit v then 0 else 2
+    EVar { name = n } -> 0
+    ECall { args = as } -> lawEvalSafeList as
+    ELambda { body = bd } -> lawEvalSafe bd
+    EMatch { scrutinee = sc } -> 1
+    EConstruct { args = as, fields = fs } -> lawSafeWorse (lawEvalSafeList as) (lawEvalSafeFields fs)
+    ERecord { fields = fs } -> lawEvalSafeFields fs
+    other -> 2
+
+@label "synthesize: law safety (list)"
+@description "decide-substrate Phase 8λ.6 — the worst law-safety code across a list of expression children. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+lawEvalSafeList : (es: List (Expr Any)) -> Number
+lawEvalSafeList es =
+  case head es of
+    Nothing -> 0
+    Just e -> lawSafeWorse (lawEvalSafe e) (lawEvalSafeList (eufRest es))
+
+@label "synthesize: law safety (fields)"
+@description "decide-substrate Phase 8λ.6 — the worst law-safety code across a named-field list. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+lawEvalSafeFields : (fs: List ({ name: String, value: (Expr Any) })) -> Number
+lawEvalSafeFields fs =
+  case head fs of
+    Nothing -> 0
+    Just f -> lawSafeWorse (lawEvalSafe f.value) (lawEvalSafeFields (eufRest fs))
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Duplicate identity (pin 14). The recursive structural comparison IS Fenel's
+-- own structural `eq` over the Expr ADT; the one refinement the pin demands is
+-- that an expression carrying a NON-SCALAR literal is conservatively distinct
+-- from everything, so it can never be suppressed by an equal-looking sibling.
+-- The lowest-`R` occurrence is retained because the list is already `R`-ordered.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: opaque literal inside"
+@description "decide-substrate Phase 8λ.6 — does this expression carry a NON-SCALAR literal anywhere? Such an expression is conservatively distinct from every other for duplicate suppression (pin 14), because its literal payload cannot be compared structurally without inspecting host data. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synOpaque : (e: (Expr Any)) -> Boolean
+synOpaque e =
+  case e of
+    ELit { value = v } -> not (synScalarLit v)
+    EVar { name = n } -> false
+    ECall { args = as } -> synOpaqueList as
+    ELambda { body = bd } -> synOpaque bd
+    EMatch { arms = ar } -> synOpaqueArms ar
+    EConstruct { args = as, fields = fs } -> or (synOpaqueList as) (synOpaqueFields fs)
+    ERecord { fields = fs } -> synOpaqueFields fs
+    other -> true
+
+@label "synthesize: opaque literal inside (list)"
+@description "decide-substrate Phase 8λ.6 — any non-scalar literal across a list of expression children. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synOpaqueList : (es: List (Expr Any)) -> Boolean
+synOpaqueList es =
+  case head es of
+    Nothing -> false
+    Just e -> if synOpaque e then true else synOpaqueList (eufRest es)
+
+@label "synthesize: opaque literal inside (fields)"
+@description "decide-substrate Phase 8λ.6 — any non-scalar literal across a named-field list. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synOpaqueFields : (fs: List ({ name: String, value: (Expr Any) })) -> Boolean
+synOpaqueFields fs =
+  case head fs of
+    Nothing -> false
+    Just f -> if synOpaque f.value then true else synOpaqueFields (eufRest fs)
+
+@label "synthesize: opaque literal inside (arms)"
+@description "decide-substrate Phase 8λ.6 — any non-scalar literal across match arm bodies. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synOpaqueArms : (ar: List ({ pattern: (Pattern Any), body: (Expr Any) })) -> Boolean
+synOpaqueArms ar =
+  case head ar of
+    Nothing -> false
+    Just a -> if synOpaque a.body then true else synOpaqueArms (eufRest ar)
+
+@label "synthesize: duplicate syntax"
+@description "decide-substrate Phase 8λ.6 — pin 14 duplicate identity: structurally equal expressions are duplicates UNLESS either carries a non-scalar literal, in which case they are conservatively distinct. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synDupEq : (a: (Expr Any)) -> (b: (Expr Any)) -> Boolean
+synDupEq a b =
+  if synOpaque a then false
+  else if synOpaque b then false
+  else eq a b
+
+@label "synthesize: seen duplicate"
+@description "decide-substrate Phase 8λ.6 — is this expression a duplicate of one already retained? Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synDupSeen : (e: (Expr Any)) -> (seen: List (Expr Any)) -> Boolean
+synDupSeen e seen =
+  case head seen of
+    Nothing -> false
+    Just s -> if synDupEq e s then true else synDupSeen e (eufRest seen)
+
+@label "synthesize: remove duplicates"
+@description "decide-substrate Phase 8λ.6 — drop duplicate syntax among the realized survivors, retaining the LOWEST-`R` occurrence (the input list is already in `R` order). A later equal candidate has already consumed its own admission slot; suppression only stops it reaching the consumer twice. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synDedup : (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> (seen: List (Expr Any)) -> List ({ tk: SynTicket, ex: (Expr Any) })
+synDedup ps seen =
+  case head ps of
+    Nothing -> []
+    Just p ->
+      if synDupSeen p.ex seen then synDedup (eufRest ps) seen
+      else concat (appendItem p []) (synDedup (eufRest ps) (appendItem p.ex seen))
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The root exception scope (pin 15), computed ONCE per public entry. Only the
+-- root forced-Intro spine hosts the free Vacuous and the free reserve; no
+-- recursive subgoal or product coordinate mints a free candidate, and a
+-- Point or Vacuous below any paid node stays paid.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: free vacuous candidate"
+@description "decide-substrate Phase 8λ.6 — the uncharged root-spine `Intro*;Vacuous` candidate: follow the forced arrow returns to the FIRST decidably-empty parameter product and emit the nested false-bodied lambda. Offered FIRST, at every fuel and budget — treating vacuity as a top-level-only shortcut is what would lose the shipped nested witness. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFreeVac : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synFreeVac env goal =
+  if not (eq (seTag goal) "SeArrow") then Nothing
+  else if not (fieldSemanticSlotsValid goal.params) then Nothing
+  else synFreeVacGo env goal
+
+@label "synthesize: free vacuous candidate (spine)"
+@description "decide-substrate Phase 8λ.6 — one step of the forced arrow-return spine for the free Vacuous candidate. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFreeVacGo : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synFreeVacGo env goal =
+  let bound = synIntroBind goal.params env
+  if arrowSomeParamEmpty goal.params then Just (ELambda { params = bound.names, body = ELit { value = false } })
+  else synRealIntroGo bound.names (synFreeVac bound.env goal.returns)
+
+@label "synthesize: free reserve candidate"
+@description "decide-substrate Phase 8λ.6 — the ONE uncharged bare reserve `Intro*;Point(groundReturn)`, offered AFTER the paid window: follow the forced arrow returns to the first non-arrow return and embed its canonical point as syntax, never as an embedded closure. It has required fuel zero, so a law that only the constant satisfies is reachable at every fuel. Absent when the ground point is missing or not embeddable. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFreeRes : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synFreeRes env goal =
+  if not (eq (seTag goal) "SeArrow") then synRealPoint goal
+  else if not (fieldSemanticSlotsValid goal.params) then Nothing
+  else if arrowSomeParamEmpty goal.params then Nothing
+  else synFreeResGo env goal
+
+@label "synthesize: free reserve candidate (spine)"
+@description "decide-substrate Phase 8λ.6 — one step of the forced arrow-return spine for the free reserve. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "inhabit" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFreeResGo : (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synFreeResGo env goal =
+  let bound = synIntroBind goal.params env
+  synRealIntroGo bound.names (synFreeRes bound.env goal.returns)
+
+@label "synthesize: root-spine ticket"
+@description "decide-substrate Phase 8λ.6 — is this ticket one of the two canonical root-spine derivations (`Intro*;Vacuous` or `Intro*;Point`)? Those are REMOVED from the paid domain before ranks are assigned, so they never consume a slot and never compete inside `P`. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synIsSpine : (t: SynTicket) -> Boolean
+synIsSpine t =
+  if eq t.rule 0 then synIsSpineKid t.kids
+  else or (eq t.rule 5) (eq t.rule 6)
+
+@label "synthesize: root-spine ticket (descend)"
+@description "decide-substrate Phase 8λ.6 — descend the forced Intro spine of a candidate root-spine ticket. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synIsSpineKid : (ks: List SynTicket) -> Boolean
+synIsSpineKid ks =
+  case head ks of
+    Nothing -> false
+    Just k -> synIsSpine k
+
+@label "synthesize: paid tickets only"
+@description "decide-substrate Phase 8λ.6 — remove the two count-free root-spine exceptions from a generated list, leaving exactly the PAID domain. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synNotSpine : (ts: List SynTicket) -> List SynTicket
+synNotSpine ts =
+  case head ts of
+    Nothing -> []
+    Just t ->
+      let rest = synNotSpine (eufRest ts)
+      if synIsSpine t then rest else concat (appendItem t []) rest
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The fuel × admission-COUNT budget. The public width parameter counts complete
+-- chargeable SHAPES, not successful expressions: FuelOut, an unavailable Point,
+-- a build miss, duplicate syntax, a failed self-check and a law rejection all
+-- consume the same stable slot and none of them refills it. Counting only
+-- realized expressions is exactly the bug that turns Found into Unknown as fuel
+-- grows.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: finite number"
+@description "decide-substrate Phase 8λ.6 — is this Number finite? `x - x` is 0 for every finite value and NaN for NaN and for either infinity, so one subtraction separates the three non-finite cases from the rest without a host predicate. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synFiniteNum : (b: Number) -> Boolean
+synFiniteNum b = eq (sub b b) 0
+
+@label "synthesize: normalize admission budget"
+@description "decide-substrate Phase 8λ.6 — pin 9's normalization, IN ORDER: NaN and either infinity become 0 FIRST, and only then a finite value becomes `min(64, floor(max(0, b)))`. Composing the formula naively would send +Infinity to the cap instead of to zero. `admissionCap = 64` is the operational fence and changes only by a Step-D reopen; the default 8 and every gate sweep sit far below it. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "budget" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synBudgetNorm : (b: Number) -> Number
+synBudgetNorm b =
+  if not (synFiniteNum b) then 0 else min 64 (floor (max 0 b))
+
+@label "synthesize: budget was clamped"
+@description "decide-substrate Phase 8λ.6 — did the operational cap fire on this invocation? Recorded in the trace so a clamped run is never mistaken for the requested width. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "budget" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synBudgetClamped : (b: Number) -> Boolean
+synBudgetClamped b =
+  if not (synFiniteNum b) then false else gt (floor (max 0 b)) 64
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Admission. Grow the node cap until the window holds `b+1` paid tickets (a
+-- PROVEN successor — Cut) or the generator proves it has no more (Exhausted).
+-- A short window with pruning still outstanding at the ceiling can prove
+-- NEITHER, so it reports `refused` rather than fabricating a cursor state. It
+-- KEEPS the tickets it generated: `R` is node-count-primary, so everything
+-- generated below the ceiling IS a genuine prefix of `A_b`, and discarding it
+-- would let the count-free Point reserve pre-empt an already-generated
+-- base-free ticket — precisely the demotion this phase exists to kill, and a
+-- direct contradiction of the growing-resource clause. Fail-closed here means
+-- "never claim cut or exhausted", not "throw away a correct prefix".
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: admit tickets"
+@description "decide-substrate Phase 8λ.6 — the admitted window `A_b`: the first `b+1` paid tickets in `R` order, with the cursor state from pin 10's structural, non-realizing, uncharged successor peek. Independent of fuel, Point availability, self-check and consumer. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synAdmit : (b: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, cursor: String }
+synAdmit b env goal = synAdmitGo 2 b env goal
+
+@label "synthesize: admit tickets (grow the node cap)"
+@description "decide-substrate Phase 8λ.6 — one node-cap round: a full window is `cut` (a successor is proven), no outstanding pruning is `exhausted` (the generator end is proven), and neither at the ceiling is `refused`. The cap grows rather than being guessed, so admission never depends on a hidden third budget. It asks the generator for ONE MORE than the window it needs: the generator truncates before the two count-free root-spine exceptions are removed, so asking for exactly the window would leave at most `b` paid tickets and the successor peek could never be satisfied — every case-bearing goal would climb to the ceiling and refuse. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synAdmitGo : (cap: Number) -> (b: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> { list: List SynTicket, cursor: String }
+synAdmitGo cap b env goal =
+  let g = synGen cap (add b 1) env goal
+  let paid = synTake (add b 1) (synNotSpine g.list)
+  if gte (length paid) (add b 1) then { list = paid, cursor = "cut" }
+  else if not g.more then { list = paid, cursor = "exhausted" }
+  else if gte cap 16 then { list = paid, cursor = "refused" }
+  else synAdmitGo (add cap 1) b env goal
+
+@label "synthesize: realize the admitted batch"
+@description "decide-substrate Phase 8λ.6 — realize the admitted tickets in `R` order, keeping the ticket alongside its expression so preference can sort them afterwards. A ticket that fails to realize has consumed its slot and simply does not reach the consumer. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealize : (fuel: Number) -> (ts: List SynTicket) -> List ({ tk: SynTicket, ex: (Expr Any) })
+synRealize fuel ts =
+  case head ts of
+    Nothing -> []
+    Just t -> synRealizeGo fuel t (synReal fuel t) ts
+
+@label "synthesize: realize the admitted batch (step)"
+@description "decide-substrate Phase 8λ.6 — keep one realized pair, or skip a charged miss, then continue in `R` order. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synRealizeGo : (fuel: Number) -> (t: SynTicket) -> (m: Maybe (Expr Any)) -> (ts: List SynTicket) -> List ({ tk: SynTicket, ex: (Expr Any) })
+synRealizeGo fuel t m ts =
+  case m of
+    Nothing -> synRealize fuel (eufRest ts)
+    Just e -> concat (appendItem { tk = t, ex = e } []) (synRealize fuel (eufRest ts))
+
+@label "synthesize: one optional candidate"
+@description "decide-substrate Phase 8λ.6 — project an optional free candidate into a list so the three tiers concatenate uniformly. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synMaybeOne : (m: Maybe (Expr Any)) -> List (Expr Any)
+synMaybeOne m =
+  case m of
+    Nothing -> []
+    Just e -> appendItem e []
+
+@label "synthesize: ordered candidates"
+@description "decide-substrate Phase 8λ.6 — the complete ordered candidate list a consumer sees: the uncharged root-spine Vacuous FIRST, then the realized, de-duplicated, `P`-sorted paid batch, then the ONE uncharged bare reserve. At most `b` paid expressions plus the reserve reach a consumer. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synCands : (fuel: Number) -> (b: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> List (Expr Any)
+synCands fuel b env goal =
+  let paid = synPaid fuel b env goal
+  let pre = concat (synMaybeOne (synFreeVac env goal)) paid
+  concat pre (synMaybeOne (synFreeRes env goal))
+
+@label "synthesize: the paid batch"
+@description "decide-substrate Phase 8λ.6 — admit, realize in `R` order, remove duplicate syntax, then stable-sort by `P`. This is where the two orders meet and nowhere else: admission decided WHICH tickets, preference decides IN WHAT ORDER the survivors are offered. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synPaid : (fuel: Number) -> (b: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> List (Expr Any)
+synPaid fuel b env goal =
+  let ad = synAdmit b env goal
+  let real = synRealize fuel (synTake b ad.list)
+  map (\p -> p.ex) (synSortP (synDedup real []))
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Consumers. Self-check is an ACCEPTING CONSUMER, not a terminal verdict: a
+-- `checkExpr` miss is Reject-and-continue, so a failed first candidate no
+-- longer strands a later certifiable one. Only an acceptance stops traversal.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: ordinary consumer"
+@description "decide-substrate Phase 8λ.6 — take the FIRST candidate whose self-re-check decides `Just true`. `Nothing` and `Just false` are Reject-and-continue (each having already consumed its admission slot), never a terminal Unknown. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "check" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synConsumeChk : (cs: List (Expr Any)) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synConsumeChk cs env goal =
+  case head cs of
+    Nothing -> Nothing
+    Just e ->
+      case checkExpr e env goal of
+        Just true -> Just e
+        _ -> synConsumeChk (eufRest cs) env goal
+
+@label "synthesize: law consumer"
+@description "decide-substrate Phase 8λ.6 — the combined law pipeline in `P` order: self-check, then Option A's Expr-level safety screen, then conversion, then the predicate. Every non-accepting stage continues. On exhaustion the reason is TOTAL (pin 21): `law-match-unsupported` iff at least one self-check-accepted candidate was excluded by the match rule AND every law-ineligibility among them was that class AND no law invocation returned false — an EMatch-only profile reports it even when the search then exhausts or cuts. Anything mixed uses the general reason. Never `TvEmpty`. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synConsumeLaw : (cs: List (Expr Any)) -> (goal: SetExpr) -> (lawPred: Any) -> (m: Number) -> (o: Number) -> TermVerdict Any
+synConsumeLaw cs goal lawPred m o =
+  case head cs of
+    Nothing -> if and (gt m 0) (eq o 0) then TvUnknown "law-match-unsupported" else TvUnknown "law-rejected"
+    Just e -> synConsumeLawChk e cs goal lawPred m o
+
+@label "synthesize: law consumer (self-check stage)"
+@description "decide-substrate Phase 8λ.6 — a candidate that fails its own re-check is skipped WITHOUT entering the law-ineligibility profile: realization and check failures are not law exclusions. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synConsumeLawChk : (e: (Expr Any)) -> (cs: List (Expr Any)) -> (goal: SetExpr) -> (lawPred: Any) -> (m: Number) -> (o: Number) -> TermVerdict Any
+synConsumeLawChk e cs goal lawPred m o =
+  case checkExpr e [] goal of
+    Just true -> synConsumeLawSafe e cs goal lawPred m o
+    _ -> synConsumeLaw (eufRest cs) goal lawPred m o
+
+@label "synthesize: law consumer (safety stage)"
+@description "decide-substrate Phase 8λ.6 — Option A's screen runs BEFORE conversion and before any predicate call: a match-excluded candidate consumes its slot and continues with the match profile marked, any other unsafe candidate marks the general profile, and only a safe candidate is converted. A law-invocation spy therefore stays at zero for every excluded eliminator. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synConsumeLawSafe : (e: (Expr Any)) -> (cs: List (Expr Any)) -> (goal: SetExpr) -> (lawPred: Any) -> (m: Number) -> (o: Number) -> TermVerdict Any
+synConsumeLawSafe e cs goal lawPred m o =
+  let sf = lawEvalSafe e
+  if eq sf 1 then synConsumeLaw (eufRest cs) goal lawPred (add m 1) o
+  else if eq sf 2 then synConsumeLaw (eufRest cs) goal lawPred m (add o 1)
+  else synConsumeLawPred e cs goal lawPred m o
+
+@label "synthesize: law consumer (predicate stage)"
+@description "decide-substrate Phase 8λ.6 — convert the safe candidate and evaluate the law; a falsey result is Reject-and-continue and marks the general profile. The first full acceptance returns TvFound. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synConsumeLawPred : (e: (Expr Any)) -> (cs: List (Expr Any)) -> (goal: SetExpr) -> (lawPred: Any) -> (m: Number) -> (o: Number) -> TermVerdict Any
+synConsumeLawPred e cs goal lawPred m o =
+  let w = termWitnessValue e
+  if lawPred w then TvFound w
+  else synConsumeLaw (eufRest cs) goal lawPred m (add o 1)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The public faces. `Fix` stays OUTSIDE `R`, `P`, the budget and law
+-- preference: the ordinary arrow face keeps its legacy tail after the root
+-- Vacuous, the admitted batch and the reserve all fail to self-certify, at
+-- every budget and for either cursor state, and the law face is never offered
+-- it. `synthesizeFixArrow` and the whole legacy first-success cascade remain
+-- byte-stable as its private internals.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: ordered arrow search"
+@description "decide-substrate Phase 8λ.6 — the ordinary arrow face: offer the ordered candidates to the self-check consumer and return the first acceptance as a witness value; if none self-certifies, hand off to the UNCHANGED legacy fixed-point tail. Fixed-point preference is out of scope, so the tail is preserved rather than ranked. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "arrow" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synEngineArrow : (fuel: Number) -> (b: Number) -> (s: SetExpr) -> TermVerdict Any
+synEngineArrow fuel b s =
+  case synConsumeChk (synCands fuel (synBudgetNorm b) [] s) [] s of
+    Just e -> TvFound (termWitnessValue e)
+    Nothing -> synFixGo fuel s
+
+@label "synthesize: ground law face"
+@description "decide-substrate Phase 8λ.6 — the non-arrow law path: apply §6.2's scalar test to the ground witness VALUE, then the predicate, over `inhabit`'s sole candidate. A non-scalar ground witness is law-ineligible rather than inspected. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGroundLaw : (goal: SetExpr) -> (lawPred: Any) -> TermVerdict Any
+synGroundLaw goal lawPred =
+  case inhabit goal of
+    Just w -> synGroundLawGo w lawPred
+    Nothing -> TvUnknown "no-ground-witness"
+
+@label "synthesize: ground law face (test)"
+@description "decide-substrate Phase 8λ.6 — the scalar screen and the predicate for a ground witness. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synGroundLawGo : (w: Any) -> (lawPred: Any) -> TermVerdict Any
+synGroundLawGo w lawPred =
+  if not (synScalarLit w) then TvUnknown "law-rejected"
+  else if lawPred w then TvFound w
+  else TvUnknown "law-rejected"
+
+@label "synthesize: legacy non-arrow route"
+@description "decide-substrate Phase 8λ.6 — pin 20: `synthesizeArrow` does NOT refuse a non-arrow goal today, it runs the legacy first-success route and may return a ground witness. That behaviour is preserved BYTE-FOR-BYTE here, under its own name, so nothing keeps dispatching first-success behaviour under the retired `synArrowGo`. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synLegacyNonArrow : (fuel: Number) -> (s: SetExpr) -> TermVerdict Any
+synLegacyNonArrow fuel s =
+  case synTerm fuel [] s of
+    Just e ->
+      case checkExpr e [] s of
+        Just true -> TvFound (termWitnessValue e)
+        _ -> TvUnknown "self-recheck-failed"
+    Nothing -> synFixGo fuel s
+
+@label "synthesize: term search (budgeted)"
+@description "decide-substrate Phase 8λ.6 — the engine's Γ-carrying internal entry: an INDEPENDENT root invocation that builds tickets under the given environment, applies the ordinary self-check consumer, and returns the first `P`-ordered accepted candidate's expression, with NO value conversion and NO fixed-point tail. It owns one root exception scope. There is deliberately no wrapper equation from the legacy `synTerm` to it: `synTerm` stays byte-stable as the fixed-point face's private cascade."
+@tags "engine" "solve" "synthesize" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTermBudget : (fuel: Number) -> (admissionBudget: Number) -> (env: List ({ name: String, semanticKey: Maybe FieldKey, wirePath: String, set: SetExpr })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synTermBudget fuel admissionBudget env goal =
+  synConsumeChk (synCands fuel (synBudgetNorm admissionBudget) env goal) env goal
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The TRACE face (pin 24). Fenel-owned: the harness only invokes and
+-- serializes it. Charges appear in the order incurred and PHASE-TAGGED —
+-- realization-phase charges (FuelOut / PointOut / build / duplicate) in `R`
+-- order, then consumer-phase charges (check) in `P` visit order — which is what
+-- makes the default-8 stop condition checkable: a mandatory PAID winner whose
+-- one-based `R` slot exceeds 8 reopens Step D and never silently raises the
+-- default. The count-free Vacuous and reserve have no slot and are exempt.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: trace (present)"
+@description "decide-substrate Phase 8λ.6 — is a count-free candidate present? Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceHas : (m: Maybe (Expr Any)) -> Boolean
+synTraceHas m =
+  case m of
+    Nothing -> false
+    Just e -> true
+
+@label "synthesize: trace (slot of a ticket)"
+@description "decide-substrate Phase 8λ.6 — the ONE-BASED admission slot of a ticket within the admitted window, found by its unique `R` rank. Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceSlot : (t: SynTicket) -> (ts: List SynTicket) -> (i: Number) -> Number
+synTraceSlot t ts i =
+  case head ts of
+    Nothing -> 0
+    Just x -> if eq (synCmpR t x) 0 then i else synTraceSlot t (eufRest ts) (add i 1)
+
+@label "synthesize: trace (retained)"
+@description "decide-substrate Phase 8λ.6 — did this ticket survive duplicate suppression? Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceKept : (t: SynTicket) -> (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> Boolean
+synTraceKept t ps =
+  case head ps of
+    Nothing -> false
+    Just p -> if eq (synCmpR t p.tk) 0 then true else synTraceKept t (eufRest ps)
+
+@label "synthesize: trace (realization phase)"
+@description "decide-substrate Phase 8λ.6 — one row per admitted paid ticket in `R` order: its one-based slot, its complete `P` key, its node count and structural address, and the realization-phase outcome (`fuel-out`, `point-or-build`, `duplicate` or `realized`). Every non-accepting outcome charged that slot. Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceReal : (fuel: Number) -> (ts: List SynTicket) -> (kept: List ({ tk: SynTicket, ex: (Expr Any) })) -> (i: Number) -> List ({ slot: Number, rule: Number, nodes: Number, req: Number, pt: Boolean, prule: Number, sord: Number, addr: List Number, outcome: String })
+synTraceReal fuel ts kept i =
+  case head ts of
+    Nothing -> []
+    Just t -> concat (appendItem (synTraceRow fuel t kept i) []) (synTraceReal fuel (eufRest ts) kept (add i 1))
+
+@label "synthesize: trace (one realization row)"
+@description "decide-substrate Phase 8λ.6 — classify one admitted ticket's realization outcome without re-deciding anything: a static requirement above the fuel is `fuel-out`, a missing realization is `point-or-build`, a realized ticket absent from the survivors is `duplicate`. Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceRow : (fuel: Number) -> (t: SynTicket) -> (kept: List ({ tk: SynTicket, ex: (Expr Any) })) -> (i: Number) -> { slot: Number, rule: Number, nodes: Number, req: Number, pt: Boolean, prule: Number, sord: Number, addr: List Number, outcome: String }
+synTraceRow fuel t kept i =
+  let oc = synTraceOutcome fuel t kept
+  { slot = i, rule = t.rule, nodes = t.nodes, req = t.req, pt = t.pt, prule = t.prule, sord = t.sord, addr = t.addr, outcome = oc }
+
+@label "synthesize: trace (realization outcome)"
+@description "decide-substrate Phase 8λ.6 — the realization-phase outcome string for one ticket. Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceOutcome : (fuel: Number) -> (t: SynTicket) -> (kept: List ({ tk: SynTicket, ex: (Expr Any) })) -> String
+synTraceOutcome fuel t kept =
+  if gt t.req fuel then "fuel-out"
+  else if synTraceKept t kept then "realized"
+  else synTraceOutcome2 t
+
+@label "synthesize: trace (realization outcome, miss)"
+@description "decide-substrate Phase 8λ.6 — distinguish a ticket that could not build from one suppressed as duplicate syntax. Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceOutcome2 : (t: SynTicket) -> String
+synTraceOutcome2 t =
+  case synRealGo t of
+    Nothing -> "point-or-build"
+    Just e -> "duplicate"
+
+@label "synthesize: trace (consumer phase)"
+@description "decide-substrate Phase 8λ.6 — one row per surviving candidate in `P` VISIT order, carrying its admission slot, its `P` key and the consumer outcome (`accepted` or `check-rejected`). Rows after the first acceptance are `not-reached`, because only an acceptance stops traversal. Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceCons : (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> (ts: List SynTicket) -> (goal: SetExpr) -> (done: Boolean) -> List ({ slot: Number, pt: Boolean, prule: Number, sord: Number, nodes: Number, outcome: String })
+synTraceCons ps ts goal done =
+  case head ps of
+    Nothing -> []
+    Just p -> synTraceConsGo p ps ts goal done
+
+@label "synthesize: trace (one consumer row)"
+@description "decide-substrate Phase 8λ.6 — evaluate one candidate's self-check outcome in `P` order and continue. Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceConsGo : (p: { tk: SynTicket, ex: (Expr Any) }) -> (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> (ts: List SynTicket) -> (goal: SetExpr) -> (done: Boolean) -> List ({ slot: Number, pt: Boolean, prule: Number, sord: Number, nodes: Number, outcome: String })
+synTraceConsGo p ps ts goal done =
+  let oc = synTraceConsOutcome p goal done
+  let row = { slot = synTraceSlot p.tk ts 1, pt = p.tk.pt, prule = p.tk.prule, sord = p.tk.sord, nodes = p.tk.nodes, outcome = oc }
+  concat (appendItem row []) (synTraceCons (eufRest ps) ts goal (or done (eq oc "accepted")))
+
+@label "synthesize: trace (consumer outcome)"
+@description "decide-substrate Phase 8λ.6 — the consumer-phase outcome for one candidate: everything after the first acceptance is `not-reached`. Internal helper to the trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceConsOutcome : (p: { tk: SynTicket, ex: (Expr Any) }) -> (goal: SetExpr) -> (done: Boolean) -> String
+synTraceConsOutcome p goal done =
+  if done then "not-reached"
+  else
+    case checkExpr p.ex [] goal of
+      Just true -> "accepted"
+      _ -> "check-rejected"
+
+@label "Synthesize trace"
+@description "decide-substrate Phase 8λ.6 — the Fenel-owned route/trace artifact required before the behaviour landing: the raw and normalized admission budget with its clamping flag, the cursor state from the structural successor peek, whether each count-free root-spine candidate is present AND whether it satisfies the consumer. `freeVacuousAccepted` genuinely means the FIRST, uncharged exception ENDED traversal, because it is offered before everything else; `freeReserveWouldAccept` is deliberately named as a CONDITIONAL — the bare reserve is offered LAST, so it answers only when nothing before it did, and reading it as “the reserve answered” would report two winners on any goal whose paid batch already succeeded. `winner` is the candidate this recording walk itself selected, published so a consumer can pin it against the live face byte-for-byte instead of inferring agreement from both sides merely finding something, the generated count `admitted` — which CAN exceed `windowed` by the one non-admitted successor peek on a Cut, so `windowed` is the ranked-and-charged window and `admitted` is not, and the two phase-tagged charge lists — realization-phase (`R` order) then consumer-phase (`P` visit order) — each row carrying its one-based admission slot and complete `P` key. Harness TypeScript only invokes and serializes this; it owns no search semantics. The stop condition it exists to check: a mandatory PAID winner outside slots 1..8 reopens Step D rather than raising the default."
+@tags "engine" "solve" "synthesize" "trace" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceArrow : (fuel: Number) -> (b: Number) -> (s: SetExpr) -> { budgetRaw: Number, budget: Number, clamped: Boolean, cursor: String, freeVacuous: Boolean, freeVacuousAccepted: Boolean, freeReserve: Boolean, freeReserveWouldAccept: Boolean, admitted: Number, windowed: Number, winner: Maybe (Expr Any), realizePhase: List ({ slot: Number, rule: Number, nodes: Number, req: Number, pt: Boolean, prule: Number, sord: Number, addr: List Number, outcome: String }), consumerPhase: List ({ slot: Number, pt: Boolean, prule: Number, sord: Number, nodes: Number, outcome: String }) }
+synTraceArrow fuel b s =
+  let bn = synBudgetNorm b
+  let ad = synAdmit bn [] s
+  let ts = synTake bn ad.list
+  let ded = synDedup (synRealize fuel ts) []
+  let fv = synFreeVac [] s
+  let fvOk = synTraceFreeChk fv s
+  let fr = synFreeRes [] s
+  let ps = synSortP ded
+  { budgetRaw = b, budget = bn, clamped = synBudgetClamped b, cursor = ad.cursor, freeVacuous = synTraceHas fv, freeVacuousAccepted = fvOk, freeReserve = synTraceHas fr, freeReserveWouldAccept = synTraceFreeChk fr s, admitted = length ad.list, windowed = length ts, winner = synTraceWin fvOk fv fr ps s, realizePhase = synTraceReal fuel ts ded 1, consumerPhase = synTraceCons ps ts s fvOk }
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The LAW-MODE trace (pin 24's second consumer). `synTraceArrow` records the
+-- ORDINARY consumer; running a law row through it recorded the ordinary winner
+-- and the ordinary rejections, which is not where that row's verdict came from
+-- (round-1 finding 6 — the harness refused law rows rather than lying about
+-- them). This is the same generator, the same admission, the same window and
+-- the same `P` order: only the RECORDING consumer differs, staging each
+-- candidate through self-check, then Option A's screen, then the predicate,
+-- exactly as `synConsumeLaw` does. It is never a second search path.
+--
+-- Both faces also record the count-free root-spine Vacuous honestly. It is
+-- offered FIRST and is UNCHARGED (no admission slot), so when it accepts, every
+-- paid row is `not-reached` — `freeVacuousAccepted` carries that fact and seeds
+-- the paid walk, instead of the paid walk independently reporting a winner the
+-- engine never reached.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "synthesize: trace (count-free vacuous, ordinary)"
+@description "decide-substrate Phase 8λ.6 — does the UNCHARGED root-spine Vacuous candidate satisfy the ORDINARY consumer? It is offered before the paid batch, so an acceptance here means every paid candidate is `not-reached`. Internal helper to the trace faces."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceFreeChk : (m: Maybe (Expr Any)) -> (goal: SetExpr) -> Boolean
+synTraceFreeChk m goal =
+  case m of
+    Nothing -> false
+    Just e ->
+      case checkExpr e [] goal of
+        Just true -> true
+        _ -> false
+
+@label "synthesize: trace (count-free vacuous, law)"
+@description "decide-substrate Phase 8λ.6 — the same question for the LAW consumer: the uncharged root-spine Vacuous is staged through self-check, Option A's screen and the predicate before any paid candidate. Internal helper to the trace faces."
+@tags "engine" "internal" "solve" "synthesize" "trace" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceLawFree : (m: Maybe (Expr Any)) -> (goal: SetExpr) -> (lawPred: Any) -> Boolean
+synTraceLawFree m goal lawPred =
+  case m of
+    Nothing -> false
+    Just e -> eq (synTraceLawOut e goal lawPred false) "accepted"
+
+@label "synthesize: trace (law consumer outcome)"
+@description "decide-substrate Phase 8λ.6 — one candidate's LAW-consumer outcome, in the pinned stage order: everything after the first acceptance is `not-reached`; a failed self-check is `check-rejected` and never enters the law-ineligibility profile; only a self-checked candidate reaches Option A's screen. Internal helper to the law trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceLawOut : (e: (Expr Any)) -> (goal: SetExpr) -> (lawPred: Any) -> (done: Boolean) -> String
+synTraceLawOut e goal lawPred done =
+  if done then "not-reached"
+  else
+    case checkExpr e [] goal of
+      Just true -> synTraceLawStage e lawPred
+      _ -> "check-rejected"
+
+@label "synthesize: trace (law screen and predicate)"
+@description "decide-substrate Phase 8λ.6 — Option A's screen runs BEFORE conversion and before any predicate call, so an excluded candidate is recorded as `law-match-excluded` or `law-unsafe-excluded` and the predicate is never invoked for it (which is exactly what a law-invocation spy pins). A converted candidate is `accepted` or `law-rejected`. Internal helper to the law trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceLawStage : (e: (Expr Any)) -> (lawPred: Any) -> String
+synTraceLawStage e lawPred =
+  let sf = lawEvalSafe e
+  if eq sf 1 then "law-match-excluded"
+  else if eq sf 2 then "law-unsafe-excluded"
+  else if lawPred (termWitnessValue e) then "accepted"
+  else "law-rejected"
+
+@label "synthesize: trace (law consumer phase)"
+@description "decide-substrate Phase 8λ.6 — one row per surviving candidate in `P` VISIT order under the law consumer, carrying its one-based admission slot, its `P` key and the staged outcome. Internal helper to the law trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceLawCons : (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> (ts: List SynTicket) -> (goal: SetExpr) -> (lawPred: Any) -> (done: Boolean) -> List ({ slot: Number, pt: Boolean, prule: Number, sord: Number, nodes: Number, outcome: String })
+synTraceLawCons ps ts goal lawPred done =
+  case head ps of
+    Nothing -> []
+    Just p -> synTraceLawGo p ps ts goal lawPred done
+
+@label "synthesize: trace (one law consumer row)"
+@description "decide-substrate Phase 8λ.6 — evaluate one candidate's law-consumer outcome in `P` order and continue; only an acceptance stops traversal. Internal helper to the law trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceLawGo : (p: { tk: SynTicket, ex: (Expr Any) }) -> (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> (ts: List SynTicket) -> (goal: SetExpr) -> (lawPred: Any) -> (done: Boolean) -> List ({ slot: Number, pt: Boolean, prule: Number, sord: Number, nodes: Number, outcome: String })
+synTraceLawGo p ps ts goal lawPred done =
+  let oc = synTraceLawOut p.ex goal lawPred done
+  let row = { slot = synTraceSlot p.tk ts 1, pt = p.tk.pt, prule = p.tk.prule, sord = p.tk.sord, nodes = p.tk.nodes, outcome = oc }
+  concat (appendItem row []) (synTraceLawCons (eufRest ps) ts goal lawPred (or done (eq oc "accepted")))
+
+@label "Synthesize law trace"
+@description "decide-substrate Phase 8λ.6 — the LAW-mode route/trace artifact: identical generator, admission window, `R` realization phase and `P` order as the ordinary trace — including `windowed` (the ranked window) versus `admitted` (which can carry the non-admitted successor peek) and both count-free acceptance flags — with the law consumer's staged outcomes (`check-rejected`, `law-match-excluded`, `law-unsafe-excluded`, `law-rejected`, `accepted`, `not-reached`) in `P` visit order. It is a RECORDING CONSUMER over the one engine, never a second search path: the harness only invokes and serializes it. Same stop condition — a mandatory PAID winner outside one-based `R` slots 1..8 reopens Step D rather than raising the default; the count-free Vacuous and the bare reserve have no slot and are exempt."
+@tags "engine" "solve" "synthesize" "trace" "law" "ticket" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceLawArrow : (fuel: Number) -> (b: Number) -> (s: SetExpr) -> (lawPred: Any) -> { budgetRaw: Number, budget: Number, clamped: Boolean, cursor: String, freeVacuous: Boolean, freeVacuousAccepted: Boolean, freeReserve: Boolean, freeReserveWouldAccept: Boolean, admitted: Number, windowed: Number, winner: Maybe Any, realizePhase: List ({ slot: Number, rule: Number, nodes: Number, req: Number, pt: Boolean, prule: Number, sord: Number, addr: List Number, outcome: String }), consumerPhase: List ({ slot: Number, pt: Boolean, prule: Number, sord: Number, nodes: Number, outcome: String }) }
+synTraceLawArrow fuel b s lawPred =
+  let bn = synBudgetNorm b
+  let ad = synAdmit bn [] s
+  let ts = synTake bn ad.list
+  let ded = synDedup (synRealize fuel ts) []
+  let fv = synFreeVac [] s
+  let fvOk = synTraceLawFree fv s lawPred
+  let fr = synFreeRes [] s
+  let ps = synSortP ded
+  { budgetRaw = b, budget = bn, clamped = synBudgetClamped b, cursor = ad.cursor, freeVacuous = synTraceHas fv, freeVacuousAccepted = fvOk, freeReserve = synTraceHas fr, freeReserveWouldAccept = synTraceLawFree fr s lawPred, admitted = length ad.list, windowed = length ts, winner = synTraceLawWin fvOk fv fr ps s lawPred, realizePhase = synTraceReal fuel ts ded 1, consumerPhase = synTraceLawCons ps ts s lawPred fvOk }
+
+@label "synthesize: trace (the walk's own winner)"
+@description "decide-substrate Phase 8λ.6 — the candidate THIS RECORDING WALK selected, mirroring the live candidate order exactly: the uncharged root-spine Vacuous first, then the `P`-sorted admitted batch, then the one count-free bare reserve. It is published so the harness can pin the traced winner against the live face BYTE-FOR-BYTE. Deriving it from the trace's own outcome function rather than by calling the live face is the whole point: an agreement check against a value the live face produced would be vacuous, and both sides merely finding something is not agreement. Internal helper to the trace faces."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceWin : (fvOk: Boolean) -> (fv: Maybe (Expr Any)) -> (fr: Maybe (Expr Any)) -> (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synTraceWin fvOk fv fr ps goal =
+  if fvOk then fv
+  else
+    case synTraceWinGo ps goal of
+      Just e -> Just e
+      Nothing -> if synTraceFreeChk fr goal then fr else Nothing
+
+@label "synthesize: trace (winner scan)"
+@description "decide-substrate Phase 8λ.6 — the first `P`-ordered candidate this walk's own outcome function accepts. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "trace" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceWinGo : (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> (goal: SetExpr) -> Maybe (Expr Any)
+synTraceWinGo ps goal =
+  case head ps of
+    Nothing -> Nothing
+    Just p -> if eq (synTraceConsOutcome p goal false) "accepted" then Just p.ex else synTraceWinGo (eufRest ps) goal
+
+@label "synthesize: trace (witness value of a candidate)"
+@description "decide-substrate Phase 8λ.6 — project an optional candidate expression through the SAME Expr-to-runtime-value boundary the law consumer uses, so the law trace's winner is comparable to the public law verdict's payload byte-for-byte. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "trace" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceValOf : (m: Maybe (Expr Any)) -> Maybe Any
+synTraceValOf m =
+  case m of
+    Nothing -> Nothing
+    Just e -> Just (termWitnessValue e)
+
+@label "synthesize: trace (the law walk's own winner)"
+@description "decide-substrate Phase 8λ.6 — the law-consumer twin of `synTraceWin`, returning the converted witness VALUE because that is what the public law face returns and what the byte comparison must be against. Same offer order: the uncharged Vacuous, then the `P`-sorted batch, then the bare reserve. Internal helper to the law trace face."
+@tags "engine" "internal" "solve" "synthesize" "trace" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceLawWin : (fvOk: Boolean) -> (fv: Maybe (Expr Any)) -> (fr: Maybe (Expr Any)) -> (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> (goal: SetExpr) -> (lawPred: Any) -> Maybe Any
+synTraceLawWin fvOk fv fr ps goal lawPred =
+  if fvOk then synTraceValOf fv
+  else
+    case synTraceLawWinGo ps goal lawPred of
+      Just w -> Just w
+      Nothing -> if synTraceLawFree fr goal lawPred then synTraceValOf fr else Nothing
+
+@label "synthesize: trace (law winner scan)"
+@description "decide-substrate Phase 8λ.6 — the first `P`-ordered candidate this law walk's own staged outcome accepts, converted to its witness value. Internal helper."
+@tags "engine" "internal" "solve" "synthesize" "trace" "law" "decide-substrate" "phase-8lambda"
+@category "engine-internal"
+synTraceLawWinGo : (ps: List ({ tk: SynTicket, ex: (Expr Any) })) -> (goal: SetExpr) -> (lawPred: Any) -> Maybe Any
+synTraceLawWinGo ps goal lawPred =
+  case head ps of
+    Nothing -> Nothing
+    Just p -> if eq (synTraceLawOut p.ex goal lawPred false) "accepted" then Just (termWitnessValue p.ex) else synTraceLawWinGo (eufRest ps) goal lawPred

@@ -1,0 +1,159 @@
+module std where
+
+-- One authored document tree. RichDocument avoids the existing Telegram file
+-- type's Document name; its public label remains Document. This first stage
+-- keeps embedded data explicitly typed and editable through FieldRenderer.
+-- document-formats.fenel exports a bounded Markdown/XHTML fragment of this tree.
+-- document-html-import.fenel reads the exported XHTML fragment back into it.
+-- Arbitrary values, persisted references, figures, broader format imports and
+-- richer exports remain extensions of this same document model.
+
+@entity
+@label "Document"
+@description "A typed document with nested sections, paragraphs, code, notes and embedded scalar or list data."
+@tags "document" "content"
+@discriminator "$tag"
+RichDocument = RichDocument blocks: List DocBlock
+
+@entity
+@label "Document block"
+@description "Sections derive their heading level from nesting. Embedded data uses the same universal typed editor as other data."
+DocBlock = DocSection title: List DocInline blocks: List DocBlock
+  | DocParagraph content: List DocInline
+  | DocCode language: Maybe String source: String
+  | DocNote blocks: List DocBlock
+  | DocEmbed data: DocEmbeddedData caption: List DocInline
+
+@entity
+@label "Document inline content"
+DocInline = DocText text: String
+  | DocEmphasis content: List DocInline
+  | DocStrong content: List DocInline
+  | DocInlineCode code: String
+  | DocLink url: String content: List DocInline
+
+@entity
+@label "Embedded document data"
+@description "This authorable first stage accepts text, numbers, booleans and lists of text or numbers. Other data and saved references are not yet supported."
+DocEmbeddedData = DocTextData text: String
+  | DocNumberData number: Number
+  | DocBooleanData enabled: Boolean
+  | DocNumbersData numbers: List Number
+  | DocTextsData texts: List String
+
+-- The read plan is a derived presentation, never a second authored tree.
+-- Fenel owns traversal, markup and heading depth; the host binds the plan to
+-- safe browser nodes and delegates embed presentation to TypedReadValue.
+@entity
+@label "Document read plan"
+DocReadPart = DocReadMarkup markup: Markup
+  | DocReadSection heading: Markup children: List DocReadPart
+  | DocReadNote children: List DocReadPart
+  | DocReadEmbed value: a type: Type caption: Markup
+
+documentInlineMarkup : (inline: DocInline) -> Markup
+documentInlineMarkup inline = case inline of
+  DocText { text = value } -> text value
+  DocEmphasis { content = content } -> element "em" [] (map documentInlineMarkup content)
+  DocStrong { content = content } -> element "strong" [] (map documentInlineMarkup content)
+  DocInlineCode { code = code } -> element "code" [] [text code]
+  DocLink { url = url, content = content } -> element "a" [attr "href" url] (map documentInlineMarkup content)
+
+documentInlineGroup : (tag: String) -> (content: List DocInline) -> Markup
+documentInlineGroup tag content = element tag [] (map documentInlineMarkup content)
+
+documentEmbeddedValue : (data: DocEmbeddedData) -> a
+documentEmbeddedValue data = case data of
+  DocTextData { text = value } -> value
+  DocNumberData { number = value } -> value
+  DocBooleanData { enabled = value } -> value
+  DocNumbersData { numbers = values } -> values
+  DocTextsData { texts = values } -> values
+
+-- typeOf's array carrier currently forgets element types. Retain the declared
+-- element type here through the existing type-level Vec constructor instead
+-- of describing nonempty embedded lists as List Void.
+documentEmbeddedType : (data: DocEmbeddedData) -> Type
+documentEmbeddedType data = case data of
+  DocTextData { text = value } -> typeOf value
+  DocNumberData { number = value } -> typeOf value
+  DocBooleanData { enabled = value } -> typeOf value
+  DocNumbersData { numbers = values } -> vecOfLength (typeOf 0) (length values)
+  DocTextsData { texts = values } -> vecOfLength (typeOf "") (length values)
+
+documentCodeAttributes : (language: Maybe String) -> List ({ key: String, value: String })
+documentCodeAttributes language = case language of
+  Nothing -> []
+  Just name -> [attr "data-language" name]
+
+documentBlockReadPlan : (depth: Nat) -> (block: DocBlock) -> DocReadPart
+documentBlockReadPlan depth block = case block of
+  DocSection { title = title, blocks = blocks } -> DocReadSection { heading = documentInlineGroup (join ["h", toString (min 6 depth)] "") title, children = map (documentBlockReadPlan (depth + 1)) blocks }
+  DocParagraph { content = content } -> DocReadMarkup { markup = documentInlineGroup "p" content }
+  DocCode { language = language, source = source } -> DocReadMarkup { markup = element "pre" [] [element "code" (documentCodeAttributes language) [text source]] }
+  DocNote { blocks = blocks } -> DocReadNote { children = map (documentBlockReadPlan depth) blocks }
+  DocEmbed { data = data, caption = caption } ->
+    let value = documentEmbeddedValue data
+    DocReadEmbed { value = value, type = documentEmbeddedType data, caption = documentInlineGroup "figcaption" caption }
+
+@label "Preview document"
+@description "Derive safe markup and ordinary typed embedded data from the same document tree. Heading depth follows section nesting, capped at HTML heading level six."
+@tags "document" "preview"
+documentReadPlan : (document: RichDocument) -> List DocReadPart
+documentReadPlan document = map (documentBlockReadPlan 1) document.blocks
+
+-- Plain text and the outline are projections of the authored tree. Notes do
+-- not add a heading level, and outline depth retains the actual nesting even
+-- where the browser read plan caps its HTML heading level at six.
+documentInlinePlainText : (inline: DocInline) -> String
+documentInlinePlainText inline = case inline of
+  DocText { text = value } -> value
+  DocEmphasis { content = content } -> documentInlinePlainTextGroup content
+  DocStrong { content = content } -> documentInlinePlainTextGroup content
+  DocInlineCode { code = code } -> code
+  DocLink { url = url, content = content } -> documentInlinePlainTextGroup content
+
+documentInlinePlainTextGroup : (content: List DocInline) -> String
+documentInlinePlainTextGroup content = join (map documentInlinePlainText content) ""
+
+documentEmbeddedPlainText : (data: DocEmbeddedData) -> String
+documentEmbeddedPlainText data = case data of
+  DocTextData { text = value } -> value
+  DocNumberData { number = value } -> toString value
+  DocBooleanData { enabled = value } -> toString value
+  DocNumbersData { numbers = values } -> join (map toString values) ", "
+  DocTextsData { texts = values } -> join values "\n"
+
+documentPlainTextParts : (parts: List String) -> String
+documentPlainTextParts parts = join (filter (\part -> not (eq part "")) parts) "\n\n"
+
+documentBlockPlainText : (block: DocBlock) -> String
+documentBlockPlainText block = case block of
+  DocSection { title = title, blocks = blocks } -> documentPlainTextParts [documentInlinePlainTextGroup title, documentBlocksPlainText blocks]
+  DocParagraph { content = content } -> documentInlinePlainTextGroup content
+  DocCode { language = language, source = source } -> source
+  DocNote { blocks = blocks } -> documentBlocksPlainText blocks
+  DocEmbed { data = data, caption = caption } -> documentPlainTextParts [documentEmbeddedPlainText data, documentInlinePlainTextGroup caption]
+
+documentBlocksPlainText : (blocks: List DocBlock) -> String
+documentBlocksPlainText blocks = documentPlainTextParts (map documentBlockPlainText blocks)
+
+@label "Document as plain text"
+@description "Extract headings, link labels, code, notes, embedded scalar/list data and captions from the same document. Styling is removed, nonempty blocks are separated by blank lines, and text/code contents remain literal."
+@tags "document" "text" "conversion"
+documentPlainText : (document: RichDocument) -> String
+documentPlainText document = documentBlocksPlainText document.blocks
+
+documentBlockOutline : (depth: Nat) -> (block: DocBlock) -> List ({ depth: Nat, title: String })
+documentBlockOutline depth block = case block of
+  DocSection { title = title, blocks = blocks } -> concat [{ depth = depth, title = documentInlinePlainTextGroup title }] (flatMap (documentBlockOutline (depth + 1)) blocks)
+  DocNote { blocks = blocks } -> flatMap (documentBlockOutline depth) blocks
+  DocParagraph { content = content } -> []
+  DocCode { language = language, source = source } -> []
+  DocEmbed { data = data, caption = caption } -> []
+
+@label "Document outline"
+@description "List section headings in document order with their actual nesting depth. Titles use the same plain-text projection; notes preserve the surrounding section depth."
+@tags "document" "outline" "projection"
+documentOutline : (document: RichDocument) -> List ({ depth: Nat, title: String })
+documentOutline document = flatMap (documentBlockOutline 1) document.blocks

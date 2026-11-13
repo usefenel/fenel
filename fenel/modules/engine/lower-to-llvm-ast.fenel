@@ -1,0 +1,3609 @@
+module engine where
+
+-- lowerToLlvmAst — lower a ClosuresExplicitProgram body to a LlvmModule,
+-- the LLVM IR target's typed AST. The seventh Fenel-authored engine pass
+-- and the final step on the LLVM pipeline before the (TS-only)
+-- serializeLlvmModule text-encode step.
+--
+-- Mirrors the TS oracle at
+-- implementations/typescript/engine/src/modules/compile-llvm.ts:lowerToLlvmAstNative.
+--
+-- Phase 21.8 — closes the LLVM pipeline (modulo the IR-text encode). After
+-- this body lands, every step from raw source to LlvmModule has a Fenel
+-- body when the production pipeline dispatches through engine-bodies-
+-- dispatch. Symmetric work to Phase 21.7's lowerToWasmAst.
+--
+-- Architectural decisions for the port (recorded here so a future session
+-- reading this file knows why):
+--
+--   1. Builder state — Option B from the brief (HasLlvmBuilder typeclass
+--      capability). The mutable Builder (SSA temp counter, block-id
+--      counter, scope map, declarations, finalised blocks, currentBlock,
+--      stringPool, effectImports, pendingDefinitions, nextClosureId,
+--      entryName) is exposed to the Fenel body via a typeclass-mediated
+--      mutation surface. The dispatch wrapper creates a fresh Builder per
+--      call and registers an instance whose methods are backed by the
+--      builder's mutation. ~20 methods — ~10 more than HasWasmBuilder
+--      because of the SSA + basic block management surface
+--      (startBlock / endBlock / emit / freshTemp / freshBlockId /
+--      getCurrentBlockLabel).
+--
+--   2. Domain inference — Option II from the brief (TS-side, marshalled
+--      as paramDomains + externalReturn). The MVP closes the harder
+--      problem (the per-CeExpr lowering body) without bundling in the
+--      ~290 LOC inference port. Phase 21.8.1 follow-on can port
+--      inferDomains via the HasDomainEnv pattern (forked from Phase
+--      21.7.1's Wasm body — Option B per the brief; Option A unification
+--      is a follow-on substrate phase).
+--
+--   3. LlvmAst entities — Strategy A. Declare every variant from
+--      ir/llvm-ast.ts in this file's entities array. The LlvmAst is a
+--      closed-form subset (LLVM Language Reference Manual); declaring
+--      everything once means future bodies inherit the entities without
+--      re-declaration churn.
+--
+--   4. SSA + basic block discipline — builder-mediated, NOT body-state.
+--      The Fenel body invokes startBlock / endBlock / emit natives in
+--      sequence; the builder owns the currentBlock state. The body
+--      never sees the {label, instructions} pair directly — it only
+--      sees the operands returned from freshTemp and the block labels
+--      returned from freshBlockId (formatted Fenel-side as e.g.
+--      "then.0" / "match.0.arm0.check"). Routing mutation through
+--      natives mirrors the HasWasmBuilder + HasDomainEnv pattern from
+--      Phase 21.7 + 21.7.1.
+--
+-- The body's input is `ClosuresExplicitProgram` — already a typed Fenel
+-- ADT declared in `make-closures-explicit.fenel`. The dispatch wrapper
+-- supplies the entry's paramDomains (TS-inferred, LlvmDomUnknown→DomDouble
+-- coerced at the boundary) + the resolved return domain + an empty-list
+-- seed for in-body accumulator initialisation.
+
+-- LlvmValType / LlvmDomain / LlvmDomainEntry / LlvmOperand / LlvmInstr /
+-- LlvmTerminator / LlvmBasicBlock / LlvmParam / LlvmFunctionDef /
+-- LlvmFunctionDecl / LlvmGlobal / LlvmEffectImport / LlvmModule /
+-- LlvmLowerOutput / LlvmDirectArith / LlvmDirectCmp / LlvmScopeEntry /
+-- LlvmParamDomain / LlvmCallDomain / LlvmPhiIncoming / LlvmCallArg /
+-- LlvmSwitchCase — declared canonically in
+-- `fenel/modules/compile-llvm/types.fenel` (Phase 4j consolidation). The
+-- compile-llvm module loads that file via `?raw` import and registers the
+-- entities with the system registry; this body file references them by
+-- name via lazy `$named` lookup at runtime.
+
+-- ---------------------------------------------------------------------------
+-- llvmDomainToValType — 4-arm switch from LlvmDomain to LlvmValType.
+-- Mirrors compile-llvm.ts:150-160. DomDouble → Double, DomI1 → I1,
+-- DomPtr / LlvmDomUnknown → Ptr (the safe boundary type).
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: llvmDomainToValType"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmDomainToValType : (d: LlvmDomain) -> LlvmValType
+llvmDomainToValType d =
+  case d of
+    DomDouble -> Double
+    DomI1 -> I1
+    DomPtr -> Ptr
+    LlvmDomUnknown -> Ptr
+
+-- ---------------------------------------------------------------------------
+-- llvmDirectArithOp — fnId → LlvmDirectArith dispatch for the four
+-- standard floating-point arithmetic ops (add/sub/mul/div). Mirrors the
+-- DIRECT_FP_ARITH_OPS table in compile-llvm.ts:2021.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: llvmDirectArithOp"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmDirectArithOp : (fnId: String) -> LlvmDirectArith
+llvmDirectArithOp fnId =
+  if eq fnId "add" then LDArithFAdd
+  else if eq fnId "sub" then LDArithFSub
+  else if eq fnId "mul" then LDArithFMul
+  else if eq fnId "div" then LDArithFDiv
+  else LDArithNone
+
+-- ---------------------------------------------------------------------------
+-- llvmDirectCmpOp — fnId → LlvmDirectCmp dispatch for the six
+-- floating-point comparison ops. Mirrors DIRECT_FP_COMPARISONS in
+-- compile-llvm.ts:2026. The TS table uses the LLVM fcmp ordered-predicate
+-- names ("olt", "ole", "ogt", "oge", "oeq", "one") which match NaN-
+-- propagation semantics with Wasm's f64.gt etc.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: llvmDirectCmpOp"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmDirectCmpOp : (fnId: String) -> LlvmDirectCmp
+llvmDirectCmpOp fnId =
+  if eq fnId "lt" then LDCmp { predicate = "olt" }
+  else if eq fnId "lte" then LDCmp { predicate = "ole" }
+  else if eq fnId "gt" then LDCmp { predicate = "ogt" }
+  else if eq fnId "gte" then LDCmp { predicate = "oge" }
+  else if eq fnId "eq" then LDCmp { predicate = "oeq" }
+  else if eq fnId "neq" then LDCmp { predicate = "one" }
+  else LDCmpNone
+
+-- ---------------------------------------------------------------------------
+-- llvmReplicateDomain — produce a List<LlvmDomain> of length `n` filled
+-- with `d`. Used by llvmCallDomainOf to build argDomains lists uniformly
+-- when all args share a domain (e.g. add expects N DomDouble args).
+-- Forward recursion via appendItem matches the Fenel snoc-list convention.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: llvmReplicateDomain"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmReplicateDomain : (n: Number) -> (d: LlvmDomain) -> (emptyList: List LlvmDomain) -> List LlvmDomain
+llvmReplicateDomain n d emptyList =
+  llvmReplicateDomainLoop n d 0 emptyList
+
+@label "LLVM lowering: llvmReplicateDomainLoop"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmReplicateDomainLoop : (n: Number) -> (d: LlvmDomain) -> (idx: Number) -> (acc: List LlvmDomain) -> List LlvmDomain
+llvmReplicateDomainLoop n d idx acc =
+  if lt idx n
+  then llvmReplicateDomainLoop n d (add idx 1) (appendItem d acc)
+  else acc
+
+-- ---------------------------------------------------------------------------
+-- llvmCallDomainOf — fnId × arity → LlvmCallDomain. Mirrors
+-- compile-llvm.ts:callDomainOf at 194-224. Per-fnId precise typings
+-- cover the std arithmetic / comparison / boolean / concat ops; the
+-- unknown default returns N DomPtr args + DomPtr result (the
+-- `@fenel_<fnId>(ptr...) → ptr` runtime-helper fallback).
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: llvmCallDomainOf"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmCallDomainOf : (fnId: String) -> (arity: Number) -> (emptyList: List LlvmDomain) -> LlvmCallDomain
+llvmCallDomainOf fnId arity emptyList =
+  if eq fnId "add" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomDouble }
+  else if eq fnId "sub" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomDouble }
+  else if eq fnId "mul" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomDouble }
+  else if eq fnId "div" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomDouble }
+  else if eq fnId "mod" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomDouble }
+  else if eq fnId "negate" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomDouble }
+  else if eq fnId "lt" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomI1 }
+  else if eq fnId "lte" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomI1 }
+  else if eq fnId "gt" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomI1 }
+  else if eq fnId "gte" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomI1 }
+  else if eq fnId "eq" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomI1 }
+  else if eq fnId "neq" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomDouble) emptyList, resultDomain = DomI1 }
+  else if eq fnId "and" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomI1) emptyList, resultDomain = DomI1 }
+  else if eq fnId "or" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomI1) emptyList, resultDomain = DomI1 }
+  else if eq fnId "not" then LlvmCallDomain { argDomains = appendItem (DomI1) emptyList, resultDomain = DomI1 }
+  else if eq fnId "concat" then LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomPtr) emptyList, resultDomain = DomPtr }
+  else if eq fnId "length" then LlvmCallDomain { argDomains = appendItem (DomPtr) emptyList, resultDomain = DomDouble }
+  else if eq fnId "slice" then LlvmCallDomain { argDomains = appendItem (DomDouble) (appendItem (DomDouble) (appendItem (DomPtr) emptyList)), resultDomain = DomPtr }
+  -- Phase 5b38 — Fenel-body helper `positionalFieldsForCtor` was being
+  -- called via the default all-DomPtr path, but its inferred body ABI is
+  -- `(ptr ctorDefM, double argLen) → ptr` (argLen is used in `eq (length
+  -- ctorDef) argLen` where `length` is DomDouble). The caller emitted
+  -- `box_num(length args)` (ptr) where the callee read XMM0 as a double,
+  -- producing stale/undefined argLen → wrong `Nothing` return → sample 7
+  -- (`{construct:["Just",5]}`) cascaded to a NULL output. Closes (c-8).
+  else if eq fnId "positionalFieldsForCtor" then LlvmCallDomain { argDomains = appendItem (DomDouble) (appendItem (DomPtr) emptyList), resultDomain = DomPtr }
+  else LlvmCallDomain { argDomains = llvmReplicateDomain arity (DomPtr) emptyList, resultDomain = DomPtr }
+
+-- ---------------------------------------------------------------------------
+-- llvmIsUnknownDomain / llvmDomainEq — pure predicates over LlvmDomain.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: llvmIsUnknownDomain"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmIsUnknownDomain : (d: LlvmDomain) -> Boolean
+llvmIsUnknownDomain d =
+  case d of
+    LlvmDomUnknown -> true
+    _ -> false
+
+@label "LLVM lowering: llvmDomainEq"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmDomainEq : (a: LlvmDomain) -> (b: LlvmDomain) -> Boolean
+llvmDomainEq a b =
+  case a of
+    DomDouble ->
+      case b of
+        DomDouble -> true
+        _ -> false
+    DomI1 ->
+      case b of
+        DomI1 -> true
+        _ -> false
+    DomPtr ->
+      case b of
+        DomPtr -> true
+        _ -> false
+    LlvmDomUnknown ->
+      case b of
+        LlvmDomUnknown -> true
+        _ -> false
+
+-- ---------------------------------------------------------------------------
+-- llvmHasStringTypedArg / llvmArgIsStringTyped / llvmIsStringTypedEq —
+-- string-typed detection for Phase 21.5.2's polymorphic-eq routing.
+-- Mirrors compile-llvm.ts:178-192. Same structural heuristic as the
+-- Wasm version but checking against DomPtr (not DomRef) since LLVM's
+-- pointer domain is the equivalent.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: llvmHasStringTypedArg"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmHasStringTypedArg : (args: List (CeExpr Any)) -> (emptyList: List LlvmDomain) -> Boolean
+llvmHasStringTypedArg args emptyList =
+  case head args of
+    Nothing -> false
+    Just a ->
+      if llvmArgIsStringTyped a emptyList
+      then true
+      else
+        case tail args of
+          Nothing -> false
+          Just rest -> llvmHasStringTypedArg rest emptyList
+
+@label "LLVM lowering: llvmArgIsStringTyped"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmArgIsStringTyped : (a: (CeExpr Any)) -> (emptyList: List LlvmDomain) -> Boolean
+llvmArgIsStringTyped a emptyList =
+  case a of
+    CeLit { value = v } -> isString v
+    CeVar { name = n } -> contains n "."
+    CeCall { fnId = fnId, args = aargs } ->
+      let cd = llvmCallDomainOf fnId (length aargs) emptyList
+      case cd.resultDomain of
+        DomPtr -> true
+        _ -> false
+    _ -> false
+
+@label "LLVM lowering: llvmIsStringTypedEq"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmIsStringTypedEq : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List LlvmDomain) -> Boolean
+llvmIsStringTypedEq fnId args emptyList =
+  if eq fnId "eq" then llvmHasStringTypedArg args emptyList
+  else if eq fnId "neq" then llvmHasStringTypedArg args emptyList
+  else false
+
+-- ---------------------------------------------------------------------------
+-- coerceLlvmDomain — insert conversion instructions when produced and
+-- target domains differ. Mirrors compile-llvm.ts:1905-2007 (the 9-arm
+-- conversion table). LLVM's coerce is more involved than Wasm's because
+-- some conversions take two instructions (i1 → double via zext+sitofp).
+--
+-- Algorithm:
+--   - target=LlvmDomUnknown → no-op
+--   - produced=target → no-op
+--   - DomI1 → DomDouble: ZExt i1→i32, SIToFP i32→double (two-instr)
+--   - DomDouble → DomI1: FCmp one double, 0.0 (one-instr)
+--   - * → DomPtr: LlvmCall fenel_box_<num/bool/unknown> (one-instr)
+--   - DomPtr → *: LlvmCall fenel_unbox_<num/bool/unknown> (one-instr)
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: coerceLlvmDomain"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+coerceLlvmDomain : (produced: LlvmLowerOutput) -> (target: LlvmDomain) -> (emptyList: List Any) -> LlvmLowerOutput
+coerceLlvmDomain produced target emptyList =
+  case target of
+    LlvmDomUnknown -> produced
+    _ -> coerceLlvmResolved produced target emptyList
+
+@label "LLVM lowering: coerceLlvmResolved"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+coerceLlvmResolved : (produced: LlvmLowerOutput) -> (target: LlvmDomain) -> (emptyList: List Any) -> LlvmLowerOutput
+coerceLlvmResolved produced target emptyList =
+  if llvmDomainEq (produced.domain) target then LlvmLowerOutput { operand = produced.operand, domain = target }
+  else coerceLlvmCross produced target emptyList
+
+@label "LLVM lowering: coerceLlvmCross"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+coerceLlvmCross : (produced: LlvmLowerOutput) -> (target: LlvmDomain) -> (emptyList: List Any) -> LlvmLowerOutput
+coerceLlvmCross produced target emptyList =
+  case produced.domain of
+    DomI1 ->
+      case target of
+        DomDouble -> coerceLlvmI1ToDouble produced
+        DomPtr -> coerceLlvmI1ToPtr produced emptyList
+        _ -> produced
+    DomDouble ->
+      case target of
+        DomI1 -> coerceLlvmDoubleToI1 produced
+        DomPtr -> coerceLlvmDoubleToPtr produced emptyList
+        _ -> produced
+    DomPtr ->
+      case target of
+        DomDouble -> coerceLlvmPtrToDouble produced emptyList
+        DomI1 -> coerceLlvmPtrToI1 produced emptyList
+        _ -> produced
+    LlvmDomUnknown ->
+      case target of
+        DomPtr -> coerceLlvmUnknownToPtr produced emptyList
+        _ -> LlvmLowerOutput { operand = produced.operand, domain = target }
+
+-- i1 → double: zext i1 → i32, sitofp i32 → double (two-instr sequence,
+-- matches clang's `(double)bool_val`).
+@label "LLVM lowering: coerceLlvmI1ToDouble"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+-- Signature-substrate Phase 2: HasLlvmBuilder is a per-evaluation
+-- capability, not a registry-global callable surface. Functions that cross
+-- that boundary therefore carry complete source signatures instead of
+-- asking inference to guess schemes for dynamically supplied native names.
+coerceLlvmI1ToDouble : (produced: LlvmLowerOutput) -> LlvmLowerOutput
+coerceLlvmI1ToDouble produced =
+  let zextTemp = freshTemp ()
+  let _e1 = emit (ZExt {
+    result = zextTemp,
+    fromType = I1,
+    value = produced.operand,
+    toType = LlvmI32
+  })
+  let sitofpTemp = freshTemp ()
+  let _e2 = emit (SIToFP {
+    result = sitofpTemp,
+    fromType = LlvmI32,
+    value = LocalRef { name = zextTemp },
+    toType = Double
+  })
+  LlvmLowerOutput { operand = LocalRef { name = sitofpTemp }, domain = DomDouble }
+
+-- double → i1: fcmp one double val, 0.0 (true if non-zero AND ordered).
+@label "LLVM lowering: coerceLlvmDoubleToI1"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+coerceLlvmDoubleToI1 : (produced: LlvmLowerOutput) -> LlvmLowerOutput
+coerceLlvmDoubleToI1 produced =
+  let cmpTemp = freshTemp ()
+  let _e = emit (FCmp {
+    result = cmpTemp,
+    predicate = "one",
+    opType = Double,
+    lhs = produced.operand,
+    rhs = ConstDouble { value = 0 }
+  })
+  LlvmLowerOutput { operand = LocalRef { name = cmpTemp }, domain = DomI1 }
+
+-- double → ptr: call ptr @fenel_box_num(double).
+@label "LLVM lowering: coerceLlvmDoubleToPtr"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+coerceLlvmDoubleToPtr : (produced: LlvmLowerOutput) -> (emptyList: List Any) -> LlvmLowerOutput
+coerceLlvmDoubleToPtr produced emptyList =
+  let _d_p0 = appendItem (LlvmParam { name = "v", paramType = Double }) emptyList
+  let _d = internDecl "fenel_box_num" (Ptr) _d_p0
+  let resultTemp = freshTemp ()
+  let argList = appendItem (LlvmCallArg { argType = Double, value = produced.operand }) emptyList
+  let _e = emit (LlvmCall {
+    result = resultTemp,
+    retType = Ptr,
+    fn = GlobalRef { name = "fenel_box_num" },
+    args = argList
+  })
+  LlvmLowerOutput { operand = LocalRef { name = resultTemp }, domain = DomPtr }
+
+-- i1 → ptr: call ptr @fenel_box_bool(i1).
+@label "LLVM lowering: coerceLlvmI1ToPtr"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+coerceLlvmI1ToPtr : (produced: LlvmLowerOutput) -> (emptyList: List Any) -> LlvmLowerOutput
+coerceLlvmI1ToPtr produced emptyList =
+  let _d_p0 = appendItem (LlvmParam { name = "v", paramType = I1 }) emptyList
+  let _d = internDecl "fenel_box_bool" (Ptr) _d_p0
+  let resultTemp = freshTemp ()
+  let argList = appendItem (LlvmCallArg { argType = I1, value = produced.operand }) emptyList
+  let _e = emit (LlvmCall {
+    result = resultTemp,
+    retType = Ptr,
+    fn = GlobalRef { name = "fenel_box_bool" },
+    args = argList
+  })
+  LlvmLowerOutput { operand = LocalRef { name = resultTemp }, domain = DomPtr }
+
+-- LlvmDomUnknown → ptr: call ptr @fenel_box_unknown(ptr). Fallback per the
+-- TS oracle's `produced.domain.$tag === "DomDouble" ? ... : produced.
+-- domain.$tag === "DomI1" ? ... : "fenel_box_unknown"`.
+@label "LLVM lowering: coerceLlvmUnknownToPtr"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+coerceLlvmUnknownToPtr : (produced: LlvmLowerOutput) -> (emptyList: List Any) -> LlvmLowerOutput
+coerceLlvmUnknownToPtr produced emptyList =
+  let _d_p0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+  let _d = internDecl "fenel_box_unknown" (Ptr) _d_p0
+  let resultTemp = freshTemp ()
+  let argList = appendItem (LlvmCallArg { argType = Ptr, value = produced.operand }) emptyList
+  let _e = emit (LlvmCall {
+    result = resultTemp,
+    retType = Ptr,
+    fn = GlobalRef { name = "fenel_box_unknown" },
+    args = argList
+  })
+  LlvmLowerOutput { operand = LocalRef { name = resultTemp }, domain = DomPtr }
+
+-- ptr → double: call double @fenel_unbox_num(ptr).
+@label "LLVM lowering: coerceLlvmPtrToDouble"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+coerceLlvmPtrToDouble : (produced: LlvmLowerOutput) -> (emptyList: List Any) -> LlvmLowerOutput
+coerceLlvmPtrToDouble produced emptyList =
+  let _d_p0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+  let _d = internDecl "fenel_unbox_num" (Double) _d_p0
+  let resultTemp = freshTemp ()
+  let argList = appendItem (LlvmCallArg { argType = Ptr, value = produced.operand }) emptyList
+  let _e = emit (LlvmCall {
+    result = resultTemp,
+    retType = Double,
+    fn = GlobalRef { name = "fenel_unbox_num" },
+    args = argList
+  })
+  LlvmLowerOutput { operand = LocalRef { name = resultTemp }, domain = DomDouble }
+
+-- ptr → i1: call i1 @fenel_unbox_bool(ptr).
+@label "LLVM lowering: coerceLlvmPtrToI1"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+coerceLlvmPtrToI1 : (produced: LlvmLowerOutput) -> (emptyList: List Any) -> LlvmLowerOutput
+coerceLlvmPtrToI1 produced emptyList =
+  let _d_p0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+  let _d = internDecl "fenel_unbox_bool" (I1) _d_p0
+  let resultTemp = freshTemp ()
+  let argList = appendItem (LlvmCallArg { argType = Ptr, value = produced.operand }) emptyList
+  let _e = emit (LlvmCall {
+    result = resultTemp,
+    retType = I1,
+    fn = GlobalRef { name = "fenel_unbox_bool" },
+    args = argList
+  })
+  LlvmLowerOutput { operand = LocalRef { name = resultTemp }, domain = DomI1 }
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmExprAt — internal dispatch entry. Takes the caller's target
+-- so CeIf / CeLet body / CeDo last-expr can thread it through. The
+-- wrapper `lowerLlvmExprWithTarget` calls this then applies coerceLlvmDomain.
+-- Mirrors compile-llvm.ts:lowerExprInternal at 593-763.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmExprAt"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmExprAt : (expr: (CeExpr Any)) -> (target: LlvmDomain) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmExprAt expr target emptyList =
+  case expr of
+    CeLit { value = v } -> lowerLlvmLit v emptyList
+    CeVar { name = n } -> lowerLlvmVar n emptyList
+    CeIf { cond = c, then = t, else = e } -> lowerLlvmIf c t e target emptyList
+    CeDo { exprs = es } -> lowerLlvmDo es target emptyList
+    CeLet { bindings = bs, body = bd } -> lowerLlvmLet bs bd target emptyList
+    CeCall { fnId = fnId, args = args } ->
+      if or (eq fnId "$structuralTruthy") (and (elem fnId ["if", "?:", "and", "or", "std:and", "std:or"]) (eq (lookup expr "structural") (Just false)))
+      then Err (Unsupported { reason = "target has no exact Boolean runtime ABI", node = fnId })
+      else lowerLlvmCall fnId args emptyList
+    CeClosure { params = ps, captures = cs, body = b } ->
+      lowerLlvmClosure ps cs b emptyList
+    CeConstruct { ctor = c, args = a } ->
+      lowerLlvmConstruct c a (expr.fields) emptyList
+    CeRecord { fields = fs } -> lowerLlvmRecord fs emptyList
+    CeMatch { scrutinee = s, arms = a } -> lowerLlvmMatch s a emptyList
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmExprWithTarget — wrapper around lowerLlvmExprAt that applies
+-- coerceLlvmDomain to the produced (operand, domain) pair when it
+-- doesn't match the caller's target. Mirrors compile-llvm.ts:582-591
+-- (TS-side `lowerExpr`).
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmExprWithTarget"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmExprWithTarget : (expr: (CeExpr Any)) -> (target: LlvmDomain) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmExprWithTarget expr target emptyList =
+  let r = lowerLlvmExprAt expr target emptyList
+  case r of
+    Err err -> Err err
+    Ok out -> Ok (coerceLlvmDomain out target emptyList)
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmLit — 5-arm dispatch on JS value type for CeLit lowering.
+-- Strings call into HasLlvmBuilder (internString) for interning + emit
+-- the fenel_lit_string call; numbers / booleans / null emit constants
+-- directly. Mirrors compile-llvm.ts:lowerExprInternal CeLit arm.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmLit"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmLit : (v: Any) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmLit v emptyList =
+  if isNumber v
+  then Ok (LlvmLowerOutput {
+    operand = ConstDouble { value = v },
+    domain = DomDouble
+  })
+  else if isBoolean v
+  then Ok (LlvmLowerOutput {
+    operand = ConstI1 { value = v },
+    domain = DomI1
+  })
+  else if isNull v
+  then Ok (LlvmLowerOutput {
+    operand = ConstNullPtr,
+    domain = DomPtr
+  })
+  else if isArray v
+  then Ok (LlvmLowerOutput {
+    operand = ConstNullPtr,
+    domain = DomPtr
+  })
+  else if isString v
+  then
+    let idx = internString v
+    let utf8Len = utf8ByteLength v
+    let p1 = appendItem (LlvmParam { name = "ptr", paramType = Ptr }) emptyList
+    let paramList = appendItem (LlvmParam { name = "len", paramType = LlvmI64 }) p1
+    let _d = internDecl "fenel_lit_string" (Ptr) paramList
+    let resultTemp = freshTemp ()
+    let strRef = GlobalRef { name = join [".str.", toString idx] "" }
+    let a1 = appendItem (LlvmCallArg { argType = Ptr, value = strRef }) emptyList
+    let argList = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = utf8Len } }) a1
+    let _e = emit (LlvmCall {
+      result = resultTemp,
+      retType = Ptr,
+      fn = GlobalRef { name = "fenel_lit_string" },
+      args = argList
+    })
+    Ok (LlvmLowerOutput {
+      operand = LocalRef { name = resultTemp },
+      domain = DomPtr
+    })
+  else Err (Unsupported {
+    reason = "CeLit of unsupported value type",
+    node = v
+  })
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmVar — CeVar lookup. Undotted names resolve through
+-- HasLlvmBuilder.lookupScope to (operand, domain). Dotted names split
+-- into head-binding + per-segment chained `fenel_get_field_named` calls
+-- via interned name strings.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmVar"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmVar : (n: String) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmVar n emptyList =
+  if contains n "."
+  then lowerLlvmVarDotted n emptyList
+  else lowerLlvmVarUndotted n emptyList
+
+@label "LLVM lowering: lowerLlvmVarUndotted"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmVarUndotted : (n: String) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmVarUndotted n emptyList =
+  let _u = emptyList
+  let loc = lookupScope n
+  case loc of
+    Nothing -> Err (Unsupported {
+      reason = "CeVar is not in scope at LLVM lowering",
+      node = n
+    })
+    Just entry -> Ok (LlvmLowerOutput {
+      operand = entry.operand,
+      domain = entry.domain
+    })
+
+-- Dotted-CeVar lowering: split on '.', look up the head binding, coerce
+-- to DomPtr, then for each remaining segment emit a fenel_get_field_named
+-- call with the segment's interned name + UTF-8 byte length. Result
+-- domain DomPtr (the chain's leaf is always ptr).
+@label "LLVM lowering: lowerLlvmVarDotted"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmVarDotted : (n: String) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmVarDotted n emptyList =
+  let parts = split n "."
+  let headM = head parts
+  let segsM = tail parts
+  case headM of
+    Nothing -> Err (Unsupported {
+      reason = "CeVar dotted access with empty head",
+      node = n
+    })
+    Just headStr ->
+      let loc = lookupScope headStr
+      case loc of
+        Nothing -> Err (Unsupported {
+          reason = join ["CeVar dotted head '", headStr, "' not in scope"] "",
+          node = n
+        })
+        Just entry ->
+          let coercedHead = coerceLlvmDomain (LlvmLowerOutput { operand = entry.operand, domain = entry.domain }) (DomPtr) emptyList
+          case segsM of
+            Nothing -> Ok (LlvmLowerOutput {
+              operand = coercedHead.operand,
+              domain = DomPtr
+            })
+            Just segs ->
+              let p3 = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+              let p2 = appendItem (LlvmParam { name = "name", paramType = Ptr }) p3
+              let paramList = appendItem (LlvmParam { name = "name_len", paramType = LlvmI64 }) p2
+              let _d = internDecl "fenel_get_field_named" (Ptr) paramList
+              let finalOperand = chainGetFieldNamedLlvm segs (coercedHead.operand) emptyList
+              Ok (LlvmLowerOutput {
+                operand = finalOperand,
+                domain = DomPtr
+              })
+
+-- chainGetFieldNamedLlvm — emit per-segment `fenel_get_field_named(prev,
+-- nameStr, nameLen) → ptr` calls. Each iteration interns the segment
+-- name + emits the call; the returned LocalRef becomes the next
+-- iteration's `prev`. Mirrors compile-llvm.ts:692-709.
+@label "LLVM lowering: chainGetFieldNamedLlvm"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+chainGetFieldNamedLlvm : (segs: List String) -> (acc: LlvmOperand) -> (emptyList: List Any) -> LlvmOperand
+chainGetFieldNamedLlvm segs acc emptyList =
+  case head segs of
+    Nothing -> acc
+    Just seg ->
+      let nameIdx = internString seg
+      let nameLen = utf8ByteLength seg
+      let fieldTemp = freshTemp ()
+      let argList__a1 = appendItem (LlvmCallArg { argType = Ptr, value = acc }) emptyList
+      let argList__a0 = appendItem (LlvmCallArg { argType = Ptr, value = GlobalRef { name = join [".str.", toString nameIdx] "" } }) argList__a1
+      let argList = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = nameLen } }) argList__a0
+      let _e = emit (LlvmCall {
+        result = fieldTemp,
+        retType = Ptr,
+        fn = GlobalRef { name = "fenel_get_field_named" },
+        args = argList
+      })
+      let nextAcc = LocalRef { name = fieldTemp }
+      case tail segs of
+        Nothing -> nextAcc
+        Just rest -> chainGetFieldNamedLlvm rest nextAcc emptyList
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmDo — sequential lowering of expression list. All but the last
+-- lower at LlvmDomUnknown; the last lowers at the caller's target. The do
+-- block's domain = the last expr's domain. Mirrors compile-llvm.ts:738-753.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmDo"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmDo : (exprs: List (CeExpr Any)) -> (target: LlvmDomain) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmDo exprs target emptyList =
+  case head exprs of
+    Nothing -> Err (Unsupported {
+      reason = "empty CeDo not supported by LLVM lowering",
+      node = exprs
+    })
+    Just e0 ->
+      let restM = tail exprs
+      case restM of
+        Nothing -> lowerLlvmExprWithTarget e0 target emptyList
+        Just rest ->
+          case head rest of
+            Nothing -> lowerLlvmExprWithTarget e0 target emptyList
+            Just _ ->
+              let firstR = lowerLlvmExprWithTarget e0 (LlvmDomUnknown) emptyList
+              case firstR of
+                Err err -> Err err
+                Ok _firstOut -> lowerLlvmDo rest target emptyList
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmLet — for each binding, lower the value at LlvmDomUnknown +
+-- bindScope. Then lower body at the caller's target. Mirrors
+-- compile-llvm.ts:727-737.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmLet"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmLet : (bindings: List ({ name: String, value: (CeExpr Any) })) -> (body: (CeExpr Any)) -> (target: LlvmDomain) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmLet bindings body target emptyList =
+  let bindingsR = lowerLlvmLetBindings bindings emptyList
+  case bindingsR of
+    Err err -> Err err
+    Ok _bs -> lowerLlvmExprWithTarget body target emptyList
+
+@label "LLVM lowering: lowerLlvmLetBindings"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmLetBindings : (bindings: List ({ name: String, value: (CeExpr Any) })) -> (emptyList: List Any) -> Result CompileError Boolean
+lowerLlvmLetBindings bindings emptyList =
+  case head bindings of
+    Nothing -> Ok true
+    Just binding ->
+      let valueR = lowerLlvmExprWithTarget (binding.value) (LlvmDomUnknown) emptyList
+      case valueR of
+        Err err -> Err err
+        Ok valueOut ->
+          let _b = bindScope (binding.name) (valueOut.operand) (valueOut.domain)
+          case tail bindings of
+            Nothing -> Ok true
+            Just rest -> lowerLlvmLetBindings rest emptyList
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmIf — SSA + phi-based conditional lowering. Mirrors
+-- compile-llvm.ts:lowerIf at 1845-1898. Algorithm:
+--   1. Lower cond at DomI1.
+--   2. Allocate then/else/merge labels via freshBlockId.
+--   3. endBlock current with BrCond.
+--   4. startBlock then, lower then at target, capture exit-block label
+--      via getCurrentBlockLabel, endBlock with LlvmBr to merge.
+--   5. startBlock else, lower else at target, capture exit-block label,
+--      endBlock with LlvmBr to merge.
+--   6. startBlock merge, emit Phi over [(thenOp, thenExit), (elseOp,
+--      elseExit)], return (phiTemp, resolvedDomain).
+--
+-- The exit-block label capture (NOT the entry-block label) is critical:
+-- nested CeIf inside the then-branch can emit multiple blocks, so the
+-- phi-incoming-binding needs the LAST block the branch ended in, not
+-- the first. Mirrors compile-llvm.ts:1869 exactly.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmIf"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmIf : (cond: (CeExpr Any)) -> (thenE: (CeExpr Any)) -> (elseE: (CeExpr Any)) -> (target: LlvmDomain) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmIf cond thenE elseE target emptyList =
+  let condR = lowerLlvmExprWithTarget cond (DomI1) emptyList
+  case condR of
+    Err err -> Err err
+    Ok condOut ->
+      let blockId = freshBlockId ()
+      let thenLabel = join ["then.", toString blockId] ""
+      let elseLabel = join ["else.", toString blockId] ""
+      let mergeLabel = join ["merge.", toString blockId] ""
+      let _e1 = endBlock (BrCond {
+        cond = condOut.operand,
+        ifTrue = thenLabel,
+        ifFalse = elseLabel
+      })
+      -- Then-branch.
+      let _s2 = startBlock thenLabel
+      let thenR = lowerLlvmExprWithTarget thenE target emptyList
+      case thenR of
+        Err err -> Err err
+        Ok thenOut ->
+          let thenExitLabel = getCurrentBlockLabel ()
+          let _e2 = endBlock (LlvmBr { target = mergeLabel })
+          -- Else-branch.
+          let _s3 = startBlock elseLabel
+          let elseR = lowerLlvmExprWithTarget elseE target emptyList
+          case elseR of
+            Err err -> Err err
+            Ok elseOut ->
+              let elseExitLabel = getCurrentBlockLabel ()
+              let _e3 = endBlock (LlvmBr { target = mergeLabel })
+              -- Merge with phi.
+              let _s4 = startBlock mergeLabel
+              let resolvedDomain =
+                if llvmIsUnknownDomain target then thenOut.domain else target
+              let phiType = llvmDomainToValType resolvedDomain
+              let phiTemp = freshTemp ()
+              let incoming__a0 = appendItem (LlvmPhiIncoming { value = thenOut.operand, label = thenExitLabel }) emptyList
+              let incoming = appendItem (LlvmPhiIncoming { value = elseOut.operand, label = elseExitLabel }) incoming__a0
+              let _e4 = emit (Phi {
+                result = phiTemp,
+                phiType = phiType,
+                incoming = incoming
+              })
+              Ok (LlvmLowerOutput {
+                operand = LocalRef { name = phiTemp },
+                domain = resolvedDomain
+              })
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmCall — central CeCall dispatch. Mirrors compile-llvm.ts:1048-1339.
+-- Dispatch order:
+--   1. llvmDirectArithOp fnId (add/sub/mul/div) → left-fold at DomDouble
+--      with FAdd/FSub/FMul/FDiv. Result: DomDouble.
+--   2. llvmIsStringTypedEq fnId args → both args at DomPtr, LlvmCall
+--      fenel_str_eq → i1; neq XOR-flips. Result: DomI1.
+--   3. llvmDirectCmpOp fnId (lt/lte/gt/gte/eq/neq numeric) → both args at
+--      DomDouble, FCmp with predicate. Result: DomI1.
+--   4. and / or → fold at DomI1 with And/Or. Result: DomI1.
+--   5. not → arg at DomI1, Xor with i1 true. Result: DomI1.
+--   6. negate → arg at DomDouble, FNeg. Result: DomDouble.
+--   7. $dyn:<varName> → indirect closure call. Result: DomPtr.
+--   8. $effect:<Class>:<method> → effect-dispatch sentinel. Result: DomPtr.
+--   9. Default → fenel_<fnId> runtime helper. Result: DomPtr.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmCall"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmCall : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmCall fnId args emptyList =
+  let directArith = llvmDirectArithOp fnId
+  case directArith of
+    LDArithFAdd -> lowerLlvmDirectArithPath fnId args emptyList
+    LDArithFSub -> lowerLlvmDirectArithPath fnId args emptyList
+    LDArithFMul -> lowerLlvmDirectArithPath fnId args emptyList
+    LDArithFDiv -> lowerLlvmDirectArithPath fnId args emptyList
+    LDArithNone -> lowerLlvmCallDispatch fnId args emptyList
+
+@label "LLVM lowering: lowerLlvmDirectArithPath"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmDirectArithPath : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmDirectArithPath fnId args emptyList =
+  if lt (length args) 2
+  then Err (Unsupported {
+    reason = join ["'", fnId, "' expects at least 2 args"] "",
+    node = fnId
+  })
+  else
+    case head args of
+      Nothing -> Err (Unsupported {
+        reason = join ["'", fnId, "' expects at least 1 arg"] "",
+        node = fnId
+      })
+      Just a0 ->
+        let r0 = lowerLlvmExprWithTarget a0 (DomDouble) emptyList
+        case r0 of
+          Err err -> Err err
+          Ok out0 ->
+            case tail args of
+              Nothing -> Ok out0
+              Just rest ->
+                lowerLlvmDirectArithFold fnId rest (out0.operand) emptyList
+
+@label "LLVM lowering: lowerLlvmDirectArithFold"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmDirectArithFold : (fnId: String) -> (args: List (CeExpr Any)) -> (acc: LlvmOperand) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmDirectArithFold fnId args acc emptyList =
+  case head args of
+    Nothing -> Ok (LlvmLowerOutput { operand = acc, domain = DomDouble })
+    Just a ->
+      let r = lowerLlvmExprWithTarget a (DomDouble) emptyList
+      case r of
+        Err err -> Err err
+        Ok out ->
+          let resultTemp = freshTemp ()
+          let arithInstr =
+            if eq fnId "add" then FAdd { result = resultTemp, opType = Double, lhs = acc, rhs = out.operand }
+            else if eq fnId "sub" then FSub { result = resultTemp, opType = Double, lhs = acc, rhs = out.operand }
+            else if eq fnId "mul" then FMul { result = resultTemp, opType = Double, lhs = acc, rhs = out.operand }
+            else FDiv { result = resultTemp, opType = Double, lhs = acc, rhs = out.operand }
+          let _e = emit arithInstr
+          let nextAcc = LocalRef { name = resultTemp }
+          case tail args of
+            Nothing -> Ok (LlvmLowerOutput { operand = nextAcc, domain = DomDouble })
+            Just rest -> lowerLlvmDirectArithFold fnId rest nextAcc emptyList
+
+@label "LLVM lowering: lowerLlvmCallDispatch"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmCallDispatch : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmCallDispatch fnId args emptyList =
+  if llvmIsStringTypedEq fnId args emptyList
+  then lowerLlvmStrEqPath fnId args emptyList
+  else lowerLlvmCallNonStringEq fnId args emptyList
+
+@label "LLVM lowering: lowerLlvmCallNonStringEq"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmCallNonStringEq : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmCallNonStringEq fnId args emptyList =
+  let directCmp = llvmDirectCmpOp fnId
+  case directCmp of
+    LDCmp { predicate = pred } -> lowerLlvmDirectCmpPath fnId pred args emptyList
+    LDCmpNone -> lowerLlvmCallNonCmp fnId args emptyList
+
+@label "LLVM lowering: lowerLlvmCallNonCmp"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmCallNonCmp : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmCallNonCmp fnId args emptyList =
+  if eq fnId "and" then lowerLlvmLogicalPath fnId args emptyList
+  else if eq fnId "or" then lowerLlvmLogicalPath fnId args emptyList
+  else if eq fnId "not" then lowerLlvmNotPath args emptyList
+  else if eq fnId "negate" then lowerLlvmNegatePath args emptyList
+  else if startsWith fnId "$dyn:" then lowerLlvmIndirectCall fnId args emptyList
+  else lowerLlvmCallEffectOrDefault fnId args emptyList
+
+@label "LLVM lowering: lowerLlvmCallEffectOrDefault"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmCallEffectOrDefault : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmCallEffectOrDefault fnId args emptyList =
+  let effectM = parseEffectFnId fnId
+  case effectM of
+    Just parsed -> lowerLlvmEffectPath (parsed.typeName) (parsed.methodName) args emptyList
+    Nothing -> lowerLlvmDefaultPath fnId args emptyList
+
+-- Phase 21.5.2 — string-typed eq/neq via fenel_str_eq. Both args lower
+-- at DomPtr; for neq XOR-flip the i1 result. Mirrors compile-llvm.ts:
+-- 1092-1139.
+@label "LLVM lowering: lowerLlvmStrEqPath"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmStrEqPath : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmStrEqPath fnId args emptyList =
+  if eq (length args) 2
+  then
+    let paramList__a0 = appendItem (LlvmParam { name = "a", paramType = Ptr }) emptyList
+    let paramList = appendItem (LlvmParam { name = "b", paramType = Ptr }) paramList__a0
+    let _d = internDecl "fenel_str_eq" (I1) paramList
+    case head args of
+      Nothing -> Err (Unsupported { reason = "str_eq missing lhs", node = fnId })
+      Just lhsExpr ->
+        let lhsR = lowerLlvmExprWithTarget lhsExpr (DomPtr) emptyList
+        case lhsR of
+          Err err -> Err err
+          Ok lhsOut ->
+            case tail args of
+              Nothing -> Err (Unsupported { reason = "str_eq missing rhs", node = fnId })
+              Just rest ->
+                case head rest of
+                  Nothing -> Err (Unsupported { reason = "str_eq missing rhs", node = fnId })
+                  Just rhsExpr ->
+                    let rhsR = lowerLlvmExprWithTarget rhsExpr (DomPtr) emptyList
+                    case rhsR of
+                      Err err -> Err err
+                      Ok rhsOut ->
+                        let eqTemp = freshTemp ()
+                        let argList__a0 = appendItem (LlvmCallArg { argType = Ptr, value = lhsOut.operand }) emptyList
+                        let argList = appendItem (LlvmCallArg { argType = Ptr, value = rhsOut.operand }) argList__a0
+                        let _e = emit (LlvmCall {
+                          result = eqTemp,
+                          retType = I1,
+                          fn = GlobalRef { name = "fenel_str_eq" },
+                          args = argList
+                        })
+                        if eq fnId "eq"
+                        then Ok (LlvmLowerOutput {
+                          operand = LocalRef { name = eqTemp },
+                          domain = DomI1
+                        })
+                        else
+                          let negTemp = freshTemp ()
+                          let _en = emit (Xor {
+                            result = negTemp,
+                            opType = I1,
+                            lhs = LocalRef { name = eqTemp },
+                            rhs = ConstI1 { value = true }
+                          })
+                          Ok (LlvmLowerOutput {
+                            operand = LocalRef { name = negTemp },
+                            domain = DomI1
+                          })
+  else Err (Unsupported {
+    reason = join ["comparison '", fnId, "' expects 2 args"] "",
+    node = fnId
+  })
+
+-- Direct fcmp — both args at DomDouble + FCmp with predicate. Mirrors
+-- compile-llvm.ts:1141-1169.
+@label "LLVM lowering: lowerLlvmDirectCmpPath"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmDirectCmpPath : (fnId: String) -> (pred: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmDirectCmpPath fnId pred args emptyList =
+  if eq (length args) 2
+  then
+    case head args of
+      Nothing -> Err (Unsupported { reason = "cmp missing lhs", node = fnId })
+      Just lhsExpr ->
+        let lhsR = lowerLlvmExprWithTarget lhsExpr (DomDouble) emptyList
+        case lhsR of
+          Err err -> Err err
+          Ok lhsOut ->
+            case tail args of
+              Nothing -> Err (Unsupported { reason = "cmp missing rhs", node = fnId })
+              Just rest ->
+                case head rest of
+                  Nothing -> Err (Unsupported { reason = "cmp missing rhs", node = fnId })
+                  Just rhsExpr ->
+                    let rhsR = lowerLlvmExprWithTarget rhsExpr (DomDouble) emptyList
+                    case rhsR of
+                      Err err -> Err err
+                      Ok rhsOut ->
+                        let cmpTemp = freshTemp ()
+                        let _e = emit (FCmp {
+                          result = cmpTemp,
+                          predicate = pred,
+                          opType = Double,
+                          lhs = lhsOut.operand,
+                          rhs = rhsOut.operand
+                        })
+                        Ok (LlvmLowerOutput {
+                          operand = LocalRef { name = cmpTemp },
+                          domain = DomI1
+                        })
+  else Err (Unsupported {
+    reason = join ["comparison '", fnId, "' expects 2 args"] "",
+    node = fnId
+  })
+
+-- Logical and/or — fold at DomI1 with And/Or. Mirrors compile-llvm.ts:
+-- 1172-1201.
+@label "LLVM lowering: lowerLlvmLogicalPath"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmLogicalPath : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmLogicalPath fnId args emptyList =
+  if lt (length args) 2
+  then Err (Unsupported {
+    reason = join ["'", fnId, "' expects at least 2 args"] "",
+    node = fnId
+  })
+  else
+    case head args of
+      Nothing -> Err (Unsupported { reason = "logical missing first", node = fnId })
+      Just a0 ->
+        let r0 = lowerLlvmExprWithTarget a0 (DomI1) emptyList
+        case r0 of
+          Err err -> Err err
+          Ok out0 ->
+            case tail args of
+              Nothing -> Ok out0
+              Just rest -> lowerLlvmLogicalFold fnId rest (out0.operand) emptyList
+
+@label "LLVM lowering: lowerLlvmLogicalFold"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmLogicalFold : (fnId: String) -> (args: List (CeExpr Any)) -> (acc: LlvmOperand) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmLogicalFold fnId args acc emptyList =
+  case head args of
+    Nothing -> Ok (LlvmLowerOutput { operand = acc, domain = DomI1 })
+    Just a ->
+      let r = lowerLlvmExprWithTarget a (DomI1) emptyList
+      case r of
+        Err err -> Err err
+        Ok out ->
+          let resultTemp = freshTemp ()
+          let logicInstr =
+            if eq fnId "and" then And { result = resultTemp, opType = I1, lhs = acc, rhs = out.operand }
+            else Or { result = resultTemp, opType = I1, lhs = acc, rhs = out.operand }
+          let _e = emit logicInstr
+          let nextAcc = LocalRef { name = resultTemp }
+          case tail args of
+            Nothing -> Ok (LlvmLowerOutput { operand = nextAcc, domain = DomI1 })
+            Just rest -> lowerLlvmLogicalFold fnId rest nextAcc emptyList
+
+-- not(b) = xor b, true. Mirrors compile-llvm.ts:1203-1224.
+@label "LLVM lowering: lowerLlvmNotPath"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmNotPath : (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmNotPath args emptyList =
+  if eq (length args) 1
+  then
+    case head args of
+      Nothing -> Err (Unsupported { reason = "'not' missing arg", node = args })
+      Just a ->
+        let r = lowerLlvmExprWithTarget a (DomI1) emptyList
+        case r of
+          Err err -> Err err
+          Ok out ->
+            let resultTemp = freshTemp ()
+            let _e = emit (Xor {
+              result = resultTemp,
+              opType = I1,
+              lhs = out.operand,
+              rhs = ConstI1 { value = true }
+            })
+            Ok (LlvmLowerOutput {
+              operand = LocalRef { name = resultTemp },
+              domain = DomI1
+            })
+  else Err (Unsupported {
+    reason = "'not' expects exactly 1 arg",
+    node = args
+  })
+
+-- FNeg double. Mirrors compile-llvm.ts:1226-1245.
+@label "LLVM lowering: lowerLlvmNegatePath"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmNegatePath : (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmNegatePath args emptyList =
+  if eq (length args) 1
+  then
+    case head args of
+      Nothing -> Err (Unsupported { reason = "'negate' missing arg", node = args })
+      Just a ->
+        let r = lowerLlvmExprWithTarget a (DomDouble) emptyList
+        case r of
+          Err err -> Err err
+          Ok out ->
+            let resultTemp = freshTemp ()
+            let _e = emit (FNeg {
+              result = resultTemp,
+              opType = Double,
+              operand = out.operand
+            })
+            Ok (LlvmLowerOutput {
+              operand = LocalRef { name = resultTemp },
+              domain = DomDouble
+            })
+  else Err (Unsupported {
+    reason = "'negate' expects exactly 1 arg",
+    node = args
+  })
+
+-- $dyn:<varName> — indirect closure call. Extract fn + env via
+-- fenel_closure_fn / fenel_closure_env helpers; call through the loaded
+-- function pointer with env prepended. Mirrors compile-llvm.ts:985-1046.
+@label "LLVM lowering: lowerLlvmIndirectCall"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmIndirectCall : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmIndirectCall fnId args emptyList =
+  let varName = slice fnId 5 (unitLen fnId)
+  let loc = lookupScope varName
+  case loc of
+    Nothing -> Err (Unsupported {
+      reason = join ["indirect call target '", varName, "' not in scope at LLVM lowering"] "",
+      node = fnId
+    })
+    Just entry ->
+      let closure = coerceLlvmDomain (LlvmLowerOutput { operand = entry.operand, domain = entry.domain }) (DomPtr) emptyList
+      let cParam = appendItem (LlvmParam { name = "c", paramType = Ptr }) emptyList
+      let _d1 = internDecl "fenel_closure_fn" (Ptr) cParam
+      let _d2 = internDecl "fenel_closure_env" (Ptr) cParam
+      let fnTemp = freshTemp ()
+      let fnArgList = appendItem (LlvmCallArg { argType = Ptr, value = closure.operand }) emptyList
+      let _e1 = emit (LlvmCall {
+        result = fnTemp,
+        retType = Ptr,
+        fn = GlobalRef { name = "fenel_closure_fn" },
+        args = fnArgList
+      })
+      let envTemp = freshTemp ()
+      let envArgList = appendItem (LlvmCallArg { argType = Ptr, value = closure.operand }) emptyList
+      let _e2 = emit (LlvmCall {
+        result = envTemp,
+        retType = Ptr,
+        fn = GlobalRef { name = "fenel_closure_env" },
+        args = envArgList
+      })
+      let envArg = LlvmCallArg { argType = Ptr, value = LocalRef { name = envTemp } }
+      let argsR = lowerLlvmIndirectArgs args (appendItem envArg emptyList) emptyList
+      case argsR of
+        Err err -> Err err
+        Ok allArgs ->
+          let resultTemp = freshTemp ()
+          let _e3 = emit (LlvmCall {
+            result = resultTemp,
+            retType = Ptr,
+            fn = LocalRef { name = fnTemp },
+            args = allArgs
+          })
+          Ok (LlvmLowerOutput {
+            operand = LocalRef { name = resultTemp },
+            domain = DomPtr
+          })
+
+@label "LLVM lowering: lowerLlvmIndirectArgs"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmIndirectArgs : (args: List (CeExpr Any)) -> (acc: List LlvmCallArg) -> (emptyList: List Any) -> Result CompileError (List LlvmCallArg)
+lowerLlvmIndirectArgs args acc emptyList =
+  case head args of
+    Nothing -> Ok acc
+    Just a ->
+      let r = lowerLlvmExprWithTarget a (DomPtr) emptyList
+      case r of
+        Err err -> Err err
+        Ok out ->
+          let nextAcc = appendItem (LlvmCallArg { argType = Ptr, value = out.operand }) acc
+          case tail args of
+            Nothing -> Ok nextAcc
+            Just rest -> lowerLlvmIndirectArgs rest nextAcc emptyList
+
+-- $effect:<Class>:<method> dispatch — internEffectImport + internDecl,
+-- args lower at DomPtr, LlvmCall result DomPtr. Mirrors compile-llvm.ts:
+-- 1272-1309.
+@label "LLVM lowering: lowerLlvmEffectPath"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmEffectPath : (typeName: String) -> (methodName: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmEffectPath typeName methodName args emptyList =
+  let arity = length args
+  let symbol = internEffectImport typeName methodName arity
+  let paramList = buildLlvmPtrParamList arity 0 emptyList
+  let _d = internDecl symbol (Ptr) paramList
+  let argsR = lowerLlvmPtrArgs args emptyList emptyList
+  case argsR of
+    Err err -> Err err
+    Ok loweredArgs ->
+      let resultTemp = freshTemp ()
+      let _e = emit (LlvmCall {
+        result = resultTemp,
+        retType = Ptr,
+        fn = GlobalRef { name = symbol },
+        args = loweredArgs
+      })
+      Ok (LlvmLowerOutput {
+        operand = LocalRef { name = resultTemp },
+        domain = DomPtr
+      })
+
+-- Default — fenel_<fnId> runtime helper. Args at DomPtr, result DomPtr.
+-- Mirrors compile-llvm.ts:1311-1339.
+-- Canonical full function ids use a reversible UTF-8 hex symbol ABI:
+-- `engine:convert` => `fenel_fn_656E67696E653A636F6E76657274`.
+-- Bare native/IO leaves retain the historical `fenel_<name>` ABI.
+@label "LLVM full function symbol bytes"
+@description "Hex-encode UTF-8 bytes for the canonical LLVM full-function-id ABI."
+@tags "engine" "internal" "llvm" "field-identity"
+@category "engine-internal"
+llvmFullFnSymbolBytes : (bytes: List Number) -> (acc: List String) -> List String
+llvmFullFnSymbolBytes bytes acc =
+  case head bytes of
+    Nothing -> acc
+    Just b ->
+      let next = appendItem (emitLlvmHexByte b) acc
+      case tail bytes of
+        Nothing -> next
+        Just rest -> llvmFullFnSymbolBytes rest next
+
+@label "LLVM extern name"
+@description "Map a canonical full fnId to its reversible collision-free LLVM symbol; preserve the native bare-name ABI for unresolved runtime leaves."
+@tags "engine" "internal" "llvm" "field-identity"
+@category "engine-internal"
+llvmExternName : (fnId: String) -> String
+llvmExternName fnId =
+  if contains fnId ":"
+  then join ["fenel_fn_", join (llvmFullFnSymbolBytes (utf8Bytes fnId) []) ""] ""
+  else join ["fenel_", fnId] ""
+
+@label "LLVM entry name"
+@description "Canonicalize full-id helper entries while preserving public short entry exports."
+@tags "engine" "internal" "llvm" "field-identity"
+@category "engine-internal"
+llvmEntryName : (name: String) -> String
+llvmEntryName name =
+  if contains name ":" then llvmExternName name else name
+
+@label "LLVM lowering: lowerLlvmDefaultPath"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmDefaultPath : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmDefaultPath fnId args emptyList =
+  let arity = length args
+  let externName = llvmExternName fnId
+  let cd = llvmCallDomainOf fnId arity emptyList
+  let paramList = buildLlvmDomainTypedParamList (cd.argDomains) 0 emptyList
+  let retT = llvmDomainToValType (cd.resultDomain)
+  -- A canonical recursive call targets this module's own encoded entry
+  -- definition. Do not also emit an extern declaration for the same symbol.
+  let _d = if eq externName (llvmEntryName (getEntryName ()))
+           then true
+           else internDecl externName retT paramList
+  let argsR = lowerLlvmDomainTypedArgs args (cd.argDomains) emptyList emptyList
+  case argsR of
+    Err err -> Err err
+    Ok loweredArgs ->
+      let resultTemp = freshTemp ()
+      let _e = emit (LlvmCall {
+        result = resultTemp,
+        retType = retT,
+        fn = GlobalRef { name = externName },
+        args = loweredArgs
+      })
+      Ok (LlvmLowerOutput {
+        operand = LocalRef { name = resultTemp },
+        domain = cd.resultDomain
+      })
+
+-- Build a List<LlvmParam> of `arity` Ptr-typed entries (`a0`, `a1`,
+-- ...). Used by the effect-dispatch path (all-ptr by ABI contract).
+@label "LLVM lowering: buildLlvmPtrParamList"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+buildLlvmPtrParamList : (arity: Number) -> (idx: Number) -> (acc: List LlvmParam) -> List LlvmParam
+buildLlvmPtrParamList arity idx acc =
+  if lt idx arity
+  then
+    let p = LlvmParam { name = join ["a", toString idx] "", paramType = Ptr }
+    buildLlvmPtrParamList arity (add idx 1) (appendItem p acc)
+  else acc
+
+-- Phase 5b34 — build a List<LlvmParam> by walking argDomains; per-arg
+-- valType derived from llvmDomainToValType. Used by lowerLlvmDefaultPath
+-- so the declare matches the actual C-runtime ABI for natives whose
+-- llvmCallDomainOf entry is non-default (e.g. fenel_length returning
+-- double, fenel_slice taking mixed ptr/double args).
+@label "LLVM lowering: buildLlvmDomainTypedParamList"
+@description "Phase 5b34 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-5b"
+@category "engine-internal"
+buildLlvmDomainTypedParamList : (argDomains: List LlvmDomain) -> (idx: Number) -> (acc: List LlvmParam) -> List LlvmParam
+buildLlvmDomainTypedParamList argDomains idx acc =
+  case head argDomains of
+    Nothing -> acc
+    Just d ->
+      let pt = llvmDomainToValType d
+      let p = LlvmParam { name = join ["a", toString idx] "", paramType = pt }
+      let nextAcc = appendItem p acc
+      case tail argDomains of
+        Nothing -> nextAcc
+        Just rest -> buildLlvmDomainTypedParamList rest (add idx 1) nextAcc
+
+-- Lower each arg at DomPtr; thread the snoc-list LlvmCallArg accumulator
+-- through. Used by the $effect: path (all-ptr by ABI contract).
+@label "LLVM lowering: lowerLlvmPtrArgs"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmPtrArgs : (args: List (CeExpr Any)) -> (acc: List LlvmCallArg) -> (emptyList: List Any) -> Result CompileError (List LlvmCallArg)
+lowerLlvmPtrArgs args acc emptyList =
+  case head args of
+    Nothing -> Ok acc
+    Just a ->
+      let r = lowerLlvmExprWithTarget a (DomPtr) emptyList
+      case r of
+        Err err -> Err err
+        Ok out ->
+          let nextAcc = appendItem (LlvmCallArg { argType = Ptr, value = out.operand }) acc
+          case tail args of
+            Nothing -> Ok nextAcc
+            Just rest -> lowerLlvmPtrArgs rest nextAcc emptyList
+
+-- Phase 5b34 — lower each arg at its target domain from argDomains
+-- (parallel walk). Per-arg valType derived from llvmDomainToValType.
+-- Used by lowerLlvmDefaultPath so each arg's type matches the declare
+-- produced by buildLlvmDomainTypedParamList.
+@label "LLVM lowering: lowerLlvmDomainTypedArgs"
+@description "Phase 5b34 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-5b"
+@category "engine-internal"
+lowerLlvmDomainTypedArgs : (args: List (CeExpr Any)) -> (argDomains: List LlvmDomain) -> (acc: List LlvmCallArg) -> (emptyList: List Any) -> Result CompileError (List LlvmCallArg)
+lowerLlvmDomainTypedArgs args argDomains acc emptyList =
+  case head args of
+    Nothing -> Ok acc
+    Just a ->
+      case head argDomains of
+        Nothing -> Err (Unsupported {
+          reason = "lowerLlvmDomainTypedArgs: argDomains shorter than args",
+          node = a
+        })
+        Just expectedDom ->
+          let r = lowerLlvmExprWithTarget a expectedDom emptyList
+          case r of
+            Err err -> Err err
+            Ok out ->
+              let argT = llvmDomainToValType expectedDom
+              let nextAcc = appendItem (LlvmCallArg { argType = argT, value = out.operand }) acc
+              case tail args of
+                Nothing -> Ok nextAcc
+                Just restA ->
+                  case tail argDomains of
+                    Nothing -> Ok nextAcc
+                    Just restD -> lowerLlvmDomainTypedArgs restA restD nextAcc emptyList
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmConstruct / lowerLlvmRecord / lowerLlvmTaggedRecord — ADT /
+-- record construction. Calls fenel_construct(tag_ptr, tag_len, n_fields)
+-- to allocate; then per field emits fenel_set_field or
+-- fenel_set_field_named based on whether the field has a name.
+-- Mirrors compile-llvm.ts:1391-1495.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmConstruct"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmConstruct : (ctor: String) -> (args: List (CeExpr Any)) -> (fields: Any) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmConstruct ctor args fields emptyList =
+  let fieldNamesList = if isNull fields then emptyList else compileSlotWireNames fields emptyList
+  lowerLlvmTaggedRecord ctor args fieldNamesList emptyList
+
+@label "LLVM lowering: lowerLlvmRecord"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmRecord : (recordFields: List ({ name: String, value: (CeExpr Any) })) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmRecord recordFields emptyList =
+  let values = extractLlvmRecordValues recordFields emptyList
+  let names = extractLlvmRecordNames recordFields emptyList
+  lowerLlvmTaggedRecord "$record" values names emptyList
+
+@label "LLVM lowering: extractLlvmRecordValues"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+extractLlvmRecordValues : (fs: List ({ name: String, value: (CeExpr Any) })) -> (acc: List (CeExpr Any)) -> List (CeExpr Any)
+extractLlvmRecordValues fs acc =
+  case head fs of
+    Nothing -> acc
+    Just f ->
+      let next = appendItem (f.value) acc
+      case tail fs of
+        Nothing -> next
+        Just rest -> extractLlvmRecordValues rest next
+
+@label "LLVM lowering: extractLlvmRecordNames"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+extractLlvmRecordNames : (fs: List ({ name: String, value: (CeExpr Any) })) -> (acc: List String) -> List String
+extractLlvmRecordNames fs acc =
+  case head fs of
+    Nothing -> acc
+    Just f ->
+      let next = appendItem (f.name) acc
+      case tail fs of
+        Nothing -> next
+        Just rest -> extractLlvmRecordNames rest next
+
+-- llvmListIndex — return Just element when 0 <= i < length, else Nothing.
+@label "LLVM lowering: llvmListIndex"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmListIndex : (xs: List a) -> (i: Number) -> Maybe a
+llvmListIndex xs i =
+  if lt i 0 then Nothing
+  else llvmListIndexLoop xs i 0
+
+@label "LLVM lowering: llvmListIndexLoop"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmListIndexLoop : (xs: List a) -> (i: Number) -> (cur: Number) -> Maybe a
+llvmListIndexLoop xs i cur =
+  case head xs of
+    Nothing -> Nothing
+    Just x ->
+      if eq cur i then Just x
+      else
+        case tail xs of
+          Nothing -> Nothing
+          Just rest -> llvmListIndexLoop rest i (add cur 1)
+
+-- lowerLlvmTaggedRecord — central helper. Intern tag string, declare
+-- helpers, call fenel_construct, iterate fields, finalise with the
+-- result operand. Mirrors compile-llvm.ts:1413-1495.
+@label "LLVM lowering: lowerLlvmTaggedRecord"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmTaggedRecord : (tag: String) -> (fields: List (CeExpr Any)) -> (fieldNames: List String) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmTaggedRecord tag fields fieldNames emptyList =
+  let tagIdx = internString tag
+  let tagLen = utf8ByteLength tag
+  let nFields = length fields
+  let cParams__a1 = appendItem (LlvmParam { name = "tag", paramType = Ptr }) emptyList
+  let cParams__a0 = appendItem (LlvmParam { name = "len", paramType = LlvmI64 }) cParams__a1
+  let cParams = appendItem (LlvmParam { name = "n", paramType = LlvmI64 }) cParams__a0
+  let _d1 = internDecl "fenel_construct" (Ptr) cParams
+  let sfParams__a1 = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+  let sfParams__a0 = appendItem (LlvmParam { name = "i", paramType = LlvmI64 }) sfParams__a1
+  let sfParams = appendItem (LlvmParam { name = "f", paramType = Ptr }) sfParams__a0
+  let _d2 = internDecl "fenel_set_field" (Void) sfParams
+  let sfnParams__a3 = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+  let sfnParams__a2 = appendItem (LlvmParam { name = "i", paramType = LlvmI64 }) sfnParams__a3
+  let sfnParams__a1 = appendItem (LlvmParam { name = "name", paramType = Ptr }) sfnParams__a2
+  let sfnParams__a0 = appendItem (LlvmParam { name = "name_len", paramType = LlvmI64 }) sfnParams__a1
+  let sfnParams = appendItem (LlvmParam { name = "f", paramType = Ptr }) sfnParams__a0
+  let _d3 = internDecl "fenel_set_field_named" (Void) sfnParams
+  let valTemp = freshTemp ()
+  let constructArgs__a1 = appendItem (LlvmCallArg { argType = Ptr, value = GlobalRef { name = join [".str.", toString tagIdx] "" } }) emptyList
+  let constructArgs__a0 = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = tagLen } }) constructArgs__a1
+  let constructArgs = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = nFields } }) constructArgs__a0
+  let _e1 = emit (LlvmCall {
+    result = valTemp,
+    retType = Ptr,
+    fn = GlobalRef { name = "fenel_construct" },
+    args = constructArgs
+  })
+  let fieldsR = lowerLlvmTaggedRecordFields fields fieldNames 0 valTemp emptyList
+  case fieldsR of
+    Err err -> Err err
+    Ok _ok ->
+      Ok (LlvmLowerOutput {
+        operand = LocalRef { name = valTemp },
+        domain = DomPtr
+      })
+
+-- Per-field iteration: walks fields list alongside an index counter,
+-- dispatching per-field on whether the matching fieldNames entry exists.
+@label "LLVM lowering: lowerLlvmTaggedRecordFields"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmTaggedRecordFields : (fields: List (CeExpr Any)) -> (fieldNames: List String) -> (idx: Number) -> (valTemp: String) -> (emptyList: List Any) -> Result CompileError Boolean
+lowerLlvmTaggedRecordFields fields fieldNames idx valTemp emptyList =
+  case head fields of
+    Nothing -> Ok true
+    Just fieldExpr ->
+      let nameAtIdxM = llvmListIndex fieldNames idx
+      let perFieldR = lowerLlvmOneTaggedRecordField fieldExpr nameAtIdxM idx valTemp emptyList
+      case perFieldR of
+        Err err -> Err err
+        Ok _ok ->
+          case tail fields of
+            Nothing -> Ok true
+            Just rest ->
+              lowerLlvmTaggedRecordFields rest fieldNames (add idx 1) valTemp emptyList
+
+-- Per-field dispatcher: route to named or positional helper based on
+-- whether fieldNames[idx] is Just.
+@label "LLVM lowering: lowerLlvmOneTaggedRecordField"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmOneTaggedRecordField : (fieldExpr: (CeExpr Any)) -> (nameAtIdxM: Maybe String) -> (idx: Number) -> (valTemp: String) -> (emptyList: List Any) -> Result CompileError Boolean
+lowerLlvmOneTaggedRecordField fieldExpr nameAtIdxM idx valTemp emptyList =
+  case nameAtIdxM of
+    Nothing -> lowerLlvmPositionalField fieldExpr idx valTemp emptyList
+    Just name -> lowerLlvmNamedField fieldExpr name idx valTemp emptyList
+
+-- Positional: lower field at DomPtr, LlvmCall fenel_set_field (void).
+@label "LLVM lowering: lowerLlvmPositionalField"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmPositionalField : (fieldExpr: (CeExpr Any)) -> (idx: Number) -> (valTemp: String) -> (emptyList: List Any) -> Result CompileError Boolean
+lowerLlvmPositionalField fieldExpr idx valTemp emptyList =
+  let fieldR = lowerLlvmExprWithTarget fieldExpr (DomPtr) emptyList
+  case fieldR of
+    Err err -> Err err
+    Ok fieldOut ->
+      let argList__a1 = appendItem (LlvmCallArg { argType = Ptr, value = LocalRef { name = valTemp } }) emptyList
+      let argList__a0 = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = idx } }) argList__a1
+      let argList = appendItem (LlvmCallArg { argType = Ptr, value = fieldOut.operand }) argList__a0
+      let _e = emit (LlvmCallVoid {
+        retType = Void,
+        fn = GlobalRef { name = "fenel_set_field" },
+        args = argList
+      })
+      Ok true
+
+-- Named: intern name, lower field at DomPtr, LlvmCall fenel_set_field_named.
+@label "LLVM lowering: lowerLlvmNamedField"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmNamedField : (fieldExpr: (CeExpr Any)) -> (name: String) -> (idx: Number) -> (valTemp: String) -> (emptyList: List Any) -> Result CompileError Boolean
+lowerLlvmNamedField fieldExpr name idx valTemp emptyList =
+  let nameIdx = internString name
+  let nameLen = utf8ByteLength name
+  let fieldR = lowerLlvmExprWithTarget fieldExpr (DomPtr) emptyList
+  case fieldR of
+    Err err -> Err err
+    Ok fieldOut ->
+      let argList__a3 = appendItem (LlvmCallArg { argType = Ptr, value = LocalRef { name = valTemp } }) emptyList
+      let argList__a2 = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = idx } }) argList__a3
+      let argList__a1 = appendItem (LlvmCallArg { argType = Ptr, value = GlobalRef { name = join [".str.", toString nameIdx] "" } }) argList__a2
+      let argList__a0 = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = nameLen } }) argList__a1
+      let argList = appendItem (LlvmCallArg { argType = Ptr, value = fieldOut.operand }) argList__a0
+      let _e = emit (LlvmCallVoid {
+        retType = Void,
+        fn = GlobalRef { name = "fenel_set_field_named" },
+        args = argList
+      })
+      Ok true
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmMatch + emitLlvmPatternGuard + bindLlvmPattern — CeMatch lowering.
+-- Each match arm is its own basic-block sequence; the guard uses BrCond
+-- to skip to the next arm's check on mismatch. Mirrors compile-llvm.ts:
+-- 1497-1843.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmMatch"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmMatch : (scrutinee: (CeExpr Any)) -> (arms: List ({ pattern: CorePattern p, body: (CeExpr Any) })) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmMatch scrutinee arms emptyList =
+  let scrutR = lowerLlvmExprWithTarget scrutinee (DomPtr) emptyList
+  case scrutR of
+    Err err -> Err err
+    Ok scrutOut ->
+      let scrutOp = scrutOut.operand
+      let matchId = freshBlockId ()
+      let mergeLabel = join ["match.", toString matchId, ".merge"] ""
+      let defaultLabel = join ["match.", toString matchId, ".default"] ""
+      let armCount = length arms
+      let firstCheckLabel =
+        if gt armCount 0
+        then llvmArmCheckLabel matchId 0
+        else defaultLabel
+      let _e1 = endBlock (LlvmBr { target = firstCheckLabel })
+      let armsR = emitLlvmMatchArms arms 0 scrutOp matchId defaultLabel mergeLabel emptyList emptyList
+      case armsR of
+        Err err -> Err err
+        Ok armResults ->
+          -- Default block: fenel_match_fail(scrut).
+          let mfParams = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+          let _d = internDecl "fenel_match_fail" (Ptr) mfParams
+          let _s = startBlock defaultLabel
+          let failTemp = freshTemp ()
+          let mfArgs = appendItem (LlvmCallArg { argType = Ptr, value = scrutOp }) emptyList
+          let _e2 = emit (LlvmCall {
+            result = failTemp,
+            retType = Ptr,
+            fn = GlobalRef { name = "fenel_match_fail" },
+            args = mfArgs
+          })
+          let _e3 = endBlock (LlvmBr { target = mergeLabel })
+          let incomingWithDefault = appendItem (LlvmPhiIncoming { value = LocalRef { name = failTemp }, label = defaultLabel }) armResults
+          -- Merge block: phi over all arm results + default.
+          let _s2 = startBlock mergeLabel
+          let phiTemp = freshTemp ()
+          let _e4 = emit (Phi {
+            result = phiTemp,
+            phiType = Ptr,
+            incoming = incomingWithDefault
+          })
+          Ok (LlvmLowerOutput {
+            operand = LocalRef { name = phiTemp },
+            domain = DomPtr
+          })
+
+@label "LLVM lowering: llvmArmCheckLabel"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmArmCheckLabel : (matchId: Number) -> (armIdx: Number) -> String
+llvmArmCheckLabel matchId armIdx =
+  join ["match.", toString matchId, ".arm", toString armIdx, ".check"] ""
+
+@label "LLVM lowering: llvmArmBodyLabel"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+llvmArmBodyLabel : (matchId: Number) -> (armIdx: Number) -> String
+llvmArmBodyLabel matchId armIdx =
+  join ["match.", toString matchId, ".arm", toString armIdx, ".body"] ""
+
+-- emitLlvmMatchArms — recursive arm walker. For each arm: open check
+-- block, emit guard, BrCond to body or next-check; open body block,
+-- snapshot scope, bind pattern names, lower body at DomPtr, capture
+-- exit-block label, endBlock with LlvmBr to merge, restore scope. Returns
+-- the accumulated arm-results list (each entry is a LlvmPhiIncoming for
+-- the merge phi).
+@label "LLVM lowering: emitLlvmMatchArms"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmMatchArms : (arms: List ({ pattern: CorePattern p, body: (CeExpr Any) })) -> (idx: Number) -> (scrutOp: LlvmOperand) -> (matchId: Number) -> (defaultLabel: String) -> (mergeLabel: String) -> (armResults: List LlvmPhiIncoming) -> (emptyList: List Any) -> Result CompileError (List LlvmPhiIncoming)
+emitLlvmMatchArms arms idx scrutOp matchId defaultLabel mergeLabel armResults emptyList =
+  case head arms of
+    Nothing -> Ok armResults
+    Just arm ->
+      let checkLabel = llvmArmCheckLabel matchId idx
+      let bodyLabel = llvmArmBodyLabel matchId idx
+      let restArms = tail arms
+      let hasMoreArms =
+        case restArms of
+          Nothing -> false
+          Just rest ->
+            case head rest of
+              Nothing -> false
+              Just _ -> true
+      let nextLabel =
+        if hasMoreArms
+        then llvmArmCheckLabel matchId (add idx 1)
+        else defaultLabel
+      let _s1 = startBlock checkLabel
+      let guardR = emitLlvmPatternGuard (arm.pattern) scrutOp emptyList
+      case guardR of
+        Err err -> Err err
+        Ok guardOp ->
+          let _e1 = endBlock (BrCond {
+            cond = guardOp,
+            ifTrue = bodyLabel,
+            ifFalse = nextLabel
+          })
+          let _s2 = startBlock bodyLabel
+          let savedScope = snapshotScope ()
+          let _b = bindLlvmPattern (arm.pattern) scrutOp emptyList
+          let bodyR = lowerLlvmExprWithTarget (arm.body) (DomPtr) emptyList
+          case bodyR of
+            Err err ->
+              let _r = restoreScope savedScope
+              Err err
+            Ok bodyOut ->
+              let bodyExitLabel = getCurrentBlockLabel ()
+              let _e2 = endBlock (LlvmBr { target = mergeLabel })
+              let _r = restoreScope savedScope
+              let newResults = appendItem (LlvmPhiIncoming { value = bodyOut.operand, label = bodyExitLabel }) armResults
+              case restArms of
+                Nothing -> Ok newResults
+                Just rest ->
+                  emitLlvmMatchArms rest (add idx 1) scrutOp matchId defaultLabel mergeLabel newResults emptyList
+
+-- emitLlvmPatternGuard — emit a straight-line sequence of i1 instructions
+-- computing "does scrut match pattern?", returning the final i1 operand.
+-- PatVar / PatWildcard → ConstI1 true. PatLit → call fenel_lit_eq with
+-- boxed literal. PatConstruct → tag check + AND-folded per-sub presence
+-- + recursive sub-guard. Mirrors compile-llvm.ts:emitLlvmPatternGuard
+-- (1600-1775).
+@label "LLVM lowering: emitLlvmPatternGuard"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPatternGuard : (pattern: CorePattern p) -> (scrut: LlvmOperand) -> (emptyList: List Any) -> Result CompileError LlvmOperand
+emitLlvmPatternGuard pattern scrut emptyList =
+  case pattern of
+    PatVar { name = _n } -> Ok (ConstI1 { value = true })
+    PatWildcard -> Ok (ConstI1 { value = true })
+    PatLit { value = v } -> emitLlvmPatLitGuard v scrut emptyList
+    PatConstruct { ctor = c, args = subs } ->
+      let fieldNames = if isNull pattern.fields then emptyList else compileSlotWireNames pattern.fields emptyList
+      emitLlvmPatConstructGuard c subs fieldNames scrut emptyList
+
+@label "LLVM lowering: emitLlvmPatLitGuard"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPatLitGuard : (v: Any) -> (scrut: LlvmOperand) -> (emptyList: List Any) -> Result CompileError LlvmOperand
+emitLlvmPatLitGuard v scrut emptyList =
+  let litR = lowerLlvmExprWithTarget (CeLit { value = v }) (DomPtr) emptyList
+  case litR of
+    Err err -> Err err
+    Ok litOut ->
+      let params__a0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+      let params = appendItem (LlvmParam { name = "lit", paramType = Ptr }) params__a0
+      let _d = internDecl "fenel_lit_eq" (I1) params
+      let resultTemp = freshTemp ()
+      let argList__a0 = appendItem (LlvmCallArg { argType = Ptr, value = scrut }) emptyList
+      let argList = appendItem (LlvmCallArg { argType = Ptr, value = litOut.operand }) argList__a0
+      let _e = emit (LlvmCall {
+        result = resultTemp,
+        retType = I1,
+        fn = GlobalRef { name = "fenel_lit_eq" },
+        args = argList
+      })
+      Ok (LocalRef { name = resultTemp })
+
+@label "LLVM lowering: emitLlvmPatConstructGuard"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPatConstructGuard : (ctor: String) -> (subs: List (CorePattern p)) -> (fieldNames: List String) -> (scrut: LlvmOperand) -> (emptyList: List Any) -> Result CompileError LlvmOperand
+emitLlvmPatConstructGuard ctor subs fieldNames scrut emptyList =
+  -- 1. Tag check: call fenel_tag_eq(scrut, @.str.<tagIdx>).
+  let tagIdx = internString ctor
+  let teParams__a0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+  let teParams = appendItem (LlvmParam { name = "tag", paramType = Ptr }) teParams__a0
+  let _d = internDecl "fenel_tag_eq" (I1) teParams
+  let tagOkTemp = freshTemp ()
+  let teArgs__a0 = appendItem (LlvmCallArg { argType = Ptr, value = scrut }) emptyList
+  let teArgs = appendItem (LlvmCallArg { argType = Ptr, value = GlobalRef { name = join [".str.", toString tagIdx] "" } }) teArgs__a0
+  let _e1 = emit (LlvmCall {
+    result = tagOkTemp,
+    retType = I1,
+    fn = GlobalRef { name = "fenel_tag_eq" },
+    args = teArgs
+  })
+  -- 2. Pre-declare get_field / get_field_named / has_field /
+  --    has_field_named for the sub-pattern walk.
+  let _d2_p1 = appendItem (LlvmParam { name = "i", paramType = LlvmI64 }) emptyList
+  let _d2_p0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) _d2_p1
+  let _d2 = internDecl "fenel_get_field" (Ptr) _d2_p0
+  let _d3_p2 = appendItem (LlvmParam { name = "name_len", paramType = LlvmI64 }) emptyList
+  let _d3_p1 = appendItem (LlvmParam { name = "name", paramType = Ptr }) _d3_p2
+  let _d3_p0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) _d3_p1
+  let _d3 = internDecl "fenel_get_field_named" (Ptr) _d3_p0
+  let _d4_p1 = appendItem (LlvmParam { name = "i", paramType = LlvmI64 }) emptyList
+  let _d4_p0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) _d4_p1
+  let _d4 = internDecl "fenel_has_field" (I1) _d4_p0
+  let _d5_p2 = appendItem (LlvmParam { name = "name_len", paramType = LlvmI64 }) emptyList
+  let _d5_p1 = appendItem (LlvmParam { name = "name", paramType = Ptr }) _d5_p2
+  let _d5_p0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) _d5_p1
+  let _d5 = internDecl "fenel_has_field_named" (I1) _d5_p0
+  -- 3. AND-fold sub-pattern guards onto tagOk.
+  emitLlvmPatConstructSubs subs fieldNames 0 scrut (LocalRef { name = tagOkTemp }) emptyList
+
+@label "LLVM lowering: emitLlvmPatConstructSubs"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPatConstructSubs : (subs: List (CorePattern p)) -> (fieldNames: List String) -> (idx: Number) -> (scrut: LlvmOperand) -> (acc: LlvmOperand) -> (emptyList: List Any) -> Result CompileError LlvmOperand
+emitLlvmPatConstructSubs subs fieldNames idx scrut acc emptyList =
+  case head subs of
+    Nothing -> Ok acc
+    Just sub ->
+      let fieldNameM =
+        if isNull fieldNames then Nothing
+        else llvmListIndex fieldNames idx
+      -- Presence check (has_field / has_field_named).
+      let hasTemp = freshTemp ()
+      let _h = emitLlvmPresenceCall fieldNameM idx scrut hasTemp emptyList
+      -- AND-fold presence into acc.
+      let presAndTemp = freshTemp ()
+      let _e1 = emit (And {
+        result = presAndTemp,
+        opType = I1,
+        lhs = acc,
+        rhs = LocalRef { name = hasTemp }
+      })
+      let acc1 = LocalRef { name = presAndTemp }
+      -- Skip field-load + recursive sub-guard when sub is PatVar /
+      -- PatWildcard (the presence check above is the only contribution).
+      emitLlvmPatConstructSubsNext sub subs fieldNames idx scrut acc1 emptyList
+
+@label "LLVM lowering: emitLlvmPatConstructSubsNext"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPatConstructSubsNext : (sub: CorePattern p) -> (subs: List (CorePattern p)) -> (fieldNames: List String) -> (idx: Number) -> (scrut: LlvmOperand) -> (acc1: LlvmOperand) -> (emptyList: List Any) -> Result CompileError LlvmOperand
+emitLlvmPatConstructSubsNext sub subs fieldNames idx scrut acc1 emptyList =
+  case sub of
+    PatVar { name = _n } -> emitLlvmPatConstructAdvance subs fieldNames idx scrut acc1 emptyList
+    PatWildcard -> emitLlvmPatConstructAdvance subs fieldNames idx scrut acc1 emptyList
+    _ ->
+      -- Load field + recursive sub-guard.
+      let fieldNameM =
+        if isNull fieldNames then Nothing
+        else llvmListIndex fieldNames idx
+      let fieldTemp = freshTemp ()
+      let _l = emitLlvmFieldLoadCall fieldNameM idx scrut fieldTemp emptyList
+      let subR = emitLlvmPatternGuard sub (LocalRef { name = fieldTemp }) emptyList
+      case subR of
+        Err err -> Err err
+        Ok subGuard ->
+          let andTemp = freshTemp ()
+          let _e2 = emit (And {
+            result = andTemp,
+            opType = I1,
+            lhs = acc1,
+            rhs = subGuard
+          })
+          let acc2 = LocalRef { name = andTemp }
+          emitLlvmPatConstructAdvance subs fieldNames idx scrut acc2 emptyList
+
+@label "LLVM lowering: emitLlvmPatConstructAdvance"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPatConstructAdvance : (subs: List (CorePattern p)) -> (fieldNames: List String) -> (idx: Number) -> (scrut: LlvmOperand) -> (acc: LlvmOperand) -> (emptyList: List Any) -> Result CompileError LlvmOperand
+emitLlvmPatConstructAdvance subs fieldNames idx scrut acc emptyList =
+  case tail subs of
+    Nothing -> Ok acc
+    Just rest ->
+      case head rest of
+        Nothing -> Ok acc
+        Just _ -> emitLlvmPatConstructSubs rest fieldNames (add idx 1) scrut acc emptyList
+
+@label "LLVM lowering: emitLlvmPresenceCall"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPresenceCall : (fieldNameM: Maybe String) -> (idx: Number) -> (scrut: LlvmOperand) -> (hasTemp: String) -> (emptyList: List Any) -> Boolean
+emitLlvmPresenceCall fieldNameM idx scrut hasTemp emptyList =
+  case fieldNameM of
+    Just name ->
+      let nameIdx = internString name
+      let nameLen = utf8ByteLength name
+      let argList__a1 = appendItem (LlvmCallArg { argType = Ptr, value = scrut }) emptyList
+      let argList__a0 = appendItem (LlvmCallArg { argType = Ptr, value = GlobalRef { name = join [".str.", toString nameIdx] "" } }) argList__a1
+      let argList = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = nameLen } }) argList__a0
+      emit (LlvmCall {
+        result = hasTemp,
+        retType = I1,
+        fn = GlobalRef { name = "fenel_has_field_named" },
+        args = argList
+      })
+    Nothing ->
+      let argList__a0 = appendItem (LlvmCallArg { argType = Ptr, value = scrut }) emptyList
+      let argList = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = idx } }) argList__a0
+      emit (LlvmCall {
+        result = hasTemp,
+        retType = I1,
+        fn = GlobalRef { name = "fenel_has_field" },
+        args = argList
+      })
+
+@label "LLVM lowering: emitLlvmFieldLoadCall"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmFieldLoadCall : (fieldNameM: Maybe String) -> (idx: Number) -> (scrut: LlvmOperand) -> (fieldTemp: String) -> (emptyList: List Any) -> Boolean
+emitLlvmFieldLoadCall fieldNameM idx scrut fieldTemp emptyList =
+  case fieldNameM of
+    Just name ->
+      let nameIdx = internString name
+      let nameLen = utf8ByteLength name
+      let argList__a1 = appendItem (LlvmCallArg { argType = Ptr, value = scrut }) emptyList
+      let argList__a0 = appendItem (LlvmCallArg { argType = Ptr, value = GlobalRef { name = join [".str.", toString nameIdx] "" } }) argList__a1
+      let argList = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = nameLen } }) argList__a0
+      emit (LlvmCall {
+        result = fieldTemp,
+        retType = Ptr,
+        fn = GlobalRef { name = "fenel_get_field_named" },
+        args = argList
+      })
+    Nothing ->
+      let argList__a0 = appendItem (LlvmCallArg { argType = Ptr, value = scrut }) emptyList
+      let argList = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = idx } }) argList__a0
+      emit (LlvmCall {
+        result = fieldTemp,
+        retType = Ptr,
+        fn = GlobalRef { name = "fenel_get_field" },
+        args = argList
+      })
+
+-- bindLlvmPattern — bind every name introduced by pattern into b.scope.
+-- For top-level PatVar: scrut → name@DomPtr. For PatConstruct nested
+-- PatVar: get_field result → name@DomPtr. PatLit / PatWildcard
+-- contribute no bindings.
+-- Mirrors compile-llvm.ts:bindLlvmPattern at 1783-1843.
+@label "LLVM lowering: bindLlvmPattern"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+bindLlvmPattern : (pattern: CorePattern p) -> (scrut: LlvmOperand) -> (emptyList: List Any) -> Boolean
+bindLlvmPattern pattern scrut emptyList =
+  case pattern of
+    PatLit { value = _v } -> true
+    PatWildcard -> true
+    PatVar { name = n } ->
+      let _b = bindScope n scrut (DomPtr)
+      true
+    PatConstruct { ctor = _c, args = subs } ->
+      let fieldNames = if isNull pattern.fields then emptyList else compileSlotWireNames pattern.fields emptyList
+      bindLlvmPatternSubs subs fieldNames 0 scrut emptyList
+
+@label "LLVM lowering: bindLlvmPatternSubs"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+bindLlvmPatternSubs : (subs: List (CorePattern p)) -> (fieldNames: List String) -> (idx: Number) -> (scrut: LlvmOperand) -> (emptyList: List Any) -> Boolean
+bindLlvmPatternSubs subs fieldNames idx scrut emptyList =
+  case head subs of
+    Nothing -> true
+    Just sub ->
+      let _b = bindLlvmOnePatternSub sub fieldNames idx scrut emptyList
+      case tail subs of
+        Nothing -> true
+        Just rest -> bindLlvmPatternSubs rest fieldNames (add idx 1) scrut emptyList
+
+@label "LLVM lowering: bindLlvmOnePatternSub"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+bindLlvmOnePatternSub : (sub: CorePattern p) -> (fieldNames: List String) -> (idx: Number) -> (scrut: LlvmOperand) -> (emptyList: List Any) -> Boolean
+bindLlvmOnePatternSub sub fieldNames idx scrut emptyList =
+  case sub of
+    PatLit { value = _v } -> true
+    PatWildcard -> true
+    _ ->
+      let fieldNameM =
+        if isNull fieldNames then Nothing
+        else llvmListIndex fieldNames idx
+      let _d2_p1 = appendItem (LlvmParam { name = "i", paramType = LlvmI64 }) emptyList
+      let _d2_p0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) _d2_p1
+      let _d2 = internDecl "fenel_get_field" (Ptr) _d2_p0
+      let _d3_p2 = appendItem (LlvmParam { name = "name_len", paramType = LlvmI64 }) emptyList
+      let _d3_p1 = appendItem (LlvmParam { name = "name", paramType = Ptr }) _d3_p2
+      let _d3_p0 = appendItem (LlvmParam { name = "v", paramType = Ptr }) _d3_p1
+      let _d3 = internDecl "fenel_get_field_named" (Ptr) _d3_p0
+      let fieldTemp = freshTemp ()
+      let _l = emitLlvmFieldLoadCall fieldNameM idx scrut fieldTemp emptyList
+      let _b = bindLlvmPattern sub (LocalRef { name = fieldTemp }) emptyList
+      true
+
+-- ---------------------------------------------------------------------------
+-- lowerLlvmClosure — CeClosure arm. Algorithm (mirrors compile-llvm.ts:
+-- lowerClosure at 811-978):
+--   1. Allocate fresh closure id + name (`<entry>__cl<N>`).
+--   2. Resolve captures in the CALLER's scope (coerce each to DomPtr).
+--   3. Pre-declare fenel_env_get before swapping frame.
+--   4. enterClosureFrame — swap to a fresh per-body frame (scope,
+--      currentBlock, blocks, nextTemp, nextBlockId). The caller's
+--      module-level state (declarations, stringPool, effectImports,
+--      pendingDefinitions, nextClosureId, entryName) persists.
+--   5. Emit body's capture-loading prologue (fenel_env_get per capture).
+--   6. Bind closure params at DomPtr in the body scope.
+--   7. Lower body at DomPtr.
+--   8. endBlock body with Ret ptr.
+--   9. Assemble LlvmFunctionDef + addPendingDefinition.
+--  10. exitClosureFrame — restore caller's frame.
+--  11. Emit closure-construction sequence (fenel_env_alloc, per-capture
+--      fenel_env_set, fenel_make_closure) into caller's open block.
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerLlvmClosure"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+lowerLlvmClosure : (params: List String) -> (captures: List String) -> (body: (CeExpr Any)) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+lowerLlvmClosure params captures body emptyList =
+  let clId = nextClosureId ()
+  let entryName = llvmEntryName (getEntryName ())
+  let clName = join [entryName, "__cl", toString clId] ""
+  -- Step 2: resolve captures in caller's scope.
+  let capOperandsR = resolveLlvmCaptureOperands captures emptyList
+  case capOperandsR of
+    Err err -> Err err
+    Ok captureOperands ->
+      -- Step 3 + 4: pre-declare env_get + swap frame.
+      let _d_p1 = appendItem (LlvmParam { name = "i", paramType = LlvmI64 }) emptyList
+      let _d_p0 = appendItem (LlvmParam { name = "env", paramType = Ptr }) _d_p1
+      let _d = internDecl "fenel_env_get" (Ptr) _d_p0
+      let snap = enterClosureFrame ()
+      -- Step 5: capture-loading prologue.
+      let _p = emitLlvmCaptureLoadPrologue captures 0 emptyList
+      -- Step 6: bind closure params at DomPtr.
+      let _bp = bindLlvmClosureParams params emptyList
+      -- Step 7: lower body at DomPtr.
+      let bodyR = lowerLlvmExprWithTarget body (DomPtr) emptyList
+      case bodyR of
+        Err err ->
+          let _r = exitClosureFrame snap
+          Err err
+        Ok bodyOut ->
+          -- Step 8: end body with Ret ptr.
+          let _e = endBlock (Ret {
+            retType = Ptr,
+            value = bodyOut.operand
+          })
+          let bodyBlocks = getCurrentBlocks ()
+          -- Step 9: assemble + addPendingDefinition.
+          let restParams = buildLlvmClosureParamList params 0 emptyList
+          let paramList = appendItem (LlvmParam { name = "env", paramType = Ptr }) restParams
+          let bodyDef = LlvmFunctionDef {
+            name = clName,
+            returnType = Ptr,
+            params = paramList,
+            blocks = bodyBlocks
+          }
+          let _a = addPendingDefinition bodyDef
+          -- Step 10: restore caller's frame.
+          let _r = exitClosureFrame snap
+          -- Step 11: closure-construction sequence in caller's open block.
+          emitLlvmClosureConstruction clName captureOperands emptyList
+
+-- Resolve each capture name in caller's scope, coerce to DomPtr,
+-- return list of operands. MUST run BEFORE enterClosureFrame.
+@label "LLVM lowering: resolveLlvmCaptureOperands"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+resolveLlvmCaptureOperands : (captures: List String) -> (emptyList: List Any) -> Result CompileError (List LlvmOperand)
+resolveLlvmCaptureOperands captures emptyList =
+  resolveLlvmCaptureOperandsLoop captures emptyList emptyList
+
+@label "LLVM lowering: resolveLlvmCaptureOperandsLoop"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+resolveLlvmCaptureOperandsLoop : (captures: List String) -> (acc: List LlvmOperand) -> (emptyList: List Any) -> Result CompileError (List LlvmOperand)
+resolveLlvmCaptureOperandsLoop captures acc emptyList =
+  case head captures of
+    Nothing -> Ok acc
+    Just name ->
+      let loc = lookupScope name
+      case loc of
+        Nothing -> Err (Unsupported {
+          reason = join ["CeClosure capture '", name, "' not in scope at LLVM lowering"] "",
+          node = name
+        })
+        Just entry ->
+          let coerced = coerceLlvmDomain (LlvmLowerOutput { operand = entry.operand, domain = entry.domain }) (DomPtr) emptyList
+          let nextAcc = appendItem (coerced.operand) acc
+          case tail captures of
+            Nothing -> Ok nextAcc
+            Just rest -> resolveLlvmCaptureOperandsLoop rest nextAcc emptyList
+
+-- Emit the body's capture-loading prologue: for each capture i with
+-- name = captures[i], emit %t = call ptr @fenel_env_get(ptr %env, i64 i)
+-- + bindScope name LocalRef DomPtr.
+@label "LLVM lowering: emitLlvmCaptureLoadPrologue"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmCaptureLoadPrologue : (captures: List String) -> (idx: Number) -> (emptyList: List Any) -> Boolean
+emitLlvmCaptureLoadPrologue captures idx emptyList =
+  case head captures of
+    Nothing -> true
+    Just name ->
+      let resultTemp = freshTemp ()
+      let argList__a0 = appendItem (LlvmCallArg { argType = Ptr, value = LocalRef { name = "env" } }) emptyList
+      let argList = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = idx } }) argList__a0
+      let _e = emit (LlvmCall {
+        result = resultTemp,
+        retType = Ptr,
+        fn = GlobalRef { name = "fenel_env_get" },
+        args = argList
+      })
+      let _b = bindScope name (LocalRef { name = resultTemp }) (DomPtr)
+      case tail captures of
+        Nothing -> true
+        Just rest -> emitLlvmCaptureLoadPrologue rest (add idx 1) emptyList
+
+-- Bind each lambda param at DomPtr in the body scope (params arrive as
+-- `ptr` per the closure ABI; coerceDomain unboxes at use sites).
+@label "LLVM lowering: bindLlvmClosureParams"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+bindLlvmClosureParams : (params: List String) -> (emptyList: List Any) -> Boolean
+bindLlvmClosureParams params emptyList =
+  case head params of
+    Nothing -> true
+    Just paramName ->
+      let _b = bindScope paramName (LocalRef { name = paramName }) (DomPtr)
+      case tail params of
+        Nothing -> true
+        Just rest -> bindLlvmClosureParams rest emptyList
+
+-- Build the LlvmParam list for the closure body's params (after the
+-- leading `env`). Each is Ptr-typed.
+@label "LLVM lowering: buildLlvmClosureParamList"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+buildLlvmClosureParamList : (params: List String) -> (idx: Number) -> (acc: List LlvmParam) -> List LlvmParam
+buildLlvmClosureParamList params idx acc =
+  case head params of
+    Nothing -> acc
+    Just p ->
+      let next = appendItem (LlvmParam { name = p, paramType = Ptr }) acc
+      case tail params of
+        Nothing -> next
+        Just rest -> buildLlvmClosureParamList rest (add idx 1) next
+
+-- Emit the closure-construction sequence: fenel_env_alloc(N) → env;
+-- per-capture fenel_env_set(env, i, cap); fenel_make_closure(@<clName>,
+-- env) → closure handle. Mirrors compile-llvm.ts:935-972.
+@label "LLVM lowering: emitLlvmClosureConstruction"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmClosureConstruction : (clName: String) -> (captureOperands: List LlvmOperand) -> (emptyList: List Any) -> Result CompileError LlvmLowerOutput
+emitLlvmClosureConstruction clName captureOperands emptyList =
+  let _d1_p0 = appendItem (LlvmParam { name = "n", paramType = LlvmI64 }) emptyList
+  let _d1 = internDecl "fenel_env_alloc" (Ptr) _d1_p0
+  let _d2_p2 = appendItem (LlvmParam { name = "v", paramType = Ptr }) emptyList
+  let _d2_p1 = appendItem (LlvmParam { name = "i", paramType = LlvmI64 }) _d2_p2
+  let _d2_p0 = appendItem (LlvmParam { name = "env", paramType = Ptr }) _d2_p1
+  let _d2 = internDecl "fenel_env_set" (Void) _d2_p0
+  let _d3_p1 = appendItem (LlvmParam { name = "env", paramType = Ptr }) emptyList
+  let _d3_p0 = appendItem (LlvmParam { name = "fn", paramType = Ptr }) _d3_p1
+  let _d3 = internDecl "fenel_make_closure" (Ptr) _d3_p0
+  let nCaps = length captureOperands
+  let envTemp = freshTemp ()
+  let envAllocArgs = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = nCaps } }) emptyList
+  let _e1 = emit (LlvmCall {
+    result = envTemp,
+    retType = Ptr,
+    fn = GlobalRef { name = "fenel_env_alloc" },
+    args = envAllocArgs
+  })
+  let _e2 = emitLlvmEnvSetCalls captureOperands 0 envTemp emptyList
+  let clTemp = freshTemp ()
+  let mkArgs__a0 = appendItem (LlvmCallArg { argType = Ptr, value = GlobalRef { name = clName } }) emptyList
+  let mkArgs = appendItem (LlvmCallArg { argType = Ptr, value = LocalRef { name = envTemp } }) mkArgs__a0
+  let _e3 = emit (LlvmCall {
+    result = clTemp,
+    retType = Ptr,
+    fn = GlobalRef { name = "fenel_make_closure" },
+    args = mkArgs
+  })
+  Ok (LlvmLowerOutput {
+    operand = LocalRef { name = clTemp },
+    domain = DomPtr
+  })
+
+@label "LLVM lowering: emitLlvmEnvSetCalls"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmEnvSetCalls : (captureOperands: List LlvmOperand) -> (idx: Number) -> (envTemp: String) -> (emptyList: List Any) -> Boolean
+emitLlvmEnvSetCalls captureOperands idx envTemp emptyList =
+  case head captureOperands of
+    Nothing -> true
+    Just capOp ->
+      let argList__a1 = appendItem (LlvmCallArg { argType = Ptr, value = LocalRef { name = envTemp } }) emptyList
+      let argList__a0 = appendItem (LlvmCallArg { argType = LlvmI64, value = ConstI64 { value = idx } }) argList__a1
+      let argList = appendItem (LlvmCallArg { argType = Ptr, value = capOp }) argList__a0
+      let _e = emit (LlvmCallVoid {
+        retType = Void,
+        fn = GlobalRef { name = "fenel_env_set" },
+        args = argList
+      })
+      case tail captureOperands of
+        Nothing -> true
+        Just rest -> emitLlvmEnvSetCalls rest (add idx 1) envTemp emptyList
+
+-- ---------------------------------------------------------------------------
+-- lowerToLlvmAst — program-level entry. Takes a ClosuresExplicitProgram +
+-- pre-computed paramDomains + externalReturn from the dispatch wrapper's
+-- TS-side inferEntryDomains. Assembles the LlvmModule envelope.
+--
+-- Algorithm (mirrors compile-llvm.ts:lowerProgramToLlvm at 2059-2126):
+--   1. seedEntryScope — bind each param at (LocalRef name, domain).
+--   2. lowerLlvmExprWithTarget body externalReturn → final operand.
+--   3. endBlock with Ret (externalReturn type, operand).
+--   4. Read builder state: blocks, declarations, stringPool,
+--      effectImports, pendingDefinitions.
+--   5. Assemble entry LlvmFunctionDef.
+--   6. Assemble LlvmModule with all definitions = pendingDefinitions ++
+--      [entry].
+-- ---------------------------------------------------------------------------
+@label "LLVM lowering: lowerToLlvmAst"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "ir" "llvm" "self-host" "phase-21"
+lowerToLlvmAst : (program: ClosuresExplicitProgram) -> (paramDomains: List ({ name: String, domain: LlvmDomain })) -> (externalReturn: LlvmDomain) -> (emptyList: List Any) -> Result CompileError LlvmModule
+lowerToLlvmAst program paramDomains externalReturn emptyList =
+  let _seed = seedEntryScope paramDomains
+  let bodyR = lowerLlvmExprWithTarget (program.body) externalReturn emptyList
+  case bodyR of
+    Err err -> Err err
+    Ok bodyOut ->
+      let retType = llvmDomainToValType externalReturn
+      let _e = endBlock (Ret {
+        retType = retType,
+        value = bodyOut.operand
+      })
+      let entryBlocks = getCurrentBlocks ()
+      let entryParams = buildLlvmEntryParamList paramDomains emptyList
+      let entryDef = LlvmFunctionDef {
+        name = llvmEntryName (program.name),
+        returnType = retType,
+        params = entryParams,
+        blocks = entryBlocks
+      }
+      let decls = getDeclarations ()
+      let stringPool = getStringPool ()
+      let effectImports = getEffectImports ()
+      let pendingDefs = getPendingDefinitions ()
+      let allDefs = concat pendingDefs (appendItem entryDef emptyList)
+      Ok (LlvmModule {
+        name = program.name,
+        fieldSlots = program.params,
+        declarations = decls,
+        globals = emptyList,
+        definitions = allDefs,
+        effectImports = effectImports,
+        stringPool = stringPool
+      })
+
+-- Build the entry function's LlvmParam list from paramDomains. Each
+-- entry maps {name, domain} → LlvmParam {name, paramType=valTypeOf
+-- domain}.
+@label "LLVM lowering: buildLlvmEntryParamList"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+buildLlvmEntryParamList : (paramDomains: List LlvmParamDomain) -> (emptyList: List LlvmParam) -> List LlvmParam
+buildLlvmEntryParamList paramDomains emptyList =
+  buildLlvmEntryParamListLoop paramDomains emptyList
+
+@label "LLVM lowering: buildLlvmEntryParamListLoop"
+@description "Phase 21.8 — LLVM lowering body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+buildLlvmEntryParamListLoop : (paramDomains: List LlvmParamDomain) -> (acc: List LlvmParam) -> List LlvmParam
+buildLlvmEntryParamListLoop paramDomains acc =
+  case head paramDomains of
+    Nothing -> acc
+    Just p ->
+      let pt = llvmDomainToValType (p.domain)
+      let next = appendItem (LlvmParam { name = p.name, paramType = pt }) acc
+      case tail paramDomains of
+        Nothing -> next
+        Just rest -> buildLlvmEntryParamListLoop rest next
+
+-- ---------------------------------------------------------------------------
+-- Phase 21.8.1 — forward-walk type inference for LLVM (inferLlvmDomains +
+-- propagateLlvmCeVarDomain + walkLlvmForDomainPropagation). Closes the
+-- LLVM-side inference gap; the last TS-only piece of the LLVM lowering
+-- pipeline (before the IR-text encoder `emitModule`).
+--
+-- Substrate: reuses the Phase 21.7.1 `HasDomainEnv` capability (the
+-- dispatch wrapper binds the same 3 natives — `getDomain`, `setDomain`,
+-- `getEnvEntries` — onto ctx.natives at evaluation time). The natives
+-- are domain-polymorphic: the JS Map holds whatever the body writes, so
+-- LlvmDomain values flow through the same interface as WasmDomain values
+-- did in Phase 21.7.1. Option B fork per the Phase 21.8.1 brief — the
+-- inference walk is structurally identical to Wasm's; only the domain
+-- ADT constructors differ. Phase 21.9 (follow-on) unifies the two
+-- bodies via Option A (parameterise over the domain ADT).
+--
+-- Algorithm: a forward walker over CeExpr that propagates expected
+-- argument domains into the env. Each binding's domain refines (one-way:
+-- `undefined` or LlvmDomUnknown → expected) the first time a typed context
+-- demands it; downstream uses see the refined domain. The 4 ptr-producing
+-- arms (CeClosure / CeConstruct / CeRecord / CeMatch) delegate to
+-- `walkLlvmForDomainPropagation` for child-CeVar refinement and return
+-- DomPtr directly.
+--
+-- Watch-outs preserved from the TS oracle (engine-bodies-dispatch.ts's
+-- inferLlvmDomainsTS / walkLlvmForDomainPropagation / propagateOrInferLlvm,
+-- deleted in this phase):
+--   - propagateLlvmCeVarDomain is ONE-WAY: never overwrites a concrete
+--     domain. Flipping DomDouble→DomPtr mid-walk would corrupt the
+--     function-signature inference.
+--   - Dotted-CeVar HEAD propagation: both `propagateLlvmCeVarDomain` and
+--     the CeVar arm of `inferLlvmDomains` force the HEAD binding to
+--     DomPtr. Load-bearing for `bot.token`-style access — without it the
+--     head local settles on the caller's default (usually DomDouble) and
+--     the call-boundary unboxes the record handle to NaN.
+--   - CeIf branch agreement: when then/else dom-tags match, return that
+--     domain; otherwise DomPtr (the safe boundary type). Mirrors the TS
+--     oracle's `thenDom.$tag === elseDom.$tag` check.
+--   - CeConstruct / CeRecord / CeMatch CeVar-field/scrutinee →
+--     propagate(DomPtr). Phase 21.5.2's substrate fix; without it
+--     string-typed fields unbox to f64 at the call boundary and the
+--     downstream comparison-vs-NaN cascade fails silently.
+--
+-- Naming: helpers postfix with `Llvm` (or use the `llvm` prefix on
+-- shared semantics) to avoid registry collisions with the Phase 21.7.1
+-- Wasm helpers. Mirrors the `llvmCallDomainOf` / `callDomainOf`
+-- distinction already in place.
+-- ---------------------------------------------------------------------------
+
+-- refineLlvmDomain — one-way refinement primitive. setDomain iff the
+-- current entry is absent (Nothing) or LlvmDomUnknown. Returns True as a
+-- unit-like placeholder so call sites can use `let _x = refineLlvmDomain
+-- ...` to sequence the mutation. Mirrors engine-bodies-dispatch.ts:
+-- propagateOrInferLlvm's inner `cur === undefined || cur.$tag ===
+-- "LlvmDomUnknown"` guard.
+@label "LLVM inference: refineLlvmDomain"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+-- HasDomainEnv is the companion per-evaluation capability used by the
+-- forward domain walk. Its direct callers are source-annotated for the same
+-- reason as the HasLlvmBuilder seam above.
+refineLlvmDomain : (name: String) -> (expected: LlvmDomain) -> Boolean
+refineLlvmDomain name expected =
+  let cur = getDomain name
+  case cur of
+    Nothing ->
+      let _set = setDomain name expected
+      true
+    Just d ->
+      case d of
+        LlvmDomUnknown ->
+          let _set = setDomain name expected
+          true
+        _ -> true
+
+-- propagateLlvmCeVarDomain — refine a CeVar's binding domain, honouring
+-- the dotted-name HEAD special case. Mirrors engine-bodies-dispatch.ts:
+-- propagateOrInferLlvm's CeVar branch. For dotted names the HEAD binding
+-- refines to DomPtr (the record/ADT handle); the leaf domain is DomPtr
+-- regardless of `expected`. For undotted names the binding refines to
+-- `expected`.
+@label "LLVM inference: propagateLlvmCeVarDomain"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+propagateLlvmCeVarDomain : (varName: String) -> (expected: LlvmDomain) -> Boolean
+propagateLlvmCeVarDomain varName expected =
+  if contains varName "."
+  then
+    let parts = split varName "."
+    case head parts of
+      Nothing -> true
+      Just headName -> refineLlvmDomain headName (DomPtr)
+  else refineLlvmDomain varName expected
+
+-- inferOrPropagateLlvm — small dispatch helper used by every CeCall /
+-- CeConstruct / CeRecord / CeMatch arg-walk site. If `a` is a CeVar,
+-- propagate the expected domain into the env; otherwise recurse via
+-- inferLlvmDomains (ignoring the returned result domain — we only care
+-- about the env-mutation side effects from nested CeVar references).
+@label "LLVM inference: inferOrPropagateLlvm"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferOrPropagateLlvm : (a: (CeExpr Any)) -> (expected: LlvmDomain) -> (emptyList: List LlvmDomain) -> Boolean
+inferOrPropagateLlvm a expected emptyList =
+  case a of
+    CeVar { name = n } -> propagateLlvmCeVarDomain n expected
+    _ ->
+      let _d = inferLlvmDomains a emptyList
+      true
+
+-- domainOfLlvmLit — JS-value-type → LlvmDomain. Numbers → DomDouble,
+-- booleans → DomI1, null/strings → DomPtr. Mirrors engine-bodies-
+-- dispatch.ts:inferLlvmDomainsTS's CeLit arm.
+@label "LLVM inference: domainOfLlvmLit"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+domainOfLlvmLit : (v: Any) -> LlvmDomain
+domainOfLlvmLit v =
+  if isNumber v then DomDouble
+  else if isBoolean v then DomI1
+  else if isNull v then DomPtr
+  else if isString v then DomPtr
+  else LlvmDomUnknown
+
+-- ---------------------------------------------------------------------------
+-- inferLlvmDomains — entry. 10-arm dispatch over CeExpr.
+-- Mirrors engine-bodies-dispatch.ts:inferLlvmDomainsTS (the TS oracle).
+-- ---------------------------------------------------------------------------
+@label "LLVM inference: inferLlvmDomains"
+@description "Phase 21.8.1 / signature-substrate Phase 2 — LLVM forward-walk type inference. 10-arm CeExpr dispatch propagating expected argument domains into the per-call HasDomainEnv via getDomain / setDomain natives. Param domains start LlvmDomUnknown; the target-prefixed constructor avoids the WasmDomain DomUnknown collision. Refine the first time the body uses them in a typed context."
+@tags "engine" "ir" "llvm" "self-host" "phase-21"
+inferLlvmDomains : (body: (CeExpr Any)) -> (emptyList: List LlvmDomain) -> LlvmDomain
+inferLlvmDomains body emptyList =
+  case body of
+    CeLit { value = v } -> domainOfLlvmLit v
+    CeVar { name = n } -> inferLlvmCeVarDom n
+    CeCall { fnId = fnId, args = args } -> inferLlvmCeCall fnId args emptyList
+    CeIf { cond = c, then = t, else = e } -> inferLlvmCeIf c t e emptyList
+    CeLet { bindings = bs, body = bd } -> inferLlvmCeLet bs bd emptyList
+    CeDo { exprs = es } -> inferLlvmCeDo es (LlvmDomUnknown) emptyList
+    CeClosure { params = _ps, captures = _cs, body = _b } ->
+      let _w = walkLlvmForDomainPropagation body emptyList
+      DomPtr
+    CeConstruct { ctor = _c, args = _a } ->
+      let _w = walkLlvmForDomainPropagation body emptyList
+      DomPtr
+    CeRecord { fields = _fs } ->
+      let _w = walkLlvmForDomainPropagation body emptyList
+      DomPtr
+    CeMatch { scrutinee = _s, arms = _a } ->
+      let _w = walkLlvmForDomainPropagation body emptyList
+      DomPtr
+
+-- CeVar inference. Dotted: refine HEAD to DomPtr, return DomPtr (the
+-- chain's leaf is always ptr). Undotted: read the env entry, default to
+-- LlvmDomUnknown when absent. Mirrors engine-bodies-dispatch.ts:
+-- inferLlvmDomainsTS's CeVar arm at lines 1062-1074.
+@label "LLVM inference: inferLlvmCeVarDom"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferLlvmCeVarDom : (n: String) -> LlvmDomain
+inferLlvmCeVarDom n =
+  if contains n "."
+  then
+    let parts = split n "."
+    let _h = case head parts of
+      Nothing -> true
+      Just headName -> refineLlvmDomain headName (DomPtr)
+    DomPtr
+  else
+    let cur = getDomain n
+    case cur of
+      Nothing -> LlvmDomUnknown
+      Just d -> d
+
+-- CeCall inference. Three dispatch paths matching the TS oracle's CeCall
+-- arm at engine-bodies-dispatch.ts:1075-1097:
+--   1. $dyn:<varName> — indirect call. Refine `varName` to DomPtr; each
+--      arg propagates DomPtr. Result: DomPtr.
+--   2. llvmIsStringTypedEq — string-typed eq/neq. Each arg propagates
+--      DomPtr. Result: DomI1.
+--   3. Default — llvmCallDomainOf's per-arg expected domains; each
+--      CeVar arg propagates that domain. Result: cd.resultDomain.
+@label "LLVM inference: inferLlvmCeCall"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferLlvmCeCall : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List LlvmDomain) -> LlvmDomain
+inferLlvmCeCall fnId args emptyList =
+  if startsWith fnId "$dyn:"
+  then inferLlvmDynCall fnId args emptyList
+  else if llvmIsStringTypedEq fnId args emptyList
+  then
+    let _w = inferLlvmArgsAtDom args (DomPtr) emptyList
+    DomI1
+  else
+    let cd = llvmCallDomainOf fnId (length args) emptyList
+    let _w = inferLlvmCallArgsWithDomains args (cd.argDomains) emptyList
+    cd.resultDomain
+
+@label "LLVM inference: inferLlvmDynCall"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferLlvmDynCall : (fnId: String) -> (args: List (CeExpr Any)) -> (emptyList: List LlvmDomain) -> LlvmDomain
+inferLlvmDynCall fnId args emptyList =
+  let varName = slice fnId 5 (unitLen fnId)
+  let _r = refineLlvmDomain varName (DomPtr)
+  let _w = inferLlvmArgsAtDom args (DomPtr) emptyList
+  DomPtr
+
+-- For each arg, propagate `target` when CeVar, else recurse via
+-- inferLlvmDomains. Used by the $dyn: and llvmIsStringTypedEq paths
+-- (both want every arg at DomPtr).
+@label "LLVM inference: inferLlvmArgsAtDom"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferLlvmArgsAtDom : (args: List (CeExpr Any)) -> (target: LlvmDomain) -> (emptyList: List LlvmDomain) -> Boolean
+inferLlvmArgsAtDom args target emptyList =
+  case head args of
+    Nothing -> true
+    Just a ->
+      let _r = inferOrPropagateLlvm a target emptyList
+      case tail args of
+        Nothing -> true
+        Just rest -> inferLlvmArgsAtDom rest target emptyList
+
+-- Parallel walk over args + argDomains. When argDomains runs out before
+-- args, default to DomPtr per the TS oracle's `argDomains[i] ?? DOM_PTR`.
+@label "LLVM inference: inferLlvmCallArgsWithDomains"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferLlvmCallArgsWithDomains : (args: List (CeExpr Any)) -> (argDomains: List LlvmDomain) -> (emptyList: List LlvmDomain) -> Boolean
+inferLlvmCallArgsWithDomains args argDomains emptyList =
+  case head args of
+    Nothing -> true
+    Just a ->
+      let expected = case head argDomains of
+        Nothing -> DomPtr
+        Just e -> e
+      let _r = inferOrPropagateLlvm a expected emptyList
+      let restDoms = case tail argDomains of
+        Nothing -> emptyList
+        Just rd -> rd
+      case tail args of
+        Nothing -> true
+        Just rest -> inferLlvmCallArgsWithDomains rest restDoms emptyList
+
+-- CeIf inference. Cond propagates DomI1; then/else recurse; if both
+-- branches agree on domain return that domain, else DomPtr. Mirrors
+-- engine-bodies-dispatch.ts:inferLlvmDomainsTS's CeIf arm at 1098-1104.
+@label "LLVM inference: inferLlvmCeIf"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferLlvmCeIf : (c: (CeExpr Any)) -> (t: (CeExpr Any)) -> (e: (CeExpr Any)) -> (emptyList: List LlvmDomain) -> LlvmDomain
+inferLlvmCeIf c t e emptyList =
+  let _cond = inferOrPropagateLlvm c (DomI1) emptyList
+  let thenDom = inferLlvmDomains t emptyList
+  let elseDom = inferLlvmDomains e emptyList
+  if llvmDomainEq thenDom elseDom then thenDom else DomPtr
+
+-- CeLet inference. Each binding's value recurses; the binding's name
+-- gets the inferred value-domain unconditionally (NOT one-way, since
+-- this is a fresh binding rather than a param refinement). Then the
+-- body recurses. Mirrors engine-bodies-dispatch.ts:inferLlvmDomainsTS's
+-- CeLet arm at 1105-1112.
+@label "LLVM inference: inferLlvmCeLet"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferLlvmCeLet : (bs: List ({ name: String, value: (CeExpr Any) })) -> (bd: (CeExpr Any)) -> (emptyList: List LlvmDomain) -> LlvmDomain
+inferLlvmCeLet bs bd emptyList =
+  let _bs = inferLlvmLetBindings bs emptyList
+  inferLlvmDomains bd emptyList
+
+@label "LLVM inference: inferLlvmLetBindings"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferLlvmLetBindings : (bs: List ({ name: String, value: (CeExpr Any) })) -> (emptyList: List LlvmDomain) -> Boolean
+inferLlvmLetBindings bs emptyList =
+  case head bs of
+    Nothing -> true
+    Just binding ->
+      let valDom = inferLlvmDomains (binding.value) emptyList
+      let _s = setDomain (binding.name) valDom
+      case tail bs of
+        Nothing -> true
+        Just rest -> inferLlvmLetBindings rest emptyList
+
+-- CeDo inference. Sequential walk; the return domain is the last expr's.
+-- Mirrors engine-bodies-dispatch.ts:inferLlvmDomainsTS's CeDo arm at
+-- 1113-1118 (seeded with `last = LlvmDomUnknown` so the empty-exprs base case
+-- mirrors the TS oracle's `let last = DOM_UNKNOWN`).
+@label "LLVM inference: inferLlvmCeDo"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+inferLlvmCeDo : (exprs: List (CeExpr Any)) -> (last: LlvmDomain) -> (emptyList: List LlvmDomain) -> LlvmDomain
+inferLlvmCeDo exprs last emptyList =
+  case head exprs of
+    Nothing -> last
+    Just e ->
+      let d = inferLlvmDomains e emptyList
+      case tail exprs of
+        Nothing -> d
+        Just rest -> inferLlvmCeDo rest d emptyList
+
+-- ---------------------------------------------------------------------------
+-- walkLlvmForDomainPropagation — child-recursion helper for the 4
+-- ptr-producing arms (CeClosure / CeConstruct / CeRecord / CeMatch).
+-- Mirrors engine-bodies-dispatch.ts:walkLlvmForDomainPropagation at
+-- 1129-1180. Returns True as a unit-like placeholder; the side effect
+-- is env mutation via nested propagate / inferLlvmDomains calls.
+-- ---------------------------------------------------------------------------
+@label "LLVM inference: walkLlvmForDomainPropagation"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+walkLlvmForDomainPropagation : (expr: (CeExpr Any)) -> (emptyList: List LlvmDomain) -> Boolean
+walkLlvmForDomainPropagation expr emptyList =
+  case expr of
+    CeLit { value = _v } -> true
+    CeVar { name = _n } -> true
+    CeCall { fnId = _f, args = args } -> walkLlvmInferEach args emptyList
+    CeIf { cond = c, then = t, else = e } ->
+      let _c = inferLlvmDomains c emptyList
+      let _t = inferLlvmDomains t emptyList
+      let _e = inferLlvmDomains e emptyList
+      true
+    CeLet { bindings = bs, body = bd } ->
+      let _bs = walkLlvmLetBindings bs emptyList
+      let _b = inferLlvmDomains bd emptyList
+      true
+    CeDo { exprs = es } -> walkLlvmInferEach es emptyList
+    CeClosure { params = _ps, captures = _cs, body = b } ->
+      let _b = inferLlvmDomains b emptyList
+      true
+    CeConstruct { ctor = _c, args = args } -> walkLlvmPropagateOrInfer args emptyList
+    CeRecord { fields = fs } -> walkLlvmRecordFields fs emptyList
+    CeMatch { scrutinee = s, arms = a } -> walkLlvmMatch s a emptyList
+
+-- For each expr in a list, recurse via inferLlvmDomains (discard the
+-- result). Used by walkLlvmForDomainPropagation's CeCall + CeDo arms.
+@label "LLVM inference: walkLlvmInferEach"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+walkLlvmInferEach : (exprs: List (CeExpr Any)) -> (emptyList: List LlvmDomain) -> Boolean
+walkLlvmInferEach exprs emptyList =
+  case head exprs of
+    Nothing -> true
+    Just e ->
+      let _d = inferLlvmDomains e emptyList
+      case tail exprs of
+        Nothing -> true
+        Just rest -> walkLlvmInferEach rest emptyList
+
+-- For each CeLet binding, recurse on .value via inferLlvmDomains and
+-- discard the result. Used by walkLlvmForDomainPropagation's CeLet arm
+-- (does NOT setDomain — distinct from inferLlvmLetBindings which is the
+-- inference-side walker).
+@label "LLVM inference: walkLlvmLetBindings"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+walkLlvmLetBindings : (bs: List ({ name: String, value: (CeExpr Any) })) -> (emptyList: List LlvmDomain) -> Boolean
+walkLlvmLetBindings bs emptyList =
+  case head bs of
+    Nothing -> true
+    Just binding ->
+      let _d = inferLlvmDomains (binding.value) emptyList
+      case tail bs of
+        Nothing -> true
+        Just rest -> walkLlvmLetBindings rest emptyList
+
+-- CeConstruct.args walker: CeVar fields propagate DomPtr, others recurse.
+-- Mirrors engine-bodies-dispatch.ts:walkLlvmForDomainPropagation's
+-- CeConstruct arm at 1157-1161. Phase 21.5.2's substrate fix carried
+-- through to Phase 21.8 — without DomPtr propagation here, CeVar fields
+-- holding string-typed values unbox to f64 at the call boundary.
+@label "LLVM inference: walkLlvmPropagateOrInfer"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+walkLlvmPropagateOrInfer : (args: List (CeExpr Any)) -> (emptyList: List LlvmDomain) -> Boolean
+walkLlvmPropagateOrInfer args emptyList =
+  case head args of
+    Nothing -> true
+    Just a ->
+      let _r = inferOrPropagateLlvm a (DomPtr) emptyList
+      case tail args of
+        Nothing -> true
+        Just rest -> walkLlvmPropagateOrInfer rest emptyList
+
+-- CeRecord.fields walker: each field is a {name, value} record; same
+-- shape as walkLlvmPropagateOrInfer but reaches inside `.value`.
+-- Mirrors engine-bodies-dispatch.ts:walkLlvmForDomainPropagation's
+-- CeRecord arm at 1162-1166.
+@label "LLVM inference: walkLlvmRecordFields"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+walkLlvmRecordFields : (fs: List ({ name: String, value: (CeExpr Any) })) -> (emptyList: List LlvmDomain) -> Boolean
+walkLlvmRecordFields fs emptyList =
+  case head fs of
+    Nothing -> true
+    Just f ->
+      let _r = inferOrPropagateLlvm (f.value) (DomPtr) emptyList
+      case tail fs of
+        Nothing -> true
+        Just rest -> walkLlvmRecordFields rest emptyList
+
+-- CeMatch walker. Scrutinee propagates DomPtr when CeVar; each arm body
+-- recurses. The env is shared across arms (mirrors the TS oracle's
+-- single-env-shared-across-iterations loop body). Mirrors engine-bodies-
+-- dispatch.ts:walkLlvmForDomainPropagation's CeMatch arm at 1167-1178.
+@label "LLVM inference: walkLlvmMatch"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+walkLlvmMatch : (scrutinee: (CeExpr Any)) -> (arms: List ({ pattern: (CorePattern Any), body: (CeExpr Any) })) -> (emptyList: List LlvmDomain) -> Boolean
+walkLlvmMatch scrutinee arms emptyList =
+  let _s = inferOrPropagateLlvm scrutinee (DomPtr) emptyList
+  walkLlvmMatchArms arms emptyList
+
+@label "LLVM inference: walkLlvmMatchArms"
+@description "Phase 21.8.1 — LLVM inference body. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+walkLlvmMatchArms : (arms: List ({ pattern: (CorePattern Any), body: (CeExpr Any) })) -> (emptyList: List LlvmDomain) -> Boolean
+walkLlvmMatchArms arms emptyList =
+  case head arms of
+    Nothing -> true
+    Just arm ->
+      let _d = inferLlvmDomains (arm.body) emptyList
+      case tail arms of
+        Nothing -> true
+        Just rest -> walkLlvmMatchArms rest emptyList
+
+-- ===========================================================================
+-- Phase 21.10 — LLVM IR text serialiser (emitLlvmModule + helpers).
+--
+-- The LAST TS-only step on the LLVM pipeline ports here. Pattern-matches
+-- the Fenel-native LlvmModule shape (LlvmCall / LlvmCallVoid / LlvmBr /
+-- Ret / RetVoid as distinct variants — the dispatch wrapper no longer
+-- normalises to the TS oracle's optional-fields shape).
+--
+-- Mirrors compile-llvm.ts:147-393 (emitValType / emitDoubleLiteral /
+-- emitOperand / emitInstr / emitTerminator / emitBasicBlock / emitParams
+-- / emitDeclaration / emitDefinition / emitModule / emitStringConstant
+-- + the LLVM_INSTR_NAMES table). The TS table is inlined per-arm here —
+-- the per-arm pattern match already knows the constructor so emitting
+-- the right keyword inline is the cleanest move in Fenel.
+--
+-- The emitter is pure (no per-call mutable state; every helper is a
+-- string-builder over read-only typed values). No HasXxxBuilder
+-- typeclass needed — distinct from the lowering body's
+-- HasLlvmBuilder capability.
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmValType — 8 atomic + 3 composite arms. Mirrors compile-llvm.ts:
+-- emitValType at 147-174. The composite arms (Vector / LlvmArrayT /
+-- LlvmStructT) are unused by the Phase 21.8 bootstrap lowering but
+-- declared in the LlvmValType ADT, so the emitter handles them for
+-- completeness. Threads `emptyList` through helpers that build accumulator
+-- lists — matches the existing Phase 21.7 / 21.8 / 21.8.1 convention.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmValType"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmValType : (t: LlvmValType) -> (emptyList: List String) -> String
+emitLlvmValType t emptyList =
+  case t of
+    I1 -> "i1"
+    I8 -> "i8"
+    I16 -> "i16"
+    LlvmI32 -> "i32"
+    LlvmI64 -> "i64"
+    Float -> "float"
+    Double -> "double"
+    Void -> "void"
+    Ptr -> "ptr"
+    Vector { elemType, count } ->
+      join ["<", toString count, " x ", emitLlvmValType elemType emptyList, ">"] ""
+    LlvmArrayT { elemType, count } ->
+      join ["[", toString count, " x ", emitLlvmValType elemType emptyList, "]"] ""
+    LlvmStructT { fields } ->
+      let inner = join (mapEmitLlvmValType fields emptyList emptyList) ", "
+      join ["{ ", inner, " }"] ""
+
+-- Map emitLlvmValType over a list of LlvmValType into a List<String>.
+-- Used by the LlvmStructT arm of emitLlvmValType.
+@label "LLVM serialiser: mapEmitLlvmValType"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+mapEmitLlvmValType : (ts: List LlvmValType) -> (emptyList: List String) -> (acc: List String) -> List String
+mapEmitLlvmValType ts emptyList acc =
+  case head ts of
+    Nothing -> acc
+    Just t ->
+      let s = emitLlvmValType t emptyList
+      let accNext = appendItem s acc
+      case tail ts of
+        Nothing -> accNext
+        Just rest -> mapEmitLlvmValType rest emptyList accNext
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmDoubleLiteral — LLVM double constants. Mirrors
+-- compile-llvm.ts:emitDoubleLiteral at 181-200.
+--   - NaN → canonical hex bit pattern "0x7FF8000000000000".
+--   - +Inf → "0x7FF0000000000000", -Inf → "0xFFF0000000000000".
+--   - Integer doubles (Number.isInteger AND abs < 1e15) → "<n>.0" decimal.
+--   - Generic → toString; force ".0" suffix when the string has no decimal
+--     point or exponent (LLVM requires unambiguous double syntax).
+-- The NaN check uses `neq n n` — NaN is the only IEEE 754 value that is
+-- not equal to itself (per JS `!=` semantics, which the std `neq` shim
+-- preserves). The isInteger check uses `eq n (floor n)`, valid once n is
+-- known to be finite (filtered earlier in the chain).
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmDoubleLiteral"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmDoubleLiteral : (n: Number) -> String
+emitLlvmDoubleLiteral n =
+  if neq n n
+  then "0x7FF8000000000000"
+  else if not (numberIsFinite n)
+  then (if gt n 0 then "0x7FF0000000000000" else "0xFFF0000000000000")
+  else if eq n (floor n)
+  then
+    if lt (abs n) 1000000000000000
+    then join [toString n, ".0"] ""
+    else emitLlvmDoubleLiteralGeneric n
+  else emitLlvmDoubleLiteralGeneric n
+
+-- Generic-case double formatting: trust JS toString; force `.0` suffix
+-- when the string contains no decimal point or exponent marker. Mirrors
+-- the trailing branch of compile-llvm.ts:emitDoubleLiteral at 197-199.
+-- Nested ifs (rather than chained or) — Fenel `and`/`or` are infix-only
+-- keywords; existing engine bodies use nested ifs for the same purpose.
+@label "LLVM serialiser: emitLlvmDoubleLiteralGeneric"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmDoubleLiteralGeneric : (n: Number) -> String
+emitLlvmDoubleLiteralGeneric n =
+  let s = toString n
+  if contains s "."
+  then s
+  else if contains s "e"
+  then s
+  else if contains s "E"
+  then s
+  else join [s, ".0"] ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmOperand — 8 arms from the LlvmOperand ADT. Mirrors
+-- compile-llvm.ts:emitOperand at 202-224.
+--   - ConstI1 → "true" / "false"
+--   - ConstI32 / ConstI64 → decimal toString
+--   - ConstFloat / ConstDouble → emitLlvmDoubleLiteral
+--   - ConstNullPtr → "null"
+--   - LocalRef name → "%<name>"
+--   - GlobalRef name → "@<name>"
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmOperand"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmOperand : (o: LlvmOperand) -> String
+emitLlvmOperand o =
+  case o of
+    ConstI1 { value = v } -> (if v then "true" else "false")
+    ConstI32 { value = v } -> toString v
+    ConstI64 { value = v } -> toString v
+    ConstFloat { value = v } -> emitLlvmDoubleLiteral v
+    ConstDouble { value = v } -> emitLlvmDoubleLiteral v
+    ConstNullPtr -> "null"
+    LocalRef { name = n } -> join ["%", n] ""
+    GlobalRef { name = n } -> join ["@", n] ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmBinaryArith — shared shape for the 12 binary arith/bitwise
+-- instructions (Add / Sub / Mul / SDiv / SRem / FAdd / FSub / FMul /
+-- FDiv / And / Or / Xor). Format: "  %<result> = <op> <type> <lhs>, <rhs>".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmBinaryArith"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmBinaryArith : (opName: String) -> (result: String) -> (opType: LlvmValType) -> (lhs: LlvmOperand) -> (rhs: LlvmOperand) -> (emptyList: List String) -> String
+emitLlvmBinaryArith opName result opType lhs rhs emptyList =
+  let p__a = appendItem "  %" emptyList
+  let p__b = appendItem result p__a
+  let p__c = appendItem " = " p__b
+  let p__d = appendItem opName p__c
+  let p__e = appendItem " " p__d
+  let p__f = appendItem (emitLlvmValType opType emptyList) p__e
+  let p__g = appendItem " " p__f
+  let p__h = appendItem (emitLlvmOperand lhs) p__g
+  let p__i = appendItem ", " p__h
+  let parts = appendItem (emitLlvmOperand rhs) p__i
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmCmp — shared shape for ICmp / FCmp.
+-- Format: "  %<result> = <icmp|fcmp> <predicate> <type> <lhs>, <rhs>".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmCmp"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmCmp : (opName: String) -> (result: String) -> (predicate: String) -> (opType: LlvmValType) -> (lhs: LlvmOperand) -> (rhs: LlvmOperand) -> (emptyList: List String) -> String
+emitLlvmCmp opName result predicate opType lhs rhs emptyList =
+  let p__a = appendItem "  %" emptyList
+  let p__b = appendItem result p__a
+  let p__c = appendItem " = " p__b
+  let p__d = appendItem opName p__c
+  let p__e = appendItem " " p__d
+  let p__f = appendItem predicate p__e
+  let p__g = appendItem " " p__f
+  let p__h = appendItem (emitLlvmValType opType emptyList) p__g
+  let p__i = appendItem " " p__h
+  let p__j = appendItem (emitLlvmOperand lhs) p__i
+  let p__k = appendItem ", " p__j
+  let parts = appendItem (emitLlvmOperand rhs) p__k
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmConv — shared shape for the 6 type-conversion instructions
+-- (SIToFP / FPToSI / ZExt / SExt / Trunc / BitCast). Format:
+-- "  %<result> = <op> <fromType> <value> to <toType>".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmConv"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmConv : (opName: String) -> (result: String) -> (fromType: LlvmValType) -> (value: LlvmOperand) -> (toType: LlvmValType) -> (emptyList: List String) -> String
+emitLlvmConv opName result fromType value toType emptyList =
+  let p__a = appendItem "  %" emptyList
+  let p__b = appendItem result p__a
+  let p__c = appendItem " = " p__b
+  let p__d = appendItem opName p__c
+  let p__e = appendItem " " p__d
+  let p__f = appendItem (emitLlvmValType fromType emptyList) p__e
+  let p__g = appendItem " " p__f
+  let p__h = appendItem (emitLlvmOperand value) p__g
+  let p__i = appendItem " to " p__h
+  let parts = appendItem (emitLlvmValType toType emptyList) p__i
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmFNeg — single-operand "  %<r> = fneg <type> <operand>".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmFNeg"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmFNeg : (result: String) -> (opType: LlvmValType) -> (operand: LlvmOperand) -> (emptyList: List String) -> String
+emitLlvmFNeg result opType operand emptyList =
+  let p__a = appendItem "  %" emptyList
+  let p__b = appendItem result p__a
+  let p__c = appendItem " = fneg " p__b
+  let p__d = appendItem (emitLlvmValType opType emptyList) p__c
+  let p__e = appendItem " " p__d
+  let parts = appendItem (emitLlvmOperand operand) p__e
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmAlloca — "  %<r> = alloca <elemType>".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmAlloca"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmAlloca : (result: String) -> (elemType: LlvmValType) -> (emptyList: List String) -> String
+emitLlvmAlloca result elemType emptyList =
+  join ["  %", result, " = alloca ", emitLlvmValType elemType emptyList] ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmLoad — "  %<r> = load <valType>, ptr <ptr>".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmLoad"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmLoad : (result: String) -> (valType: LlvmValType) -> (ptr: LlvmOperand) -> (emptyList: List String) -> String
+emitLlvmLoad result valType ptr emptyList =
+  let p__a = appendItem "  %" emptyList
+  let p__b = appendItem result p__a
+  let p__c = appendItem " = load " p__b
+  let p__d = appendItem (emitLlvmValType valType emptyList) p__c
+  let p__e = appendItem ", ptr " p__d
+  let parts = appendItem (emitLlvmOperand ptr) p__e
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmStore — "  store <valType> <value>, ptr <ptr>".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmStore"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmStore : (valType: LlvmValType) -> (value: LlvmOperand) -> (ptr: LlvmOperand) -> (emptyList: List String) -> String
+emitLlvmStore valType value ptr emptyList =
+  let p__a = appendItem "  store " emptyList
+  let p__b = appendItem (emitLlvmValType valType emptyList) p__a
+  let p__c = appendItem " " p__b
+  let p__d = appendItem (emitLlvmOperand value) p__c
+  let p__e = appendItem ", ptr " p__d
+  let parts = appendItem (emitLlvmOperand ptr) p__e
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmPhi — SSA join. Format:
+-- "  %<r> = phi <type> [ <op0>, %<lbl0> ], [ <op1>, %<lbl1> ], ...".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmPhi"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPhi : (result: String) -> (phiType: LlvmValType) -> (incoming: List LlvmPhiIncoming) -> (emptyList: List String) -> String
+emitLlvmPhi result phiType incoming emptyList =
+  let armStrs = emitLlvmPhiIncomings incoming emptyList emptyList
+  let armsJoined = join armStrs ", "
+  let p__a = appendItem "  %" emptyList
+  let p__b = appendItem result p__a
+  let p__c = appendItem " = phi " p__b
+  let p__d = appendItem (emitLlvmValType phiType emptyList) p__c
+  let p__e = appendItem " " p__d
+  let parts = appendItem armsJoined p__e
+  join parts ""
+
+-- Per-arm formatter: "[ <operand>, %<label> ]".
+@label "LLVM serialiser: emitLlvmPhiIncomingArm"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPhiIncomingArm : (inc: LlvmPhiIncoming) -> String
+emitLlvmPhiIncomingArm inc =
+  join ["[ ", emitLlvmOperand inc.value, ", %", inc.label, " ]"] ""
+
+-- Map per-arm formatter over the incoming list.
+@label "LLVM serialiser: emitLlvmPhiIncomings"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmPhiIncomings : (incs: List LlvmPhiIncoming) -> (emptyList: List String) -> (acc: List String) -> List String
+emitLlvmPhiIncomings incs emptyList acc =
+  case head incs of
+    Nothing -> acc
+    Just inc ->
+      let s = emitLlvmPhiIncomingArm inc
+      let accNext = appendItem s acc
+      case tail incs of
+        Nothing -> accNext
+        Just rest -> emitLlvmPhiIncomings rest emptyList accNext
+
+-- Per-arg formatter for a Call: "<argType> <operand>".
+@label "LLVM serialiser: emitLlvmCallArg"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmCallArg : (arg: LlvmCallArg) -> (emptyList: List String) -> String
+emitLlvmCallArg arg emptyList =
+  join [emitLlvmValType (arg.argType) emptyList, " ", emitLlvmOperand (arg.value)] ""
+
+-- Map per-arg formatter over the args list.
+@label "LLVM serialiser: emitLlvmCallArgs"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmCallArgs : (args: List LlvmCallArg) -> (emptyList: List String) -> (acc: List String) -> List String
+emitLlvmCallArgs args emptyList acc =
+  case head args of
+    Nothing -> acc
+    Just a ->
+      let s = emitLlvmCallArg a emptyList
+      let accNext = appendItem s acc
+      case tail args of
+        Nothing -> accNext
+        Just rest -> emitLlvmCallArgs rest emptyList accNext
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmCallValue — value-producing call. Format:
+-- "  %<result> = call <retType> <fn>(<arg0>, <arg1>, ...)".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmCallValue"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmCallValue : (result: String) -> (retType: LlvmValType) -> (fn: LlvmOperand) -> (args: List LlvmCallArg) -> (emptyList: List String) -> String
+emitLlvmCallValue result retType fn args emptyList =
+  let argStrs = emitLlvmCallArgs args emptyList emptyList
+  let argList = join argStrs ", "
+  let p__a = appendItem "  %" emptyList
+  let p__b = appendItem result p__a
+  let p__c = appendItem " = call " p__b
+  let p__d = appendItem (emitLlvmValType retType emptyList) p__c
+  let p__e = appendItem " " p__d
+  let p__f = appendItem (emitLlvmOperand fn) p__e
+  let p__g = appendItem "(" p__f
+  let p__h = appendItem argList p__g
+  let parts = appendItem ")" p__h
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmCallVoid — void call (no result temp). Format:
+-- "  call <retType> <fn>(<arg0>, <arg1>, ...)".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmCallVoid"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmCallVoid : (retType: LlvmValType) -> (fn: LlvmOperand) -> (args: List LlvmCallArg) -> (emptyList: List String) -> String
+emitLlvmCallVoid retType fn args emptyList =
+  let argStrs = emitLlvmCallArgs args emptyList emptyList
+  let argList = join argStrs ", "
+  let p__a = appendItem "  call " emptyList
+  let p__b = appendItem (emitLlvmValType retType emptyList) p__a
+  let p__c = appendItem " " p__b
+  let p__d = appendItem (emitLlvmOperand fn) p__c
+  let p__e = appendItem "(" p__d
+  let p__f = appendItem argList p__e
+  let parts = appendItem ")" p__f
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmInstr — 27-arm LlvmInstr dispatcher. Each per-arm dispatch
+-- inlines the LLVM opcode keyword (no LLVM_INSTR_NAMES table — the per-
+-- arm case already knows the constructor, so emitting the right keyword
+-- inline is the cleanest move in Fenel).
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmInstr"
+@description "Phase 21.10 — LLVM IR text serialiser. 27-arm LlvmInstr dispatcher; per-arm inlining of LLVM opcode keywords (no LLVM_INSTR_NAMES table). See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "ir" "llvm" "self-host" "phase-21"
+emitLlvmInstr : (instr: LlvmInstr) -> (emptyList: List String) -> String
+emitLlvmInstr instr emptyList =
+  case instr of
+    -- 12 binary arith/bitwise
+    Add { result, opType, lhs, rhs } -> emitLlvmBinaryArith "add" result opType lhs rhs emptyList
+    Sub { result, opType, lhs, rhs } -> emitLlvmBinaryArith "sub" result opType lhs rhs emptyList
+    Mul { result, opType, lhs, rhs } -> emitLlvmBinaryArith "mul" result opType lhs rhs emptyList
+    SDiv { result, opType, lhs, rhs } -> emitLlvmBinaryArith "sdiv" result opType lhs rhs emptyList
+    SRem { result, opType, lhs, rhs } -> emitLlvmBinaryArith "srem" result opType lhs rhs emptyList
+    FAdd { result, opType, lhs, rhs } -> emitLlvmBinaryArith "fadd" result opType lhs rhs emptyList
+    FSub { result, opType, lhs, rhs } -> emitLlvmBinaryArith "fsub" result opType lhs rhs emptyList
+    FMul { result, opType, lhs, rhs } -> emitLlvmBinaryArith "fmul" result opType lhs rhs emptyList
+    FDiv { result, opType, lhs, rhs } -> emitLlvmBinaryArith "fdiv" result opType lhs rhs emptyList
+    And { result, opType, lhs, rhs } -> emitLlvmBinaryArith "and" result opType lhs rhs emptyList
+    Or { result, opType, lhs, rhs } -> emitLlvmBinaryArith "or" result opType lhs rhs emptyList
+    Xor { result, opType, lhs, rhs } -> emitLlvmBinaryArith "xor" result opType lhs rhs emptyList
+    -- FNeg (single operand)
+    FNeg { result, opType, operand } -> emitLlvmFNeg result opType operand emptyList
+    -- Comparisons
+    ICmp { result, predicate, opType, lhs, rhs } -> emitLlvmCmp "icmp" result predicate opType lhs rhs emptyList
+    FCmp { result, predicate, opType, lhs, rhs } -> emitLlvmCmp "fcmp" result predicate opType lhs rhs emptyList
+    -- 6 conversions
+    SIToFP { result, fromType, value, toType } -> emitLlvmConv "sitofp" result fromType value toType emptyList
+    FPToSI { result, fromType, value, toType } -> emitLlvmConv "fptosi" result fromType value toType emptyList
+    ZExt { result, fromType, value, toType } -> emitLlvmConv "zext" result fromType value toType emptyList
+    SExt { result, fromType, value, toType } -> emitLlvmConv "sext" result fromType value toType emptyList
+    Trunc { result, fromType, value, toType } -> emitLlvmConv "trunc" result fromType value toType emptyList
+    BitCast { result, fromType, value, toType } -> emitLlvmConv "bitcast" result fromType value toType emptyList
+    -- Memory
+    Alloca { result, elemType } -> emitLlvmAlloca result elemType emptyList
+    Load { result, valType, ptr } -> emitLlvmLoad result valType ptr emptyList
+    Store { valType, value, ptr } -> emitLlvmStore valType value ptr emptyList
+    -- SSA join
+    Phi { result, phiType, incoming } -> emitLlvmPhi result phiType incoming emptyList
+    -- Calls
+    LlvmCall { result, retType, fn, args } -> emitLlvmCallValue result retType fn args emptyList
+    LlvmCallVoid { retType, fn, args } -> emitLlvmCallVoid retType fn args emptyList
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmSwitchCase — per-case formatter for the Switch terminator.
+-- Format: "<opType> <caseValue>, label %<target>".
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmSwitchCase"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmSwitchCase : (c: LlvmSwitchCase) -> (opType: LlvmValType) -> (emptyList: List String) -> String
+emitLlvmSwitchCase c opType emptyList =
+  let p__a = appendItem (emitLlvmValType opType emptyList) emptyList
+  let p__b = appendItem " " p__a
+  let p__c = appendItem (emitLlvmOperand (c.caseValue)) p__b
+  let p__d = appendItem ", label %" p__c
+  let parts = appendItem (c.target) p__d
+  join parts ""
+
+@label "LLVM serialiser: emitLlvmSwitchCases"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmSwitchCases : (cs: List LlvmSwitchCase) -> (opType: LlvmValType) -> (emptyList: List String) -> (acc: List String) -> List String
+emitLlvmSwitchCases cs opType emptyList acc =
+  case head cs of
+    Nothing -> acc
+    Just c ->
+      let s = emitLlvmSwitchCase c opType emptyList
+      let accNext = appendItem s acc
+      case tail cs of
+        Nothing -> accNext
+        Just rest -> emitLlvmSwitchCases rest opType emptyList accNext
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmTerminator — 6 arms. The lowering body only emits Ret (with
+-- value), LlvmBr, BrCond today; RetVoid + Switch + LlvmUnreachable are
+-- declared variants supported for completeness / future use.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmTerminator"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "ir" "llvm" "self-host" "phase-21"
+emitLlvmTerminator : (t: LlvmTerminator) -> (emptyList: List String) -> String
+emitLlvmTerminator t emptyList =
+  case t of
+    Ret { retType, value } ->
+      join ["  ret ", emitLlvmValType retType emptyList, " ", emitLlvmOperand value] ""
+    RetVoid { retType = _rt } -> "  ret void"
+    LlvmBr { target } ->
+      join ["  br label %", target] ""
+    BrCond { cond, ifTrue, ifFalse } ->
+      let p__a = appendItem "  br i1 " emptyList
+      let p__b = appendItem (emitLlvmOperand cond) p__a
+      let p__c = appendItem ", label %" p__b
+      let p__d = appendItem ifTrue p__c
+      let p__e = appendItem ", label %" p__d
+      let parts = appendItem ifFalse p__e
+      join parts ""
+    Switch { opType, value, defaultLabel, cases } ->
+      let caseStrs = emitLlvmSwitchCases cases opType emptyList emptyList
+      let caseLines = join caseStrs "\n    "
+      let p__a = appendItem "  switch " emptyList
+      let p__b = appendItem (emitLlvmValType opType emptyList) p__a
+      let p__c = appendItem " " p__b
+      let p__d = appendItem (emitLlvmOperand value) p__c
+      let p__e = appendItem ", label %" p__d
+      let p__f = appendItem defaultLabel p__e
+      let p__g = appendItem " [\n    " p__f
+      let p__h = appendItem caseLines p__g
+      let parts = appendItem "\n  ]" p__h
+      join parts ""
+    LlvmUnreachable -> "  unreachable"
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmBasicBlock — "<label>:\n  <instr0>\n  <instr1>\n  <terminator>".
+-- Mirrors compile-llvm.ts:emitBasicBlock at 321-326.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmBasicBlock"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmBasicBlock : (block: LlvmBasicBlock) -> (emptyList: List String) -> String
+emitLlvmBasicBlock block emptyList =
+  let headerLine = join [block.label, ":"] ""
+  let initLines = appendItem headerLine emptyList
+  let instrLines = emitLlvmInstrList (block.instructions) emptyList emptyList
+  let withInstrs = concat initLines instrLines
+  let termLine = emitLlvmTerminator (block.terminator) emptyList
+  let allLines = appendItem termLine withInstrs
+  join allLines "\n"
+
+-- Map emitLlvmInstr over a list of LlvmInstr into a List<String>.
+@label "LLVM serialiser: emitLlvmInstrList"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmInstrList : (instrs: List LlvmInstr) -> (emptyList: List String) -> (acc: List String) -> List String
+emitLlvmInstrList instrs emptyList acc =
+  case head instrs of
+    Nothing -> acc
+    Just i ->
+      let s = emitLlvmInstr i emptyList
+      let accNext = appendItem s acc
+      case tail instrs of
+        Nothing -> accNext
+        Just rest -> emitLlvmInstrList rest emptyList accNext
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmParams — definition's param list, with names. Format:
+-- "<type0> %<name0>, <type1> %<name1>, ...". Mirrors compile-llvm.ts:328-330.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmParams"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmParams : (ps: List LlvmParam) -> (emptyList: List String) -> String
+emitLlvmParams ps emptyList =
+  join (emitLlvmParamList ps emptyList emptyList) ", "
+
+@label "LLVM serialiser: emitLlvmParamList"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmParamList : (ps: List LlvmParam) -> (emptyList: List String) -> (acc: List String) -> List String
+emitLlvmParamList ps emptyList acc =
+  case head ps of
+    Nothing -> acc
+    Just p ->
+      let s = join [emitLlvmValType (p.paramType) emptyList, " %", p.name] ""
+      let accNext = appendItem s acc
+      case tail ps of
+        Nothing -> accNext
+        Just rest -> emitLlvmParamList rest emptyList accNext
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmDeclParamTypes — declaration's param list, types only (no names).
+-- Used by emitLlvmDeclaration. Mirrors the inline map in
+-- compile-llvm.ts:332-335.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmDeclParamTypes"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmDeclParamTypes : (ps: List LlvmParam) -> (emptyList: List String) -> String
+emitLlvmDeclParamTypes ps emptyList =
+  join (emitLlvmDeclParamTypesLoop ps emptyList emptyList) ", "
+
+@label "LLVM serialiser: emitLlvmDeclParamTypesLoop"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmDeclParamTypesLoop : (ps: List LlvmParam) -> (emptyList: List String) -> (acc: List String) -> List String
+emitLlvmDeclParamTypesLoop ps emptyList acc =
+  case head ps of
+    Nothing -> acc
+    Just p ->
+      let s = emitLlvmValType (p.paramType) emptyList
+      let accNext = appendItem s acc
+      case tail ps of
+        Nothing -> accNext
+        Just rest -> emitLlvmDeclParamTypesLoop rest emptyList accNext
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmDeclaration — extern function signature. Format:
+-- "declare <retType> @<name>(<paramType0>, <paramType1>, ...)".
+-- Mirrors compile-llvm.ts:emitDeclaration at 332-335.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmDeclaration"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "ir" "llvm" "self-host" "phase-21"
+emitLlvmDeclaration : (decl: LlvmFunctionDecl) -> (emptyList: List String) -> String
+emitLlvmDeclaration decl emptyList =
+  let paramList = emitLlvmDeclParamTypes (decl.params) emptyList
+  let p__a = appendItem "declare " emptyList
+  let p__b = appendItem (emitLlvmValType (decl.returnType) emptyList) p__a
+  let p__c = appendItem " @" p__b
+  let p__d = appendItem (decl.name) p__c
+  let p__e = appendItem "(" p__d
+  let p__f = appendItem paramList p__e
+  let parts = appendItem ")" p__f
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmDefinition — function definition: signature + blocks.
+-- Format: "define <retType> @<name>(<params>) {\n<block0>\n\n<block1>\n}".
+-- Mirrors compile-llvm.ts:emitDefinition at 337-341.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmDefinition"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "ir" "llvm" "self-host" "phase-21"
+emitLlvmDefinition : (def: LlvmFunctionDef) -> (emptyList: List String) -> String
+emitLlvmDefinition def emptyList =
+  let paramsStr = emitLlvmParams (def.params) emptyList
+  let p__a = appendItem "define " emptyList
+  let p__b = appendItem (emitLlvmValType (def.returnType) emptyList) p__a
+  let p__c = appendItem " @" p__b
+  let p__d = appendItem (def.name) p__c
+  let p__e = appendItem "(" p__d
+  let p__f = appendItem paramsStr p__e
+  let headerParts = appendItem ") {" p__f
+  let header = join headerParts ""
+  let blockStrs = emitLlvmBlocksList (def.blocks) emptyList emptyList
+  let blocksJoined = join blockStrs "\n\n"
+  join [header, "\n", blocksJoined, "\n}"] ""
+
+@label "LLVM serialiser: emitLlvmBlocksList"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmBlocksList : (blocks: List LlvmBasicBlock) -> (emptyList: List String) -> (acc: List String) -> List String
+emitLlvmBlocksList blocks emptyList acc =
+  case head blocks of
+    Nothing -> acc
+    Just b ->
+      let s = emitLlvmBasicBlock b emptyList
+      let accNext = appendItem s acc
+      case tail blocks of
+        Nothing -> accNext
+        Just rest -> emitLlvmBlocksList rest emptyList accNext
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmHexNibble — one hex digit (0–15) → uppercase ASCII char.
+-- 0–9 → '0'–'9' (code points 48–57); 10–15 → 'A'–'F' (code points 65–70).
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmHexNibble"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmHexNibble : (n: Number) -> String
+emitLlvmHexNibble n =
+  if lt n 10
+  then charFromCode (add n 48)
+  else charFromCode (add n 55)
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmHexByte — 8-bit unsigned (0–255) → 2-char uppercase hex.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmHexByte"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmHexByte : (b: Number) -> String
+emitLlvmHexByte b =
+  let hi = floor (div b 16)
+  let lo = mod b 16
+  join [emitLlvmHexNibble hi, emitLlvmHexNibble lo] ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmStringConstantByte — per-byte escape for LLVM string-constant
+-- bodies. Printable ASCII (0x20–0x7E) except `"` (0x22) and `\` (0x5C)
+-- passes through literally; everything else is `\XX` two-char hex.
+-- Mirrors the inner loop of compile-llvm.ts:emitStringConstant at 380-389.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmStringConstantByte"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmStringConstantByte : (b: Number) -> String
+emitLlvmStringConstantByte b =
+  if lt b 32
+  then join ["\\", emitLlvmHexByte b] ""
+  else if gt b 126
+  then join ["\\", emitLlvmHexByte b] ""
+  else if eq b 34
+  then join ["\\", emitLlvmHexByte b] ""
+  else if eq b 92
+  then join ["\\", emitLlvmHexByte b] ""
+  else charFromCode b
+
+-- Walk the byte list, accumulating per-byte escapes.
+@label "LLVM serialiser: emitLlvmStringConstantBytes"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmStringConstantBytes : (bytes: List Number) -> (acc: List String) -> List String
+emitLlvmStringConstantBytes bytes acc =
+  case head bytes of
+    Nothing -> acc
+    Just b ->
+      let s = emitLlvmStringConstantByte b
+      let accNext = appendItem s acc
+      case tail bytes of
+        Nothing -> accNext
+        Just rest -> emitLlvmStringConstantBytes rest accNext
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmStringConstant — module-level string-pool entry. Format:
+-- "@.str.<idx> = private unnamed_addr constant [<N> x i8] c"<bytes>\00"".
+-- Mirrors compile-llvm.ts:emitStringConstant at 377-393. The byte length
+-- in the constant's type is `utf8ByteLength + 1` (for the trailing NUL).
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmStringConstant"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmStringConstant : (idx: Number) -> (value: String) -> (emptyList: List String) -> String
+emitLlvmStringConstant idx value emptyList =
+  let bytes = utf8Bytes value
+  let totalLen = add (length bytes) 1
+  let byteStrs = emitLlvmStringConstantBytes bytes emptyList
+  let bodyStr = join byteStrs ""
+  let withTerm = join [bodyStr, "\\00"] ""
+  let p__a = appendItem "@.str." emptyList
+  let p__b = appendItem (toString idx) p__a
+  let p__c = appendItem " = private unnamed_addr constant [" p__b
+  let p__d = appendItem (toString totalLen) p__c
+  let p__e = appendItem " x i8] c\"" p__d
+  let p__f = appendItem withTerm p__e
+  let parts = appendItem "\"" p__f
+  join parts ""
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmStringPoolLines — for each string-pool entry, append two lines:
+-- an empty separator line + the @.str.<i> constant declaration. Indexing
+-- starts at 0 and increments per-entry; mirrors the for-loop in
+-- compile-llvm.ts:emitModule at 355-359.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmStringPoolLines"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmStringPoolLines : (pool: List String) -> (idx: Number) -> (acc: List String) -> (emptyList: List String) -> List String
+emitLlvmStringPoolLines pool idx acc emptyList =
+  case head pool of
+    Nothing -> acc
+    Just s ->
+      let line = emitLlvmStringConstant idx s emptyList
+      let acc1 = appendItem "" acc
+      let acc2 = appendItem line acc1
+      case tail pool of
+        Nothing -> acc2
+        Just rest -> emitLlvmStringPoolLines rest (add idx 1) acc2 emptyList
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmDeclarationLines — for each declaration, append empty + declare-
+-- line. Mirrors compile-llvm.ts:emitModule at 360-363.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmDeclarationLines"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmDeclarationLines : (decls: List LlvmFunctionDecl) -> (acc: List String) -> (emptyList: List String) -> List String
+emitLlvmDeclarationLines decls acc emptyList =
+  case head decls of
+    Nothing -> acc
+    Just d ->
+      let line = emitLlvmDeclaration d emptyList
+      let acc1 = appendItem "" acc
+      let acc2 = appendItem line acc1
+      case tail decls of
+        Nothing -> acc2
+        Just rest -> emitLlvmDeclarationLines rest acc2 emptyList
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmDefinitionLines — for each definition, append empty + definition
+-- block. Mirrors compile-llvm.ts:emitModule at 364-367.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmDefinitionLines"
+@description "Phase 21.10 — LLVM IR text serialiser. See fenel/modules/engine/lower-to-llvm-ast.fenel for the per-function comment block."
+@tags "engine" "internal" "llvm" "phase-21"
+@category "engine-internal"
+emitLlvmDefinitionLines : (defs: List LlvmFunctionDef) -> (acc: List String) -> (emptyList: List String) -> List String
+emitLlvmDefinitionLines defs acc emptyList =
+  case head defs of
+    Nothing -> acc
+    Just d ->
+      let line = emitLlvmDefinition d emptyList
+      let acc1 = appendItem "" acc
+      let acc2 = appendItem line acc1
+      case tail defs of
+        Nothing -> acc2
+        Just rest -> emitLlvmDefinitionLines rest acc2 emptyList
+
+-- ---------------------------------------------------------------------------
+-- emitLlvmModule — program-level entry. Assembles the IR text from the
+-- typed LlvmModule. Mirrors compile-llvm.ts:emitModule at 343-370. The
+-- ADT today doesn't carry targetTriple / dataLayout (the lowering body
+-- never sets them); when the ADT grows those fields, the corresponding
+-- conditional emits land here.
+-- ---------------------------------------------------------------------------
+@label "LLVM serialiser: emitLlvmModule"
+@description "Phase 21.10 — LLVM IR text serialiser entry. Takes a Fenel-native LlvmModule (with LlvmCall / LlvmCallVoid / LlvmBr / Ret / RetVoid as distinct variants — no wire-shape normalisation; both ends of the LLVM pipeline are Fenel) and returns the IR text. Mirrors compile-llvm.ts:emitModule (deleted in Phase 21.10)."
+@tags "engine" "ir" "llvm" "self-host" "phase-21"
+emitLlvmModule : (mod: LlvmModule) -> (emptyList: List String) -> String
+emitLlvmModule mod emptyList =
+  let header = join ["; ModuleID = '", mod.name, "'"] ""
+  let initLines = appendItem header emptyList
+  let withStr = emitLlvmStringPoolLines (mod.stringPool) 0 initLines emptyList
+  let withDecls = emitLlvmDeclarationLines (mod.declarations) withStr emptyList
+  let withDefs = emitLlvmDefinitionLines (mod.definitions) withDecls emptyList
+  let allLines = appendItem "" withDefs
+  join allLines "\n"

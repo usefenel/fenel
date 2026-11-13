@@ -1,0 +1,126 @@
+module ImportDemo where
+
+using std (File, Byte, Bytes, fold, appendItem, length, join, slice, chars, drop, all, startsWith, isString, isNumber, isArray, numberIsFinite, floor, charCode, charFromCode, bytesToList, bindResult, toString, not)
+using codec (base64Decode, base64Encode)
+
+-- Retained browser File data is already an inline data URL. No URL is fetched,
+-- no file is uploaded, and no second JSON or CSV parser is introduced here.
+-- The existing base64 codec supplies Bytes; its host representation bridge
+-- exposes List Byte, and the strict UTF-8 state machine is Fenel-bodied.
+-- Byte size is limited before allocation. Preserve a leading UTF-8 BOM in
+-- retained text; remove one only from the text passed to the existing parsers.
+
+@label "File text"
+@description "The original File metadata and exact decoded UTF-8 text, including a leading byte-order mark when present."
+FileText = FileText file: File text: String
+
+@label "JSON file inspection"
+@description "The original File, retained UTF-8 text and the same typed JSON inspection produced by the text utility. A single leading UTF-8 byte-order mark is ignored only for parsing."
+FileJson = FileJson file: File text: String inspection: JsonInspection
+
+@label "CSV file inspection"
+@description "The original File, retained UTF-8 text and the same typed CSV table/inspection produced by the text utility. A single leading UTF-8 byte-order mark is ignored only for parsing."
+FileCsv = FileCsv file: File text: String inspection: CsvInspection
+
+FileUtf8State = FileUtf8State output: List String remaining: Nat codepoint: Nat minimum: Nat offset: Nat failure: Maybe String
+
+fileUtf8Failure : (state: FileUtf8State) -> (reason: String) -> FileUtf8State
+fileUtf8Failure state reason = FileUtf8State { output = state.output, remaining = state.remaining, codepoint = state.codepoint, minimum = state.minimum, offset = state.offset, failure = Just (join ["UTF-8 byte ", toString (state.offset + 1), ": ", reason] "") }
+
+fileUtf8Scalar : (codepoint: Nat) -> (minimum: Nat) -> Bool
+fileUtf8Scalar codepoint minimum = codepoint >= minimum && codepoint <= 1114111 && not (codepoint >= 55296 && codepoint <= 57343)
+
+fileUtf8Emit : (state: FileUtf8State) -> (codepoint: Nat) -> FileUtf8State
+fileUtf8Emit state codepoint = FileUtf8State { output = appendItem (charFromCode codepoint) state.output, remaining = 0, codepoint = 0, minimum = 0, offset = state.offset + 1, failure = Nothing }
+
+fileUtf8Start : (state: FileUtf8State) -> (byte: Byte) -> FileUtf8State
+fileUtf8Start state byte =
+  if byte <= 127 then fileUtf8Emit state byte
+  else if byte >= 194 && byte <= 223 then FileUtf8State { output = state.output, remaining = 1, codepoint = byte - 192, minimum = 128, offset = state.offset + 1, failure = Nothing }
+  else if byte >= 224 && byte <= 239 then FileUtf8State { output = state.output, remaining = 2, codepoint = byte - 224, minimum = 2048, offset = state.offset + 1, failure = Nothing }
+  else if byte >= 240 && byte <= 244 then FileUtf8State { output = state.output, remaining = 3, codepoint = byte - 240, minimum = 65536, offset = state.offset + 1, failure = Nothing }
+  else fileUtf8Failure state "invalid leading byte."
+
+fileUtf8Continue : (state: FileUtf8State) -> (byte: Byte) -> FileUtf8State
+fileUtf8Continue state byte =
+  if byte < 128 || byte > 191 then fileUtf8Failure state "expected a continuation byte."
+  else
+    let codepoint = state.codepoint * 64 + byte - 128
+    if state.remaining > 1 then FileUtf8State { output = state.output, remaining = state.remaining - 1, codepoint = codepoint, minimum = state.minimum, offset = state.offset + 1, failure = Nothing }
+    else if fileUtf8Scalar codepoint state.minimum then fileUtf8Emit state codepoint
+    else fileUtf8Failure state "overlong sequence, surrogate or code point above U+10FFFF."
+
+fileUtf8Step : (state: FileUtf8State) -> (byte: Byte) -> FileUtf8State
+fileUtf8Step state byte = case state.failure of
+  Just _ -> state
+  Nothing ->
+    if not (isNumber byte && numberIsFinite byte && floor byte == byte && byte >= 0 && byte <= 255) then fileUtf8Failure state "expected a whole byte from 0 through 255."
+    else if state.remaining == 0 then fileUtf8Start state byte
+    else fileUtf8Continue state byte
+
+@label "Decode bounded UTF-8 bytes"
+@description "A strict Fenel byte fold accepts at most 16384 bytes and emits Unicode text. Invalid byte values, leading/continuation bytes, truncated sequences, overlong encodings, surrogates and code points above U+10FFFF return Err with a byte location; no replacement characters are inserted."
+fileUtf8Text : (bytes: List Byte) -> Result String String
+fileUtf8Text bytes =
+  if not (isArray bytes) then Err "UTF-8 decoding expects a byte list."
+  else if length bytes > 16384 then Err "Use a file of at most 16384 bytes."
+  else
+    let initial = FileUtf8State { output = [], remaining = 0, codepoint = 0, minimum = 0, offset = 0, failure = Nothing }
+    let finished = fold fileUtf8Step initial bytes
+    case finished.failure of
+      Just reason -> Err reason
+      Nothing ->
+        if finished.remaining > 0 then Err (join ["UTF-8 byte ", toString (finished.offset + 1), ": truncated sequence."] "")
+        else Ok (join finished.output "")
+
+fileReadBytes : (file: File) -> Result String Bytes
+fileReadBytes file =
+  if not (isNumber file.size && numberIsFinite file.size && floor file.size == file.size && file.size >= 0 && file.size <= 16384) then Err "Use a file of at most 16384 bytes."
+  else if not (isString file.name && isString file.mimeType && isString file.hash && isString file.url) then Err "Expected the retained File name, media type, hash and inline bytes."
+  else if length file.name > 512 || length file.mimeType > 128 || length file.hash > 128 then Err "File metadata is too large for this utility."
+  else if not (all (chars file.mimeType) (\character -> charCode character >= 33 && charCode character <= 126 && character != "," && character != ";")) then Err "Use a retained ASCII media type without parameters."
+  else
+    let prefix = join ["data:", file.mimeType, ";base64,"] ""
+    if not (startsWith file.url prefix) then Err "Use a file dropped or selected in this tab, with retained inline bytes. External file URLs are not fetched."
+    else if length file.url > length prefix + 21848 then Err "Use a file of at most 16384 bytes."
+    else
+      let encoded = slice file.url (length prefix) (length file.url)
+      bindResult (codec.base64Decode encoded) (\bytes ->
+        bindResult (codec.base64Encode bytes) (\canonical ->
+          if canonical != encoded then Err "File bytes must use canonical base64, including zero padding bits."
+          else if length (bytesToList bytes) != file.size then Err "The retained byte count does not match the File size."
+          else Ok bytes))
+
+@label "Read file as text"
+@description "Read retained inline browser File bytes as strict UTF-8 and return the original File beside the exact text. Refuse external URLs, mismatched byte size, noncanonical base64, invalid UTF-8 or more than 16384 bytes. No upload, storage or network request."
+@tags "utility" "file" "text" "utf8"
+fileText : (file: File) -> Result String FileText
+fileText file = bindResult (fileReadBytes file) (\bytes -> bindResult (fileUtf8Text (bytesToList bytes)) (\text -> Ok (FileText { file = file, text = text })))
+
+fileParsingText : (text: String) -> String
+fileParsingText text = if startsWith text (charFromCode 65279) then join (drop 1 (chars text)) "" else text
+
+@label "Inspect JSON file"
+@description "Decode a retained File as strict UTF-8, keep its metadata/exact text and call the same bounded JSON inspection used by pasted text. Ignore one leading UTF-8 BOM only for parsing. JSON syntax, node/depth/string/output bounds and failures use the existing owner; the file fits 16384 bytes."
+@tags "utility" "file" "json" "parse" "inspect"
+fileJson : (file: File) -> Result String FileJson
+fileJson file = bindResult (fileText file) (\read -> bindResult (inspectJsonText (fileParsingText read.text)) (\inspection -> Ok (FileJson { file = read.file, text = read.text, inspection = inspection })))
+
+@label "Inspect CSV file"
+@description "Decode a retained File as strict UTF-8, keep its metadata/exact text and call the same bounded CSV inspection used by pasted text. Ignore one leading UTF-8 BOM only for parsing. All cells remain Strings; existing column/row/quote/output bounds and failures apply; the file fits 16384 bytes."
+@tags "utility" "file" "csv" "parse" "inspect"
+fileCsv : (file: File) -> Result String FileCsv
+fileCsv file = bindResult (fileText file) (\read -> bindResult (inspectCsvInput (ImportTextInput { text = fileParsingText read.text })) (\inspection -> Ok (FileCsv { file = read.file, text = read.text, inspection = inspection })))
+
+fileDemoJson : File
+fileDemoJson = { name = "example.json", mimeType = "application/json", size = 38, hash = "7922a466b4d29eb4302705db3d2164e08efc7146e1380abbd1b8c997ad201721", url = "data:application/json;base64,eyJuYW1lIjoiRmVuZWwiLCJpdGVtcyI6WzEsdHJ1ZSxudWxsXX0=" }
+
+fileDemoCsv : File
+fileDemoCsv = { name = "example.csv", mimeType = "text/csv", size = 24, hash = "33bccfab6b0f99e0b9ed80f18c9370e6ea80902018cd1b781aeea0f38f6c41c5", url = "data:text/csv;base64,bmFtZSxjb2RlCkFkYSwwMDEKQm8sMDAy" }
+
+fileDemoStartingInputs : List ({ function: Any, arguments: List Any })
+fileDemoStartingInputs = [
+  { function = fileText, arguments = [fileDemoCsv ()] },
+  { function = fileJson, arguments = [fileDemoJson ()] },
+  { function = fileCsv, arguments = [fileDemoCsv ()] }
+]

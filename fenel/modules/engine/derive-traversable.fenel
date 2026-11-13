@@ -1,0 +1,292 @@
+module engine where
+
+-- derive-traversable — the generic, schema-directed `traverse` (the Traversable
+-- half of the FP-derivation arc, unified-static-analysis Phase 6d).
+--
+-- Any `* -> *` type WITHOUT an authored `Traversable` instance gets `traverse`
+-- (and `sequenceA` over it) for FREE: a single always-on structural `Traversable`
+-- instance keyed by `{$pattern:"engine:isUnaryConstructor"}` resolves through the
+-- SHIPPED `matchStructural` substrate, and its `traverse` is `engine:deriveTraverse`
+-- — a thin category-B reflection+marshal bridge (engine-bodies-dispatch.ts) that
+-- (a) resolves the dispatched value's owning type + marshals its schema across the
+-- `$`-key barrier via `marshalTraversalType`, and (b) RESOLVES THE APPLICATIVE `g`
+-- (D-6d-2 — see below) and threads `g`'s `pure`/`ap` handles into THIS body. The
+-- authored `Maybe`/`List`/`Result` instances keep nominal precedence
+-- (`resolveStructural` is the last fall-through).
+--
+-- traverse : (a -> g b) -> f a -> g (f b). Walk the structure `f a`, apply the
+-- effectful `f`-arg to each element (an `a`, producing a `g b`), SEQUENCE the
+-- effects with the applicative `g`, and rebuild the structure inside `g`.
+--
+-- THE EMPTY-APPLICATIVE / RETURN-POSITION `pure` PROBLEM (D-6d-2). In the
+-- empty/leaf case, `traverse` must return `pure (empty structure)` in `g`. But
+-- `g` is determined by the RETURN type of the effectful function `a -> g b`, NOT
+-- by any runtime value (Fenel dispatches on values; Haskell resolves this by
+-- TYPES). The resolution: the bridge resolves `g`'s `pure`/`ap` (from the
+-- function's declared return type — the SOUND path that also covers the empty
+-- case — with a non-empty first-element reflection fallback) and threads them in
+-- as `pureFn`/`apFn`. So THIS body never guesses `g`: the empty case is just
+-- `pureFn $ value`, and a field is sequenced with `apFn`. An unresolvable
+-- all-empty-over-an-opaque-closure case is the bridge's documented fence, never a
+-- silently-wrong applicative.
+--
+-- THE REBUILD (the generic, sound accumulator). `acc` starts as `pureFn $ value`
+-- (the ORIGINAL value, in `g`) — so `$tag` + every NON-traversed field survive
+-- automatically. For each field that DOES traverse (element / self-recursive /
+-- nested functor), produce its `g`-wrapped new value `gNew` and combine:
+--   acc' = ap (fmap (\v nv -> assocRecord v fldName nv) acc) gNew
+-- i.e. lift a one-field SETTER over the accumulator (`g (nv -> value)`), then
+-- `ap` it against `gNew` (`g nv`) ⇒ `g value'`. This handles ANY arity / shape,
+-- and the empty/no-traversable-field case is exactly `acc = pureFn $ value`.
+-- `fmap` resolves `g`'s own Functor by dispatch (nominal for `Maybe`/`List`/
+-- `Result`, derived for a user functor); `pureFn`/`apFn` are the threaded handles.
+--
+-- TOTALITY (D-6d-5): descend ONLY into strictly-smaller self-recursive sub-values;
+-- an unknown tag / non-record value / unrecognised field-type ⇒ `pureFn $ value`
+-- (never crash). FENCE (D-6d-4): one-level nested foreign functor (`Wrap (List a)`
+-- ⇒ a `TtApp` arg carrying the param) re-dispatches `Traversable.traverse`;
+-- COMPOUND nesting (`List (Box a)`) is LEFT (treated as a non-traversed field),
+-- documented, never silently mis-handled.
+--
+-- `$map`-FIELD DESCENT (D-6c-3 CLOSED, array-substrate Phase 1a). A `TtMap` field
+-- whose VALUES carry the functor param (`Map String a`) is TRAVERSED by
+-- `mapTraverse f` over the field value — the `Traversable (Map k)` operation
+-- (`g (Map k b)`), combined onto the accumulator via the same `deriveTraverseAp`
+-- as the nested-functor arm. A direct call, NOT a `Traversable.traverse`
+-- re-dispatch (a bare map field has no `$tag` to dispatch on — the Phase-1a
+-- Step-0 fact). COMPOUND map values (`Map String (Box a)`) stay LEFT (D-6d-4).
+--
+-- Closure-apply uses `$` (`($) f x = f x`): the binop/handles are closure- or
+-- fnId-valued, applied via `$` (`(apFn $ setterG) $ gNew`) — the algebra-methods
+-- convention. std fns (`mapGet`/`assocRecord`/`eq`/`head`/`tail`/`concat`/`map`)
+-- are called by bare codeName (the engine-body idiom). All helpers are prefixed
+-- `deriveTraverse…` to avoid registry collisions with the deriveFmap…/deriveFoldr…
+-- families.
+
+-- deriveTraverse — the bridge's declaration, so the nominal Traversable
+-- instances (std/algebra-instances.fenel) can hold it as the reference
+-- `engine.deriveTraverse`. Its native is a context native of the
+-- `derive-functor` container (engine-bodies-dispatch.ts `deriveFunctorModule`),
+-- so it runs only in a registry that carries that container (the engine
+-- harness, the derive-* tests). Two parameters, `traverse`'s arity. The return
+-- is `Any`, not a type variable: the native returns either the traversed value
+-- inside the applicative or, when it cannot resolve the applicative, its input
+-- unchanged, and a free result variable would let a caller pick any type for
+-- that (`consumeString (deriveTraverse f 7)` would infer). No `@requires`: it
+-- performs nothing.
+@native
+@label "Derive traverse (bridge)"
+@description "Phase 6d — the reflection + marshal bridge behind `Traversable.traverse`: resolves the dispatched value's owning type and the applicative `g` (from `f`'s declared return type, else a first element), marshals the schema, and delegates the sequencing to `deriveTraverseFold` / `deriveTraverseList`. Returns the value unchanged when the applicative cannot be resolved. Implemented by a context native of the `derive-functor` container."
+@tags "engine" "traversable" "derive" "kinds" "phase-6d"
+deriveTraverse : (f: a -> b) -> (value: c) -> Any
+
+-- deriveTraverseFold — the entry (the `$tag`-record / variant arm). `f` the
+-- effectful fn, `value` the runtime functor value, `schemaView` the dispatched
+-- type's schema marshalled to TraversalType, `paramName` the functor type-param
+-- name, `typeName` the owning type-constructor name (self-recursion detection),
+-- `pureFn`/`apFn` the resolved applicative `g`'s handles. (The array repr is
+-- handled by deriveTraverseList, called directly by the bridge.)
+@label "Derive traverse (generic sequence)"
+@description "Phase 6d — the generic schema-directed `traverse`: any `* -> *` type without an authored Traversable instance gets traverse free. Sequences the functor-param leaves (TtVar paramName) with the threaded applicative, recurses self-recursive fields (TtNamed typeName), re-dispatches one-level nested foreign functors (TtApp carrying the param), leaves the rest. The decision half of the derived Traversable instance; the engine:deriveTraverse bridge supplies (f, value, schemaView, paramName, typeName, pureFn, apFn) — pureFn/apFn the resolved applicative g (D-6d-2). Total: descends only into strictly-smaller self-recursive sub-values."
+@tags "engine" "traversable" "derive" "kinds" "phase-6d"
+deriveTraverseFold : (f: a) -> (value: b) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> (pureFn: c) -> (apFn: d) -> e
+deriveTraverseFold f value schemaView paramName typeName pureFn apFn =
+  case schemaView of
+    TtOpaque { pure = p } -> deriveTraverseFold f value p paramName typeName pureFn apFn
+    TtRefined { base = bse } -> deriveTraverseFold f value bse paramName typeName pureFn apFn
+    TtMu { body = bdy } -> deriveTraverseFold f value bdy paramName typeName pureFn apFn
+    TtRecord { fields = fs } ->
+      deriveTraverseFields f value fs schemaView paramName typeName pureFn apFn
+    TtVariant { cases = cs } ->
+      case mapGet value "$tag" of
+        Nothing -> pureFn $ value
+        Just tag ->
+          case deriveTraverseFindCase cs tag of
+            Nothing -> pureFn $ value
+            Just c -> deriveTraverseFields f value c.fields schemaView paramName typeName pureFn apFn
+    _ -> pureFn $ value
+
+-- deriveTraverseFindCase — locate the variant case whose name matches the value's
+-- `$tag`. Internal helper; head/tail recursion (the array-repr List idiom).
+@label "derive-traversable: findCase"
+@description "Phase 6d — locate the TtVariantCase matching the value's $tag. Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "phase-6d"
+@category "engine-internal"
+deriveTraverseFindCase : (cases: List a) -> (tag: String) -> Maybe a
+deriveTraverseFindCase cases tag =
+  case head cases of
+    Nothing -> Nothing
+    Just c ->
+      if eq c.name tag
+        then Just c
+        else case tail cases of
+          Nothing -> Nothing
+          Just rest -> deriveTraverseFindCase rest tag
+
+-- deriveTraverseFields — sequence a case's fields. Start the accumulator at
+-- `pureFn $ value` (the original value in `g`, preserving $tag + untouched
+-- fields), then thread it left-to-right combining each traversed field. Internal.
+@label "derive-traversable: fields"
+@description "Phase 6d — sequence a case's fields: acc starts at `pureFn value` (g-wrapped original), each traversed field is combined via ap. Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "phase-6d"
+@category "engine-internal"
+deriveTraverseFields : (f: a) -> (value: b) -> (fields: List c) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> (pureFn: d) -> (apFn: e) -> g
+deriveTraverseFields f value fields schemaView paramName typeName pureFn apFn =
+  deriveTraverseFieldsGo f (pureFn $ value) value fields schemaView paramName typeName pureFn apFn
+
+-- deriveTraverseFieldsGo — the accumulator-threaded fold behind deriveTraverseFields.
+@label "derive-traversable: fieldsGo"
+@description "Phase 6d — accumulator-threaded fold: walk the declared fields, combine each traversed field's effect onto the g-accumulator via ap. Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "phase-6d"
+@category "engine-internal"
+deriveTraverseFieldsGo : (f: a) -> (acc: g) -> (value: b) -> (fields: List c) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> (pureFn: d) -> (apFn: e) -> g
+deriveTraverseFieldsGo f acc value fields schemaView paramName typeName pureFn apFn =
+  case head fields of
+    Nothing -> acc
+    Just fld ->
+      let acc2 = deriveTraverseStepField f acc value fld schemaView paramName typeName pureFn apFn
+      case tail fields of
+        Nothing -> acc2
+        Just rest -> deriveTraverseFieldsGo f acc2 value rest schemaView paramName typeName pureFn apFn
+
+-- deriveTraverseStepField — one field step. A field absent from the value (a
+-- partial record) leaves the accumulator untouched; else classify+combine it.
+-- Split out to avoid a `case`-in-`let` (the analyze.fenel/totality.fenel idiom).
+@label "derive-traversable: stepField"
+@description "Phase 6d — one field: read the value's field (absent ⇒ leave acc), classify+combine its effect onto acc. Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "phase-6d"
+@category "engine-internal"
+deriveTraverseStepField : (f: a) -> (acc: g) -> (value: b) -> (fld: c) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> (pureFn: d) -> (apFn: e) -> g
+deriveTraverseStepField f acc value fld schemaView paramName typeName pureFn apFn =
+  case mapGet value fld.name of
+    Nothing -> acc
+    Just fieldVal ->
+      deriveTraverseCombineField f acc fld.name fieldVal fld.type schemaView paramName typeName pureFn apFn
+
+-- deriveTraverseCombineField — CLASSIFY one field by its marshalled TraversalType,
+-- and (when it traverses) produce its `g`-wrapped value `gNew` + combine onto acc:
+--   element        — `TtVar paramName`  ⇒ `f $ fieldVal` (`g b`).
+--   self-recursive — `TtNamed typeName` ⇒ recurse `deriveTraverseFold` (`g (f b)`).
+--   nested functor — `TtApp` carrying the param ⇒ re-dispatch `Traversable.traverse`
+--                    on the field value (D-6d-4, one level; nominal for List/Maybe,
+--                    derived for a user functor).
+--   map-field      — `TtMap` whose values carry the param ⇒ `mapTraverse f` over
+--                    the map's values (D-6c-3, closed Phase 1a — a direct call,
+--                    the bare map field has no `$tag` to re-dispatch on).
+--   otherwise (a different var / fixed type / compound-nested TtApp / TtMap)
+--            ⇒ LEAVE acc unchanged (the field stays as in the pureFn-wrapped value).
+@label "derive-traversable: combineField"
+@description "Phase 6d/1a — classify a field by its TraversalType: TtVar paramName ⇒ f the value (g b); TtNamed typeName ⇒ recurse (self-recursive); TtApp carrying the param ⇒ re-dispatch Traversable.traverse on the nested functor value (D-6d-4, one level); TtMap whose values carry the param ⇒ mapTraverse f over the map values (D-6c-3, closed Phase 1a); else leave. Combine the traversed effect onto the g-accumulator via deriveTraverseAp. Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "phase-6d"
+@category "engine-internal"
+deriveTraverseCombineField : (f: a) -> (acc: g) -> (fldName: String) -> (fieldVal: b) -> (ft: TraversalType) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> (pureFn: d) -> (apFn: e) -> g
+deriveTraverseCombineField f acc fldName fieldVal ft schemaView paramName typeName pureFn apFn =
+  case ft of
+    TtVar { name = vn } ->
+      if eq vn paramName
+        then deriveTraverseAp apFn acc fldName (f $ fieldVal)
+        else acc
+    TtNamed { name = nn } ->
+      if eq nn typeName
+        then deriveTraverseAp apFn acc fldName (deriveTraverseFold f fieldVal schemaView paramName typeName pureFn apFn)
+        else acc
+    TtApp { args = as } ->
+      if deriveTraverseAppHasParam as paramName
+        then deriveTraverseAp apFn acc fldName (traverse f fieldVal)
+        else acc
+    TtMap { values = vs } ->
+      if deriveTraverseArgIsParam vs paramName
+        then deriveTraverseAp apFn acc fldName (mapTraverse f fieldVal)
+        else acc
+    _ -> acc
+
+-- deriveTraverseAp — combine one traversed field's effect onto the accumulator:
+-- lift a one-field SETTER over acc (`g (nv -> value)`) via the g-Functor, then
+-- `ap` it against `gNew` (`g nv`) ⇒ `g value'` with `fldName` set to the traversed
+-- value. Internal helper.
+@label "derive-traversable: ap"
+@description "Phase 6d — combine a traversed field onto the g-accumulator: fmap a one-field setter over acc, then ap against the field's g-wrapped value. Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "phase-6d"
+@category "engine-internal"
+deriveTraverseAp : (apFn: e) -> (acc: g) -> (fldName: String) -> (gNew: g) -> g
+deriveTraverseAp apFn acc fldName gNew =
+  let setterG = fmap (deriveTraverseSetter fldName) acc
+  (apFn $ setterG) $ gNew
+
+-- deriveTraverseSetter — the one-field record setter (curried: fldName, the
+-- record `v`, the new value `nv`). `fmap (deriveTraverseSetter fldName) acc`
+-- collects [fldName, v] leaving `nv -> record'`; `ap` supplies `nv`. Internal.
+@label "derive-traversable: setter"
+@description "Phase 6d — one-field record setter: assoc nv onto v at fldName. Curried so fmap+ap thread it. Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "phase-6d"
+@category "engine-internal"
+deriveTraverseSetter : (fldName: String) -> (v: a) -> (nv: b) -> a
+deriveTraverseSetter fldName v nv = assocRecord v fldName nv
+
+-- deriveTraverseAppHasParam — does this applied-type's arg list carry the functor
+-- param DIRECTLY (one-level nesting)? A nested TtApp arg (compound nesting,
+-- `List (Box a)`) does NOT count — the D-6d-4 fence. Internal helper.
+@label "derive-traversable: appHasParam"
+@description "Phase 6d — does an applied-type's arg list carry the functor param directly (one-level nesting)? A nested TtApp arg (compound nesting) does NOT count — D-6d-4 fence. Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "phase-6d"
+@category "engine-internal"
+deriveTraverseAppHasParam : (args: List a) -> (paramName: String) -> Bool
+deriveTraverseAppHasParam args paramName =
+  case head args of
+    Nothing -> false
+    Just a ->
+      if deriveTraverseArgIsParam a paramName
+        then true
+        else case tail args of
+          Nothing -> false
+          Just rest -> deriveTraverseAppHasParam rest paramName
+
+-- deriveTraverseArgIsParam — is this single TraversalType arg the functor param
+-- (`TtVar paramName`)? Internal helper.
+@label "derive-traversable: argIsParam"
+@description "Phase 6d — is a single TraversalType arg the functor param (TtVar paramName)? Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "phase-6d"
+@category "engine-internal"
+deriveTraverseArgIsParam : (a: TraversalType) -> (paramName: String) -> Bool
+deriveTraverseArgIsParam a paramName =
+  case a of
+    TtVar { name = vn } -> eq vn paramName
+    _ -> false
+
+-- deriveTraverseList — the array-repr arm (`List`'s `$opaque` array carries no
+-- `$tag`, so the schema-fold can't reach it — the 6c Foldable List precedent).
+-- `traverse f [] = pure []`; `traverse f (x:xs) = ap (fmap prepend (f x)) (traverse f xs)`.
+-- The bridge calls THIS directly when the dispatched value is a JS array; it
+-- re-dispatches via plain recursion (NOT `Traversable.traverse`) so it stays in
+-- the array arm and reuses the threaded `pureFn`/`apFn`.
+@label "derive-traversable: list"
+@description "Phase 6d — the array-repr arm: traverse a List left-to-right, sequencing with the threaded applicative. `traverse f [] = pure []`; `traverse f (x:xs) = ap (fmap (:) (f x)) (traverse f xs)`. Called by the engine:deriveTraverse bridge for JS arrays. Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "list" "phase-6d"
+@category "engine-internal"
+deriveTraverseList : (f: a) -> (xs: List b) -> (pureFn: c) -> (apFn: d) -> g
+deriveTraverseList f xs pureFn apFn =
+  case head xs of
+    Nothing -> pureFn $ []
+    Just x -> deriveTraverseListCons f x (tail xs) pureFn apFn
+
+-- deriveTraverseListCons — the cons step: prepend the head's traversed effect onto
+-- the recursively-traversed tail, all inside `g`. Internal helper.
+@label "derive-traversable: listCons"
+@description "Phase 6d — the List cons step: ap (fmap prepend (f x)) (traverse f rest). Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "list" "phase-6d"
+@category "engine-internal"
+deriveTraverseListCons : (f: a) -> (x: b) -> (maybeRest: Maybe (List b)) -> (pureFn: c) -> (apFn: d) -> g
+deriveTraverseListCons f x maybeRest pureFn apFn =
+  let consG = fmap deriveTraversePrepend (f $ x)
+  case maybeRest of
+    Nothing -> (apFn $ consG) $ (pureFn $ [])
+    Just rest -> (apFn $ consG) $ (deriveTraverseList f rest pureFn apFn)
+
+-- deriveTraversePrepend — cons an element onto the front of a list (the List
+-- traverse's element-order builder). Curried so fmap+ap thread it. Internal.
+@label "derive-traversable: prepend"
+@description "Phase 6d — cons an element onto the front of a list (List traverse's builder). Helper; tagged engine-internal."
+@tags "engine" "internal" "traversable" "list" "phase-6d"
+@category "engine-internal"
+deriveTraversePrepend : (y: a) -> (ys: List a) -> List a
+deriveTraversePrepend y ys = concat [y] ys

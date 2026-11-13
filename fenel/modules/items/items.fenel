@@ -1,0 +1,205 @@
+-- =========================================================================
+-- Items CRUD — create_item + update_item.
+--
+-- ts-elimination-completion Phase 2 (items area). Ports the two
+-- entity_instances-backed `(E)` handlers in core/actions/items.ts
+-- (createItemHandler / updateItemHandler) from live TS orchestration
+-- (`createEntityInstance` / `getEntityInstance` / `updateEntityInstance` /
+-- `appendEvent` + `Object.assign` config-merge + patch-merge) to Fenel
+-- bodies over `state:*`, reducing each TS handler to a thin
+-- `validateActionParams` + `invokeIOAction` + `actionResultAdtToTs`
+-- delegator.
+--
+-- This is a NEW module (items had no `.fenel` source before) — created
+-- directly in the `module … where` + `@facet` format proven on
+-- profiles/inventory (module-substrate is CLOSED; no workstream to
+-- coordinate with — just use its format). The thin `engine/src/modules/
+-- items.ts` seam loads this file; `itemsModule` is registered at the same
+-- four boot sites `inventoryModule` is (system-entities, type-catalog,
+-- runtime evaluator, self-host matrix).
+--
+-- The header keeps the LEGACY lowercase `items:` id-prefix + `items`
+-- category + the `"item"` entity-type string byte-identical (Decision 3 —
+-- no PascalCase rename; that needs a data migration + `$enum` updates).
+--
+-- Substrate consumed:
+--   - state:tryCreateInstanceByName "item" data  ({ok, value, error})
+--   - state:getInstance "item" id                (Maybe<Record> guard)
+--   - state:updateInstance id patch              (patch-merge / Nothing-clear)
+--   - state:appendEvent type payload …           (write-only event log)
+--   - std:mergeRecords                           (right-biased config merge)
+--
+-- ActionResult ADT (ActionOk { data, aggregateType, aggregateId,
+-- profileId } | ActionErr { message }) is the return; the wrapper's
+-- `actionResultAdtToTs` translates it (ActionErr → throw).
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line.
+--
+-- action-subsumption Phase 1 — the `items` pilot (2026-06-08). `createItem` /
+-- `updateItem` ARE the public actions now (D1 COLLAPSE): their params carry the
+-- public contract directly — public field NAMES (`type`/`config`/`name`, not the
+-- old `itemType`/`configM`/`nameM` marshalling renames) + the refinement types
+-- the deleted `create_item_params` / `update_item_params` mirrored (the `ItemType`
+-- enum + the `Uuid` `format:uuid` refinement below — byte-identical `$refined`
+-- nodes). The TS handlers in core/actions/items.ts are deleted; dispatch resolves
+-- `create_item`/`update_item` → these fnRefs, validates args against
+-- `paramRecordOf(fn)` (the function's own param-record, D2), and injects `adapter`
+-- (D4 — still an explicit param; the Channel arc removes it later). `slug`/`name`
+-- stay plain `String`: the record's required+non-empty check already rejects
+-- ""/absent, so `String` is behaviour-equivalent to the old `NonEmptyStr` ref —
+-- which is in any case currently UNRESOLVED (`NonEmptyStr` lives in
+-- `foundationTemplates().paths`, not the entity catalog, so `{$ref:"NonEmptyStr"}`
+-- validated to "Unknown field type" at HEAD; registering it is a separate
+-- engine-wide fix, see the roadmap surprise).
+-- =========================================================================
+
+module items where
+
+-- Uuid — the refinement type `create_item_params` / `update_item_params`
+-- carried inline, now named so the function params project a byte-identical
+-- `$refined` node (D2 parity): Uuid ⇒ {$refined: {base: String, set: {$ref:
+-- "format:uuid"}}}. Registered as a module catalog entity so `{$ref:"Uuid"}`
+-- resolves in validate().
+--
+-- `ItemType` (the item-kind enum `createItem` / `updateItem` take) is the
+-- system declaration in `fenel/std/entities/item.fenel`. This module used to
+-- declare an identical copy, which gave one set two type identities
+-- (modules-as-values Phase 5 per-owner type identity, S1); `{$ref:"ItemType"}`
+-- resolves to the system type in every registry.
+Uuid = String | value ∈ format:uuid
+
+-- EnforceMode / ImportFormat — refined-String `$enum` validation types for the
+-- `create_inventory.enforce` and `import_profiles.format` action params
+-- (action-subsumption Phase 3, 2026-06-08). They project byte-identical
+-- `$refined` nodes to the deleted `create_inventory_params.enforce` /
+-- `import_profiles_params.format` (`{$refined: {base: String, set: {$enum:
+-- [...]}}}`). They are hosted HERE — the cross-module shared-refinement module
+-- (cf. `Uuid`, used by inventory/plans/purchases) — rather than in their own
+-- `inventory` / `imports` domain modules, because those are oracle-backed MIGRATED
+-- modules whose `module-migrate-*.test.ts` freezes `.entities` to `[]` (a new
+-- type-decl there would drift their migration identity — the entity-analog of the
+-- Phase-2 `"action"`-tag oracle break). The global catalog resolves
+-- `{$ref:"EnforceMode"}` / `{$ref:"ImportFormat"}` from any module's sig.
+EnforceMode = String | value ∈ {"soft", "hard"}
+
+ImportFormat = String | value ∈ {"csv", "json"}
+
+-- ViaMode — the `$enum` `send_payment_link_params.via` carried inline
+-- (action-subsumption Phase 3b, 2026-06-08), hosted here for the same reason as
+-- EnforceMode/ImportFormat: `payments` is an oracle-frozen migrated module that
+-- can't grow an entity, so the send_payment_link `via` enum lives in the
+-- cross-module shared-refinement module. {$refined: {base: String, set: {$enum:
+-- ["email","telegram","both"]}}}.
+ViaMode = String | value ∈ {"email", "telegram", "both"}
+
+-- buildItemData — pre-port `const data = { slug, name, type };
+-- Object.assign(data, config ?? {})`. base record + right-biased config
+-- merge (config overrides on key collision, matching Object.assign).
+buildItemData : String -> String -> String -> Maybe ({}) -> {}
+@label "Build item data"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the item entity_instances data record: {slug, name, type} base + right-biased config merge via std:mergeRecords (config overrides on collision, matching pre-port Object.assign(data, config ?? {}))."
+@tags "item" "pure" "ts-elimination"
+buildItemData slug name itemType configM =
+  let base = { slug = slug, name = name, type = itemType }
+  case configM of
+    Nothing -> base
+    Just config -> mergeRecords base config
+
+-- createItem — main body. Builds the data record, persists via
+-- state:tryCreateInstanceByName, then emits item_created + returns the
+-- itemId/slug payload. On insert failure surfaces ActionErr.
+createItem : String -> String -> ItemType -> Maybe ({}) -> String -> ActionResult
+@label "Create item"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 1 — the public create_item action (no separate TS handler). Params ARE the public contract (slug, name, type, config?, adapter). Builds the item data record (buildItemData), persists via state:tryCreateInstanceByName, emits item_created, returns ActionOk { data = {itemId, slug}, aggregateType = Just 'item', aggregateId = Just itemId }. Insert failure → ActionErr."
+@tags "item" "create" "ts-elimination" "action"
+@ioAction "items.create_item"
+createItem slug name type config adapter =
+  let data = buildItemData slug name type config
+  let r = tryCreateInstanceByName "item" data
+  if r.ok
+  then createItemEmit r.value slug name type adapter
+  else ActionErr { message = r.error }
+
+-- createItemEmit — successful-create tail. Attaches the instance's Codeable
+-- (codeName ← slug) + Labelable (label ← name) representations, writes
+-- item_created with the {slug, name, type, adapter} payload (no profileId —
+-- items aren't profile-scoped), and returns the Ok payload.
+--
+-- typed-function-references Phase 9a-3 — the two registerRepresentation calls
+-- replace the retired central `attachInstanceRepresentations` TS hook + its
+-- `representationSources: { codeName: "slug", label: "name" }` map declaration
+-- (system-entities.ts). registerRepresentation persists a typeclass_instances
+-- row AND merges the in-memory registry — byte-identical to the old hook's
+-- createSpecInstance + applyAccountSpecInstances pair. Decentralized + open:
+-- add `Soundable` = add a registerRepresentation call, no central edit.
+createItemEmit : String -> String -> String -> String -> String -> ActionResult
+@label "Create item (emit)"
+@description "ts-elimination-completion Phase 2 + typed-function-references Phase 9a-3 — successful-create tail of createItem. Attaches the instance Codeable (codeName ← slug) + Labelable (label ← name) via state:registerRepresentation (replacing the retired central representationSources attach hook), writes item_created via state:appendEvent (aggregateType=Just 'item', aggregateId=Just itemId, profileId=Nothing — items aren't profile-scoped), and returns ActionOk { data = {itemId, slug} }."
+@tags "item" "create" "ts-elimination" "representation"
+createItemEmit itemId slug name itemType adapter =
+  let _c = registerRepresentation itemId "Codeable" { codeName = slug }
+  let _l = registerRepresentation itemId "Labelable" { label = name }
+  let payload = { slug = slug, name = name, type = itemType, adapter = adapter }
+  let _e = appendEvent "item_created" payload (Just "item") (Just itemId) Nothing
+  ActionOk { data = { itemId = itemId, slug = slug }, aggregateType = Just "item", aggregateId = Just itemId, profileId = Nothing }
+
+-- buildItemPatch — pre-port `next = {...current}; if (name) next.name = name;
+-- if (config) Object.assign(next, config)`. Because state:updateInstance is
+-- patch-merge (missing keys unchanged), the patch carries ONLY the changed
+-- fields — name when Just, config keys when Just — instead of re-sending
+-- the whole current record. Empty patch ({} ) when both are absent is a
+-- harmless no-op merge.
+buildItemPatch : Maybe String -> Maybe ({}) -> {}
+@label "Build item patch"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the update patch for state:updateInstance (patch-merge semantics): name when Just, config keys when Just (right-biased). Carries only changed fields rather than re-sending the whole record (the pre-port {...current} rewrite is unnecessary under patch-merge)."
+@tags "item" "pure" "ts-elimination"
+buildItemPatch nameM configM =
+  let base = case nameM of
+    Nothing -> {}
+    Just n -> { name = n }
+  case configM of
+    Nothing -> base
+    Just config -> mergeRecords base config
+
+-- buildItemUpdatePayload — pre-port event payload `{ name, config, adapter }`
+-- where name/config were string|undefined / record|undefined (JSON drops
+-- undefined keys). Mirrors that: name + config included only when Just.
+buildItemUpdatePayload : Maybe String -> Maybe ({}) -> String -> {}
+@label "Build item-update payload"
+@description "ts-elimination-completion Phase 2 — pure helper. Composes the item_updated event payload: {adapter} base + name when Just + config when Just (mirrors pre-port's `{name, config, adapter}` where undefined keys dropped from the JSON)."
+@tags "item" "pure" "ts-elimination"
+buildItemUpdatePayload nameM configM adapter =
+  let base = { adapter = adapter }
+  let withName = case nameM of
+    Nothing -> base
+    Just n -> mergeRecords base { name = n }
+  case configM of
+    Nothing -> withName
+    Just config -> mergeRecords withName { config = config }
+
+-- updateItem — main body. Guards on existence (pre-port throws "Item not
+-- found"); the known arm patches + emits item_updated.
+updateItem : Uuid -> Maybe String -> Maybe ({}) -> String -> ActionResult
+@label "Update item"
+@description "ts-elimination-completion Phase 2 / action-subsumption Phase 1 — the public update_item action (no separate TS handler). Params ARE the public contract (itemId, name?, config?, adapter). Guards on state:getInstance 'item' id (Nothing → ActionErr 'Item not found', matching pre-port throw); the known arm patches via state:updateInstance + emits item_updated."
+@tags "item" "update" "ts-elimination" "action"
+@ioAction "items.update_item"
+updateItem itemId name config adapter =
+  case getInstance "item" itemId of
+    Nothing -> ActionErr { message = `Item not found: ${itemId}` }
+    Just _ -> updateItemKnown itemId name config adapter
+
+-- updateItemKnown — after the existence guard. Patches the row, emits the
+-- event, returns Ok (no data payload — pre-port returns bare success).
+updateItemKnown : String -> Maybe String -> Maybe ({}) -> String -> ActionResult
+@label "Update item (known)"
+@description "ts-elimination-completion Phase 2 — case-arm extraction from updateItem (item exists). Applies buildItemPatch via state:updateInstance (patch-merge), emits item_updated (buildItemUpdatePayload), returns ActionOk { data = {} } with item aggregate provenance."
+@tags "item" "update" "ts-elimination"
+updateItemKnown itemId nameM configM adapter =
+  let patch = buildItemPatch nameM configM
+  let _u = updateInstance itemId patch
+  let payload = buildItemUpdatePayload nameM configM adapter
+  let _e = appendEvent "item_updated" payload (Just "item") (Just itemId) Nothing
+  ActionOk { data = {}, aggregateType = Just "item", aggregateId = Just itemId, profileId = Nothing }

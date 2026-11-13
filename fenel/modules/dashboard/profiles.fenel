@@ -1,0 +1,239 @@
+module dashboard where
+
+-- =========================================================================
+-- Profile aggregation route bodies + supporting helpers — ported from
+-- api/src/routes/dashboard.ts' 3 Disposition-C profile routes
+-- (/profiles, /profiles/:id, /profiles POST). The PUT /profiles/:id route
+-- already landed in 12a-2 as dashboard:patchProfile.
+--
+-- Phase 12a sub-step 3 of the ts-elimination workstream.
+--
+-- Wire-shape decisions:
+--   * Anonymous records for the response shape (matches the legacy JSON
+--     wire format; no $tag pollution). Direction encoded as a string
+--     ("outgoing" / "incoming") not an ADT — keeps the wire shape stable.
+--   * Per Decision I: activeFlows + entitlements stay in the TS wrapper.
+--     The body returns a ProfileDetail-Core (no activeFlows/entitlements);
+--     the wrapper splices those fields in.
+--   * Per Decision G: POST /profiles iterates handles/phones/tags in TS.
+--     The body just creates the profile row.
+--   * Per Decision H (resolved YES): state.list_instances now returns the
+--     merged-envelope shape `{id, accountId, ...data, createdAt, updatedAt}`
+--     (mirroring 12a-2's list_instances_by_name evolution). Relation
+--     wire-shape gains an extra `updatedAt` — minor additive change.
+--
+-- Smoke-tested via engine/src/modules/smoke-12a-3.ts (REMOVED pre-commit)
+-- on the pure transforms (flattenProfileFromMerged + normaliseRelationship
+-- + attachRelatedProfile + tag-aggregation map-builds).
+-- =========================================================================
+
+-- flattenProfileFromMerged — envelope-merged profile row → legacy profile
+-- wire-shape. Counterpart of flattenProfile (which reads `.data` from a
+-- raw drizzle row); this variant reads data fields directly from the
+-- top-level of the merged envelope (post-12a-3 state:listInstances
+-- evolution + the existing state:listInstancesByName envelope from 12a-2).
+--
+-- Same per-field defaults as flattenProfile: `type` defaults to "person";
+-- every other absent field projects to null via record-literal evaluation
+-- of `row.<field>` over the possibly-empty envelope.
+
+@label "Flatten profile (from merged envelope)"
+@description "Envelope-merged profile row → legacy profile wire-shape. Counterpart of flattenProfile (which reads `.data` from a raw drizzle row); this variant reads data fields directly from the top-level of the merged envelope produced by state:listInstancesByName (12a-2) + state:listInstances (12a-3). Same per-field defaults: type→'person'; every other absent field projects to null."
+@tags "dashboard" "profile" "flatten" "pure"
+flattenProfileFromMerged : (row: {}) -> {}
+flattenProfileFromMerged row = {
+  id = row.id,
+  accountId = row.accountId,
+  type = defaultTo "person" row.type,
+  gender = row.gender,
+  email = row.email,
+  phone = row.phone,
+  dob = row.dob,
+  avatar = row.avatar,
+  notes = row.notes,
+  firstName = row.firstName,
+  lastName = row.lastName,
+  nicknames = row.nicknames,
+  archivedAt = row.archivedAt,
+  createdAt = row.createdAt
+}
+
+-- normaliseRelationship — given a profile_relationship envelope row and
+-- the selfId (the profile whose detail page we're rendering), produce
+-- the normalised wire-shape where profileBId is ALWAYS the OTHER
+-- profile and `direction` records the original direction ("outgoing"
+-- when self was profileAId in storage; "incoming" when self was
+-- profileBId). `relatedProfile` is left as null here — resolved in a
+-- second pass by attachRelatedProfile after the profiles list is read.
+--
+-- Implementation: mergeRecords right-biased so the override fields
+-- (direction, relatedProfile, and on the incoming branch the swapped
+-- profileAId/profileBId) replace the row's storage fields. This
+-- preserves the legacy JS-spread semantics — every other data field
+-- (type, note, etc.) survives — without needing recordEntries to
+-- iterate keys.
+--
+-- The two branches are extracted to outgoingRel / incomingRel so the
+-- ifElse call fits on one line — parseApp doesn't continue across
+-- newlines (canStartArg sees the newline token and stops accumulating
+-- args), so `ifElse cond branch1 branch2` must be single-line. Helper
+-- extraction is the canonical workaround for multi-line conditional
+-- branches that themselves contain multi-line record literals.
+
+@label "Outgoing relationship (no swap)"
+@description "Outgoing branch of normaliseRelationship — mergeRecords rel { direction = 'outgoing', relatedProfile = null }. Extracted because parseApp doesn't continue an arg list across newlines; a multi-line if/ifElse with multi-line branches needs helper extraction to keep the conditional call single-line."
+@tags "dashboard" "profile" "relationship" "pure" "helper"
+outgoingRel : (rel: {}) -> {}
+outgoingRel rel =
+  mergeRecords rel { direction = "outgoing", relatedProfile = null }
+
+@label "Incoming relationship (with A/B swap)"
+@description "Incoming branch of normaliseRelationship — swaps profileAId/profileBId so the OTHER profile is consistently in profileBId and sets direction='incoming'. Sister of outgoingRel."
+@tags "dashboard" "profile" "relationship" "pure" "helper"
+incomingRel : (rel: {}) -> {}
+incomingRel rel =
+  mergeRecords rel {
+    profileAId = rel.profileBId,
+    profileBId = rel.profileAId,
+    direction = "incoming",
+    relatedProfile = null
+  }
+
+@label "Normalise relationship direction"
+@description "Given a profile_relationship envelope row + the selfId (profile whose detail page we're rendering), produce the normalised wire-shape where profileBId is ALWAYS the OTHER profile and `direction` records the original direction ('outgoing' when self was profileAId in storage; 'incoming' when self was profileBId). `relatedProfile` is left as null — resolved separately by attachRelatedProfile."
+@tags "dashboard" "profile" "relationship" "pure"
+normaliseRelationship : (selfId: String) -> (rel: {}) -> {}
+normaliseRelationship selfId rel = ifElse (eq rel.profileAId selfId) (outgoingRel rel) (incomingRel rel)
+
+-- attachRelatedProfile — given a normalised relationship + the list of
+-- all profile rows, look up the row whose `id` matches rel.profileBId
+-- (which post-normaliseRelationship is always the OTHER profile) and
+-- fold it into the relationship as `relatedProfile`. Matches the
+-- legacy `relatedMap[r.profileBId]` lookup.
+--
+-- `find` returns `Maybe<row>`; the JSON wire serialises Just/Nothing
+-- as objects rather than the raw row. For wire-shape parity (legacy
+-- emits the row directly, or `undefined` when missing), unwrap the
+-- Maybe to the row-or-null shape here.
+
+@label "Attach related profile"
+@description "Given a normalised relationship + the list of all profile rows, look up the row whose `id` matches rel.profileBId (post-normaliseRelationship, always the OTHER profile) and fold it in as `relatedProfile`. Unwraps the Maybe<row> from std:find to row-or-pass-through-on-Nothing so the wire shape matches the legacy `relatedMap[r.profileBId]` lookup."
+@tags "dashboard" "profile" "relationship" "pure"
+attachRelatedProfile : (profiles: {}) -> (rel: {}) -> {}
+attachRelatedProfile profiles rel =
+  case find (\p -> eq p.id rel.profileBId) profiles of
+    Just p -> mergeRecords rel { relatedProfile = flattenProfileFromMerged p }
+    _ -> rel
+
+-- aggregateProfileRow — per-profile stitch helper. Given the current-tag
+-- list + the handle list + a single profile envelope row, produce the
+-- flattened profile row annotated with `tags: [tag-name]` and
+-- `handleCount`. Extracted from listProfilesAggregated to keep the map
+-- callback as a single expression — multi-statement lambda bodies
+-- aren't supported (parseLambda calls parseExpr, not parseBlock), so
+-- the natural place for a body with multiple `let`s is a top-level fn.
+
+@label "Aggregate profile row"
+@description "Per-profile stitch helper for the GET /profiles aggregation. Given the current-tag rows + handle rows + a profile envelope row, produces the flattened profile row annotated with `tags: [tag-name]` and `handleCount`. Extracted from listProfilesAggregated to keep the map callback as a single expression (parseLambda parses parseExpr, not parseBlock — multi-statement lambda bodies need a top-level fn extraction)."
+@tags "dashboard" "profile" "aggregation" "pure"
+aggregateProfileRow : (currentTagRows: List ({})) -> (allHandleRows: List ({})) -> (p: {}) -> {}
+aggregateProfileRow currentTagRows allHandleRows p =
+  let pTags = filter (\t -> eq t.profileId p.id) currentTagRows
+  let pTagNames = map (\t -> t.tag) pTags
+  let pHandles = filter (\h -> eq h.profileId p.id) allHandleRows
+  let flattened = flattenProfileFromMerged p
+  mergeRecords flattened { tags = pTagNames, handleCount = length pHandles }
+
+-- listProfilesAggregated — GET /profiles route body. 3 parallel reads
+-- (profile rows + currentTags + handles) with per-profile stitching;
+-- output is the list of flattened profile rows each annotated with
+-- `tags: [tag-name]` (current tags only, validTo absent) and
+-- `handleCount: <n>` (number of profile_handle rows).
+--
+-- Ordering + 100-limit kept in the TS wrapper (no std:sortBy / std:take
+-- primitives yet — same disposition as 12a-2's listPurchases sort).
+
+@label "List profiles (aggregated)"
+@description "GET /profiles route body. 3 parallel reads (profile rows + currentTags + handles) with per-profile stitching; output is the list of flattened profile rows each annotated with `tags: [tag-name]` (current tags only, validTo absent) and `handleCount`. Ordering + 100-limit kept in TS wrapper (no std:sortBy / std:take yet)."
+@tags "dashboard" "profile" "route" "list" "aggregation"
+listProfilesAggregated : List ({})
+listProfilesAggregated =
+  let profileRows = listInstancesByName "profile"
+  let allTagRows = listInstancesByName "profile_tag"
+  let allHandleRows = listInstancesByName "profile_handle"
+  let currentTagRows = filter (\t -> isNull t.validTo) allTagRows
+  map (aggregateProfileRow currentTagRows allHandleRows) profileRows
+
+-- getProfileDetail — GET /profiles/:id route body. The heaviest single
+-- body in the dashboard module: 8 reads (1 profile + 5 relations + 2
+-- symmetric relationship sides + 1 purchases + 1 list-all-profiles for
+-- the related-profile resolution) + relationship-direction normalisation
+-- + current-vs-past tag split.
+--
+-- activeFlows + entitlements come from the TS wrapper (Decision I —
+-- they require IO leaves not yet in the state.* substrate).
+--
+-- Returns Maybe<ProfileDetail-Core>:
+--   * Nothing — profile id not found (TS wrapper maps to 404).
+--   * Just <core> — every key the legacy /profiles/:id response had
+--     EXCEPT activeFlows + entitlements (the TS wrapper splices those).
+--
+-- The profile field comes from state:getInstance "profile" id which
+-- dispatches through readSystemInstance → findProfileById and returns
+-- the already-flattened legacy profile shape (id, accountId, type,
+-- gender, email, …). No second flatten needed here.
+
+@label "Get profile detail"
+@description "GET /profiles/:id route body. The heaviest single body in the dashboard module: 8 reads (1 profile + 5 relations + 2 symmetric relationship sides + 1 purchases + 1 list-all-profiles for related-profile resolution) + relationship-direction normalisation + current-vs-past tag split. Returns Maybe<ProfileDetail-Core>: Nothing → 404; Just <core> → every key the legacy /profiles/:id response had EXCEPT activeFlows + entitlements (TS wrapper splices those — Decision I, deferred substrate-primitive question)."
+@tags "dashboard" "profile" "route" "get" "aggregation"
+getProfileDetail : (profileId: String) -> Maybe ({})
+getProfileDetail profileId =
+  case getInstance "profile" profileId of
+    Nothing -> Nothing
+    Just profile ->
+      let handleRows = listInstances "profile_handle" (Just { profileId = profileId })
+      let phoneRows = listInstances "profile_phone" (Just { profileId = profileId })
+      let tagRows = listInstances "profile_tag" (Just { profileId = profileId })
+      let intentRows = listInstances "profile_intent" (Just { profileId = profileId })
+      let purchaseRows = listInstances "purchase" (Just { profileId = profileId })
+      let relAsARows = listInstances "profile_relationship" (Just { profileAId = profileId })
+      let relAsBRows = listInstances "profile_relationship" (Just { profileBId = profileId })
+      let allProfiles = listInstancesByName "profile"
+      let normalisedA = map (normaliseRelationship profileId) relAsARows
+      let normalisedB = map (normaliseRelationship profileId) relAsBRows
+      let allRels = concat normalisedA normalisedB
+      let rels = map (attachRelatedProfile allProfiles) allRels
+      let currentTags = filter (\t -> isNull t.validTo) tagRows
+      let pastTags = filter (\t -> not (isNull t.validTo)) tagRows
+      Just {
+        profile = profile,
+        profile_handle = handleRows,
+        profile_phone = phoneRows,
+        profile_tag = tagRows,
+        profile_intent = intentRows,
+        profile_relationship = rels,
+        purchase = purchaseRows,
+        handles = handleRows,
+        phones = phoneRows,
+        tags = currentTags,
+        tagHistory = pastTags,
+        purchases = purchaseRows,
+        relationships = rels,
+        intents = intentRows
+      }
+
+-- createProfile — POST /profiles route body. Thin wrapper around
+-- tryCreateInstanceByName "profile" data. The TS wrapper handles Zod
+-- validation, field whitelisting + defaults, the relation-iteration
+-- (handles/phones/tags arrays — Decision G), and the response framing
+-- (fetch the new row + flatten it for the 201 body).
+--
+-- Returns the {ok, value?, error?} Result-shape from
+-- tryCreateInstanceByName directly.
+
+@label "Create profile"
+@description "POST /profiles route body. Thin wrapper around state:tryCreateInstanceByName 'profile' data — Result-shape return. The TS wrapper handles Zod validation, field whitelisting + defaults, the relation-iteration (handles/phones/tags arrays — Decision G keeps these in TS), and the response framing (fetch the new row + flatten for the 201 body)."
+@tags "dashboard" "profile" "route" "create"
+createProfile : (data: {}) -> {}
+createProfile data =
+  tryCreateInstanceByName "profile" data

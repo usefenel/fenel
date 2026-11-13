@@ -1,0 +1,291 @@
+-- mime — RFC 2045 / RFC 5322 MIME helpers ported as Fenel bodies.
+--
+-- Phase 11b sub-step 3 port — the pure helpers of
+-- runtime/src/providers/mime.ts. The non-pure helpers (makeBoundary
+-- + rfc822Date — random hex + wall-clock time), the IO leaf
+-- (fetchAttachments — async HTTP), the substrate-deferred
+-- base64Encode (DEFER per the brief — needs `std:base64Encode`
+-- substrate primitive; not blocking for sub-step 3), and the
+-- orchestrator buildMime all stay TS-side.
+--
+-- This sub-step validates the runtime-bodies-dispatch.ts precedent on
+-- a THIRD distinct shape:
+--   * Phase 11a:           boolean reduction over a pre-classified ADT (triggerMatches)
+--   * Phase 11b sub-step 1: structural key-rewriting walk over an ADT (telegram-codec)
+--   * Phase 11b sub-step 3: stateful per-byte walk with line wrapping (quotedPrintable)
+--
+-- Three concrete data points before scaling to notion-codec.ts
+-- (1686 LOC; sub-step 11b-2) where the same recipe will land at
+-- scale.
+--
+-- Pre-flight discovery: the email module (engine/src/modules/email.ts)
+-- already ships Fenel-bodied `email:formatAddress` + `email:bodyText` +
+-- `email:bodyHtml` (Phase 5b1). The brief's `formatAddress` /
+-- `bodyText` / `bodyHtml` targets are NOT new bodies — the existing
+-- email module's fnIds are the canonical surface. mime.ts's local
+-- formatAddress / bodyText / bodyHtml are duplicates. The
+-- dispatched wrappers in runtime-bodies-dispatch.ts route through
+-- the existing `email:*` fnIds (after marshalling the TS-side
+-- `string | null` displayName to Fenel-side `Maybe<String>`).
+--
+-- The `email:formatAddress` body was updated in this sub-step to add
+-- the `replaceAll name "\"" ""` quote-strip (closes the Phase 5b1
+-- TODO that deferred the strip "pending Phase 6 regex / replace
+-- support"). Same commit.
+--
+-- Companion DEFERs:
+--   base64Encode  — needs `std:base64Encode` substrate primitive.
+--                   Not blocking for sub-step 3 per the brief.
+--                   `codec:base64Encode` exists in codec.ts but
+--                   returns Result<EncErr, String> (different
+--                   signature from mime.ts's String-returning local
+--                   base64Encode). Future sub-step 11b-4 could
+--                   route through codec:base64Encode if the
+--                   Result-unwrap cost is acceptable.
+--
+--   makeBoundary  — non-pure (crypto.getRandomValues). Stays TS-side.
+--                   Could route through a hypothetical
+--                   `io:random_hex` IO primitive in a future phase.
+--
+--   rfc822Date    — non-pure (wall-clock time). Stays TS-side.
+--                   Could route through a hypothetical
+--                   `io:current_time` IO primitive in a future phase.
+--
+--   buildMime     — orchestrator composing all of the above. Stays
+--                   TS-side per the brief; could be Fenel-bodied if
+--                   makeBoundary / rfc822Date / base64Encode all
+--                   land as IO primitives (sub-step 11b-4).
+--
+-- CRLF retains the explicit `(concat (charFromCode 13) "\n")`
+-- spelling used when this module was ported. Both source lexers now
+-- also decode the carriage-return escape `\r`.
+--
+-- typed-function-references Phase FM-retire-5 Step 5b (2026-06-06) — gained the
+-- `module runtime where` header + sigs + facets; unions with the other 3
+-- runtime body files at the seam. Ids stay `runtime:<fn>`.
+
+module runtime where
+
+-- ---------------------------------------------------------------------------
+-- QpStep — pre-classified quoted-printable encoding step.
+--
+-- The TS classifier at runtime-bodies-dispatch.ts:classifyQuotedPrintable
+-- walks the input string's UTF-8 bytes (via TextEncoder), handles the
+-- CRLF / LF look-ahead (consuming 2 bytes for native CRLF, 1 byte
+-- for bare LF; both emit QpHardBreak), and dispatches each remaining
+-- byte to either QpEncodedByte (for byte 0x3D + control bytes other
+-- than 0x09 + bytes > 126) or QpVerbatimByte (for printable ASCII).
+--
+-- The body's std:fold-driven walk threads an anonymous state record
+-- `{ lines: List<String>, current: String }` and dispatches on the
+-- QpStep variant:
+--
+--   QpHardBreak     — flush `current` to `lines`; reset `current` to ""
+--   QpEncodedByte b — chunk = "=" ++ numberToHex(b, 2); ensureRoom check
+--                     against current.length + chunk.length > 75; either
+--                     soft-break-flush + new current or append in place
+--   QpVerbatimByte b — chunk = charFromCode(b); same ensureRoom check
+--
+-- Final flush: if `current` is non-empty after the fold, push it to
+-- `lines`. Return `join lines "\r\n"`.
+-- ---------------------------------------------------------------------------
+
+QpStep =
+  QpHardBreak
+  | QpEncodedByte b: Number
+  | QpVerbatimByte b: Number
+
+-- ---------------------------------------------------------------------------
+-- quotedPrintable — RFC 2045 quoted-printable encoder.
+--
+-- Mirrors the TS oracle at runtime/src/providers/mime.ts:68:
+--   bytes = TextEncoder.encode(input)
+--   for each byte: CRLF/LF look-ahead, encode if needed, soft-break
+--                  at 75 chars
+--   return out.join("\r\n")
+--
+-- The wrapper at runtime-bodies-dispatch.ts:classifyQuotedPrintable
+-- handles the CRLF / LF look-ahead TS-side (it's awkward inside a
+-- std:fold which sees one byte at a time — the same pattern as
+-- snakeToCamel where we kept the state inside the fold but pre-
+-- classified the input). The body sees a flat List<QpStep> and just
+-- accumulates output.
+--
+-- The "75 chars" soft-break threshold matches the TS oracle's
+-- `if (line.length + n > 75)`. Output line lengths in the final
+-- result are at most 76 chars (75 chars + the soft-break `=`).
+-- ---------------------------------------------------------------------------
+
+quotedPrintable : a -> String
+@label "mime: quotedPrintable"
+@description "Phase 11b sub-step 3 — RFC 2045 quoted-printable encoder. The TS wrapper at runtime/src/runtime-bodies-dispatch.ts pre-classifies the input string's UTF-8 bytes into List<QpStep> (handling CRLF / LF look-ahead TS-side); the body std:fold over the steps with state `{ lines: List<String>, current: String }`. Dispatches on QpStep variant (QpHardBreak / QpEncodedByte / QpVerbatimByte) via case-of; the per-step helper quotedPrintableAppend handles the 75-char soft-break check. Boundary adapter dispatched via `dispatchedQuotedPrintable`. Mirrors runtime/src/providers/mime.ts:68."
+@tags "runtime" "mime" "codec" "boundary" "phase-11b"
+quotedPrintable steps =
+  let initState = { lines = [], current = "" }
+  let finalState = fold quotedPrintableStep initState steps
+  let allLines =
+        if eq finalState.current ""
+          then finalState.lines
+        else appendItem finalState.current finalState.lines
+  join allLines (concat (charFromCode 13) "\n")
+
+-- ---------------------------------------------------------------------------
+-- quotedPrintableStep — per-step fold function.
+--
+-- Each step is one of the 3 QpStep variants. The state record is
+-- `{ lines: List<String>, current: String }`. The dispatch:
+--
+--   QpHardBreak       — push `current` to `lines`; reset `current`
+--   QpEncodedByte b   — chunk = "=" ++ numberToHex(b, 2);
+--                       call quotedPrintableAppend
+--   QpVerbatimByte b  — chunk = charFromCode(b);
+--                       call quotedPrintableAppend
+-- ---------------------------------------------------------------------------
+
+quotedPrintableStep : a -> a -> a
+@label "mime: quotedPrintableStep"
+@description "Phase 11b sub-step 3 — per-step fold function for quotedPrintable. Dispatches on the QpStep variant (QpHardBreak flushes state.current to state.lines; QpEncodedByte b computes `=` ++ numberToHex(b, 2) and calls quotedPrintableAppend; QpVerbatimByte b computes charFromCode(b) and calls quotedPrintableAppend). Internal helper consumed by `runtime:quotedPrintable` via std:fold. Body-only fnId."
+@tags "runtime" "mime" "internal" "phase-11b"
+@category "runtime-internal"
+quotedPrintableStep state step = case step of
+  QpHardBreak ->
+    { lines = appendItem state.current state.lines, current = "" }
+  QpEncodedByte { b = b } ->
+    quotedPrintableAppend state (concat "=" (numberToHex b 2))
+  QpVerbatimByte { b = b } ->
+    quotedPrintableAppend state (charFromCode b)
+
+-- ---------------------------------------------------------------------------
+-- quotedPrintableAppend — append a chunk to the current line with
+-- soft-break check.
+--
+-- Mirrors the TS oracle's `ensureRoom(n)` check at mime.ts:73:
+--   if (line.length + n > 75) { out.push(line + "="); line = ""; }
+--   line += chunk;
+--
+-- If the chunk would push current beyond 75 chars, emit a soft-break:
+-- push `current + "="` to `lines`, then start a new line with the
+-- chunk. Else append the chunk in place.
+--
+-- Used by both QpEncodedByte and QpVerbatimByte arms — factored out
+-- as a named helper rather than inlined to keep the per-arm bodies
+-- readable + the matrix surface explicit.
+-- ---------------------------------------------------------------------------
+
+quotedPrintableAppend : a -> String -> a
+@label "mime: quotedPrintableAppend"
+@description "Phase 11b sub-step 3 — chunk append helper for quotedPrintableStep. Mirrors the TS oracle's `ensureRoom(n)` check at mime.ts:73: if current.length + chunk.length > 75, emit a soft break (push `current + \"=\"` to lines, reset current to chunk); else append chunk in place. Internal helper consumed by `runtime:quotedPrintableStep`. Body-only fnId."
+@tags "runtime" "mime" "internal" "phase-11b"
+@category "runtime-internal"
+quotedPrintableAppend state chunk =
+  if gt (add (length state.current) (length chunk)) 75
+    then { lines = appendItem (concat state.current "=") state.lines, current = chunk }
+    else { lines = state.lines, current = concat state.current chunk }
+
+-- ---------------------------------------------------------------------------
+-- joinAddrs — render a list of Addresses as a comma-separated RFC
+-- 5322 string.
+--
+-- Mirrors the TS oracle at runtime/src/providers/mime.ts:61:
+--   list.map(formatAddress).filter(Boolean).join(", ")
+--
+-- `formatAddress` resolves to `email:formatAddress` via the registry
+-- (the bare codename → fnId fall-through at json-logic.ts:773 for
+-- unbound idents that ARE registered functions). The email module's
+-- formatAddress operates on Address (with `displayName: Maybe<String>`)
+-- — the runtime-bodies-dispatch.ts wrapper marshals the TS-side
+-- `string | null` displayName at the boundary before calling
+-- runtime:joinAddrs (which then internally calls email:formatAddress).
+--
+-- `filter (\s -> neq s "")` — inline lambda for the empty-string
+-- skip (mirrors TS's `.filter(Boolean)`). Lambdas in arg position
+-- to std functions parse + evaluate correctly (per the Phase 11b
+-- sub-step 1 surprise 1 commentary — only PARAMETER-bound function
+-- refs fail; lambdas in arg position are fine).
+-- ---------------------------------------------------------------------------
+
+joinAddrs : a -> String
+@label "mime: joinAddrs"
+@description "Phase 11b sub-step 3 — render a list of Addresses as a comma-separated RFC 5322 string. Maps each Address via the registry-resolved `formatAddress` (resolves to `email:formatAddress`), filters out empty strings (via inline lambda `\\s -> neq s \"\"`), joins with \", \". The runtime-bodies-dispatch.ts wrapper marshals each TS-side AddressValue's `string | null` displayName to Fenel-side `Maybe<String>` before dispatch. Boundary adapter dispatched via `dispatchedJoinAddrs`. Mirrors runtime/src/providers/mime.ts:61."
+@tags "runtime" "mime" "email" "boundary" "phase-11b"
+joinAddrs addrs =
+  join (filter (\s -> neq s "") (map formatAddress addrs)) ", "
+
+-- ---------------------------------------------------------------------------
+-- guessContentType — best-effort MIME type from filename extension.
+--
+-- Mirrors the TS oracle at runtime/src/providers/mime.ts:143:
+--   const ext = filename.toLowerCase().split(".").pop() ?? "";
+--   const map: Record<string, string> = { pdf: "application/pdf", ... };
+--   return map[ext] ?? "application/octet-stream";
+--
+-- Order matters for the case-arm fallback: the `_` arm at the bottom
+-- catches any extension not in the lookup table (including the
+-- no-dot case where `last (split "no-ext" ".")` returns
+-- `Just "no-ext"` and "no-ext" matches no arm).
+-- ---------------------------------------------------------------------------
+
+guessContentType : String -> String
+@label "mime: guessContentType"
+@description "Phase 11b sub-step 3 — best-effort MIME type from a filename's extension. Outer case-of dispatches on `last (split (lower filename) \".\")` (Nothing → octet-stream fallback; Just { value = ext } → inner 17-arm case lookup). Boundary adapter dispatched via `dispatchedGuessContentType`. Mirrors runtime/src/providers/mime.ts:143."
+@tags "runtime" "mime" "lookup" "boundary" "phase-11b"
+guessContentType filename =
+  case last (split (lower filename) ".") of
+    Nothing -> "application/octet-stream"
+    Just ext ->
+      case ext of
+        "pdf" -> "application/pdf"
+        "txt" -> "text/plain"
+        "csv" -> "text/csv"
+        "json" -> "application/json"
+        "html" -> "text/html"
+        "png" -> "image/png"
+        "jpg" -> "image/jpeg"
+        "jpeg" -> "image/jpeg"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "svg" -> "image/svg+xml"
+        "zip" -> "application/zip"
+        "mp4" -> "video/mp4"
+        "mov" -> "video/quicktime"
+        "mp3" -> "audio/mpeg"
+        "wav" -> "audio/wav"
+        _ -> "application/octet-stream"
+
+-- ---------------------------------------------------------------------------
+-- wrapBase64 — chunk a base64 string at 76-char boundaries.
+--
+-- Mirrors the TS oracle at runtime/src/providers/mime.ts:117:
+--   for (let i = 0; i < b64.length; i += 76) lines.push(b64.slice(i, i + 76));
+--   return lines.join("\r\n");
+--
+-- The TS for-loop is naturally a recursive helper in Fenel —
+-- wrapBase64Chunks recurses with an incremented index until the
+-- index reaches the string length. Tail recursion is fine because
+-- the chunk list is built by appendItem from the head.
+-- ---------------------------------------------------------------------------
+
+wrapBase64 : String -> String
+@label "mime: wrapBase64"
+@description "Phase 11b sub-step 3 — chunk a base64 string at 76-char boundaries per RFC 2045. Returns the empty string for an empty input; otherwise delegates to wrapBase64Chunks for the recursive walk. Boundary adapter dispatched via `dispatchedWrapBase64`. Mirrors runtime/src/providers/mime.ts:117."
+@tags "runtime" "mime" "codec" "boundary" "phase-11b"
+wrapBase64 b64 =
+  if eq (length b64) 0 then ""
+  else join (wrapBase64Chunks b64 0 (length b64)) (concat (charFromCode 13) "\n")
+
+-- ---------------------------------------------------------------------------
+-- wrapBase64Chunks — recursive 76-char chunker.
+--
+-- Terminates when `i >= len`. Each step extracts a 76-char slice
+-- starting at `i` (slice handles the end-of-string truncation
+-- — `slice "abc" 1 10` = "bc") and recurses with `i + 76`.
+-- ---------------------------------------------------------------------------
+
+wrapBase64Chunks : String -> Number -> Number -> a
+@label "mime: wrapBase64Chunks"
+@description "Phase 11b sub-step 3 — recursive 76-char chunker for wrapBase64. Terminates when `i >= len`; otherwise extracts `slice b64 i (i + 76)` and recurses with `i + 76`. Internal helper consumed by `runtime:wrapBase64`. Body-only fnId."
+@tags "runtime" "mime" "internal" "phase-11b"
+@category "runtime-internal"
+wrapBase64Chunks b64 i len =
+  if gte i len then []
+  else concat [slice b64 i (add i 76)] (wrapBase64Chunks b64 (add i 76) len)

@@ -1,0 +1,240 @@
+module ImportDemo where
+
+using std (fold, map, all, unique, appendItem, length, join, split, chars, head, tail, fromMaybe, bindResult, includes, isString, isArray, charFromCode, toString, zipWith, not)
+using codec (JsonValue, JsonObjectEntry, JsonObject, JsonArray, JsonString, jsonDecodeBounded, jsonEncode, decodeJsonString, decodeRecordRequiredField)
+
+-- General text tables reuse ImportDemo's strict CSV field transitions and quote
+-- escaping. No cell inference: "001", "false" and "null" remain Strings.
+-- At most 64 rows, 32 distinct nonempty headers and 16384 Unicode code points
+-- in source, aggregate authored strings and expanded CSV/JSON output.
+-- LF/CRLF separate records; quoted cells retain embedded LF, CRLF and bare CR.
+-- Headers stay on one physical line; bare CR outside quoted cells refuses.
+-- The purchase-specific one-line parser and writer retain their strict fragment.
+-- JSON uses the existing codec: repeated text keys keep the last value and
+-- integer-like keys may reorder. Authored duplicate pairs refuse. Value depth
+-- over 16 refuses before the codec constructs the wrapped tree. CSV bytes and
+-- column order after a JSON round trip are not preserved. Header-only CSV is
+-- inspectable; its JSON is [], which cannot recover headers and refuses as
+-- JSON-to-CSV input. This is not arbitrary nested or mixed-cell JSON conversion.
+
+@label "CSV text table"
+@description "Distinct nonempty column names and equal-width rows of String cells. Numeric-looking cells retain their text, including leading zeros."
+CsvTable = CsvTable headers: List String rows: List (List String)
+
+@label "CSV inspection"
+@description "The ordinary typed table, its row and column counts, and normalized JSON text. Header-only CSV retains its headers here; its JSON [] cannot supply headers for the reverse conversion."
+CsvInspection = CsvInspection table: CsvTable rowCount: Nat columnCount: Nat json: String
+
+-- Fold state keeps physical-line depth independent of the source size. The
+-- existing field parser remains nested here rather than copied or redefined.
+CsvReadState = CsvReadState rows: List (List String) record: ImportCsvState nextLine: Nat
+
+csvTextAdmitted : (text: String) -> Bool
+csvTextAdmitted text = isString text && length text <= 16384
+
+csvLimitMessage : String
+csvLimitMessage = "Use at most 16384 Unicode code points in source, aggregate table text and expanded output."
+
+csvCellAdmitted : (text: String) -> Bool
+csvCellAdmitted text = csvTextAdmitted text
+
+csvHeadersAdmitted : (headers: List String) -> Bool
+csvHeadersAdmitted headers =
+  isArray headers && length headers >= 1 && length headers <= 32 && all headers (\header -> csvCellAdmitted header && length header > 0 && all (chars header) (\character -> character != "\n" && character != charFromCode 13)) && length (unique headers) == length headers
+
+csvRowAdmitted : (headers: List String) -> (row: List String) -> Bool
+csvRowAdmitted headers row = isArray row && length row == length headers && all row csvCellAdmitted
+
+csvStringsSize : (values: List String) -> Nat
+csvStringsSize values = fold (\total value -> total + length value) 0 values
+
+csvTableChecked : (table: CsvTable) -> Result String CsvTable
+csvTableChecked table = case table of
+  CsvTable { headers, rows } ->
+    if not (csvHeadersAdmitted headers) then Err "Use 1 through 32 unique nonempty String headers, without embedded line breaks."
+    else if not (isArray rows && length rows <= 64 && all rows (csvRowAdmitted headers)) then Err "Use at most 64 equal-width rows of bounded String cells."
+    else if csvStringsSize headers + fold (\total row -> total + csvStringsSize row) 0 rows > 16384 then Err (csvLimitMessage ())
+    else Ok table
+  _ -> Err "Expected a CSV text table."
+
+-- A record may span physical lines. Carry the existing quote state, adding the
+-- original separator only while a quoted field is still open. The strict
+-- importCsvLine helper continues to own the single-line header/purchase path.
+csvMultilineStep : (state: ImportCsvState) -> (character: String) -> ImportCsvState
+csvMultilineStep state character = case state.failure of
+  Just _ -> state
+  Nothing ->
+    if character == charFromCode 13 then case state.mode of
+      ImportCsvQuoted -> importCsvAppend state character
+      _ -> importCsvFailure state "A bare carriage return must be inside a quoted CSV field."
+    else importCsvStep state character
+
+csvReadPhysicalLine : (headers: List String) -> (lastLine: Nat) -> (result: Result String CsvReadState) -> (raw: String) -> Result String CsvReadState
+csvReadPhysicalLine headers lastLine result raw = case result of
+  Err reason -> Err reason
+  Ok state ->
+    let followedByLf = state.nextLine < lastLine
+    let line = importCsvPhysicalLine raw followedByLf
+    let continued = case state.record.mode of
+          ImportCsvQuoted -> true
+          _ -> false
+    if not continued && line == "" then
+      if followedByLf then Err (join ["CSV line ", toString state.nextLine, ": Blank CSV rows are outside this fragment; quote empty cells explicitly."] "")
+      else Ok state
+    else if not continued && length state.rows >= 64 then Err "Use at most 64 CSV data rows."
+    else
+      let finished = fold csvMultilineStep state.record (chars line)
+      case finished.failure of
+        Just reason -> Err (join ["CSV line ", toString state.nextLine, ": ", reason] "")
+        Nothing -> case finished.mode of
+          ImportCsvQuoted ->
+            if not followedByLf then Err (join ["CSV line ", toString state.nextLine, ": Unclosed CSV quote."] "")
+            else
+              let separator = if raw == line then "\n" else join [charFromCode 13, "\n"] ""
+              Ok (CsvReadState { rows = state.rows, record = importCsvAppend finished separator, nextLine = state.nextLine + 1 })
+          _ ->
+            let row = appendItem finished.current finished.fields
+            if length row != length headers then Err (join ["CSV line ", toString state.nextLine, " must have the same number of cells as the header."] "")
+            else Ok (CsvReadState { rows = appendItem row state.rows, record = ImportCsvState { fields = [], current = "", mode = ImportCsvBare, failure = Nothing }, nextLine = state.nextLine + 1 })
+
+csvReadRows : (headers: List String) -> (lines: List String) -> (rows: List (List String)) -> (lineNumber: Nat) -> Result String CsvTable
+csvReadRows headers lines rows lineNumber =
+  let initial = CsvReadState { rows = rows, record = ImportCsvState { fields = [], current = "", mode = ImportCsvBare, failure = Nothing }, nextLine = lineNumber }
+  bindResult (fold (csvReadPhysicalLine headers (lineNumber + length lines - 1)) (Ok initial) lines) (\finished ->
+    csvTableChecked (CsvTable { headers = headers, rows = finished.rows }))
+
+@label "Read a CSV text table"
+@description "Read 1–32 distinct nonempty single-line headers and at most 64 equal-width data records. All cells stay text. Reuse strict CSV field transitions for quoted commas/doubled quotes; quoted cells retain LF, CRLF and bare CR. LF/CRLF separate records. Malformed quotes, bare CR outside quotes and blank internal records refuse. Source and aggregate table text fit 16384 Unicode code points."
+csvTableFromText : (text: String) -> Result String CsvTable
+csvTableFromText text =
+  if not (csvTextAdmitted text) then Err (csvLimitMessage ())
+  else if text == "" then Err "CSV needs a nonempty header row."
+  else
+    let lines = split text "\n"
+    let rest = fromMaybe [] (tail lines)
+    case head lines of
+      Nothing -> Err "CSV needs a nonempty header row."
+      Just raw -> case importCsvLine (importCsvPhysicalLine raw (length rest > 0)) of
+        Err reason -> Err (join ["CSV line 1: ", reason] "")
+        Ok headers ->
+          if csvHeadersAdmitted headers then csvReadRows headers rest [] 2
+          else Err "CSV needs 1 through 32 unique nonempty headers, without embedded line breaks."
+
+csvJsonHeaders : (value: JsonValue) -> Result String (List String)
+csvJsonHeaders value = case value of
+  JsonObject { pairs } ->
+    if not (isArray pairs && length pairs >= 1 && length pairs <= 32) then Err "Each JSON row needs 1 through 32 fields."
+    else
+      let headers = map (\pair -> pair.key) pairs
+      if csvHeadersAdmitted headers then Ok headers
+      else Err "JSON rows need distinct nonempty String keys, without embedded line breaks."
+  _ -> Err "Expected a JSON object row."
+
+csvJsonRow : (headers: List String) -> (value: JsonValue) -> Result String (List String)
+csvJsonRow headers value = bindResult (csvJsonHeaders value) (\keys ->
+  if length keys != length headers || not (all keys (includes headers)) then Err "Every JSON row must have exactly the same field names."
+  else fold (\state header -> bindResult state (\cells ->
+    bindResult (codec.decodeRecordRequiredField value header codec.decodeJsonString) (\cell ->
+      if csvCellAdmitted cell then Ok (appendItem cell cells)
+      else Err "JSON cells must be bounded Strings."))) (Ok []) headers)
+
+@label "Read JSON text-table data"
+@description "Accept a nonempty JsonArray of at most 64 JsonObject rows with the same 1–32 unique nonempty keys and only String cells. Key order may differ across rows. Nested/number/Boolean/null cells, missing/extra keys and authored repeated pairs refuse. An empty array cannot supply headers."
+csvTableFromJsonValue : (value: JsonValue) -> Result String CsvTable
+csvTableFromJsonValue value = case value of
+  JsonArray { items } ->
+    if not (isArray items && length items >= 1 && length items <= 64) then Err "Use 1 through 64 JSON object rows; an empty array cannot supply CSV headers."
+    else case head items of
+      Nothing -> Err "An empty JSON array cannot supply CSV headers."
+      Just first -> bindResult (csvJsonHeaders first) (\headers ->
+        bindResult (fold (\state row -> bindResult state (\rows -> bindResult (csvJsonRow headers row) (\cells -> Ok (appendItem cells rows)))) (Ok []) items) (\rows ->
+          csvTableChecked (CsvTable { headers = headers, rows = rows })))
+  _ -> Err "Expected a JSON array of String-valued object rows."
+
+csvTableFromJsonText : (text: String) -> Result String CsvTable
+csvTableFromJsonText text =
+  if csvTextAdmitted text then bindResult (codec.jsonDecodeBounded 16 text) csvTableFromJsonValue
+  else Err (csvLimitMessage ())
+
+csvQuotedJsonSize : (text: String) -> Result String Nat
+csvQuotedJsonSize text = bindResult (codec.jsonEncode (JsonString { value = text })) (\quoted ->
+  if length quoted <= 16384 then Ok (length quoted) else Err (csvLimitMessage ()))
+
+csvQuotedJsonStringsSize : (values: List String) -> Result String Nat
+csvQuotedJsonStringsSize values = fold (\state value -> bindResult state (\size -> bindResult (csvQuotedJsonSize value) (\next ->
+  if size + next <= 16384 then Ok (size + next) else Err (csvLimitMessage ())))) (Ok 0) values
+
+csvJsonRowBudget : (keySize: Nat) -> (columns: Nat) -> (state: Result String Nat) -> (row: List String) -> Result String Nat
+csvJsonRowBudget keySize columns state row = case state of
+  Err reason -> Err reason
+  Ok size -> case csvQuotedJsonStringsSize row of
+    Err reason -> Err reason
+    Ok cellSize ->
+      let next = size + 2 + keySize + cellSize + columns + columns - 1
+      if next <= 16384 then Ok next else Err (csvLimitMessage ())
+
+csvTableJsonBudget : (table: CsvTable) -> Result String CsvTable
+csvTableJsonBudget table = case csvTableChecked table of
+  Err reason -> Err reason
+  Ok checked ->
+    if length checked.rows == 0 then Ok checked
+    else case csvQuotedJsonStringsSize checked.headers of
+      Err reason -> Err reason
+      Ok keySize ->
+        let columns = length checked.headers
+        let initial = 2 + length checked.rows - 1
+        bindResult (fold (csvJsonRowBudget keySize columns) (Ok initial) checked.rows) (\_ -> Ok checked)
+
+csvJsonValue : (table: CsvTable) -> JsonValue
+csvJsonValue table = JsonArray { items = map (\row -> JsonObject { pairs = zipWith (\header cell -> JsonObjectEntry { key = header, value = JsonString { value = cell } }) table.headers row }) table.rows }
+
+@label "Write a text table as JSON"
+@description "Construct ordinary JsonValue String-valued rows, then use the existing JSON codec. Validate the table and predict expanded output size before encoding. Header-only tables write []; that JSON does not retain headers. Output fits 16384 Unicode code points."
+csvTableToJson : (table: CsvTable) -> Result String String
+csvTableToJson table = bindResult (csvTableJsonBudget table) (\checked -> codec.jsonEncode (csvJsonValue checked))
+
+csvQuotedFieldSize : (text: String) -> Nat
+csvQuotedFieldSize text = 2 + length text + fold (\total character -> total + (if character == "\"" then 1 else 0)) 0 (chars text)
+
+csvQuotedRowSize : (row: List String) -> Nat
+csvQuotedRowSize row = fold (\total cell -> total + csvQuotedFieldSize cell) 0 row + length row - 1
+
+csvWriteRow : (row: List String) -> Result String String
+csvWriteRow row = Ok (join (map (\cell -> join ["\"", join (map importCsvEscapeCharacter (chars cell)) "", "\""] "") row) ",")
+
+@label "Write a CSV text table"
+@description "Write the admitted String table using existing quote escaping, doubling quotes and using LF record separators. All headers and cells are quoted; values, embedded cell line breaks and column order within this table are retained. Headers stay single-line. Predict the 16384-code-point output bound before constructing the complete output."
+csvTableToText : (table: CsvTable) -> Result String String
+csvTableToText table = case csvTableChecked table of
+  Err reason -> Err reason
+  Ok checked ->
+    let outputSize = csvQuotedRowSize checked.headers + length checked.rows + fold (\size row -> size + csvQuotedRowSize row) 0 checked.rows
+    if outputSize > 16384 then Err (csvLimitMessage ())
+    else bindResult (csvWriteRow checked.headers) (\header ->
+      bindResult (fold (\state row -> bindResult state (\lines -> bindResult (csvWriteRow row) (\line -> Ok (appendItem line lines)))) (Ok [header]) checked.rows) (\lines -> Ok (join lines "\n")))
+
+@label "Inspect CSV"
+@description "Paste a bounded CSV text table and inspect its ordinary headers/String rows, record/column counts and normalized JSON. Quoted commas, doubled quotes, LF/CRLF records and quoted multiline cells work. Malformed quotes, bare CR outside quotes, duplicate/empty/multiline headers, uneven records or oversized expanded output refuse. Header-only CSV retains its headers here; its JSON [] cannot be converted back without headers."
+@tags "utility" "csv" "parse" "inspect"
+inspectCsvInput : (input: ImportTextInput) -> Result String CsvInspection
+inspectCsvInput input = bindResult (csvTableFromText input.text) (\table -> bindResult (csvTableToJson table) (\json ->
+  Ok (CsvInspection { table = table, rowCount = length table.rows, columnCount = length table.headers, json = json })))
+
+@label "Convert text-table CSV to JSON"
+@description "Convert bounded CSV with 1–32 unique nonempty single-line headers and at most 64 data records to String-valued JSON records. Keep leading zeros, quoted embedded line breaks and other cell text; do not infer numbers or booleans. Reuse existing field transitions/codec. Header-only CSV writes []; column order after a JSON round trip is not guaranteed. Expanded output fits 16384 code points."
+@tags "utility" "csv" "json" "conversion"
+csvTextToJsonInput : (input: ImportTextInput) -> Result String String
+csvTextToJsonInput input = bindResult (csvTableFromText input.text) csvTableToJson
+
+@label "Convert text-table JSON to CSV"
+@description "Convert 1–64 String-valued JSON object rows with the same 1–32 unique nonempty single-line keys to quoted CSV. Field order may differ across rows; align by key. Preserve embedded cell line breaks. Refuse empty arrays/objects, number/Boolean/null/nested cells and different key sets. Source/aggregate/output fit 16384 code points. Repeated text keys keep the codec's last value."
+@tags "utility" "json" "csv" "conversion"
+jsonTextToCsvInput : (input: ImportTextInput) -> Result String String
+jsonTextToCsvInput input = bindResult (csvTableFromJsonText input.text) csvTableToText
+
+csvDemoStartingInputs : List ({ function: Any, arguments: List Any })
+csvDemoStartingInputs = [
+  { function = inspectCsvInput, arguments = [ImportTextInput { text = "name,code,note\nAda,001,\"red, blue\"\nBo,002,\"He said \"\"hello\"\"\"" }] },
+  { function = csvTextToJsonInput, arguments = [ImportTextInput { text = "name,code\nAda,001\nBo,002" }] },
+  { function = jsonTextToCsvInput, arguments = [ImportTextInput { text = "[{\"name\":\"Ada\",\"code\":\"001\"},{\"code\":\"002\",\"name\":\"Bo\"}]" }] }
+]

@@ -1,0 +1,526 @@
+-- =========================================================================
+-- Payments full arc — create_payment_link + send_payment_link.
+--
+-- Phase 12d sub-step 5 of the ts-elimination workstream. Lifts
+-- core/actions/payments.ts:{createPaymentLinkHandler, sendPaymentLinkHandler}
+-- from ~200 LOC of TS orchestration to Fenel C-bodies behind thin
+-- Zod-parse + invokeIOAction + Result-unwrap wrappers.
+--
+-- module-substrate Phase 3c (2026-05-30) — tier-1 (mostly-)pure Shape-B
+-- migration. This file is now the SOURCE OF TRUTH for the module's
+-- signatures + identity: it grew the `module payments where` header, the
+-- per-function `name : Type` sigs, and the `@label`/`@description`/`@tags`/
+-- `@ioAction`/`@codeName` facet directives that the loader lifts into the
+-- same Codeable/Labelable/Describable/Categorizable/Taggable/IOInvokable
+-- ClassInstances the retired `engine/src/modules/payments.ts` defineFunction
+-- specs used to emit. The header keeps the LEGACY lowercase `payments:`
+-- id-prefix + `payments` category byte-identical. The TS spec wrapper
+-- shrank to a thin `loadFenelModule` seam. (Old filename `manage.fenel`
+-- consolidated into `payments.fenel`.)
+--
+-- TWO non-default axes (still tier-1, both proven recipe mechanics):
+--   1. `createStripeCheckoutSession` is a BODYLESS substrate primitive (the
+--      F-permanent Stripe SDK IO leaf, backed by a runtime IO handler at
+--      `payments.create_stripe_checkout_session` — NOT a `nativeImpls` map
+--      on this module). Authored as a `@native` FOREIGN DECLARATION (the
+--      Phase-3b convention): `@native` + identity facets above a bare sig,
+--      no def. The runtime handler stays as-is (different surface).
+--   2. Three pure helpers (`listOrEmpty`/`hasSteps`/`maybeOr`) carry a
+--      `@codeName` whose value is SUFFIXED `…Payments` to disambiguate the
+--      GLOBAL codeName from `purchases`' same-named helpers, while the fnId
+--      keeps the short name (`payments:listOrEmpty`). `@codeName` is the
+--      Phase-3c loader addition (codeName defaults to the def name).
+--
+-- ADTs declared: none (Decision A — provider stays string discriminator).
+--
+-- Substrate consumed:
+--   - payments:createStripeCheckoutSession   (Stripe SDK IO leaf; F-permanent)
+--   - state:tryCreateInstanceByName "purchase" / "payment_step"
+--   - state:getInstance / state:updateInstance / state:appendEvent
+--   - dispatch:dispatchAction                (create_payment_link / send_email /
+--                                             tg_dm)
+--   - std:head / std:filter / std:length / std:eq / std:gt / std:and /
+--     std:or / std:ifElse / std:truthy / std:mergeRecords / std:lt
+--
+-- Decisions resolved (per the brief): A getPaymentProvider stays TS F-permanent;
+-- B plan + profile resolve wrapper-side; C Result {Err e, Ok a} sentinel;
+-- E no PaymentEventType ADT; G skipped retrieveStripeSession; H Ok payload
+-- includes purchaseId + profileId; I invokeIOAction async; J/K send composes
+-- via dispatch:dispatchAction per channel; N env-default URLs wrapper-side;
+-- O provider.metadata round-trips through Stripe verbatim.
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line (12a-3/4/7 surprise pattern; 12d-3 / 12d-4 reaffirmed).
+-- =========================================================================
+
+module payments where
+
+-- Pure D helpers --------------------------------------------------------
+
+-- listOrEmpty — defensive coerce on substrate-returned fields that may
+-- be undefined (DB row missing the key). Reused sister of purchases'
+-- listOrEmpty (which lives in purchases module's scope; redeclared here
+-- to keep this module self-contained). codeName disambiguates globally.
+listOrEmpty : {} -> {}
+@codeName "listOrEmptyPayments"
+@label "List or empty (payments)"
+@description "Phase 12d sub-step 5 — defensive coerce: truthy xs → xs; else → []. Sister of purchases:listOrEmpty; redeclared in this module's scope to keep the payments .fenel file self-contained."
+@tags "payment" "defensive" "pure" "phase-12d"
+listOrEmpty xs =
+  ifElse (truthy xs) xs []
+
+-- hasSteps — does plan have explicit payment_steps (>0)? Sister of
+-- purchases:hasSteps. Branches the 1-step vs multi-step plan shape.
+hasSteps : List ({}) -> Boolean
+@codeName "hasStepsPayments"
+@label "Has payment steps (payments)"
+@description "Phase 12d sub-step 5 — pure D helper. True iff plan has explicit payment_steps (length > 0). Branches the 1-step vs multi-step plan shape in resolvePaymentTarget. Sister of purchases:hasSteps."
+@tags "payment" "predicate" "pure" "phase-12d"
+hasSteps planSteps =
+  length planSteps > 0
+
+-- findStepInPlanSteps — Maybe<Record> lookup by step.id from a plan's
+-- planSteps list. Sister of purchases:findStepInPlan; same shape.
+findStepInPlanSteps : List ({}) -> String -> Maybe ({})
+@label "Find step in plan steps"
+@description "Phase 12d sub-step 5 — pure D helper. Maybe<Record> lookup by step.id from a plan's planSteps list. Sister of purchases:findStepInPlan."
+@tags "payment" "lookup" "pure" "phase-12d"
+findStepInPlanSteps planSteps stepSlug =
+  let matches = filter (\s -> eq s.id stepSlug) planSteps
+  head matches
+
+-- maybeOr — Maybe<a> with a default. Just<x> → x; Nothing → defaultV.
+-- Sister of std's `fromMaybe` pattern; inlined here to keep parseApp
+-- single-line.
+maybeOr : {} -> {} -> {}
+@codeName "maybeOrPayments"
+@label "Maybe or default (payments)"
+@description "Phase 12d sub-step 5 — Maybe with default: Just<x> → x; Nothing → defaultV. Sister of std's fromMaybe pattern; inlined in payments scope to keep parseApp single-line at let binding sites."
+@tags "payment" "pure" "maybe" "phase-12d"
+maybeOr m defaultV =
+  case m of
+    Nothing -> defaultV
+    Just v -> v
+
+-- ResolvePaymentTarget chain --------------------------------------------
+
+-- resolvePaymentTarget — multi-step vs 1-step plan resolution. Returns
+-- Result {Err {code, message}} {Ok {amount, stepSlug, providerList}}.
+-- Multi-step branch: requires the resolved step (defaulting to the first
+-- planStep's id when stepSlugOverride is Nothing) to exist; returns Err
+-- step_not_found otherwise. 1-step branch: never Errs — uses the plan's
+-- top-level amount + providers (defensively listOrEmpty-coerced).
+resolvePaymentTarget : List ({}) -> Number -> List String -> Maybe String -> Maybe Number -> {}
+@label "Resolve payment target"
+@description "Phase 12d sub-step 5 — multi-step vs 1-step plan resolution. Returns Result {Err {code, message}} {Ok {amount, stepSlug, providerList}}. Multi-step requires the resolved step (defaulting to the first planStep's id when stepSlugOverride is Nothing) to exist. 1-step branch uses plan's top-level amount + providers."
+@tags "payment" "pure" "phase-12d"
+resolvePaymentTarget planSteps planAmount planProviders stepSlugOverrideM amountOverrideM =
+  if hasSteps planSteps
+  then resolveMultiStepTarget planSteps stepSlugOverrideM amountOverrideM
+  else resolveOneStepTarget planAmount planProviders amountOverrideM
+
+-- resolveMultiStepTarget — branches on findStepInPlanSteps with the
+-- defaulted stepSlug. The default stepSlug is the first plan step's id
+-- (matches pre-port `stepSlug ?? planSteps[0]!.id` exactly).
+resolveMultiStepTarget : List ({}) -> Maybe String -> Maybe Number -> {}
+@label "Resolve multi-step target"
+@description "Phase 12d sub-step 5 — pure D helper. Multi-step plan branch. Defaults to first planStep's id when stepSlugOverride is Nothing; finds the step via findStepInPlanSteps; returns Err step_not_found on miss."
+@tags "payment" "pure" "phase-12d"
+resolveMultiStepTarget planSteps stepSlugOverrideM amountOverrideM =
+  let firstStepM = head planSteps
+  let firstStepId = case firstStepM of
+    Nothing -> ""
+    Just s -> s.id
+  let targetSlug = maybeOr stepSlugOverrideM firstStepId
+  case findStepInPlanSteps planSteps targetSlug of
+    Nothing -> Err { code = "step_not_found", message = `Step not found: ${targetSlug}` }
+    Just step -> Ok { amount = maybeOr amountOverrideM step.amount, stepSlug = targetSlug, providerList = listOrEmpty step.providers }
+
+-- resolveOneStepTarget — 1-step plan fallback. stepSlug fixed to
+-- "payment" (matches pre-port sentinel). amount = override ?? planAmount
+-- ?? 0; providerList from plan's top-level providers.
+resolveOneStepTarget : Number -> List String -> Maybe Number -> {}
+@label "Resolve 1-step target"
+@description "Phase 12d sub-step 5 — pure D helper. 1-step plan fallback. stepSlug fixed to 'payment' (pre-port sentinel). amount = override ?? planAmount. Never Errs."
+@tags "payment" "pure" "phase-12d"
+resolveOneStepTarget planAmount planProviders amountOverrideM =
+  let amount = maybeOr amountOverrideM planAmount
+  Ok { amount = amount, stepSlug = "payment", providerList = listOrEmpty planProviders }
+
+-- PickProvider chain ----------------------------------------------------
+
+-- pickProvider — preferredProvider ?? head providerList ?? Err
+-- no_provider. Sister of inventory's enforce-mode discriminator
+-- (Decision A in 12d-3) — string-keyed, no ADT.
+pickProvider : Maybe String -> List String -> {}
+@label "Pick payment provider"
+@description "Phase 12d sub-step 5 — pure D helper. preferredProvider ?? head providerList ?? Err no_provider. String-keyed (the historical PaymentProvider plug-in retired in 14a-1cd; providers resolve by name at the IO leaf)."
+@tags "payment" "pure" "phase-12d"
+pickProvider preferredProviderM providerList =
+  case preferredProviderM of
+    Just name -> Ok name
+    Nothing -> pickFirstProvider providerList
+
+-- pickFirstProvider — Maybe head + Err on empty list.
+pickFirstProvider : List String -> {}
+@label "Pick first provider"
+@description "Phase 12d sub-step 5 — pure D helper. Maybe head + Err on empty list."
+@tags "payment" "pure" "phase-12d"
+pickFirstProvider providerList =
+  case head providerList of
+    Just name -> Ok name
+    Nothing -> Err { code = "no_provider", message = "No payment provider configured" }
+
+-- Substrate primitive: Stripe SDK F-permanent IO leaf ------------------
+--
+-- createStripeCheckoutSession — FOREIGN DECLARATION (@native): the
+-- bodyless signature + identity for the Stripe SDK IO leaf. The impl is a
+-- runtime IO handler registered at `payments.create_stripe_checkout_session`
+-- (NOT a `nativeImpls` map on this module — the Stripe surface lives in the
+-- runtime layer). The loader emits a bodyless FenelFunction; the call
+-- resolves via the ioAction. Decision A: only Stripe today; revisit as a
+-- Payable typeclass when a second provider lands.
+@native
+@label "Create Stripe checkout session"
+@description "Phase 12d sub-step 5 — wraps stripeClient.checkout.sessions.create as F-permanent IO leaf. Builds Stripe's price_data line_item shape from (amount, currency, description, customerEmail, successUrl, cancelUrl, metadata). Returns {url, providerRef} (the existing PaymentProvider.createCheckoutSession shape). Decision A: only Stripe is implemented today; revisit as Payable typeclass when a second provider lands."
+@tags "payment" "stripe" "io" "checkout" "phase-12d"
+@ioAction "payments.create_stripe_checkout_session"
+@requires "HasHTTP"
+createStripeCheckoutSession : (amount: Number, currency: String, description: String, customerEmail: String, successUrl: String, cancelUrl: String, metadata: {}) -> {}
+
+-- createPaymentLink main body -------------------------------------------
+
+-- createPaymentLink — main C-body. Returns Result {Err {code, message}}
+-- {Ok {url, purchaseId, providerRef, profileId}}. Composes:
+--   1. resolvePaymentTarget (multi-step vs 1-step branch)
+--   2. amount > 0 validation
+--   3. pickProvider
+--   4. state:tryCreateInstanceByName "purchase"
+--   5. state:tryCreateInstanceByName "payment_step"
+--   6. payments:createStripeCheckoutSession (Stripe SDK IO leaf)
+--   7. state:updateInstance payment_step.providerRef
+--   8. state:appendEvent "payment_link_created"
+-- emailMaybe — profile.email → Just<email> when truthy, Nothing otherwise.
+-- Replicates the wrapper's `toMaybeStr(profile.email ?? undefined)` for the
+-- profileEmailM the inner body threads to customerEmail (= maybeOr profileEmailM
+-- ""); an empty-string email collapses to "" either way, so truthy is faithful.
+emailMaybe : String -> Maybe String
+@label "Email maybe"
+@description "ts-elimination-completion Phase 5 (5a-3) — pure helper. profile.email → Just<email> when truthy, Nothing otherwise. Replicates the wrapper's toMaybeStr(profile.email ?? undefined) for the inner body's profileEmailM."
+@tags "payment" "pure" "ts-elimination"
+emailMaybe e =
+  ifElse (truthy e) (Just e) Nothing
+
+-- createPaymentLink — ts-elimination-completion Phase 5 (5a-3): the wrapper's
+-- findPlanBySlug + findProfileById + the two `if (!x) throw` guards + plan/
+-- profile field extraction are FOLDED INTO the body. The entry resolves the
+-- plan (state:findPlanBySlug) then the profile (state:findProfileById, the
+-- Phase-4 leaf), each Nothing → ActionErr; the env-default successUrl/cancelUrl
+-- stay wrapper-side (Decision N — process.env is an irreducible IO leaf). The
+-- TS wrapper drops its @fenel/db import + the two throws, draining payments.ts
+-- from BOTH DIRECT_DB_LEAF_ALLOW and ACTION_HANDLER_CONTROL_FLOW_ALLOW. Arity
+-- 15 → 9.
+-- action-subsumption Phase 3b (2026-06-08) — createPaymentLink IS the public
+-- create_payment_link action now (D1 COLLAPSE): public field names (`stepSlug`/
+-- `amount`/`provider`, dropping the `…M`/`…Override` marshalling) + the refinements
+-- create_payment_link_params mirrored (profileId : Uuid, planSlug : NonEmptyStr,
+-- successUrl/cancelUrl : Maybe UrlStr [format:url], amount : Maybe PositiveNat —
+-- RE-TIGHTENED 2026-06-10 from the temporary `Maybe Number` fallback now that the
+-- PositiveNat catalog gap is closed; see createInventory in inventory). The
+-- env-default URLs the TS handler injected (`successUrl ?? process.env
+-- PAYMENT_SUCCESS_URL`) move INTO the body (Fenel-first): the public params are now
+-- `Maybe UrlStr`, defaulted here via the existing `io:envGet` leaf (no new
+-- substrate). The downstream chain is UNCHANGED — it receives the effective plain
+-- Strings. The TS handler + its DEFAULT_*_URL consts are deleted; `adapter` stays a
+-- param (D4); `accountId` is context-injected (a formal here, supplied by dispatch).
+createPaymentLink : Uuid -> NonEmptyStr -> Maybe String -> Maybe PositiveNat -> Maybe String -> Maybe UrlStr -> Maybe UrlStr -> String -> String -> ActionResult
+@label "Create payment link"
+@description "Phase 13a sub-step 1 / action-subsumption Phase 3b — the public create_payment_link action (no separate TS handler). Params ARE the public contract (profileId, planSlug, stepSlug?, amount?, provider?, successUrl?, cancelUrl?, adapter; accountId context-injected). Folds findPlanBySlug + findProfileById + the not-found guards + plan/profile field extraction into the body; the env-default successUrl/cancelUrl (`?? io:envGet PAYMENT_*_URL ?? literal`) is now body-side (Fenel-first), replacing the wrapper's process.env reads."
+@tags "payment" "create" "phase-13a"
+@ioAction "payments.create_payment_link"
+createPaymentLink profileId planSlug stepSlug amount provider successUrl cancelUrl accountId adapter =
+  let successUrlEff = case successUrl of
+    Just u -> u
+    Nothing -> fromMaybe "https://dev.usefenel.com/payment/success" (envGet "PAYMENT_SUCCESS_URL")
+  let cancelUrlEff = case cancelUrl of
+    Just u -> u
+    Nothing -> fromMaybe "https://dev.usefenel.com/payment/cancel" (envGet "PAYMENT_CANCEL_URL")
+  case findPlanBySlug planSlug of
+    Nothing -> ActionErr { message = `Plan not found: ${planSlug}` }
+    Just plan -> createPaymentLinkWithPlan profileId plan stepSlug amount provider successUrlEff cancelUrlEff accountId adapter
+
+-- createPaymentLinkWithPlan — plan-resolved arm. Resolves the profile next
+-- (Nothing → ActionErr 'Profile not found'). parseApp single-line extraction.
+createPaymentLinkWithPlan : String -> {} -> Maybe String -> Maybe Number -> Maybe String -> String -> String -> String -> String -> ActionResult
+@label "Create payment link (plan known)"
+@description "ts-elimination-completion Phase 5 (5a-3) — Just-arm extraction from createPaymentLink. After the plan resolves, looks up the profile via state:findProfileById; Nothing → ActionErr 'Profile not found: \${profileId}' (pre-port wrapper threw)."
+@tags "payment" "create" "ts-elimination"
+createPaymentLinkWithPlan profileId plan stepSlugOverrideM amountOverrideM preferredProviderM successUrl cancelUrl accountId adapter =
+  case findProfileById profileId of
+    Nothing -> ActionErr { message = `Profile not found: ${profileId}` }
+    Just profile -> createPaymentLinkWithProfile profileId profile plan stepSlugOverrideM amountOverrideM preferredProviderM successUrl cancelUrl accountId adapter
+
+-- createPaymentLinkWithProfile — both resolved. Extracts plan/profile fields
+-- with the pre-port defaults (name ?? '' / amount ?? 0 / currency ?? 'USD' /
+-- steps ?? [] / providers ?? []; email → Just-when-truthy), then drives the
+-- original createPaymentLinkInner + ActionResult lift.
+createPaymentLinkWithProfile : String -> {} -> {} -> Maybe String -> Maybe Number -> Maybe String -> String -> String -> String -> String -> ActionResult
+@label "Create payment link (profile known)"
+@description "ts-elimination-completion Phase 5 (5a-3) — Just-arm extraction from createPaymentLinkWithPlan. Extracts plan/profile fields with the pre-port defaults (name ?? '' / amount ?? 0 / currency ?? 'USD' / steps ?? [] via listOrEmpty / providers ?? [] via listOrEmpty; profileEmailM via emailMaybe), runs createPaymentLinkInner, lifts the inner Result to the ActionResult ADT."
+@tags "payment" "create" "ts-elimination"
+createPaymentLinkWithProfile profileId profile plan stepSlugOverrideM amountOverrideM preferredProviderM successUrl cancelUrl accountId adapter =
+  let profileEmailM = emailMaybe profile.email
+  let planId = plan.id
+  let planName = ifElse (truthy plan.name) plan.name ""
+  let planAmount = ifElse (truthy plan.amount) plan.amount 0
+  let planCurrency = ifElse (truthy plan.currency) plan.currency "USD"
+  let planSteps = listOrEmpty plan.steps
+  let planProviders = listOrEmpty plan.providers
+  let r = createPaymentLinkInner profileId profileEmailM planId planName planAmount planCurrency planSteps planProviders stepSlugOverrideM amountOverrideM preferredProviderM successUrl cancelUrl accountId adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { url = ok.url, purchaseId = ok.purchaseId, providerRef = ok.providerRef }, aggregateType = Just "purchase", aggregateId = Just ok.purchaseId, profileId = Just ok.profileId }
+
+-- createPaymentLinkInner — pre-13a-1 entry-point logic; returns Result.
+createPaymentLinkInner : String -> Maybe String -> String -> String -> Number -> String -> List ({}) -> List String -> Maybe String -> Maybe Number -> Maybe String -> String -> String -> String -> String -> {}
+@label "Create payment link (inner — Result)"
+@description "Phase 12d sub-step 5 — pre-13a entry-point logic; returns Result."
+@tags "payment" "create" "phase-13a"
+createPaymentLinkInner profileId profileEmailM planId planName planAmount planCurrency planSteps planProviders stepSlugOverrideM amountOverrideM preferredProviderM successUrl cancelUrl accountId adapter =
+  case resolvePaymentTarget planSteps planAmount planProviders stepSlugOverrideM amountOverrideM of
+    Err e -> Err e
+    Ok target -> createPaymentLinkChecked profileId profileEmailM planId planName planCurrency target preferredProviderM successUrl cancelUrl accountId adapter
+
+-- createPaymentLinkChecked — after target resolution. Validates amount
+-- (must be positive); branches to pickProvider next.
+createPaymentLinkChecked : String -> Maybe String -> String -> String -> String -> {} -> Maybe String -> String -> String -> String -> String -> {}
+@label "Create payment link (target checked)"
+@description "Phase 12d sub-step 5 — case-arm extraction from createPaymentLink. After target resolution: validates amount > 0; branches to pickProvider next."
+@tags "payment" "phase-12d"
+createPaymentLinkChecked profileId profileEmailM planId planName planCurrency target preferredProviderM successUrl cancelUrl accountId adapter =
+  if target.amount > 0
+  then createPaymentLinkPicked profileId profileEmailM planId planName planCurrency target preferredProviderM successUrl cancelUrl accountId adapter
+  else Err { code = "amount_invalid", message = "Amount must be positive" }
+
+-- createPaymentLinkPicked — after amount check. Picks provider; branches
+-- to the create-purchase phase on Ok provider; surfaces no_provider Err
+-- otherwise.
+createPaymentLinkPicked : String -> Maybe String -> String -> String -> String -> {} -> Maybe String -> String -> String -> String -> String -> {}
+@label "Create payment link (provider picked)"
+@description "Phase 12d sub-step 5 — case-arm extraction from createPaymentLinkChecked. After amount validation: picks provider via pickProvider; branches to create-purchase phase on Ok provider; surfaces no_provider Err otherwise."
+@tags "payment" "phase-12d"
+createPaymentLinkPicked profileId profileEmailM planId planName planCurrency target preferredProviderM successUrl cancelUrl accountId adapter =
+  case pickProvider preferredProviderM target.providerList of
+    Err e -> Err e
+    Ok providerName -> createPaymentLinkProceed profileId profileEmailM planId planName planCurrency target providerName successUrl cancelUrl accountId adapter
+
+-- createPaymentLinkProceed — after picks resolved. Creates the purchase
+-- + payment_step entities; then composes Stripe checkout + updates
+-- providerRef + emits event. Decomposes through createStepAndCheckout
+-- because parseApp's single-line let constraint forces chain extraction.
+createPaymentLinkProceed : String -> Maybe String -> String -> String -> String -> {} -> String -> String -> String -> String -> String -> {}
+@label "Create payment link (proceed)"
+@description "Phase 12d sub-step 5 — case-arm extraction. After provider picked: state:tryCreateInstanceByName 'purchase'; on success delegates to createStepAndCheckout for the payment_step + checkout tail."
+@tags "payment" "phase-12d"
+createPaymentLinkProceed profileId profileEmailM planId planName planCurrency target providerName successUrl cancelUrl accountId adapter =
+  let purchaseData = { profileId = profileId, planId = planId, status = "pending" }
+  let purchaseR = tryCreateInstanceByName "purchase" purchaseData
+  if purchaseR.ok
+  then createStepAndCheckout profileId profileEmailM planName planCurrency target providerName successUrl cancelUrl accountId adapter purchaseR.value
+  else Err { code = "create_failed", message = purchaseR.error }
+
+-- createStepAndCheckout — after purchase row created. Creates the
+-- payment_step row + composes the Stripe checkout creation. Conditional
+-- branch on step-row create result; on success delegates to
+-- finalizeCheckout for the tail (checkout call + update + emit).
+createStepAndCheckout : String -> Maybe String -> String -> String -> {} -> String -> String -> String -> String -> String -> String -> {}
+@label "Create payment step + checkout"
+@description "Phase 12d sub-step 5 — case-arm extraction. After purchase row created: state:tryCreateInstanceByName 'payment_step'; on success delegates to finalizeCheckout for the Stripe checkout creation + providerRef update + emit tail."
+@tags "payment" "phase-12d"
+createStepAndCheckout profileId profileEmailM planName planCurrency target providerName successUrl cancelUrl accountId adapter purchaseId =
+  let stepData = { purchaseId = purchaseId, stepSlug = target.stepSlug, amount = target.amount, currency = planCurrency, provider = providerName, status = "pending" }
+  let stepR = tryCreateInstanceByName "payment_step" stepData
+  if stepR.ok
+  then finalizeCheckout profileId profileEmailM planName planCurrency target providerName successUrl cancelUrl accountId adapter purchaseId stepR.value
+  else Err { code = "create_failed", message = stepR.error }
+
+-- finalizeCheckout — after payment_step row created. Invokes Stripe
+-- checkout via the substrate IO leaf, updates the payment_step with the
+-- providerRef, emits the payment_link_created event, returns Ok payload.
+-- The metadata Record is round-tripped via Stripe to the webhook
+-- unchanged (Decision O).
+finalizeCheckout : String -> Maybe String -> String -> String -> {} -> String -> String -> String -> String -> String -> String -> String -> {}
+@label "Finalize checkout"
+@description "Phase 12d sub-step 5 — case-arm extraction. After payment_step row created: payments:createStripeCheckoutSession (Stripe SDK IO leaf) + state:updateInstance payment_step.providerRef + state:appendEvent 'payment_link_created'. Returns Ok payload with url + purchaseId + providerRef + profileId. The metadata Record is round-tripped via Stripe to the webhook unchanged (Decision O)."
+@tags "payment" "stripe" "phase-12d"
+finalizeCheckout profileId profileEmailM planName planCurrency target providerName successUrl cancelUrl accountId adapter purchaseId paymentStepId =
+  let metadata = { accountId = accountId, purchaseId = purchaseId, stepSlug = target.stepSlug, profileId = profileId }
+  let customerEmail = maybeOr profileEmailM ""
+  let checkout = createStripeCheckoutSession target.amount planCurrency planName customerEmail successUrl cancelUrl metadata
+  let _u = updateInstance paymentStepId { providerRef = checkout.providerRef }
+  let payload = { planId = planId, planName = planName, stepSlug = target.stepSlug, amount = target.amount, provider = providerName, url = checkout.url, adapter = adapter }
+  let _e = appendEvent "payment_link_created" payload (Just "purchase") (Just purchaseId) (Just profileId)
+  Ok { url = checkout.url, purchaseId = purchaseId, providerRef = checkout.providerRef, profileId = profileId }
+
+-- sendPaymentLink main body ---------------------------------------------
+
+-- sendPaymentLink — main C-body. Returns Result {Err {code, message}}
+-- {Ok {url, purchaseId, providerRef, profileId, sentVia}}. Composes:
+--   1. dispatch:dispatchAction "create_payment_link"
+--   2. case via of "email" | "telegram" | "both" → per-channel
+--      dispatch:dispatchAction "send_email" / "tg_dm"
+--   3. state:appendEvent "payment_link_sent"
+-- sendPaymentLink — ts-elimination-completion Phase 5 (5a-3): the wrapper's
+-- findPlanBySlug (used only for the `plan?.name ?? ""` message string) is
+-- FOLDED INTO the body via resolvePlanName (state:findPlanBySlug). Arity 8 → 7
+-- (no planName param). With createPaymentLink also folded, payments.ts has no
+-- @fenel/db use left → drains from DIRECT_DB_LEAF_ALLOW.
+-- action-subsumption Phase 3b (2026-06-08) — sendPaymentLink IS the public
+-- send_payment_link action now (D1 COLLAPSE): public field names (drop the
+-- `…M`/`…Override`) + refinements (profileId : Uuid, planSlug : NonEmptyStr, amount
+-- : Maybe PositiveNat [RE-TIGHTENED 2026-06-10, PositiveNat gap now closed — matches
+-- the create_payment_link fan-out target], via : Maybe ViaMode [the $enum hosted in
+-- items, payments being oracle-frozen]). The `via ?? "email"` default the TS handler
+-- did moves INTO the body (Fenel-first), over the public-named optional `via`. The
+-- fan-out (dispatch:dispatchAction create_payment_link + per-channel send_email/
+-- tg_dm) is UNCHANGED in the body. The TS handler is deleted; `adapter` stays (D4).
+sendPaymentLink : Uuid -> NonEmptyStr -> Maybe String -> Maybe PositiveNat -> Maybe String -> Maybe ViaMode -> String -> ActionResult
+@label "Send payment link"
+@description "Phase 13a sub-step 1 / action-subsumption Phase 3b — the public send_payment_link action (no separate TS handler). Params ARE the public contract (profileId, planSlug, stepSlug?, amount?, provider?, via?, adapter). Defaults via (?? 'email'), resolves planName internally via resolvePlanName (state:findPlanBySlug), fans out to create_payment_link + send_email/tg_dm per channel."
+@tags "payment" "send" "phase-13a"
+@ioAction "payments.send_payment_link"
+sendPaymentLink profileId planSlug stepSlug amount provider via adapter =
+  let viaEff = case via of
+    Nothing -> "email"
+    Just v -> v
+  let planName = resolvePlanName planSlug
+  let r = sendPaymentLinkInner profileId planSlug stepSlug amount provider planName viaEff adapter
+  case r of
+    Err e -> ActionErr { message = e.message }
+    Ok ok -> ActionOk { data = { url = ok.url, purchaseId = ok.purchaseId, providerRef = ok.providerRef, sentVia = ok.sentVia }, aggregateType = Just "purchase", aggregateId = Just ok.purchaseId, profileId = Just ok.profileId }
+
+-- resolvePlanName — plan-name string for the send messages. findPlanBySlug
+-- Nothing → "" (pre-port `plan?.name ?? ""`); Just plan → plan.name ?? "".
+resolvePlanName : String -> String
+@label "Resolve plan name"
+@description "ts-elimination-completion Phase 5 (5a-3) — resolves the plan-name message string via state:findPlanBySlug. Nothing → '' (pre-port `plan?.name ?? \"\"`); Just plan → plan.name when truthy else ''."
+@tags "payment" "send" "ts-elimination"
+resolvePlanName planSlug =
+  case findPlanBySlug planSlug of
+    Nothing -> ""
+    Just plan -> ifElse (truthy plan.name) plan.name ""
+
+-- sendPaymentLinkInner — pre-13a-1 entry-point logic; returns Result.
+sendPaymentLinkInner : String -> String -> Maybe String -> Maybe Number -> Maybe String -> String -> String -> String -> {}
+@label "Send payment link (inner — Result)"
+@description "Phase 12d sub-step 5 — pre-13a entry-point logic; returns Result."
+@tags "payment" "send" "phase-13a"
+sendPaymentLinkInner profileId planSlug stepSlugOverrideM amountOverrideM preferredProviderM planName via adapter =
+  let createParams = makeCreateParams profileId planSlug stepSlugOverrideM amountOverrideM preferredProviderM
+  let result = dispatchAction "create_payment_link" createParams
+  sendPaymentLinkAfterCreate result profileId planSlug planName via adapter
+
+-- makeCreateParams — pack the params record for the create_payment_link
+-- dispatch. Maybe<String> fields stay as-is (the action's Zod schema
+-- on the wrapper side unwraps them; the dispatched action's wrapper
+-- handles its own Zod parse).
+makeCreateParams : String -> String -> Maybe String -> Maybe Number -> Maybe String -> {}
+@label "Make create_payment_link params"
+@description "Phase 12d sub-step 5 — pure D helper. Packs the params Record for the create_payment_link dispatch. Conditionally merges Maybe fields (stepSlug / amount / provider) when Just<v>; omits when Nothing — mirrors pre-port `{...params, stepSlug, amount, provider}` undefined-key stripping via JSON.stringify."
+@tags "payment" "pure" "phase-12d"
+makeCreateParams profileId planSlug stepSlugOverrideM amountOverrideM preferredProviderM =
+  let base = { profileId = profileId, planSlug = planSlug }
+  let withStep = case stepSlugOverrideM of
+    Nothing -> base
+    Just s -> mergeRecords base { stepSlug = s }
+  let withAmount = case amountOverrideM of
+    Nothing -> withStep
+    Just a -> mergeRecords withStep { amount = a }
+  case preferredProviderM of
+    Nothing -> withAmount
+    Just p -> mergeRecords withAmount { provider = p }
+
+-- sendPaymentLinkAfterCreate — after create_payment_link dispatch
+-- succeeds. Threads the create_payment_link's ActionResult shape
+-- (`{success, data: {url, purchaseId, providerRef}, ...}`) through the
+-- per-channel dispatch + emit tail. On unsuccessful create (success=false
+-- or missing data.url), short-circuits to Err.
+sendPaymentLinkAfterCreate : {} -> String -> String -> String -> String -> String -> {}
+@label "Send payment link (after create)"
+@description "Phase 12d sub-step 5 — chain extraction. After create_payment_link dispatch returns: threads the ActionResult shape through the per-channel dispatch + emit tail. On unsuccessful create (success=false or missing data.url), short-circuits to Err."
+@tags "payment" "send" "phase-12d"
+sendPaymentLinkAfterCreate result profileId planSlug planName via adapter =
+  let okCreate = result.success and (truthy result.data)
+  if okCreate
+  then sendPaymentLinkChannels result profileId planSlug planName via adapter
+  else Err { code = "create_link_failed", message = "Failed to create payment link" }
+
+-- sendPaymentLinkChannels — per-channel dispatch + emit. Routes via
+-- email / telegram / both. The message includes the URL + plan name for
+-- the telegram DM body. The email template is "cf_payment_link" with
+-- payment_url / plan_name include vars (matches pre-port verbatim).
+sendPaymentLinkChannels : {} -> String -> String -> String -> String -> String -> {}
+@label "Send payment link channels"
+@description "Phase 12d sub-step 5 — chain extraction. Per-channel dispatch + emit. Routes via email / telegram / both — each arm is a conditional lazy if-then-else (sister of 12d-4's emitPaymentCompletedIfAllPaid laziness). Emits payment_link_sent + returns Ok payload."
+@tags "payment" "send" "phase-12d"
+sendPaymentLinkChannels result profileId planSlug planName via adapter =
+  let url = result.data.url
+  let purchaseId = result.data.purchaseId
+  let providerRef = result.data.providerRef
+  let _emailed = dispatchEmailIfApplicable via url profileId planSlug planName
+  let _texted = dispatchTelegramIfApplicable via url profileId planSlug planName
+  let payload = { via = via, url = url, adapter = adapter }
+  let _e = appendEvent "payment_link_sent" payload (Just "purchase") (Just purchaseId) (Just profileId)
+  Ok { url = url, purchaseId = purchaseId, providerRef = providerRef, profileId = profileId, sentVia = via }
+
+-- dispatchEmailIfApplicable — when via is "email" or "both", dispatch
+-- send_email; else no-op (returns 0). The structural if-then-else stays
+-- LAZY: when via doesn't match the email arm, the dispatchAction call
+-- is NOT evaluated (Decision K — sister of 12d-4's
+-- emitPaymentCompletedIfAllPaid laziness for state:appendEvent).
+dispatchEmailIfApplicable : String -> String -> String -> String -> String -> Number
+@label "Dispatch email if applicable"
+@description "Phase 12d sub-step 5 — when via is 'email' or 'both', dispatch send_email; else no-op. The structural if-then-else stays LAZY: when via doesn't match, the dispatchAction call is NOT evaluated."
+@tags "payment" "email" "phase-12d"
+dispatchEmailIfApplicable via url profileId planSlug planName =
+  if (eq via "email") or (eq via "both")
+  then emailPaymentLink url profileId planSlug planName
+  else 0
+
+-- emailPaymentLink — invoke send_email with template + include vars.
+-- Pre-port: template = "cf_payment_link", include = {payment_url, plan_name}.
+emailPaymentLink : String -> String -> String -> String -> Number
+@label "Email payment link"
+@description "Phase 12d sub-step 5 — invoke send_email via dispatch:dispatchAction. Template = 'cf_payment_link' with include = {payment_url, plan_name} (matches pre-port verbatim)."
+@tags "payment" "email" "phase-12d"
+emailPaymentLink url profileId planSlug planName =
+  let resolvedName = ifElse (truthy planName) planName planSlug
+  let include = { payment_url = url, plan_name = resolvedName }
+  let params = { profileId = profileId, template = "cf_payment_link", include = include }
+  let _r = dispatchAction "send_email" params
+  0
+
+-- dispatchTelegramIfApplicable — when via is "telegram" or "both",
+-- dispatch tg_dm; else no-op. Same lazy structural if as the email arm.
+dispatchTelegramIfApplicable : String -> String -> String -> String -> String -> Number
+@label "Dispatch telegram if applicable"
+@description "Phase 12d sub-step 5 — when via is 'telegram' or 'both', dispatch tg_dm; else no-op. Same lazy structural if as the email arm."
+@tags "payment" "telegram" "phase-12d"
+dispatchTelegramIfApplicable via url profileId planSlug planName =
+  if (eq via "telegram") or (eq via "both")
+  then telegramPaymentLink url profileId planSlug planName
+  else 0
+
+-- telegramPaymentLink — invoke tg_dm with the formatted message string.
+-- Pre-port: message = `Payment link for ${plan?.name ?? planSlug}: ${url}`.
+telegramPaymentLink : String -> String -> String -> String -> Number
+@label "Telegram payment link"
+@description "Phase 12d sub-step 5 — invoke tg_dm via dispatch:dispatchAction. Message = `Payment link for ${plan?.name ?? planSlug}: ${url}` (matches pre-port verbatim)."
+@tags "payment" "telegram" "phase-12d"
+telegramPaymentLink url profileId planSlug planName =
+  let resolvedName = ifElse (truthy planName) planName planSlug
+  let message = `Payment link for ${resolvedName}: ${url}`
+  let params = { profileId = profileId, message = message }
+  let _r = dispatchAction "tg_dm" params
+  0

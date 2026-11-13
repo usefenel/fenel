@@ -1,0 +1,1116 @@
+module engine where
+
+-- =========================================================================
+-- validation-check.fenel — the CARRIER-SIDE CHECKER ARM (slice 3h; P4-D3's
+-- checker rules, D3–D5).
+--
+-- THIS IS THE FIRST CONSUMER OF AN ADMISSION. 3g minted `VteAdmission` and
+-- nothing read it; from here a wrong entries is not a dormant value, it is a
+-- wrong member-check verdict produced under trusted rules. Everything below is
+-- written against that: every `case` ends in an explicit safe default, the
+-- synth face never refutes, and a rule that cannot prove its side condition
+-- produces ⊤ rather than an answer.
+--
+-- WHY A SEPARATE MODULE AND NOT `check.fenel`. The parent brief asks for "the
+-- rules and side conditions documented in `check.fenel`", and that sentence
+-- predates the carrier architecture. These rules walk `VcaNode` — the annotated
+-- carrier over the RAW stored body — not `Expr`. `check.fenel` walks `Expr`,
+-- which is produced by the provenance-free re-lift the whole S1 finding exists
+-- to keep out of validation. So the rules live here and `check.fenel` carries a
+-- cross-reference header; the general checker is UNTOUCHED and its behaviour
+-- for non-validation consumers is unchanged.
+--
+-- THE ONE EVIDENCE CHANNEL. The rules consume only what the ADMISSION and the
+-- CARRIER carry: the occurrence's minted entry (instance, declared arity,
+-- origin, saturation, locality, enters-target, authority), its re-derived
+-- partition class, the node's own projection payloads, and the caller's own
+-- scheme. There is deliberately NO `fnTypeMarker` lookup, NO `request.schemes`
+-- re-read, and no fallback from a use-site miss to a function id: an occurrence
+-- the entries does not carry means the rule does not fire, never a borrowed
+-- lookup. Everything a rule needs, the MINT bound into the entry or the carrier
+-- already carried.
+--
+-- THE PROFILE THIS ARM IMPLEMENTS. Binding and scoping semantics differ BETWEEN
+-- executor profiles (the term-substrate ADR §1.5). The carrier's projections
+-- represent authored STRUCTURE; the Γ threading below implements the PURE
+-- evaluate profile's reading — the only profile the trusted entry admits
+-- (`vteProfileRefused`). Do not "fix" this arm against durable semantics.
+--
+-- Constructor names carry the Vch prefix because constructor ids are
+-- repo-global.
+-- =========================================================================
+
+-- ---- the verdict ---------------------------------------------------------
+
+-- A NEW, PRE-TOTALITY VERDICT ADT, and NOT `MemberCheckOutcome`. Every
+-- `Mco*` arm requires a `MemberEvidence` carrying a `totalityEvidenceHash`,
+-- which is P4-D4's to produce; a placeholder there would be fabricated
+-- evidence, which is the one thing this whole phase exists to prevent. The
+-- mapping obligation onto the public outcome lands in slice 3i, and a
+-- `VchVerdict` stays INTERNAL until then: a public `Refuted` additionally
+-- requires D4's assumption fence.
+--
+-- `VchIndeterminate` carries a closed `ValidationReason` rather than a free
+-- string so every abstention class is countable by the census.
+VchVerdict =
+  VchPassed
+  | VchRefuted counterexample: Maybe Any
+  | VchIndeterminate reason: ValidationReason
+
+-- One Γ entry. A LIST, scanned head-first, so a later binding shadows an
+-- earlier one at the same spelling — the same discipline `checkEnvLookup` uses.
+VchBinding = VchBinding name: String set: SetExpr
+
+-- A projected arrow chain flattened: every parameter slot down the nested unary
+-- spine, then the terminal return.
+VchUnfolded = VchUnfolded params: [SetExpr] returns: SetExpr
+
+-- ---- the arrow view ------------------------------------------------------
+
+-- ARROW UNFOLDING FIRST, AND NOT `arrowDropParams`. An entries instance is a
+-- NESTED UNARY chain (`foldTypes`, preserved by `vteBuildEntry`), so the
+-- parameters of an n-ary declaration are spread over n layers.
+-- `arrowDropParams` drops from ONE layer and computes the wrong residual on a
+-- chain; this collects layer by layer.
+@label "Checker unfold arrow"
+@description "Flatten a projected curried arrow chain into all of its parameter sets, in order, plus the terminal return set. A non-arrow flattens to no parameters and itself."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchUnfold : (s: SetExpr) -> VchUnfolded
+vchUnfold s =
+  case s of
+    SeArrow { params = params, returns = returns } ->
+      let deeper = vchUnfold returns
+      VchUnfolded { params = concat (vchParamSets params []) deeper.params, returns = deeper.returns }
+    _ -> VchUnfolded { params = [], returns = s }
+
+@label "Checker param sets"
+@description "The parameter SETS of one arrow layer, in declaration order. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchParamSets : (params: [SetArrowParam]) -> (acc: [SetExpr]) -> [SetExpr]
+vchParamSets params acc =
+  case head params of
+    Nothing -> acc
+    Just p -> vchParamSets (eufRest params) (appendItem p.set acc)
+
+-- THE `declaredArity` BOUNDARY GOVERNS, NOT THE SPINE'S END. For a 1-formal
+-- target returning `B -> C` an EXACT call synthesises `B -> C`, not the
+-- terminal `C`: the runtime enters the target once, and the value it returns is
+-- a callable. Descending to the spine's end would claim the call produced `C`,
+-- which is a different value and a strictly stronger (and false) statement.
+@label "Checker descend arrow"
+@description "The set reached after supplying k arguments down a projected arrow chain: whole layers are consumed in turn, and a partially consumed layer yields the residual arrow over its remaining parameters. Nothing when the chain runs out of parameter slots or a zero-parameter layer blocks the descent."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchDescend : (s: SetExpr) -> (k: Nat) -> Maybe SetExpr
+vchDescend s k =
+  if eq k 0
+  then Just s
+  else
+    case s of
+      SeArrow { params = params, returns = returns } ->
+        let n = length params
+        if eq n 0
+        -- A zero-parameter layer consumes no argument, so descending THROUGH
+        -- it would silently skip a stage the runtime does apply.
+        then Nothing
+        else if gte k n
+        then vchDescend returns (sub k n)
+        else Just (SeArrow { params = arrowDropList params k, returns = returns })
+      _ -> Nothing
+
+@label "Checker arrow returns"
+@description "The immediate return set of an arrow whose parameter layer is EMPTY — the explicit zero-parameter arrow a zero-formal declaration projects to. Nothing for any other shape. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchArrowReturns : (s: SetExpr) -> Maybe SetExpr
+vchArrowReturns s =
+  case s of
+    SeArrow { params = params, returns = returns } ->
+      if eq (length params) 0 then Just returns else Nothing
+    _ -> Nothing
+
+-- THE ZERO-FORMAL PAIR. A 0-formal REFERENCE synthesises the whole explicit
+-- zero-parameter arrow unchanged — the value IS the callable. An exact
+-- ZERO-ARGUMENT CALL of the same target APPLIES that layer and synthesises its
+-- returns. "Descend 0" is right for the reference and wrong for the call, which
+-- is why application goes through here and reference does not.
+@label "Checker stage result"
+@description "The set an application of k arguments to a target of declaredArity formals produces. A zero-formal target's only exact application is the zero-argument one, which applies its explicit zero-parameter layer; every other arity descends the chain by k."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchStageResult : (instance: SetExpr) -> (declaredArity: Nat) -> (k: Nat) -> Maybe SetExpr
+vchStageResult instance declaredArity k =
+  if eq declaredArity 0
+  then (if eq k 0 then vchArrowReturns instance else Nothing)
+  else vchDescend instance k
+
+-- ---- Γ -------------------------------------------------------------------
+
+@label "Checker gamma lookup"
+@description "The set bound to a name in Γ, scanning head-first so a later binding shadows an earlier one at the same spelling. Nothing when the name is unbound."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchGammaLookup : (name: String) -> (gamma: [VchBinding]) -> Maybe SetExpr
+vchGammaLookup name gamma =
+  case head gamma of
+    Nothing -> Nothing
+    Just b -> if eq b.name name then Just b.set else vchGammaLookup name (eufRest gamma)
+
+@label "Checker gamma bind"
+@description "Extend Γ with one binding, at the FRONT so it shadows an existing binding at the same spelling. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchGammaBind : (name: String) -> (s: SetExpr) -> (gamma: [VchBinding]) -> [VchBinding]
+vchGammaBind name s gamma = concat [VchBinding { name = name, set = s }] gamma
+
+-- Γ-MASKING AT EVERY UNTRACKED BINDER-INTRODUCING SEGMENT. Descending through a
+-- lambda body or any match-arm position can introduce a binder this arm does
+-- not track; an untracked inner binder that SHADOWS an outer name would make
+-- the outer set be read for the inner value. Masking Γ entirely keeps every
+-- read under such a boundary at the conservative ⊤.
+--
+-- The set is complete for the binder-introducing segments currently
+-- represented; a segment added later that binds and is not listed here is a
+-- soundness bug, which is why the default answer is FALSE only for segments
+-- that are enumerated and known not to bind.
+@label "Checker segment masks gamma"
+@description "Does descending through this path segment cross a binder-introducing boundary the arm does not track? A lambda body and every match-arm position do; the rest do not. Crossing one masks Γ entirely."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchSegMasks : (seg: UsePathSeg) -> Boolean
+vchSegMasks seg =
+  case seg of
+    VpsLambdaBody -> true
+    VpsArmBody -> true
+    VpsArmGuard -> true
+    VpsArmPattern -> true
+    VpsPatternArg -> true
+    VpsPatternField -> true
+    VpsCallee -> false
+    VpsArg -> false
+    VpsSeq -> false
+    VpsBinding -> false
+    VpsField -> false
+    VpsScrutinee -> false
+    VpsCond -> false
+    VpsThen -> false
+    VpsElse -> false
+    VpsWhereBinding -> false
+    -- A segment nobody has classified MASKS. The safe direction is to lose
+    -- information, never to carry a binding across a boundary that binds.
+    _ -> true
+
+@label "Checker gamma through segment"
+@description "Γ as it stands after descending through one path segment: unchanged, or emptied when the segment crosses an untracked binder boundary. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchGammaThrough : (seg: UsePathSeg) -> (gamma: [VchBinding]) -> [VchBinding]
+vchGammaThrough seg gamma = if vchSegMasks seg then [] else gamma
+
+-- ---- the entries join --------------------------------------------------
+
+@label "Checker entry for node"
+@description "The minted entries entry for the occurrence this node ISSUED, or Nothing when the node issues no live identity or the entries carries no entry for it. A miss is a miss: there is no fallback to a function-id lookup, because a use-site miss falling back to a function id is exactly the second evidence channel this arm may not have."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchEntryFor : (node: VcaNode) -> (entries: [VteEntry]) -> Maybe VteEntry
+vchEntryFor node entries =
+  case node.identity of
+    VciUse { useId = useId } -> vchEntryByUseId useId entries
+    _ -> Nothing
+
+@label "Checker entry by use id"
+@description "The entries entry keyed by one occurrence identity. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchEntryByUseId : (useId: VcaUseId) -> (entries: [VteEntry]) -> Maybe VteEntry
+vchEntryByUseId useId entries =
+  case head entries of
+    Nothing -> Nothing
+    Just entry ->
+      if vcaUseIdEq entry.useId useId
+      then Just entry
+      else vchEntryByUseId useId (eufRest entries)
+
+@label "Checker class for node"
+@description "The re-derived partition class of the occurrence this node issued, or Nothing when it issues no live identity. Read from the identity itself rather than from the entries's class list, so a rule cannot be steered by a supplied classification the preflight has already re-derived anyway."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchClassFor : (node: VcaNode) -> Maybe VteClass
+vchClassFor node =
+  case node.identity of
+    VciUse { useId = useId } -> vteClassOf useId
+    _ -> Nothing
+
+-- ---- children ------------------------------------------------------------
+
+@label "Checker argument nodes"
+@description "The argument children of a call node, in logical index order, or Nothing when the indices are not exactly 0..n-1. The order is checked rather than assumed: an argument vector whose indices have a gap describes a call this arm cannot align with a parameter list, and aligning it anyway would check the wrong argument against the wrong domain."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchArgNodes : (children: [VcaChild]) -> Maybe [VcaNode]
+vchArgNodes children = vchArgNodesGo children 0 []
+
+@label "Checker argument nodes worker"
+@description "Collect VpsArg children in encounter order while checking each segment's ordinal equals its position. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchArgNodesGo : (children: [VcaChild]) -> (index: Nat) -> (acc: [VcaNode]) -> Maybe [VcaNode]
+vchArgNodesGo children index acc =
+  case head children of
+    Nothing -> Just acc
+    Just c ->
+      case c.seg of
+        VpsArg { index = here } ->
+          if not (eq here index)
+          then Nothing
+          else vchArgNodesGo (eufRest children) (add index 1) (appendItem c.node acc)
+        _ -> vchArgNodesGo (eufRest children) index acc
+
+@label "Checker children at segment kind"
+@description "Every child whose segment carries a given closed segment tag, in encounter order. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchChildrenOfKind : (children: [VcaChild]) -> (kind: String) -> (acc: [VcaChild]) -> [VcaChild]
+vchChildrenOfKind children kind acc =
+  case head children of
+    Nothing -> acc
+    Just c ->
+      let next = if eq (vcaSegKind c.seg) kind then appendItem c acc else acc
+      vchChildrenOfKind (eufRest children) kind next
+
+-- ---- the synth face ------------------------------------------------------
+
+-- SYNTH PRODUCES AN OVER-APPROXIMATION AND NEVER A REFUTATION. Everything it
+-- cannot read is ⊤, which is sound in the accept-only direction and useless in
+-- the refuting one — hence `vchAcceptOnly` at every consumption site.
+@label "Checker synth"
+@description "SYNTH mode over one carrier node: an over-approximating set for the values the node can produce. A literal is its singleton; a Γ-class read is its Γ set; an entry-bearing occurrence is its own entry's instance or application result; a rule-class occurrence is its versioned rule image; a binding form threads Γ in the pure profile's order. Everything else is the top set."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchSynth : (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchSynth node gamma entries =
+  case node.projection of
+    VcpLit -> vchLitSet node.raw
+    VcpVar -> vchVarSet node gamma entries
+    VcpCall -> vchCallSet node gamma entries
+    VcpConstruct { ctor = ctor, wireTag = wireTag, reading = reading, fields = fields } ->
+      vchConstructSet node wireTag reading fields gamma entries
+    VcpBinding { form = form } -> vchBindingSet form node gamma entries
+    VcpRecord -> SeAll
+    VcpLambda -> SeAll
+    VcpMatch -> SeAll
+    VcpPattern -> SeAll
+    VcpUnsupported -> SeAll
+    -- The safe default, written down rather than inferred from a missing arm.
+    _ -> SeAll
+
+@label "Checker literal set"
+@description "The singleton set of a scalar literal node, or the top set for a shape whose value this arm does not represent."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchLitSet : (raw: (JsonLogic Any)) -> SetExpr
+vchLitSet raw =
+  case raw of
+    JlString { value = v } -> SeEnum { values = appendItem v [] }
+    JlNumber { value = v } -> SeEnum { values = appendItem v [] }
+    JlBool { value = v } -> SeEnum { values = appendItem v [] }
+    JlNull -> SeAll
+    JlArray -> SeAll
+    JlTagged -> SeAll
+    JlObject -> SeAll
+    _ -> SeAll
+
+-- THE LEDGER'S DECISION, CONSUMED FROM THE NODE'S IDENTITY — never re-derived
+-- from the spelling. A Γ-class read is a Γ lookup; an entry-bearing function
+-- reference synthesises THAT OCCURRENCE'S entry instance (rule (a)'s reference
+-- half); anything else is ⊤. Dotted spellings cannot reach here at all: a
+-- dotted binder fences at the carrier and a dotted unbound spelling is a
+-- data-dependent dynamic row.
+@label "Checker variable set"
+@description "The synth set of a variable node: a Γ-class lexical read reads Γ (a miss is the top set), an entry-bearing function reference is that occurrence's own minted instance, and every other identity is the top set."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchVarSet : (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchVarSet node gamma entries =
+  case node.identity of
+    VciUse { useId = useId } ->
+      case vteClassOf useId of
+        Nothing -> SeAll
+        Just class ->
+          case class of
+            VtcGamma ->
+              case vchGammaLookup useId.targetId gamma of
+                Nothing -> SeAll
+                Just s -> s
+            VtcEntryBearing ->
+              case vchEntryByUseId useId entries of
+                Nothing -> SeAll
+                Just entry -> entry.instance
+            _ -> SeAll
+    _ -> SeAll
+
+-- ---- rule (d): ONE closed route result -----------------------------------
+
+-- TRAP (a), CLOSED. The route is computed ONCE, from the node's own identity
+-- and re-derived partition class, before any synth or check happens on the
+-- node — never from the raw spelling. The general checker's
+-- `checkCall`-if-first versus `synthCall`-registry-first asymmetry is therefore
+-- MOOT on this path: a registered function SPELLED `if` routes by identity in
+-- both directions and gets one answer. The general checker is untouched.
+@label "Checker call set"
+@description "The synth set of a call node, routed ONCE by occurrence identity and partition class: an entry-bearing occurrence takes the application rules, a rule-class intrinsic takes its versioned image, a rule-class constructor takes the constructor rule, and everything else — an applied lexical callable, a fence, an unidentified node — is the top set."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchCallSet : (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchCallSet node gamma entries =
+  case vchClassFor node of
+    Nothing -> SeAll
+    Just class ->
+      case class of
+        VtcEntryBearing ->
+          case vchEntryFor node entries of
+            Nothing -> SeAll
+            Just entry -> vchAppliedSet node entry gamma entries
+        VtcRule { ruleKind = ruleKind } ->
+          case ruleKind of
+            VrkIntrinsic -> vchIntrinsicSet node gamma entries
+            VrkConstructor -> SeAll
+            _ -> SeAll
+        _ -> SeAll
+
+-- ---- rules (a) / (b) / (c): the application ladder ------------------------
+
+-- THE ARGUMENT COUNT COMES FROM THE CARRIER'S OWN CHILDREN, and the ENTRY'S
+-- saturation has to agree with it. The two are derived independently — the
+-- saturation from the ledger's arity join, the children from the shared form
+-- decomposition — so a disagreement means the two walkers described different
+-- calls and neither reading may be used.
+@label "Checker applied set"
+@description "The synth set of an application of an entry-bearing occurrence: exact (rule a), under-applied (rule b, the residual arrow), or over-applied (rule c, stagewise and Fenel-origin-only). Every arm requires the arguments to fit their unfolded domains decidably and the named-argument side condition to hold; anything unprovable is the top set."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchAppliedSet : (node: VcaNode) -> (entry: VteEntry) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchAppliedSet node entry gamma entries =
+  case vchArgNodes node.children of
+    Nothing -> SeAll
+    Just args ->
+      let k = length args
+      if not (eq k (vchSuppliedOf entry.saturation entry.declaredArity))
+      then SeAll
+      else if not (vchNamedArgumentSafe args gamma entries)
+      then SeAll
+      else if gt k entry.declaredArity
+      then vchStagewiseSet entry args gamma entries
+      else
+        -- Rules (a)-exact and (b)-partial share ONE gate: every supplied
+        -- argument decidably within its own leading unfolded domain. They
+        -- differ only in where the descent stops, which `vchStageResult`
+        -- already encodes.
+        let unfolded = vchUnfold entry.instance
+        if not (vchArgsFit args unfolded.params gamma entries)
+        then SeAll
+        else
+          case vchStageResult entry.instance entry.declaredArity k of
+            Nothing -> SeAll
+            Just result -> result
+
+@label "Checker supplied of saturation"
+@description "The argument count a saturation describes, expressed against the declared arity: an exact application supplies exactly the declared count, an under- or over-application carries its own. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchSuppliedOf : (saturation: UseSaturation) -> (declaredArity: Nat) -> Nat
+vchSuppliedOf saturation declaredArity =
+  case saturation of
+    VusExact -> declaredArity
+    VusUnder { supplied = supplied } -> supplied
+    VusOver { supplied = supplied } -> supplied
+    -- Unreachable over the closed ADT. A count nothing produced can equal no
+    -- real argument count, so every rule declines.
+    _ -> 0
+
+@label "Checker arguments fit"
+@description "Every supplied argument's synth set is DECIDABLY within its corresponding unfolded parameter domain, through the kernel. An undecided fit is a failure to fit — synthFromSig's own rule, transposed to the unfolded view."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchArgsFit : (args: [VcaNode]) -> (params: [SetExpr]) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> Boolean
+vchArgsFit args params gamma entries =
+  case head args of
+    Nothing -> true
+    Just a ->
+      case head params of
+        Nothing -> false
+        Just p ->
+          let argSet = vchSynth a (vchGammaThrough (VpsArg { index = 0 }) gamma) entries
+          case decideSubset argSet p of
+            Just true -> vchArgsFit (eufRest args) (eufRest params) gamma entries
+            Just false -> false
+            Nothing -> false
+            _ -> false
+
+-- ---- rule (c): stagewise overapplication ---------------------------------
+
+-- RULE (c) DOES NOT LAND, AND THE REASON IS A REVIEW FINDING RATHER THAN A
+-- SCOPE CUT. The brief's stagewise rule rests on `invokeFunction` eta-applying
+-- an over-applied call's leftovers to the CALLABLE RESULT, with the side
+-- condition `origin = FenelBody` on the OUTER target. That side condition is
+-- necessary and NOT sufficient: it is the RESIDUAL callable that receives the
+-- leftovers, and its provenance is exactly what a `SetExpr` cannot carry.
+--
+-- The counterexample is concrete. A Fenel-bodied `f` of one formal returns a
+-- reference to a NATIVE `g` declared with one formal whose return is itself
+-- callable. `g`'s projected scheme is `C -> (D -> E)`, which is the same shape
+-- a two-formal target projects to (`foldTypes` erases the difference — the very
+-- ambiguity `declaredArity` exists to resolve, and the residual has no
+-- `declaredArity` here). Stagewise reasoning consumes `c` then `d` and claims
+-- `E`. The runtime hands the native the WHOLE leftover vector `[c, d]`
+-- (`json-logic.ts:2387-2408`), the native reads one argument, `d` is DROPPED,
+-- and the value is a callable in `D -> E`. Two different answers, and the
+-- checker's is the admitting one.
+--
+-- So an over-application refuses, precisely and countably, and the demand it
+-- carries is 3i/3j's: discharging it needs residual-callable provenance, which
+-- is certificate material rather than set material. What this slice DOES keep
+-- is the ledger's target RETENTION (`vlgAppliedCallStatus`): the occurrence now
+-- reaches the classifier as a live, identified, entry-bearing row and refuses
+-- with its own class instead of vanishing into a generic dynamic fence.
+@label "Checker stagewise set"
+@description "The synth set of an OVER-applied entry-bearing occurrence: the top set, always. The stagewise rule is not sound without residual-callable provenance — the leftovers go to the RESULT, whose implementation origin no projected set carries — so the occurrence claims nothing here and refuses at the classifier."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchStagewiseSet : (entry: VteEntry) -> (args: [VcaNode]) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchStagewiseSet entry args gamma entries = SeAll
+
+@label "Checker take"
+@description "The first n elements of a list, in order. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchTake : (xs: a) -> (n: Nat) -> (acc: a) -> a
+vchTake xs n acc =
+  if eq n 0
+  then acc
+  else
+    case head xs of
+      Nothing -> acc
+      Just x -> vchTake (eufRest xs) (sub n 1) (appendItem x acc)
+
+@label "Checker named-argument safe"
+@description "Does the named-argument reorder hazard provably not apply to this argument vector? A count other than one is vacuously safe; a single argument is safe only when its synthesised set is provably not a record."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchNamedArgumentSafe : (args: [VcaNode]) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> Boolean
+vchNamedArgumentSafe args gamma entries =
+  if not (eq (length args) 1)
+  then true
+  else
+    case head args of
+      Nothing -> true
+      Just only -> vchProvablyNonRecord (vchSynth only gamma entries)
+
+@label "Checker provably non-record"
+@description "Is every inhabitant of this set provably NOT an untagged record? A scalar enumeration, an ordered interval, an arrow and a constructor set whose tag reaches the wire are; a union is only when EVERY branch is, an intersection when ANY branch is. A name handle, a fixpoint, a predicate, a pattern and the top set are NOT provable — the explicit safe default, because the consequence of guessing is a call whose arguments the runtime silently reorders."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchProvablyNonRecord : (s: SetExpr) -> Boolean
+vchProvablyNonRecord s =
+  case s of
+    SeEnum { values = values } -> vchAllScalar values
+    SeInterval -> true
+    SeArrow -> true
+    SeNone -> true
+    -- A CONSTRUCTOR SET IS THE RECORD CASE, and calling it tagged was the
+    -- unsound arm. `$record` projects to an `SeCtor`, and an anonymous record
+    -- literal carries NO `$tag` at all — which is exactly the shape
+    -- `maybeReorderNamedArgs` accepts. This is the arm that catches the
+    -- counterexample: a declared domain containing the untagged record
+    -- `{x: Number}` whose single key is the formal name.
+    SeCtor -> false
+    SeUnion { branches = branches } -> vchAllNonRecord branches
+    SeIntersect { branches = branches } -> vchAnyNonRecord branches
+    SeAll -> false
+    -- A NAME HANDLE IS PROVABLE ONLY FOR THE ATOM TOWER, and the narrower rule
+    -- is the sound one. `typeNamedToSet` projects EVERY unrecognised named type
+    -- to `SeRef { handle = name }` — including a RECORD type, whose inhabitants
+    -- are exactly the untagged records the reorder accepts. So "a handle is
+    -- record-free" is false in general and a blanket `true` here would admit
+    -- `(c: Config) -> …` with `Config` a record.
+    --
+    -- What IS provable is the tower the projection MINTS: `Int`/`Nat`/`Number`
+    -- become `ℤ`/`ℕ`/`ℝ`, `String` becomes `String`, and `Char` stays its own
+    -- opaque atom — every one of them denotes host scalars, never a record.
+    -- (`Boolean` never reaches here at all: it projects to an `SeEnum` of two
+    -- host booleans and the enumeration arm answers it.)
+    --
+    -- The alternative — treating every handle as possibly-a-record — makes the
+    -- guard fire on essentially every declaration, and a gate that abstains on
+    -- everything is not a gate. This arm inherits exactly the closed-world
+    -- named-set resolution `vte.ground.exact` already records as a side
+    -- condition, and no more.
+    SeRef { handle = handle } -> vchAtomHandle handle
+    SeMu -> false
+    SeWhere -> false
+    SePattern -> false
+    SeRigid -> false
+    SeDiff -> false
+    SeComplement -> false
+    _ -> false
+
+@label "Checker atom handle"
+@description "Is this named-set handle one of the projection's own atom-tower spellings, whose inhabitants are host scalars rather than records? Every other handle — including a named RECORD type, which projects to a bare handle exactly like an atom does — is NOT provable."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchAtomHandle : (handle: String) -> Boolean
+vchAtomHandle handle =
+  if eq handle "ℤ" then true
+  else if eq handle "ℕ" then true
+  else if eq handle "ℝ" then true
+  else if eq handle "String" then true
+  else if eq handle "Char" then true
+  else false
+
+@label "Checker all scalar"
+@description "Is every member of this enumeration a scalar the runtime cannot read as a record? Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchAllScalar : (values: a) -> Boolean
+vchAllScalar values =
+  case head values of
+    Nothing -> true
+    Just v ->
+      if not (or (or (isString v) (isNumber v)) (isBoolean v))
+      then false
+      else vchAllScalar (eufRest values)
+
+@label "Checker all branches non-record"
+@description "Every branch of a union is provably non-record. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchAllNonRecord : (branches: [SetExpr]) -> Boolean
+vchAllNonRecord branches =
+  case head branches of
+    Nothing -> false
+    Just b -> if not (vchProvablyNonRecord b) then false else if eq (length (eufRest branches)) 0 then true else vchAllNonRecord (eufRest branches)
+
+@label "Checker any branch non-record"
+@description "Some branch of an intersection is provably non-record, which suffices: an intersection is contained in each of its branches. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchAnyNonRecord : (branches: [SetExpr]) -> Boolean
+vchAnyNonRecord branches =
+  case head branches of
+    Nothing -> false
+    Just b -> if vchProvablyNonRecord b then true else vchAnyNonRecord (eufRest branches)
+
+-- ---- D4: the rule class --------------------------------------------------
+
+-- THE RULE CLASS RECORDS WHICH RULE, NOT A CERTIFICATE. A constructor and an
+-- intrinsic have no scheme row, so no `VteEntry` can be FORMED for them and
+-- inventing a sentinel one would fork the executors. What they discharge
+-- against is already bound: the wire-projection table and the constructor
+-- field table ride `inputsHash`, and the intrinsic schedule is the closed `fdc`
+-- classification versioned by the carrier version in the snapshot. The full
+-- `ConstructorRule` / intrinsic certificate authorities with owner scheme
+-- hashes are slice 3j's certificate landing; this slice carries the rule-class
+-- vocabulary and says so.
+@label "Checker construct set"
+@description "The synth set of a construction: the exact SeCtor over the effective WIRE tag and the child-aligned semantic field identities, with each field's set synthesised from its own child. Requires the payload reading to be DECIDED and the field vector to align with the children; anything else is the top set."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchConstructSet : (node: VcaNode) -> (wireTag: String) -> (reading: VcaCtorReading) -> (fields: [VcaCtorField]) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchConstructSet node wireTag reading fields gamma entries = SeAll
+
+-- THE CONSTRUCTOR IMAGE DOES NOT LAND, and the reason is the same shape as
+-- rule (c)'s: the rule needs a runtime fact the carrier does not model.
+--
+-- The synthesised `SeCtor` has to name each field by the key the RUNTIME
+-- actually writes, and for a POSITIONAL payload the runtime writes the
+-- POSITIONAL spelling — `{construct:["C", 1]}` against declared fields
+-- `["value"]` produces `{_0: 1}`, not `{value: 1}`. Codex's round-1 result
+-- review demonstrated it executably: the checker passed the construction
+-- against a declared named-field variant while `evaluate` produced a value with
+-- no `value` key at all. Synthesising from the DECLARED field vector therefore
+-- claims membership of a set the constructed value is not in.
+--
+-- Deriving the written key would mean modelling the construct op's own
+-- name-versus-position rule inside the arm, and building the positional
+-- spelling needs a number rendered into a string — the recorded
+-- `[object Object]` landmine, since a cloned decider context boxes host
+-- numbers. So the image is ⊤ and the demand is named rather than guessed.
+--
+-- WHAT SURVIVES, AND IT IS THE HALF THE CENSUS CARES ABOUT: a constructor
+-- occurrence is still RULE-CLASS. It no longer refuses the whole admission the
+-- way 3g's mint did; it simply claims nothing. The payload retained by
+-- `vca.ctor.payload` is what a successor slice needs to make the image exact,
+-- and it is bound into `inputsHash` now rather than retrofitted later.
+
+@label "Checker intrinsic set"
+@description "The synth set of a rule-class intrinsic occurrence, selected by the versioned rule id the shared decomposition derived: a lazy three-slot conditional is the union of its branch synths, a notation op is the propagate transfer over its argument synths, and every other intrinsic form is the top set."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchIntrinsicSet : (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchIntrinsicSet node gamma entries =
+  case node.projection of
+    VcpCall { fnId = fnId, ruleId = ruleId } ->
+      if eq ruleId ""
+      then SeAll
+      else
+        case vchArgNodes node.children of
+          Nothing -> SeAll
+          Just args ->
+            if eq ruleId "fdc.form.v1/lazy/if"
+            then vchIfImage args gamma entries
+            else if synthIsOpFragment fnId
+            then setAlgebraNormalize (propagate fnId (vchSynthAll args gamma entries []))
+            else SeAll
+    _ -> SeAll
+
+@label "Checker if image"
+@description "The image of a three-slot lazy conditional: the normalized union of the then and else branch synths, because the value IS one of the two and the condition only selects. A shorter form's missing-else value is host-null, which is not representable, so it stays the top set. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchIfImage : (args: [VcaNode]) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchIfImage args gamma entries =
+  -- EXACTLY three, not "at least three". The runtime's `if` is VARIADIC —
+  -- `[c1, t1, c2, t2, …, else]` — so a five-argument form's VALUE can be a
+  -- branch a then/else reading never looked at. Codex's round-1 result review
+  -- produced the executable counterexample: `{if:[false, n, 0, "bad", "bad"]}`
+  -- passed against an Int return while `evaluate` answered the String "bad".
+  -- The union of TWO slots is not an over-approximation of a five-slot form.
+  if not (eq (length args) 3)
+  then SeAll
+  else
+    let rest = eufRest args
+    case head rest of
+      Nothing -> SeAll
+      Just thenNode ->
+        case head (eufRest rest) of
+          Nothing -> SeAll
+          Just elseNode ->
+            let branches = appendItem (vchSynth elseNode gamma entries) (appendItem (vchSynth thenNode gamma entries) [])
+            setAlgebraNormalize (SeUnion { branches = branches })
+
+@label "Checker synth all"
+@description "The synth sets of a node list, in order. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchSynthAll : (nodes: [VcaNode]) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> (acc: [SetExpr]) -> [SetExpr]
+vchSynthAll nodes gamma entries acc =
+  case head nodes of
+    Nothing -> acc
+    Just n -> vchSynthAll (eufRest nodes) gamma entries (appendItem (vchSynth n gamma entries) acc)
+
+-- ---- D1's binding family: Γ threading ------------------------------------
+
+-- SEQUENTIAL, IN THE PURE PROFILE'S ORDER. `let` and a `do` item's inline `let`
+-- fold bindings into a copied data context in index order, each binding seeing
+-- the ones before it, and the FORM'S VALUE IS THE LAST BINDING — there is no
+-- separate body at rest. `where` evaluates its bindings before its body and the
+-- form's value is the body. A `do` runs its items in sequence, propagating an
+-- inline `let`'s bindings to LATER items, and its value is the last item.
+@label "Checker binding set"
+@description "The synth set of a binding form, threading Γ sequentially in the pure evaluate profile's own order. A let and an inline let are their last binding's set; a where is its body's set under its bindings; a do is its last item's set with inline-let bindings propagated forward."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchBindingSet : (form: VcaBindingForm) -> (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchBindingSet form node gamma entries =
+  case form of
+    VbfLet -> vchLetSet node gamma entries
+    VbfDoInlineLet -> vchLetSet node gamma entries
+    VbfWhere -> vchWhereSet node gamma entries
+    VbfDo -> vchDoSet node gamma entries
+    _ -> SeAll
+
+@label "Checker let set"
+@description "A sequential binding list's set: each binding's value synthesised under the bindings before it, the form's value being the last one. An empty binding list is the top set. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchLetSet : (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchLetSet node gamma entries =
+  let bindings = vchChildrenOfKind node.children "VpsBinding" []
+  let folded = vchFoldBindings bindings gamma entries SeAll
+  folded.set
+
+@label "Checker where set"
+@description "A where form's set: its bindings threaded first, then its body synthesised under them. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchWhereSet : (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchWhereSet node gamma entries =
+  let bindings = vchChildrenOfKind node.children "VpsWhereBinding" []
+  let folded = vchFoldBindings bindings gamma entries SeAll
+  case head (vchChildrenOfKind node.children "VpsArg" []) of
+    Nothing -> SeAll
+    Just body -> vchSynth body.node folded.gamma entries
+
+@label "Checker fold bindings"
+@description "Fold a binding-child list into Γ sequentially, returning the extended Γ and the LAST binding's set. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchFoldBindings : (bindings: [VcaChild]) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> (last: SetExpr) -> a
+vchFoldBindings bindings gamma entries last =
+  case head bindings of
+    Nothing -> { gamma = gamma, set = last }
+    Just c ->
+      let s = vchSynth c.node gamma entries
+      let name = vcaSegName c.seg
+      vchFoldBindings (eufRest bindings) (vchGammaBind name s gamma) entries s
+
+@label "Checker do set"
+@description "A do form's set: items in sequence, an inline-let item folding its bindings into Γ for the LATER items, the form's value being the last item's set. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchDoSet : (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> SetExpr
+vchDoSet node gamma entries =
+  let items = vchChildrenOfKind node.children "VpsSeq" []
+  let folded = vchDoItems items gamma entries SeAll
+  folded.set
+
+@label "Checker do items"
+@description "The do-item fold: an inline-let item threads its own bindings into the SHARED Γ so later items see them; every other item is an ordinary expression under the Γ built so far. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchDoItems : (items: [VcaChild]) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> (last: SetExpr) -> a
+vchDoItems items gamma entries last =
+  case head items of
+    Nothing -> { gamma = gamma, set = last }
+    Just c ->
+      let itemNode = c.node
+      if vchIsInlineLet itemNode.projection
+      then
+        -- An inline `let` with NO bindings evaluates nothing, so the do-form's
+        -- running value is the one the PREVIOUS item produced; seeding the fold
+        -- with the accumulator rather than with the top set is what keeps that
+        -- true.
+        let inner = vchFoldBindings (vchChildrenOfKind itemNode.children "VpsBinding" []) gamma entries last
+        vchDoItems (eufRest items) inner.gamma entries inner.set
+      else vchDoItems (eufRest items) gamma entries (vchSynth itemNode gamma entries)
+
+@label "Checker is inline let"
+@description "Is this projection a do item's inline binding group? Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchIsInlineLet : (projection: VcaProjection) -> Boolean
+vchIsInlineLet projection =
+  case projection of
+    VcpBinding { form = form } ->
+      case form of
+        VbfDoInlineLet -> true
+        VbfLet -> false
+        VbfWhere -> false
+        VbfDo -> false
+        _ -> false
+    _ -> false
+
+-- ---- the check face ------------------------------------------------------
+
+@label "Checker accept only"
+@description "Soften a decided verdict to accept-only: a decided TRUE stays, a decided FALSE and an undecided answer both become undecided. The synth face over-approximates, so its refutation is never a term refutation."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchAcceptOnly : (d: Maybe Boolean) -> Maybe Boolean
+vchAcceptOnly d =
+  case d of
+    Just b -> if b then Just true else Nothing
+    Nothing -> Nothing
+    _ -> Nothing
+
+-- THE CHECK FACE IS WHERE REFUTATIONS CAN COME FROM, AND ONLY FROM EXACT
+-- DERIVATIONS. A literal is exact (a singleton IS the value) so both verdicts
+-- propagate. A three-slot conditional's value is one of its two branch values,
+-- so two exact refutations refute. Everything else routes through synth and is
+-- therefore accept-only.
+@label "Checker check"
+@description "CHECK mode over one carrier node against a goal set, under the Tri discipline: a decided FALSE is produced ONLY from an exact derivation — a literal's singleton membership, or a conditional whose both branches refute exactly. Every synth-routed node is accept-only, and an inline lambda argument takes the bidirectional rule."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchCheck : (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> (goal: SetExpr) -> Maybe Boolean
+vchCheck node gamma entries goal =
+  case node.projection of
+    VcpLit -> decideSubset (vchLitSet node.raw) goal
+    VcpLambda { binders = binders } -> vchCheckLambda node binders gamma entries goal
+    VcpBinding { form = form } -> vchCheckBinding form node gamma entries goal
+    VcpCall -> vchCheckCall node gamma entries goal
+    _ -> vchAcceptOnly (decideSubset (vchSynth node gamma entries) goal)
+
+@label "Checker check call"
+@description "CHECK mode over a call node: a rule-class three-slot lazy conditional checks BOTH branches against the goal directly (the value is one of the two, so two exact refutations refute); every other call routes through synth, accept-only. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchCheckCall : (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> (goal: SetExpr) -> Maybe Boolean
+vchCheckCall node gamma entries goal =
+  if not (vchIsLazyIf node)
+  then vchAcceptOnly (decideSubset (vchSynth node gamma entries) goal)
+  else
+    case vchArgNodes node.children of
+      Nothing -> Nothing
+      Just args ->
+        -- EXACTLY three, for the same variadic reason as `vchIfImage`: a
+        -- five-slot `if` has branches this arm never checks, so "both branches
+        -- refute" is not a refutation of the form.
+        if not (eq (length args) 3)
+        then Nothing
+        else
+          let rest = eufRest args
+          case head rest of
+            Nothing -> Nothing
+            Just thenNode ->
+              case head (eufRest rest) of
+                Nothing -> Nothing
+                Just elseNode ->
+                  vchCombineIf (vchCheck thenNode gamma entries goal) (vchCheck elseNode gamma entries goal)
+
+@label "Checker is lazy if"
+@description "Is this node a RULE-CLASS occurrence of the lazy conditional language rule? Decided on the re-derived class plus the versioned rule id, never on the spelling — a registered function named `if` is entry-bearing and takes the application rules in BOTH directions. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchIsLazyIf : (node: VcaNode) -> Boolean
+vchIsLazyIf node =
+  case vchClassFor node of
+    Nothing -> false
+    Just class ->
+      case class of
+        VtcRule { ruleKind = ruleKind } ->
+          case ruleKind of
+            VrkIntrinsic ->
+              case node.projection of
+                VcpCall { fnId = fnId, ruleId = ruleId } -> eq ruleId "fdc.form.v1/lazy/if"
+                _ -> false
+            VrkConstructor -> false
+            _ -> false
+        _ -> false
+
+@label "Checker combine if"
+@description "Combine two conditional branch verdicts: both decided true is true, both decided false is false, anything else is undecided. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchCombineIf : (tv: Maybe Boolean) -> (ev: Maybe Boolean) -> Maybe Boolean
+vchCombineIf tv ev =
+  case tv of
+    Nothing -> Nothing
+    Just tb ->
+      case ev of
+        Nothing -> Nothing
+        Just eb ->
+          if tb
+          then (if eb then Just true else Nothing)
+          else (if eb then Nothing else Just false)
+        _ -> Nothing
+    _ -> Nothing
+
+@label "Checker check binding"
+@description "CHECK mode over a binding form: Γ is threaded exactly as in synth and the form's VALUE POSITION is then checked against the goal, so a refutation from an exact value position propagates rather than being flattened by an accept-only synth. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchCheckBinding : (form: VcaBindingForm) -> (node: VcaNode) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> (goal: SetExpr) -> Maybe Boolean
+vchCheckBinding form node gamma entries goal =
+  case form of
+    VbfWhere ->
+      let folded = vchFoldBindings (vchChildrenOfKind node.children "VpsWhereBinding" []) gamma entries SeAll
+      case head (vchChildrenOfKind node.children "VpsArg" []) of
+        Nothing -> Nothing
+        Just body -> vchCheck body.node folded.gamma entries goal
+    VbfDo -> vchAcceptOnly (decideSubset (vchSynth node gamma entries) goal)
+    VbfLet -> vchAcceptOnly (decideSubset (vchSynth node gamma entries) goal)
+    VbfDoInlineLet -> vchAcceptOnly (decideSubset (vchSynth node gamma entries) goal)
+    _ -> Nothing
+
+-- ---- D5: the bidirectional lambda-argument rule ---------------------------
+
+-- TRAP (c). An inline lambda argument to a registered call cannot pass the
+-- synth-and-subset gate: its synth is ⊤ by construction, so the enclosing call
+-- degrades. The rule is that `vchCheck(argNode, expectedParamSet) = Just true`
+-- is an ADMISSIBLE ALTERNATIVE to exact synth-and-subset, under the SAME
+-- occurrence key.
+--
+-- ACCEPT-ONLY, DELIBERATELY. A decided FALSE from a lambda argument does NOT
+-- refute the enclosing call — it degrades to not-fitting. Refutation soundness
+-- at lambda arguments inherits the general checker's own caveats and this rule
+-- does not innovate past them.
+--
+-- THE LADDER IS EXACT-ARITY ONLY. `checkLambda`'s curry ladder re-associates a
+-- goal codomain into the parameters, which is sound over `Expr` closures whose
+-- parameter vector the checker owns; here the binder vector comes from the
+-- carrier payload and the body is a carrier node, and the re-association would
+-- need a binder source for the re-associated parameters that the payload does
+-- not have. So the ladder stops at exact arity and the classifier says so.
+@label "Checker check lambda"
+@description "The bidirectional lambda rule against an exact arrow goal: a non-arrow goal is undecided, a decidably empty goal domain passes vacuously, the binder vector must match the unfolded goal arity exactly, and the body is then checked against the goal's residual under the binders. Accept-only in the refuting direction."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchCheckLambda : (node: VcaNode) -> (binders: [String]) -> (gamma: [VchBinding]) -> (entries: [VteEntry]) -> (goal: SetExpr) -> Maybe Boolean
+vchCheckLambda node binders gamma entries goal =
+  if not (eq (seTag goal) "SeArrow")
+  then Nothing
+  -- THE VACUITY GATE COMES FIRST, exactly as `checkLambda`'s does: a goal
+  -- parameter domain that is decidably empty makes the universal vacuous, so
+  -- the lambda is a member regardless of arity or body.
+  else if arrowSomeParamEmpty goal.params
+  then Just true
+  else
+    let unfolded = vchUnfold goal
+    if vchNamedCallerHazard (length binders) unfolded.params
+    -- The same reorder hazard, at the lambda's own calling convention: a
+    -- closure invoked with one plain record whose keys are its parameter names
+    -- has that record expanded before binding (`json-logic.ts:2192-2205`), so a
+    -- record-admitting first domain makes the universal undecidable here too.
+    then Nothing
+    else if not (eq (length binders) (length unfolded.params))
+    then Nothing
+    else
+      case head (vchChildrenOfKind node.children "VpsLambdaBody" []) of
+        Nothing -> Nothing
+        Just body ->
+          case vchDescend goal (length binders) of
+            Nothing -> Nothing
+            Just codomain ->
+              -- Γ is REPLACED, not extended: the carrier masks Γ at
+              -- `VpsLambdaBody` in synth mode precisely because an untracked
+              -- binder could shadow. Here the binders ARE tracked, so the
+              -- lambda's own frame is the whole of Γ underneath it — an outer
+              -- binding that survived would be readable under a shadowing
+              -- inner name.
+              vchAcceptOnly (vchCheck body.node (vchSeedGamma binders unfolded.params []) entries codomain)
+
+@label "Checker seed gamma"
+@description "Bind an ordered name vector to an ordered set vector, stopping at the shorter. The seeding used for both a lambda's own binders and the caller's formals."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchSeedGamma : (names: [String]) -> (sets: [SetExpr]) -> (acc: [VchBinding]) -> [VchBinding]
+vchSeedGamma names sets acc =
+  case head names of
+    Nothing -> acc
+    Just n ->
+      case head sets of
+        Nothing -> acc
+        -- PREPEND, so a DUPLICATE spelling later in the vector shadows the
+        -- earlier one — which is what the runtime does. Both a function's
+        -- formals and a closure's parameters are installed in order by
+        -- `Object.defineProperty`, so `["x","x"]` leaves `x` bound to the SECOND
+        -- argument. Appending and looking up head-first read the FIRST domain,
+        -- and Codex's round-1 result review turned that into an executable false
+        -- accept in both positions: the checker passed `(Int, String) -> Int`
+        -- with body `x` while the runtime returned the String.
+        Just s -> vchSeedGamma (eufRest names) (eufRest sets) (vchGammaBind n s acc)
+
+-- ---- the whole-function claim --------------------------------------------
+
+-- THE CLAIM IS ABOUT THE FUNCTION, NOT THE BODY. Membership of the FUNCTION in
+-- its own declared arrow is the implicit-lambda discipline `checkLambda`
+-- already uses: seed Γ with the caller's formal names bound to the unfolded
+-- parameter sets, gate on vacuity FIRST, then check the body against the set
+-- reached at the caller's OWN declared-arity boundary.
+--
+-- The caller gate has already proved the caller's projected arrow is ground,
+-- exact and free of both the top set and any unreadable residual, so this does
+-- not re-litigate exactness; it consumes it.
+-- THE FORMAL NAMES COME FROM `paramNames`, and that is not a convenience: the
+-- LEDGER seeded its binder scope from exactly that vector, so those are the
+-- spellings under which a body read of a formal became a Γ-class row at all.
+-- Binding the seeded sets under any other spelling would seed Γ with names no
+-- occurrence identity names, and every formal read would then miss to ⊤ while
+-- looking as if it had been threaded. The declared arity IS the vector's
+-- length; taking it from anywhere else would let the two disagree.
+@label "Checker validate function"
+@description "The whole-FUNCTION membership verdict: the caller's own declared arrow, Γ seeded over its declared formal names, the vacuity gate FIRST, then the body checked against the set at its declared-arity boundary. A decided true passes; a decided false refutes; anything else is indeterminate with a closed reason."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchValidateFunction : (entries: [VteEntry]) -> (carrier: VcaCarrier) -> (callerScheme: VteCallerScheme) -> (paramNames: [String]) -> VchVerdict
+vchValidateFunction entries carrier callerScheme paramNames =
+  let declaredArity = length paramNames
+  let instance = vteInstanceArrow declaredArity callerScheme.arrow
+  let unfolded = vchUnfold instance
+  -- VACUOUS ∀ FIRST: a caller one of whose own parameter domains is decidably
+  -- empty has no inhabitant to disagree about, so it is a member of its
+  -- declared arrow regardless of what its body says. Gating after the body
+  -- check would let an unsatisfiable domain produce a refutation.
+  if vchAnyEmpty (vchTake unfolded.params declaredArity [])
+  then VchPassed
+  -- THE NAMED-ARGUMENT HAZARD REACHES THE WHOLE-FUNCTION CLAIM, and this is the
+  -- door the per-call guard does not cover. `maybeReorderNamedArgs` fires on the
+  -- CALLER: invoked with exactly one argument that is a plain record whose keys
+  -- are all formal names, the runtime expands it to positional arguments before
+  -- binding. So a caller declared `R -> R` whose `R` contains the untagged
+  -- record `{x: …}` and whose body is `x` accepts under Γ-seeding and yet
+  -- returns the FIELD, not the record, when called as `f {x = 1}`. The claim is
+  -- therefore only decidable when the caller's FIRST domain is provably not a
+  -- record — that is exactly the shape the reorder needs to fire.
+  else if vchNamedCallerHazard declaredArity unfolded.params
+  then VchIndeterminate { reason = RsnNamedArgumentUndecidable { useId = carrier.callerId, detail = "the caller's first declared domain is not provably a non-record, so a single-record invocation may be reordered into positional arguments" } }
+  else
+    case vchStageResult instance declaredArity declaredArity of
+      Nothing -> VchIndeterminate { reason = RsnCheckerAbstained { detail = "the caller's declared arity does not descend its own projected arrow" } }
+      Just goal -> vchVerdictOf (vchCheck carrier.root (vchSeedGamma paramNames unfolded.params []) entries goal)
+
+@label "Checker named caller hazard"
+@description "Could a single-record invocation of this caller be reordered into positional arguments? True whenever it declares at least one formal and its FIRST declared domain is not provably a non-record — the exact precondition the runtime's named-argument expansion needs. A zero-formal caller cannot be reordered."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchNamedCallerHazard : (declaredArity: Nat) -> (params: [SetExpr]) -> Boolean
+vchNamedCallerHazard declaredArity params =
+  if eq declaredArity 0
+  then false
+  else
+    case head params of
+      Nothing -> false
+      Just first -> not (vchProvablyNonRecord first)
+
+@label "Checker any empty"
+@description "Is any set in this vector DECIDABLY empty? The vacuity gate: a universal over an empty domain holds. An undecided emptiness is not an empty domain."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchAnyEmpty : (sets: [SetExpr]) -> Boolean
+vchAnyEmpty sets =
+  case head sets of
+    Nothing -> false
+    Just s ->
+      case setAlgebraDecideEmpty s of
+        Just true -> true
+        Just false -> vchAnyEmpty (eufRest sets)
+        Nothing -> vchAnyEmpty (eufRest sets)
+        _ -> vchAnyEmpty (eufRest sets)
+
+@label "Checker verdict of"
+@description "Project a Tri check verdict into the closed checker verdict. An undecided answer is INDETERMINATE with a closed reason, never a pass."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchVerdictOf : (d: Maybe Boolean) -> VchVerdict
+vchVerdictOf d =
+  case d of
+    Just b -> if b then VchPassed else VchRefuted { counterexample = Nothing }
+    Nothing -> VchIndeterminate { reason = RsnCheckerAbstained { detail = "the whole-function membership judgment is undecided" } }
+    _ -> VchIndeterminate { reason = RsnCheckerAbstained { detail = "the whole-function membership judgment is undecided" } }
+
+-- ---- D6: the pre-checker classifier --------------------------------------
+
+-- THE CLASSIFIER IS A PROOF OBLIGATION, NOT A BUCKET. Readiness let the
+-- certified eta-stage pendings through on the promise that this pass would
+-- discharge them; a pending nothing discharged does not become admissible by
+-- having been classified. So every over-saturated entry must PROVE the
+-- stagewise conditions here, and refuse closed when it cannot.
+--
+-- It refuses ONLY what must be refused to keep the entries honest. An
+-- occurrence whose rule merely cannot fire — a lambda argument past the
+-- ladder, an undecidable named-argument shape on a non-over-applied call —
+-- degrades to ⊤ in synth and shows up in the VERDICT as indeterminate.
+-- Refusing those too would over-fence; refusing fewer would admit an
+-- undischarged demand.
+@label "Checker classify"
+@description "The pre-checker classification pass over an entries's entries: every over-saturated occurrence must discharge its certified-eta-stage demand by proving the stagewise rule's side conditions, or the entries refuses with the exact closed class. Nothing when every occurrence is carried."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchClassify : (entries: [VteEntry]) -> (carrier: VcaCarrier) -> Maybe ValidationReason
+vchClassify entries carrier = vchClassifyGo entries carrier
+
+@label "Checker classify worker"
+@description "Walk the minted entries, refusing at the first occurrence whose typed demand this slice cannot discharge. Internal helper."
+@tags "engine" "internal" "signature-substrate" "phase-4" "validation" "checker"
+@category "engine-internal"
+vchClassifyGo : (entries: [VteEntry]) -> (carrier: VcaCarrier) -> Maybe ValidationReason
+vchClassifyGo entries carrier =
+  case head entries of
+    Nothing -> Nothing
+    Just entry ->
+      case vchEntryRefusal entry carrier of
+        Just reason -> Just reason
+        Nothing -> vchClassifyGo (eufRest entries) carrier
+
+@label "Checker entry refusal"
+@description "The closed class of one entry's undischargeable demand, or Nothing when it is carried. An over-saturated occurrence needs a Fenel-bodied origin, a decidable named-argument shape and a provable stagewise chain; anything else in that family refuses by name so the census can count it."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchEntryRefusal : (entry: VteEntry) -> (carrier: VcaCarrier) -> Maybe ValidationReason
+vchEntryRefusal entry carrier =
+  case entry.saturation of
+    VusExact -> Nothing
+    VusUnder -> Nothing
+    -- The eta demand readiness let through. It is discharged by NOTHING in this
+    -- slice, so it refuses — with the precise class rather than a generic
+    -- abstention, which is what makes it countable and what tells 3i exactly
+    -- what evidence would close it.
+    VusOver { supplied = supplied } ->
+      if not (eq entry.origin "FenelBody")
+      then Just (RsnNonFenelOriginOverapplication { useId = entry.useId.targetId, origin = entry.origin })
+      else Just (RsnUncertifiedStagewiseOverapplication { useId = entry.useId.targetId, detail = "the leftover arguments enter a residual callable whose implementation origin no projected set carries" })
+    _ -> Just (RsnUncertifiedStagewiseOverapplication { useId = entry.useId.targetId, detail = "an unrecognised saturation" })
+
+@label "Checker verdict key"
+@description "The closed tag of a checker verdict, for diagnostics and test pins."
+@tags "engine" "signature-substrate" "phase-4" "validation" "checker"
+vchVerdictKey : (verdict: VchVerdict) -> String
+vchVerdictKey verdict =
+  case verdict of
+    VchPassed -> "VchPassed"
+    VchRefuted -> "VchRefuted"
+    VchIndeterminate -> "VchIndeterminate"
+    _ -> "VchUnknown"

@@ -1,0 +1,187 @@
+module dashboard where
+
+-- =========================================================================
+-- Dashboard /stats + /analytics/* + /proxy-links/stats +
+-- /functions/:id/stats + /functions/live-counts + /types/:typeName/activity
+--
+-- Phase 12a sub-step 8 of the ts-elimination workstream — closes Phase 12a.
+-- Seven route bodies + supporting pure helpers wrapping the 13 state:*
+-- substrate primitives added in 12a-8.
+--
+-- Decisions resolved (per the brief):
+--   LL: dedicated per-stat substrate primitives (each filter is genuine
+--       SQL — JSONB accessors). No generic group-by.
+--   MM + OO: dynamic-key Record outputs (Record<tag, count>, Record<type,
+--       count>, Record<aggregateId, {...}>) built JS-side in the IO handler
+--       via Object.fromEntries. Reason: no std:recordFromEntries primitive
+--       today; Fenel-side mergeRecords only handles static keys. Pure-Fenel
+--       composes sums + lookups via std:find / std:fold over the row-list
+--       outputs.
+--   NN: single Fenel body for /analytics/summary's 4-read assembly.
+--   PP: /types/seed STAYS IN TS (Disposition F — no std:traverse_).
+--   QQ: wire-shape pass-through for Date columns (c.json ISO-serialises).
+--
+-- Anonymous records throughout — Maybe<String> for the optional eventType
+-- filter; everything else is anonymous records / List Record. No new ADT
+-- entity.
+-- =========================================================================
+
+-- ---- Pure helpers -------------------------------------------------------
+
+-- extractTotal — project the `total` field off a row. Used by sumRowTotals.
+@label "Extract total"
+@description "Project the `total` field off a row. Used by sumRowTotals."
+@tags "dashboard" "stats" "pure" "phase-12a"
+extractTotal : (row: {}) -> Number
+extractTotal row = row.total
+
+-- sumRowTotals — sum the `total` field across a row list. Used by
+-- /stats to compute purchaseTotal and flowTotal.
+@label "Sum row totals"
+@description "Sum the `total` field across a row list."
+@tags "dashboard" "stats" "pure" "phase-12a"
+sumRowTotals : (rows: List ({})) -> Number
+sumRowTotals rows = fold add 0 (map (extractTotal) rows)
+
+-- statusEquals — partial-applied predicate. `statusEquals "running"` returns
+-- `row -> Bool`; consumed by std:find.
+@label "Status equals"
+@description "Partial-applied predicate over rows by their `status` field. `statusEquals s` returns row→Bool; consumed by std:find."
+@tags "dashboard" "stats" "pure" "phase-12a"
+statusEquals : (s: String) -> (row: {}) -> Boolean
+statusEquals s row = eq row.status s
+
+-- lookupStatusTotal — find the row matching `status`; return its total,
+-- or 0 on miss. Used by /stats to project specific status counts.
+@label "Lookup status total"
+@description "Find the row matching `status`; return its total, or 0 on miss."
+@tags "dashboard" "stats" "pure" "phase-12a"
+lookupStatusTotal : (rows: List ({})) -> (status: String) -> Number
+lookupStatusTotal rows status =
+  case find (statusEquals status) rows of
+    Just row -> row.total
+    _ -> 0
+
+-- flowWaitingCount — sum of (waiting_event + waiting_timer + awaiting_choice)
+-- counts across function_instances. The 3 status flavours all count as
+-- "waiting" for /stats.flows.waiting. parseApp doesn't continue arg
+-- accumulation across newlines (12a-3 surprise #1) — bind each lookup to a
+-- let so each `add` call sits on a single line.
+@label "Flow waiting count"
+@description "Sum of (waiting_event + waiting_timer + awaiting_choice) counts. The 3 status flavours all count as 'waiting' for /stats.flows.waiting."
+@tags "dashboard" "stats" "pure" "phase-12a"
+flowWaitingCount : (rows: List ({})) -> Number
+flowWaitingCount rows =
+  let we = lookupStatusTotal rows "waiting_event"
+  let wt = lookupStatusTotal rows "waiting_timer"
+  let ac = lookupStatusTotal rows "awaiting_choice"
+  add we (add wt ac)
+
+-- projectPurchaseSummary — project a single purchases-by-status-with-revenue
+-- row to the /analytics/summary.purchases wire shape.
+@label "Project purchase summary"
+@description "Project a single purchases-by-status-with-revenue row to the wire shape {status, count, revenueCents}."
+@tags "dashboard" "analytics" "pure" "phase-12a"
+projectPurchaseSummary : (row: {}) -> {}
+projectPurchaseSummary row =
+  { status = row.status, count = row.total, revenueCents = row.revenue }
+
+-- ---- /stats body --------------------------------------------------------
+
+-- GET /stats — 4 parallel-conceptually-but-sequenced-in-this-runtime reads
+-- + per-row projection helpers. Wire shape: {profiles, purchases, flows}.
+@label "Dashboard stats"
+@description "GET /stats — 4 substrate reads + per-row projections. Wire shape: {profiles, purchases, flows}."
+@tags "dashboard" "stats" "route" "phase-12a"
+dashboardStats : {}
+dashboardStats =
+  let profileCount = countProfiles()
+  let tagCounts = profileTagCountsRecord()
+  let purchaseRows = countPurchasesByStatus()
+  let flowRows = countFunctionInstancesByStatus()
+  let purchaseTotal = sumRowTotals purchaseRows
+  let flowTotal = sumRowTotals flowRows
+  {
+    profiles = { total = profileCount, byTag = tagCounts },
+    purchases = {
+      total = purchaseTotal,
+      completed = lookupStatusTotal purchaseRows "completed",
+      pending = lookupStatusTotal purchaseRows "pending"
+    },
+    flows = {
+      total = flowTotal,
+      running = lookupStatusTotal flowRows "running",
+      waiting = flowWaitingCount flowRows,
+      completed = lookupStatusTotal flowRows "completed"
+    }
+  }
+
+-- ---- /analytics/timeseries body -----------------------------------------
+
+-- GET /analytics/timeseries — single substrate call + thin frame. The TS
+-- wrapper computes `since` (now - days) and `days`; the Fenel body just
+-- assembles the response shape.
+@label "Analytics timeseries body"
+@description "GET /analytics/timeseries — single substrate call + thin frame. Wire shape: {timeseries, days, since}."
+@tags "dashboard" "analytics" "route" "phase-12a"
+analyticsTimeseriesBody : (since: String) -> (eventType: Maybe (String)) -> (days: Number) -> {}
+analyticsTimeseriesBody since eventType days =
+  let rows = eventsTimeseries since eventType days
+  { timeseries = rows, days = days, since = since }
+
+-- ---- /analytics/summary body --------------------------------------------
+
+-- GET /analytics/summary — 4 reads + assembly. d7 and d30 are ISO strings
+-- computed by the TS wrapper (now-7d and now-30d).
+@label "Analytics summary"
+@description "GET /analytics/summary — 4 substrate reads + assembly. Wire shape: {revenue, profiles, events, purchases}."
+@tags "dashboard" "analytics" "route" "phase-12a"
+analyticsSummary : (d7: String) -> (d30: String) -> {}
+analyticsSummary d7 d30 =
+  let revenue = sumPaidPaymentSteps()
+  let eventsByType = eventCountsByTypeSinceRecord d30
+  let profilesCounts = countProfilesCreatedSinceRecord d7 d30
+  let recentPurchases = purchasesByStatusWithRevenueSince d30
+  {
+    revenue = { totalCents = revenue },
+    profiles = profilesCounts,
+    events = eventsByType,
+    purchases = map (projectPurchaseSummary) recentPurchases
+  }
+
+-- ---- /proxy-links/stats body --------------------------------------------
+
+-- GET /proxy-links/stats — 1 read returning Record<aggregateId, {...}>.
+@label "Proxy links stats body"
+@description "GET /proxy-links/stats — Record<aggregateId, {totalClicks, uniqueVisitors}>."
+@tags "dashboard" "proxy-link" "route" "phase-12a"
+proxyLinksStatsBody : {}
+proxyLinksStatsBody = proxyLinkClicksAggregateRecord()
+
+-- ---- /functions/:id/stats body ------------------------------------------
+
+-- GET /functions/:id/stats — thin pass-through.
+@label "Function stats body"
+@description "GET /functions/:id/stats — thin pass-through."
+@tags "dashboard" "function-tracking" "route" "phase-12a"
+functionStatsBody : (fnId: String) -> {}
+functionStatsBody fnId = functionStats fnId
+
+-- ---- /functions/live-counts body ----------------------------------------
+
+-- GET /functions/live-counts — thin pass-through. Returns Record<fnId,
+-- {running, waiting}>.
+@label "Function live counts body"
+@description "GET /functions/live-counts — Record<fnId, {running, waiting}>."
+@tags "dashboard" "function-tracking" "route" "phase-12a"
+functionLiveCountsBody : {}
+functionLiveCountsBody = functionLiveCountsRecord()
+
+-- ---- /types/:typeName/activity body -------------------------------------
+
+-- GET /types/:typeName/activity — thin pass-through.
+@label "Type activity body"
+@description "GET /types/:typeName/activity — thin pass-through to recentTracesByType."
+@tags "dashboard" "trace" "route" "phase-12a"
+typeActivityBody : (typeName: String) -> (limit: Number) -> List ({})
+typeActivityBody typeName limit = recentTracesByType typeName limit

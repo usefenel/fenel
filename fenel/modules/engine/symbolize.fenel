@@ -1,0 +1,678 @@
+module engine where
+
+-- =========================================================================
+-- symbolizeEffects — the pure effect-site → fresh-unknown rewrite, and the
+-- composed solveSymbolic / solveFnSymbolic entries. expr-substrate Phase 14a
+-- (brief: `workstreams/expr-substrate/briefs/phase-14a-symbolize-effects.md`;
+-- design: `design/symbolic-execution.md`; Step-0 lock:
+-- `workstreams/expr-substrate/notes/phase-14-step0.md`).
+--
+-- THE THESIS (locked at Step-0, GO): symbolic execution of effectful Fenel
+-- code is a PURE `Expr -> Expr` rewrite + the already-shipped solver. Replace
+-- each effect-call site with a fresh unknown variable (`EVar`), then hand the
+-- residual predicate to `solve` / `solveFn`. The solver already treats any
+-- `EVar` as a free unknown to find a witness for — so an "IO read" becomes
+-- just-another-unknown with NO solver special-case, NO new `Expr` case, NO
+-- native, and NO new evaluator strategy.
+--
+--   solve (symbolizeEffects fx .{ eq (state:getInstance "counter") 42 }) ⇒ Just 42
+--                                └─ effect site → fresh EVar ─┘  no IO, no special-case
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- D-A — HOW symbolizeEffects RECOGNISES an effect-call site (the load-bearing
+-- decision). In the LIVE / reified AST (pre-compilation) an effect call is a
+-- normal `ECall "state:getInstance" […]` — NOT `$effect:`-marked (the
+-- `$effect:` sentinel is a compile-pipeline form, never present on a reified
+-- body; Step-0 §1). So a pure body keyed ONLY on `$effect:` would recognise
+-- nothing live. The settled recogniser is HYBRID (option (c) primary + option
+-- (a)'s recogniser folded in for free):
+--   * `symbolizeEffects` takes the SET of effect fnIds explicitly (option (c)
+--     — pure, zero introspection; the TS `dispatchedSolveSymbolic` wrapper
+--     supplies it from a registry `requires`-walk, the SAME boundary-marshal
+--     class as P13/P16's facts env — NOT a native, engine stays
+--     `nativeImplsCtx === {}`), AND
+--   * recognises any `$effect:<Class>:<method>`-prefixed fnId via the shipped
+--     `parseEffectFnId` (option (a)'s canonical signal) so an already-effects-
+--     explicit'd body works with an empty set.
+-- An `ECall fnId` is an effect site ⇔ `fnId ∈ effectFnIds` OR `parseEffectFnId
+-- fnId` is `Just`. The caller has full control over which fnIds symbolize; the
+-- canonical sentinel works regardless. Option (b) (a Fenel-callable `requires`
+-- read) is the named follow-up once an introspection read is justified — for
+-- 14a it lives at the TS marshal boundary, not as a new native.
+--
+-- D-B — `if`/`match` PATH-SENSITIVITY is FENCED in 14a (the EVIDENCE-backed
+-- call, not the brief's lean). LIFTED by the FORK DRIVER (partial-evaluator-
+-- substrate Phase 3, `fork-exec.fenel`) for the PATH faces: `satSymbolicPaths`
+-- (branching refutation) + `solveSymbolicPaths` (branching witness) fork the
+-- residual per branch and hand each path to `satCombined`/`solve`. The 14a
+-- entries below stay NON-branching (true statement, keep) — the fork faces are
+-- SIBLINGS. `comprehend` does not recognise `if`, so a
+-- branching predicate falls to the `SeWhere` fence. The brief's lean (i) was a
+-- minimal `if c then p else q` ≡ `or (and c p) (and (not c) q)` rewrite — but
+-- the boolean `and` lowers to `SeIntersect`, and `inhabit`'s intersect fold
+-- is INTERVALS-ONLY (a non-interval branch ⇒ ok=false ⇒ Nothing — the Phase-5
+-- fence). So `and (eq ?k 5) p` ⇒ Nothing: an if→boolean rewrite would add
+-- NON-WITNESSING surface for the headline EQUALITY fragment. The real blocker
+-- is enum-aware intersection (the `and`-over-enums fence), NOT the missing
+-- `if` arm. Fencing `if`/`match` here and deferring the widening (enum-aware
+-- `WsIntersect` first, THEN the `if` rewrite) is the honest, no-regression
+-- call. `match` over `True | False` reduces to the same; richer `match` is a
+-- further fence.
+--
+-- D-C — the composed-entry surface: `symbolizeEffects` + BOTH composed entries
+-- (`solveSymbolic` predicate-Expr + `solveFnSymbolic` lambda) ship here
+-- (mirrors P13/P15/P16 — body + full entry family). The `solveSymbolicAll`
+-- (all satisfying reads) variant is a NAMED follow-on.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- NAMING CONSTRAINT (load-bearing — the Step-0 surprise, pinned by a test): a
+-- synthetic `EVar` name must contain NO `.` — `collectFreeVars` parses a
+-- dotted name as a field-access path (`?a.b` ⇒ free var `?a`), which truncates
+-- the var and breaks the match against the solve variable. The site-derived
+-- name uses `/` path separators and `@` to join fnId@path; `:`/`@`/`$` are all
+-- safe (they appear in real effect fnIds and in `$effect:` sentinels). This is
+-- a general property of `solve`, not Phase-14-specific.
+--
+-- SINGLE-UNKNOWN FENCE (inherited from `solve`): the symbolized predicate must
+-- have EXACTLY ONE free var. A single effect site ⇒ one fresh `EVar` ⇒ solve.
+-- TWO distinct sites ⇒ two distinct names (the deterministic site-path namer,
+-- NO gensym counter) ⇒ 2 free vars ⇒ Nothing (solve's documented v1 fence —
+-- read-to-read dependencies are the deferred `Smt` slot). For `solveFnSymbolic`
+-- a lambda that ALSO references its own param yields 2 free vars (param + read)
+-- ⇒ Nothing; the natural lambda shape is a `\_ -> <effectful predicate>` whose
+-- only unknown is the read.
+--
+-- NO ENTITY DECLS (the cheapest gate class — the P5/P12/P13/P15/P16 rule): the
+-- walker is structural over the registered `Expr` (7 cases); it declares NO
+-- ADTs, so the entity oracle + ordered list stay UNTOUCHED and the law count
+-- moves +0. Only the engine fn roster grows.
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- symbolizeEffects — rewrite every effect-call site in an `Expr` to a fresh
+-- site-named `EVar`. The public entry seeds the structural path "0" and
+-- delegates to the path-threaded `symbolizeAt`.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Symbolize effects"
+@description "Walk an `Expr` and rewrite every effect-call site into a fresh site-named `EVar` — turning an 'IO read' into just-another-unknown the existing solver can witness WITHOUT performing the IO. An `ECall fnId` is an effect site iff `fnId` is in the supplied `effectFnIds` set OR `parseEffectFnId fnId` is Just (the `$effect:` sentinel). The fresh var's name derives deterministically from the effect fnId + the structural path (distinct sites ⇒ distinct names ⇒ no gensym counter); the name is DOT-FREE (`/` path separators, `@` join) since a `.` would be parsed as field access by `collectFreeVars`. Everything else recurses structurally (ECall.args / ELambda.body / EMatch.scrutinee+arms / EConstruct.args / ERecord.fields); ELit/EVar pass through. Pure `Expr -> Expr` — no IO, no native, no new Expr case. The composed `solveSymbolic`/`solveFnSymbolic` feed its output to solve. expr-substrate Phase 14a."
+@tags "engine" "symbolize" "solve" "effect" "expr-substrate" "phase-14a"
+symbolizeEffects : (effectFnIds: List String) -> (expr: Expr) -> Expr
+symbolizeEffects effectFnIds expr = symbolizeAt effectFnIds "0" expr
+
+-- symbolizeAt — the path-threaded recursive walker. `path` is the dot-free
+-- structural path to the current node (mirrors make-effects-explicit's
+-- `<path>.<suffix>` convention but with `/` separators, since the path becomes
+-- part of an `EVar` name and a `.` truncates the var).
+@label "symbolize: symbolizeAt"
+@description "Phase 14a — the path-threaded recursive walker behind symbolizeEffects. At an effect-call site (fnId in effectFnIds OR `$effect:`-marked) emit `EVar (effectSiteName fnId path)`; else recurse structurally (ECall.args / ELambda.body / EMatch.scrutinee+arms / EConstruct.args / ERecord.fields), threading the `/`-separated structural path; ELit/EVar pass through. Mirrors substituteCaptures' structural descent (arm guard dropped, same as the sibling). Internal helper."
+@tags "engine" "internal" "symbolize" "solve" "expr-substrate" "phase-14a"
+@category "engine-internal"
+symbolizeAt : (effectFnIds: List String) -> (path: String) -> (expr: Expr) -> Expr
+symbolizeAt effectFnIds path expr =
+  case expr of
+    EVar { name = n } -> EVar { name = n }
+    ELit { value = v } -> ELit { value = v }
+    ECall { fnId = f, args = args } ->
+      if isEffectFnId effectFnIds f
+      then EVar { name = effectSiteName f path }
+      else ECall { fnId = f, args = symbolizeList effectFnIds path 0 args [] }
+    ELambda { params = ps, body = bd } ->
+      ELambda { params = ps, body = symbolizeAt effectFnIds (concat path "/body") bd }
+    EMatch { scrutinee = scrut, arms = arms } ->
+      EMatch { scrutinee = symbolizeAt effectFnIds (concat path "/scrut") scrut, arms = symbolizeArms effectFnIds path 0 arms [] }
+    EConstruct { ctor = c, args = args, fields = fs } ->
+      EConstruct { ctor = c, args = symbolizeList effectFnIds path 0 args [], fields = fs }
+    EConstruct { ctor = c, args = args } ->
+      EConstruct { ctor = c, args = symbolizeList effectFnIds path 0 args [] }
+    ERecord { fields = fs } ->
+      ERecord { fields = symbolizeFields effectFnIds path fs [] }
+
+-- isEffectFnId — an `ECall` head is an effect site iff it is in the supplied
+-- effect-fnId set OR it is a `$effect:<Class>:<method>` sentinel (the D-A
+-- hybrid recogniser).
+@label "symbolize: isEffectFnId"
+@description "Phase 14a — recognise an effect-call head: true iff `fnId` is in the supplied `effectFnIds` set (option (c), the registry `requires`-walk the TS wrapper supplies) OR `parseEffectFnId fnId` is Just (option (a), the `$effect:` sentinel). The D-A hybrid recogniser. Internal helper."
+@tags "engine" "internal" "symbolize" "effect" "expr-substrate" "phase-14a"
+@category "engine-internal"
+isEffectFnId : (effectFnIds: List String) -> (fnId: String) -> Bool
+isEffectFnId effectFnIds fnId =
+  if elem fnId effectFnIds then true
+  else
+    case parseEffectFnId fnId of
+      Just p -> true
+      Nothing -> false
+
+-- effectSiteName — the DOT-FREE deterministic namer. Name = `?<fnId>@<path>`;
+-- distinct sites (distinct paths) ⇒ distinct names ⇒ no gensym counter. The
+-- `?` prefix is the solve-var convention; `@` joins the fnId and the path; the
+-- path itself uses `/` separators. NO `.` anywhere (it would be parsed as
+-- field access and truncate the var — the Step-0 surprise).
+@label "symbolize: effectSiteName"
+@description "Phase 14a — the dot-free deterministic site namer: `?<fnId>@<path>`. Distinct effect-call sites get distinct structural paths ⇒ distinct names ⇒ no gensym counter is threaded. The name avoids `.` (field-access truncation in collectFreeVars — the load-bearing Step-0 constraint); `?`/`@`/`:`/`$`/`/` are all safe. Internal helper."
+@tags "engine" "internal" "symbolize" "expr-substrate" "phase-14a"
+@category "engine-internal"
+effectSiteName : (fnId: String) -> (path: String) -> String
+effectSiteName fnId path =
+  concat "?" (concat fnId (concat "@" path))
+
+-- symbolizeList — recurse over a list of Expr children with `/`-indexed paths
+-- (`<basePath>/<idx>`); threads the accumulator (the ECall.args / EConstruct.args
+-- walk). Mirrors make-effects-explicit's scanIndexedExprs (dot-free paths).
+@label "symbolize: symbolizeList"
+@description "Phase 14a — recurse symbolizeAt over a list of Expr children with `/`-indexed structural paths (`<basePath>/<idx>`), threading the accumulator. Used for ECall.args and EConstruct.args. Internal helper."
+@tags "engine" "internal" "symbolize" "expr-substrate" "phase-14a"
+@category "engine-internal"
+symbolizeList : (effectFnIds: List String) -> (basePath: String) -> (idx: Number) -> (exprs: List Expr) -> (acc: a) -> a
+symbolizeList effectFnIds basePath idx exprs acc =
+  case head exprs of
+    Nothing -> acc
+    Just h ->
+      let subPath = concat basePath (concat "/" (toString idx))
+      let dH = symbolizeAt effectFnIds subPath h
+      let acc2 = appendItem dH acc
+      case tail exprs of
+        Nothing -> acc2
+        Just rest -> symbolizeList effectFnIds basePath (idx + 1) rest acc2
+
+-- symbolizeArms — recurse over EMatch arms with `/arm/<idx>` paths; only the
+-- arm body is walked (the pattern is structural metadata). Mirrors
+-- substituteCaptures' subCapArms (arm guard dropped, same as the sibling).
+@label "symbolize: symbolizeArms"
+@description "Phase 14a — recurse symbolizeAt over EMatch arm bodies with `/arm/<idx>` structural paths, preserving each arm's pattern (the body is the only sub-expression walked; the arm guard is dropped, mirroring substituteCaptures' subCapArms). Internal helper."
+@tags "engine" "internal" "symbolize" "expr-substrate" "phase-14a"
+@category "engine-internal"
+symbolizeArms : (effectFnIds: List String) -> (basePath: String) -> (idx: Number) -> (arms: a) -> (acc: a) -> a
+symbolizeArms effectFnIds basePath idx arms acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let subPath = concat basePath (concat "/arm/" (toString idx))
+      let dBody = symbolizeAt effectFnIds subPath arm.body
+      let acc2 = appendItem { pattern = arm.pattern, body = dBody } acc
+      case tail arms of
+        Nothing -> acc2
+        Just rest -> symbolizeArms effectFnIds basePath (idx + 1) rest acc2
+
+-- symbolizeFields — recurse over ERecord fields with `/<fieldname>` paths,
+-- preserving each field name. Mirrors substituteCaptures' subCapFields.
+@label "symbolize: symbolizeFields"
+@description "Phase 14a — recurse symbolizeAt over ERecord field values with `/<fieldname>` structural paths, preserving each field name. Internal helper."
+@tags "engine" "internal" "symbolize" "expr-substrate" "phase-14a"
+@category "engine-internal"
+symbolizeFields : (effectFnIds: List String) -> (basePath: String) -> (fields: a) -> (acc: a) -> a
+symbolizeFields effectFnIds basePath fields acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let subPath = concat basePath (concat "/" f.name)
+      let dVal = symbolizeAt effectFnIds subPath f.value
+      let acc2 = appendItem { name = f.name, value = dVal } acc
+      case tail fields of
+        Nothing -> acc2
+        Just rest -> symbolizeFields effectFnIds basePath rest acc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The composed entries (D-C) — siblings of solveRel / queryRel. Thin `.fenel`
+-- over the SHIPPED solve / solveFn (NO new solver surface).
+-- ─────────────────────────────────────────────────────────────────────────
+
+-- solveSymbolic — `solve ∘ symbolizeEffects effectFnIds` over an already-lifted
+-- predicate `Expr`. "For which read of an effect does this predicate hold?" —
+-- without performing the IO. The TS `dispatchedSolveSymbolic` lifts the body +
+-- supplies the effect-fnId set (registry `requires`-walk).
+@label "Solve symbolic"
+@description "Find a witness READ that satisfies an effectful predicate `Expr` WITHOUT performing the IO: `solve (symbolizeEffects effectFnIds expr)`. Rewrites every effect-call site (per the supplied effect-fnId set or the `$effect:` sentinel) to a fresh unknown, then hands the residual single-free-var predicate to the shipped solver. The headline `eq (state:getInstance \"counter\") 42` ⇒ Just 42, no state read. expr-substrate Phase 14a."
+@tags "engine" "symbolize" "solve" "effect" "expr-substrate" "phase-14a"
+solveSymbolic : (effectFnIds: List String) -> (expr: Expr) -> Maybe a
+solveSymbolic effectFnIds expr = solve (symbolizeEffects effectFnIds expr)
+
+-- solveFnSymbolic — the lambda case: reify the marshalled Fn value, substitute
+-- captures, symbolize the effect sites, then solve. reify's Err ⇒ Nothing
+-- (Maybe-typed end-to-end, like solveFn). The natural shape is a
+-- `\_ -> <effectful predicate>` whose only unknown is the read.
+@label "Solve fn symbolic"
+@description "The lambda symbolic-solve composition: reify the marshalled Fn value to its `Expr` body + captures, substitute the captures, symbolizeEffects the effect sites, then solve — finding the effect READ that satisfies the lambda-as-predicate WITHOUT performing the IO. reify's Err (bodyless / native / non-reifiable) ⇒ Nothing. The natural shape is `\\_ -> <effectful predicate>` (the only unknown is the read; a lambda that also references its own param yields 2 free vars ⇒ Nothing, solve's single-unknown fence). expr-substrate Phase 14a."
+@tags "engine" "symbolize" "solve" "reify" "effect" "expr-substrate" "phase-14a"
+solveFnSymbolic : (effectFnIds: List String) -> (input: a) -> (ctorDefs: a) -> (nullValue: a) -> Maybe a
+solveFnSymbolic effectFnIds input ctorDefs nullValue =
+  case reify input ctorDefs nullValue of
+    Err e -> Nothing
+    Ok r -> solve (symbolizeEffects effectFnIds (substituteCaptures r.body r.captures))
+
+-- =========================================================================
+-- partial-evaluator-substrate Phase 2 — SYMBOLIC REACH (brief:
+-- `workstreams/partial-evaluator-substrate/briefs/phase-2-symbolic-reach.md`;
+-- design: `design/partial-evaluation.md` §4-5 + `design/symbolic-execution.md`).
+--
+-- The 14a mint above is PER-SITE (distinct structural paths ⇒ distinct EVar
+-- names ⇒ solve's single-unknown fence bites for a two-read predicate). Phase 2
+-- lands the READ MEMORY MODEL that lets same-KEY reads share ONE unknown, and
+-- the EUF refutation face that hands reads to `eufSat` as application terms —
+-- lifting the two reaches the design §5 fenced (same-key multi-read for solve;
+-- read-to-read refutation via congruence).
+--
+-- THE TWO PRESENTATIONS (Phase-5 principle, made code):
+--   • To WITNESS (solve): mint effect sites into `EVar`s; VALUE-NUMBERING (same
+--     class+method+eufValEq-equal args ⇒ ONE var) widens reach — `symbolizeShared`.
+--   • To REFUTE (EUF): keep effect sites AS `ECall` application terms; congruence
+--     needs the structure. NO mint — `satSymbolic` is the LAWFUL GATE (which
+--     classes/methods/trees may be handed to `eufSat` at all).
+-- Both share one soundness precondition — the MEMORY MODEL v1 (§2): the
+-- value-numbered mint / the refutation gate apply only when every effect site in
+-- the whole tree is a declared READ (method ∈ its class's `reads` roster) of a
+-- `Symbolic`-in-scope class — i.e. NO possible write anywhere. "No write exists"
+-- makes "no INTERVENING write" vacuously true for every read pair (the
+-- conservative-but-sound v1; per-key interference is a §7 widening).
+--
+-- COMPOSED AFTER THE PE (D-A correction, in-brief): these are PURE passes over
+-- the (post-PE) residual `Expr`; the PE residual preserves every effect site as a
+-- residual call, so a post-PE pass sees exactly the site-set an in-walk mint
+-- would. The in-walk form is deferred to the fork-driver phase.
+--
+-- THE SPEC currency is a plain `List { effectClass: String, reads: List String }`
+-- (resolved from the scoped `Symbolic` instances at the TS marshal boundary — the
+-- P13/P16 facts-env class; the explicit-arg CORES here take it as data, per the
+-- 14a core-takes-data / face-resolves-data split). NO entity decls (the
+-- partial-evaluate/euf entity-free precedent — law count +0).
+--
+-- NAMING (the value-numbered var): `?sym:<class>:<method>:<groupIndex>` — dot-free
+-- (the 14a collectFreeVars constraint), and the group index is the ONLY numeric
+-- part stringified (`toString`), NEVER an arg value (the eufValEq grouping makes
+-- arg-value serialization unnecessary + dodges the opaque-Number `toString`
+-- landmine — these entries dispatch under the PLAIN ctx where numbers stringify
+-- normally). Sites failing the gate fall back to the 14a per-site `effectSiteName`.
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Site inventory — collect every effect-call site's { fnId, typeName,
+-- methodName, argTerms, hasClass } (typeName/methodName via parseEffectFnId;
+-- hasClass=false for a non-sentinel fnId matched only via the effectFnIds set).
+-- The traversal MIRRORS symbolizeAt EXACTLY so the memory-model gate sees the
+-- same site-set the mint rewrites (EConstruct fields are NOT walked, like the
+-- mint; ELambda body / EMatch arm-bodies / ECall+EConstruct args / ERecord
+-- values ARE).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "symbolize: siteOf"
+@description "partial-evaluator-substrate Phase 2 — decompose an effect-call site into { fnId, typeName, methodName, argTerms, hasClass }: parseEffectFnId gives (typeName, methodName) with hasClass=true for a `$effect:<Class>:<method>` sentinel; a non-sentinel fnId (matched only via the effectFnIds set) gets typeName/methodName \"\" + hasClass=false (unattributable ⇒ never value-numbered). Internal helper."
+@tags "engine" "internal" "symbolize" "effect" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symSiteOf : (fnId: String) -> (args: a) -> b
+symSiteOf fnId args =
+  case parseEffectFnId fnId of
+    Just p -> { fnId = fnId, typeName = p.typeName, methodName = p.methodName, argTerms = args, hasClass = true }
+    Nothing -> { fnId = fnId, typeName = "", methodName = "", argTerms = args, hasClass = false }
+
+@label "symbolize: collectSites"
+@description "partial-evaluator-substrate Phase 2 — collect every effect-call site in an `Expr` (as symSiteOf records), traversing structurally in EXACT mirror of symbolizeAt (ECall effect ⇒ a site else recurse args; ELambda body; EMatch scrutinee+arm-bodies; EConstruct args; ERecord field-values; EVar/ELit ⇒ none). The memory-model gate's site-set. Internal helper."
+@tags "engine" "internal" "symbolize" "effect" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symCollectSites : (effectFnIds: List String) -> (expr: Expr) -> a
+symCollectSites effectFnIds expr =
+  case expr of
+    EVar {} -> []
+    ELit {} -> []
+    ECall { fnId = f, args = args } ->
+      if isEffectFnId effectFnIds f
+      then appendItem (symSiteOf f args) []
+      else symCollectList effectFnIds args
+    ELambda { body = bd } -> symCollectSites effectFnIds bd
+    EMatch { scrutinee = scrut, arms = arms } ->
+      concat (symCollectSites effectFnIds scrut) (symCollectArms effectFnIds arms)
+    EConstruct { args = args } -> symCollectList effectFnIds args
+    ERecord { fields = fs } -> symCollectFieldVals effectFnIds fs
+
+@label "symbolize: collectList"
+@description "partial-evaluator-substrate Phase 2 — concat symCollectSites over an Expr-child list (ECall/EConstruct args). Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symCollectList : (effectFnIds: List String) -> (exprs: a) -> b
+symCollectList effectFnIds exprs =
+  case head exprs of
+    Nothing -> []
+    Just h ->
+      let hereSites = symCollectSites effectFnIds h
+      case tail exprs of
+        Nothing -> hereSites
+        Just rest -> concat hereSites (symCollectList effectFnIds rest)
+
+@label "symbolize: collectArms"
+@description "partial-evaluator-substrate Phase 2 — concat symCollectSites over EMatch arm BODIES (patterns carry no effect sites the mint touches). Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symCollectArms : (effectFnIds: List String) -> (arms: a) -> b
+symCollectArms effectFnIds arms =
+  case head arms of
+    Nothing -> []
+    Just arm ->
+      let hereSites = symCollectSites effectFnIds arm.body
+      case tail arms of
+        Nothing -> hereSites
+        Just rest -> concat hereSites (symCollectArms effectFnIds rest)
+
+@label "symbolize: collectFieldVals"
+@description "partial-evaluator-substrate Phase 2 — concat symCollectSites over ERecord field VALUES. Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symCollectFieldVals : (effectFnIds: List String) -> (fields: a) -> b
+symCollectFieldVals effectFnIds fields =
+  case head fields of
+    Nothing -> []
+    Just f ->
+      let hereSites = symCollectSites effectFnIds f.value
+      case tail fields of
+        Nothing -> hereSites
+        Just rest -> concat hereSites (symCollectFieldVals effectFnIds rest)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The memory model v1 — the conservative-but-sound gate. A class C is
+-- "mintable" iff it is Symbolic-in-scope AND every C-site in the WHOLE tree is
+-- a declared read (method ∈ reads C); PLUS a global precondition that EVERY
+-- effect site is parseable (an unattributable `$effect`-less site could write
+-- any store ⇒ disable value-numbering entirely). `spec` = List { effectClass,
+-- reads }.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "symbolize: readsOf"
+@description "partial-evaluator-substrate Phase 2 — the `reads` roster for an effect class in the Symbolic spec (List { effectClass, reads }), or [] when the class is not in scope. Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symReadsOf : (spec: a) -> (typeName: String) -> b
+symReadsOf spec typeName =
+  case head spec of
+    Nothing -> []
+    Just e -> if eq e.effectClass typeName then e.reads else symReadsOf (eufRest spec) typeName
+
+@label "symbolize: classInScope"
+@description "partial-evaluator-substrate Phase 2 — true when the effect class has a Symbolic instance in the spec. Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symClassInScope : (spec: a) -> (typeName: String) -> Bool
+symClassInScope spec typeName =
+  case head spec of
+    Nothing -> false
+    Just e -> if eq e.effectClass typeName then true else symClassInScope (eufRest spec) typeName
+
+@label "symbolize: isRead"
+@description "partial-evaluator-substrate Phase 2 — true when methodName is a declared observationally-pure read of typeName under the spec (method ∈ reads typeName; false when the class is not in scope). Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symIsRead : (spec: a) -> (typeName: String) -> (methodName: String) -> Bool
+symIsRead spec typeName methodName = elem methodName (symReadsOf spec typeName)
+
+@label "symbolize: allSitesParseable"
+@description "partial-evaluator-substrate Phase 2 — true when every collected effect site is a parseable `$effect:` sentinel (hasClass). A non-parseable site is unattributable to a class ⇒ a possible write to any store ⇒ the global precondition that DISABLES value-numbering (per-site fallback for all). Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symAllSitesParseable : (sites: a) -> Bool
+symAllSitesParseable sites =
+  case head sites of
+    Nothing -> true
+    Just s -> if s.hasClass then symAllSitesParseable (eufRest sites) else false
+
+@label "symbolize: noWriteForClass"
+@description "partial-evaluator-substrate Phase 2 — true when NO site of the given class is a write, i.e. every site whose typeName matches has method ∈ reads (the per-class no-write half of the memory model). Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symNoWriteForClass : (spec: a) -> (sites: b) -> (typeName: String) -> Bool
+symNoWriteForClass spec sites typeName =
+  case head sites of
+    Nothing -> true
+    Just s ->
+      if eq s.typeName typeName
+      then (if symIsRead spec typeName s.methodName then symNoWriteForClass spec (eufRest sites) typeName else false)
+      else symNoWriteForClass spec (eufRest sites) typeName
+
+@label "symbolize: siteMintable"
+@description "partial-evaluator-substrate Phase 2 — whether a single site may be value-numbered: the global no-unattributable-site precondition (parseable) AND the site is a parseable read of a Symbolic-in-scope class AND that class is write-free over the whole tree. A failing site falls back to the 14a per-site name (always sound). Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symSiteMintable : (spec: a) -> (sites: b) -> (parseable: Bool) -> (site: c) -> Bool
+symSiteMintable spec sites parseable site =
+  if not parseable then false
+  else if not site.hasClass then false
+  else if not (symClassInScope spec site.typeName) then false
+  else if not (symIsRead spec site.typeName site.methodName) then false
+  else symNoWriteForClass spec sites site.typeName
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Value-number groups — dedup mint-eligible sites by (class, method,
+-- eufValEq-equal argTerms), assigning each a sequential group index. Two reads
+-- in the same group share ONE `EVar`.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "symbolize: findGroup"
+@description "partial-evaluator-substrate Phase 2 — the group (Just { typeName, methodName, argTerms, ix }) whose typeName+methodName match and whose argTerms are eufValEq-equal (term identity, NOT JS-loose eq), or Nothing. Internal helper."
+@tags "engine" "internal" "symbolize" "euf" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symFindGroup : (groups: a) -> (typeName: String) -> (methodName: String) -> (argTerms: b) -> Maybe c
+symFindGroup groups typeName methodName argTerms =
+  case head groups of
+    Nothing -> Nothing
+    Just g ->
+      if and (eq g.typeName typeName) (and (eq g.methodName methodName) (eufValEq g.argTerms argTerms))
+      then Just g
+      else symFindGroup (eufRest groups) typeName methodName argTerms
+
+@label "symbolize: buildGroups"
+@description "partial-evaluator-substrate Phase 2 — the value-number group table: scan the sites in order; each mint-eligible site whose (class, method, argTerms) is new gets a fresh sequential index. Same-key reads collapse to one group ⇒ one shared unknown. Internal helper."
+@tags "engine" "internal" "symbolize" "euf" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symBuildGroups : (spec: a) -> (sites: b) -> (parseable: Bool) -> c
+symBuildGroups spec sites parseable = symBuildGroupsAcc spec sites parseable sites []
+
+@label "symbolize: buildGroupsAcc"
+@description "partial-evaluator-substrate Phase 2 — the accumulator loop behind symBuildGroups: for each remaining site, append a new group { typeName, methodName, argTerms, ix = length acc } when it is mint-eligible and not already grouped. Internal helper."
+@tags "engine" "internal" "symbolize" "euf" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symBuildGroupsAcc : (spec: a) -> (allSites: b) -> (parseable: Bool) -> (rem: c) -> (acc: d) -> d
+symBuildGroupsAcc spec allSites parseable rem acc =
+  case head rem of
+    Nothing -> acc
+    Just s ->
+      let acc2 =
+            if symSiteMintable spec allSites parseable s
+            then
+              (case symFindGroup acc s.typeName s.methodName s.argTerms of
+                 Just g -> acc
+                 Nothing -> appendItem { typeName = s.typeName, methodName = s.methodName, argTerms = s.argTerms, ix = length acc } acc)
+            else acc
+      case tail rem of
+        Nothing -> acc2
+        Just more -> symBuildGroupsAcc spec allSites parseable more acc2
+
+@label "symbolize: sharedName"
+@description "partial-evaluator-substrate Phase 2 — the value-numbered var name `?sym:<class>:<method>:<groupIndex>`. Dot-free (the collectFreeVars field-access constraint); the group index is the only stringified number (never an arg value — eufValEq grouping + the opaque-Number toString landmine). Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symSharedName : (typeName: String) -> (methodName: String) -> (ix: Number) -> String
+symSharedName typeName methodName ix =
+  concat "?sym:" (concat typeName (concat ":" (concat methodName (concat ":" (toString ix)))))
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- symbolizeShared — the value-numbered mint. Site-inventory + memory-model gate
+-- + value-number groups precomputed once, then the structural walk (mirroring
+-- symbolizeAt) mints a shared var for a grouped read, else falls back to the
+-- 14a per-site name. The mint-context bundle `mc = { spec, sites, parseable,
+-- groups }` threads the precompute.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Symbolize shared"
+@description "partial-evaluator-substrate Phase 2 — the VALUE-NUMBERED symbolic mint: rewrite effect-call sites to fresh `EVar`s, but same-KEY reads (same class+method+eufValEq-equal args) of a write-free Symbolic-in-scope class SHARE ONE unknown — turning `(read k) == 42 ∧ (read k) > 40` from solve's two-var fence (Nothing) into a single-unknown enum∩interval witness (Just 42). The memory model v1 (whole-tree no-write gate) makes the sharing sound. Sites failing the gate (a write present anywhere / method ∉ reads / class not Symbolic / unattributable site) fall back to the per-site 14a `effectSiteName` (always sound). `spec` = List { effectClass, reads }, resolved from the scoped `Symbolic` instances at the marshal boundary. Pure `Expr -> Expr`; composes AFTER the PE."
+@tags "engine" "symbolize" "solve" "effect" "euf" "partial-evaluator-substrate" "phase-2"
+symbolizeShared : (spec: a) -> (effectFnIds: List String) -> (expr: Expr) -> Expr
+symbolizeShared spec effectFnIds expr =
+  let sites = symCollectSites effectFnIds expr
+  let parseable = symAllSitesParseable sites
+  let groups = symBuildGroups spec sites parseable
+  let mc = { spec = spec, sites = sites, parseable = parseable, groups = groups }
+  symbolizeSharedAt effectFnIds mc "0" expr
+
+@label "symbolize: symbolizeSharedAt"
+@description "partial-evaluator-substrate Phase 2 — the path-threaded value-numbered walker (mirrors symbolizeAt): at an effect site mint via symMintSite (shared var if grouped, else per-site fallback); else recurse structurally threading the `/`-separated path. Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symbolizeSharedAt : (effectFnIds: List String) -> (mc: a) -> (path: String) -> (expr: Expr) -> Expr
+symbolizeSharedAt effectFnIds mc path expr =
+  case expr of
+    EVar { name = n } -> EVar { name = n }
+    ELit { value = v } -> ELit { value = v }
+    ECall { fnId = f, args = args } ->
+      if isEffectFnId effectFnIds f
+      then symMintSite effectFnIds mc f args path
+      else ECall { fnId = f, args = symbolizeSharedList effectFnIds mc path 0 args [] }
+    ELambda { params = ps, body = bd } ->
+      ELambda { params = ps, body = symbolizeSharedAt effectFnIds mc (concat path "/body") bd }
+    EMatch { scrutinee = scrut, arms = arms } ->
+      EMatch { scrutinee = symbolizeSharedAt effectFnIds mc (concat path "/scrut") scrut, arms = symbolizeSharedArms effectFnIds mc path 0 arms [] }
+    EConstruct { ctor = c, args = args, fields = fs } ->
+      EConstruct { ctor = c, args = symbolizeSharedList effectFnIds mc path 0 args [], fields = fs }
+    EConstruct { ctor = c, args = args } ->
+      EConstruct { ctor = c, args = symbolizeSharedList effectFnIds mc path 0 args [] }
+    ERecord { fields = fs } ->
+      ERecord { fields = symbolizeSharedFields effectFnIds mc path fs [] }
+
+@label "symbolize: mintSite"
+@description "partial-evaluator-substrate Phase 2 — mint one effect site: if the site is mint-eligible (memory-model gate) AND its (class, method, argTerms) resolves to a value-number group, emit the shared `EVar (symSharedName …)`; else fall back to the 14a per-site `EVar (effectSiteName fnId path)`. Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symMintSite : (effectFnIds: List String) -> (mc: a) -> (f: String) -> (args: b) -> (path: String) -> Expr
+symMintSite effectFnIds mc f args path =
+  let site = symSiteOf f args
+  if symSiteMintable mc.spec mc.sites mc.parseable site
+  then
+    (case symFindGroup mc.groups site.typeName site.methodName site.argTerms of
+       Just g -> EVar { name = symSharedName site.typeName site.methodName g.ix }
+       Nothing -> EVar { name = effectSiteName f path })
+  else EVar { name = effectSiteName f path }
+
+@label "symbolize: symbolizeSharedList"
+@description "partial-evaluator-substrate Phase 2 — recurse symbolizeSharedAt over an Expr-child list with `/`-indexed paths, threading the mint context + accumulator (ECall/EConstruct args). Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symbolizeSharedList : (effectFnIds: List String) -> (mc: a) -> (basePath: String) -> (idx: Number) -> (exprs: b) -> (acc: c) -> c
+symbolizeSharedList effectFnIds mc basePath idx exprs acc =
+  case head exprs of
+    Nothing -> acc
+    Just h ->
+      let subPath = concat basePath (concat "/" (toString idx))
+      let dH = symbolizeSharedAt effectFnIds mc subPath h
+      let acc2 = appendItem dH acc
+      case tail exprs of
+        Nothing -> acc2
+        Just rest -> symbolizeSharedList effectFnIds mc basePath (idx + 1) rest acc2
+
+@label "symbolize: symbolizeSharedArms"
+@description "partial-evaluator-substrate Phase 2 — recurse symbolizeSharedAt over EMatch arm bodies with `/arm/<idx>` paths, preserving patterns; threads the mint context. Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symbolizeSharedArms : (effectFnIds: List String) -> (mc: a) -> (basePath: String) -> (idx: Number) -> (arms: b) -> (acc: c) -> c
+symbolizeSharedArms effectFnIds mc basePath idx arms acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let subPath = concat basePath (concat "/arm/" (toString idx))
+      let dBody = symbolizeSharedAt effectFnIds mc subPath arm.body
+      let acc2 = appendItem { pattern = arm.pattern, body = dBody } acc
+      case tail arms of
+        Nothing -> acc2
+        Just rest -> symbolizeSharedArms effectFnIds mc basePath (idx + 1) rest acc2
+
+@label "symbolize: symbolizeSharedFields"
+@description "partial-evaluator-substrate Phase 2 — recurse symbolizeSharedAt over ERecord field values with `/<fieldname>` paths, preserving field names; threads the mint context. Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symbolizeSharedFields : (effectFnIds: List String) -> (mc: a) -> (basePath: String) -> (fields: b) -> (acc: c) -> c
+symbolizeSharedFields effectFnIds mc basePath fields acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let subPath = concat basePath (concat "/" f.name)
+      let dVal = symbolizeSharedAt effectFnIds mc subPath f.value
+      let acc2 = appendItem { name = f.name, value = dVal } acc
+      case tail fields of
+        Nothing -> acc2
+        Just rest -> symbolizeSharedFields effectFnIds mc basePath rest acc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The composed WITNESS entry + the detailed { residual, mintTable } face.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Solve symbolic shared"
+@description "partial-evaluator-substrate Phase 2 — `solve (symbolizeShared spec effectFnIds expr)`: the value-numbered symbolic solve. The memory model collapses same-key reads to ONE unknown, so `(read k) == 42 ∧ (read k) > 40` witnesses `Just 42` (enum∩interval over the shared var) where the per-site 14a mint returns Nothing (two vars). `spec` = List { effectClass, reads }."
+@tags "engine" "symbolize" "solve" "effect" "partial-evaluator-substrate" "phase-2"
+solveSymbolicShared : (spec: a) -> (effectFnIds: List String) -> (expr: Expr) -> Maybe b
+solveSymbolicShared spec effectFnIds expr = solve (symbolizeShared spec effectFnIds expr)
+
+@label "symbolize: mintTable"
+@description "partial-evaluator-substrate Phase 2 — project the value-number groups to a mint table `List { varName, typeName, methodName, argTerms }` (varName ⇒ the read it stands for; `var` is a reserved keyword) — the future fork-driver + Nelson-Oppen currency (plain records, no entity). Internal helper."
+@tags "engine" "internal" "symbolize" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symMintTable : (groups: a) -> b
+symMintTable groups =
+  case head groups of
+    Nothing -> []
+    Just g ->
+      let row = { varName = symSharedName g.typeName g.methodName g.ix, typeName = g.typeName, methodName = g.methodName, argTerms = g.argTerms }
+      case tail groups of
+        Nothing -> appendItem row []
+        Just rest -> concat (appendItem row []) (symMintTable rest)
+
+@label "Symbolize shared detailed"
+@description "partial-evaluator-substrate Phase 2 — the detailed value-numbered mint over an (already-PE'd, lifted) residual `Expr`: returns `{ residual, mintTable }` where mintTable maps each shared var to its { typeName, methodName, argTerms }. The `peSymbolic` composition (PE via the existing seam → this) yields the fork-driver / Nelson-Oppen input currency without a new PE surface."
+@tags "engine" "symbolize" "solve" "effect" "partial-evaluator-substrate" "phase-2"
+symbolizeSharedDetailed : (spec: a) -> (effectFnIds: List String) -> (expr: Expr) -> b
+symbolizeSharedDetailed spec effectFnIds expr =
+  let sites = symCollectSites effectFnIds expr
+  let parseable = symAllSitesParseable sites
+  let groups = symBuildGroups spec sites parseable
+  let mc = { spec = spec, sites = sites, parseable = parseable, groups = groups }
+  let residual = symbolizeSharedAt effectFnIds mc "0" expr
+  { residual = residual, mintTable = symMintTable groups }
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- satSymbolic — the REFUTATION face (Deliverable C), WIDENED at decide-substrate
+-- Phase 6 from EUF-only to the Nelson-Oppen combined theory (`satCombined`).
+-- Reads handed to the theory AS application terms (congruence needs the
+-- structure — NO mint), plus their order atoms (lte/lt/gte/gt) so order
+-- constraints over reads refute too. The LAWFUL GATE is unchanged: every effect
+-- site in the predicate must be a declared READ of a Symbolic-in-scope class
+-- (⇒ no writes, no unknown classes) — the Phase-5 soundness contract
+-- ("congruence over effectful call sites is the CALLER's modeling
+-- responsibility") made data. Any violation ⇒ Nothing (honest). The ambient
+-- `noDecideWhere` decider arm STILL fences all `$effect:` heads defensively (no
+-- memory model) ⇒ decideEmpty stays Nothing on the same SeWhere; THIS is the
+-- caller that lifts that fence lawfully.
+--
+-- VERDICT: `Just false` (unsat — a genuine refutation over EVERY store) / else
+-- `Nothing` (combined-sat does NOT certify satisfiability of the full mixed
+-- predicate — dropped conjuncts + finite domains; the Phase-5 honesty verbatim).
+-- Never `Just true`.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "symbolize: allSitesScopedReads"
+@description "partial-evaluator-substrate Phase 2 — the lawful-gate predicate: true iff EVERY collected effect site is a parseable declared read (hasClass ∧ class ∈ spec ∧ method ∈ reads class) — i.e. no writes, no unknown/unattributable classes anywhere. Internal helper."
+@tags "engine" "internal" "symbolize" "euf" "partial-evaluator-substrate" "phase-2"
+@category "engine-internal"
+symAllSitesScopedReads : (spec: a) -> (sites: b) -> Bool
+symAllSitesScopedReads spec sites =
+  case head sites of
+    Nothing -> true
+    Just s ->
+      if and s.hasClass (and (symClassInScope spec s.typeName) (symIsRead spec s.typeName s.methodName))
+      then symAllSitesScopedReads spec (eufRest sites)
+      else false
+
+@label "Sat symbolic"
+@description "partial-evaluator-substrate Phase 2 (WIDENED decide-substrate Phase 6) — the Nelson-Oppen refutation face over an effectful predicate `Expr`: the LAWFUL GATE (every effect site is a declared read of a Symbolic-in-scope class — no writes, no unknown classes; any violation ⇒ Nothing) then hand the and-spine's MIXED atoms (noWhereAtoms — eq/neq PLUS lte/lt/gte/gt) to `satCombined` with the read sites INTACT as `ECall` application terms (congruence needs the structure). `read(a)==1 ∧ read(b)==2 ∧ a==b` ⇒ Just false (EUF-unsat over the reads-as-applications, zero IO); `read(k)==1 ∧ read(k)==2` ⇒ Just false; `read(a) ≤ read(b) ∧ read(b) ≤ read(a) ∧ f(read a) ≠ f(read b)` ⇒ Just false (the order theory derives read a = read b, EUF refutes); a `write` site anywhere ⇒ Nothing; a class not declared Symbolic ⇒ Nothing. Just false = refuted over EVERY store; else Nothing (never Just true — dropped conjuncts + finite domains). The ambient decideEmpty still fences the same SeWhere to Nothing (the decider has no memory model); this face is its lawful caller. `spec` = List { effectClass, reads }."
+@tags "engine" "symbolize" "euf" "solve" "prover" "partial-evaluator-substrate" "phase-2"
+satSymbolic : (spec: a) -> (effectFnIds: List String) -> (pred: Expr) -> Maybe Bool
+satSymbolic spec effectFnIds pred =
+  let sites = symCollectSites effectFnIds pred
+  if not (symAllSitesScopedReads spec sites) then Nothing
+  else
+    let atoms = noWhereAtoms pred
+    case satCombined atoms.eqs atoms.neqs atoms.ltes atoms.lts of
+      Just false -> Just false
+      _ -> Nothing

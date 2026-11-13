@@ -1,0 +1,644 @@
+module engine where
+
+-- =========================================================================
+-- The Fenel LEXER in Fenel — `Pattern Char` token grammar + maximal-munch
+-- driver + the char-level token assembly. parser-substrate Phase 2 (brief:
+-- `workstreams/parser-substrate/briefs/phase-2-lexer-layout.md`).
+--
+-- This is the Fenel-bodied port of `fenel-parser.ts`'s `tokenize` (the TS
+-- tokenizer at `fenel-parser.ts:70`). The TS `tokenize` is the FROZEN PARITY
+-- ORACLE the differential (`fenel-lexer.test.ts`) diffs against — it is never
+-- called by production code, never extended, and is deleted at Phase 7 (the
+-- 21.6.2 precedent). Tokens mirror the TS `Token` shape BYTE-FOR-BYTE:
+--   { t = <TT string>, v = <string>, ln = <Number>, col = <Number> }
+-- plain records (decision 3 — no registered ADT, no `$`-keys; the Ws-marker /
+-- facts-env precedent). Chars are 1-char Strings; char classes decide via
+-- `eq`-scan (`elem` / `wsMember` WsEnum), NO intervals (the P15 lt/gt-numeric-
+-- only finding ⇒ decision 2). Token text = `slice` of the source string
+-- (decision 5); `num` rides RAW text, `str`/templates ride DECODED text.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE PARITY CONTRACT — recon of `tokenize` (`fenel-parser.ts:70–299`), the
+-- spec this file mirrors. Any divergence below is the bug.
+--
+-- TT VOCABULARY (`fenel-parser.ts:34–44`):
+--   num str str_begin str_mid str_end ident bool
+--   let if then else case of do end where in   (keywords; via the KW set)
+--   infixl infixr infix                         (fixity keywords)
+--   + - * / %  == != < <= > >= =                (arith/compare/assign)
+--   -> <- |> :: .. \ . : | & $                  (structural)
+--   ( ) { } [ ] , ; ` @                          (punctuation)
+--   op                                           (any other op-char run)
+--   nl eof                                       (newline / end)
+--
+-- PER-CLASS `v` SEMANTICS (decoded vs raw):
+--   num   — RAW source text (incl. radix 0x/0o/0b + fractional + exponent;
+--           `fenel-parser.ts:179–223`). NO numeric decode.
+--   str   — DECODED (escapes `\n \t \\ \"` resolved; `:104`). Double-quote
+--           strings do NOT increment `ln` on an embedded newline (`:99–107`).
+--   str_begin/str_mid/str_end — DECODED segment text around `${}` holes; the
+--           hole is RE-TOKENIZED and its tokens spliced FLAT into the stream
+--           (`:157,166–168,175`), each carrying the backtick's ln/col.
+--   ident — the source ident (dotted-ident JOINED when `.IDENT` has no
+--           surrounding whitespace, `:229–238`). For a no-locale parse `v` =
+--           the source text verbatim (locale word-op projection is Phase 5's
+--           seam — decision 7; this port is the en/no-locale path).
+--   bool  — the literal `"true"`/`"false"` (`:239`).
+--   keyword (let/if/…) — `v` = the keyword text (`:250`).
+--   operators — `v` = the operator text (`:263,267,270–290`).
+--   nl    — `v` = "\n" (`:95`). eof — `v` = "" (`:297`).
+--
+-- WHITESPACE / COMMENTS: space/tab/`\r` SKIPPED (no token, `:90`); `--` line
+--   comments SKIPPED to end-of-line (`:91–94`). Newline `\n` ⇒ a `nl` TOKEN
+--   (`:95`) — the layout pass (layout.fenel) consumes these.
+--
+-- BACKTICK DUAL-ROLE (`:118–176`): when the PREVIOUS token closes an
+--   expression (ident/num/str/str_end/`)`/`]`/`}`/bool) AND a single
+--   whitespace-wrapped ident is bracketed by a closing backtick, emit THREE
+--   tokens `` ` `` ident `` ` `` (Haskell `` x `add` y ``, `:138–140`).
+--   Otherwise the backtick opens a TEMPLATE string (the `${}` route).
+--
+-- OPERATOR PRIORITY (`:261–291`, NOT pure maximal-munch — a hand priority):
+--   2-char reserved-multi (`== != <= >= -> <- |> :: ..`) FIRST; then the
+--   punctuation singletons `( ) { } [ ] , ; \ @`; then `=` (unless `==`), `:`
+--   (unless `::`), `.` (always); then the longest op-char run → a named
+--   singleton (`+ - * / % < > | & $`) or `op`. This port replicates that
+--   priority in `lexOperator`; the longest-op-char RUN itself goes through
+--   the maximal-munch driver `lexMaximal` (the `runSteps` sibling, decision 4
+--   — `Pattern Char` over `PRep (PMatch opChars) 1 ∞`).
+--
+-- KNOWN corpus-ABSENT divergence: an op-char run of >2 chars whose prefix is
+--   a reserved-2 (`===`, `...`, `!==`, …) — TS would split (`==`+`=`); this
+--   port's run+reclassify yields one `op`. None occur in the 250-file corpus
+--   (the `--` comment guard handles the one realistic case, `-->`). The
+--   differential is the judge.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- MAXIMAL MUNCH (decision 4): `lexMaximal` steps chars through a token
+-- grammar tracking the LAST position where the root was nullable (+ that
+-- position's `parseNullG` value = the winning class), on dead (`PEmpty`) or
+-- EOF emitting the best. A `runSteps` SIBLING (those P1 fns stay byte-
+-- untouched). Line/col are DRIVER-threaded (this file), never the algebra's.
+-- Used here for the operator run; the lookahead-sensitive classes (number's
+-- dot-not-dot/radix/exponent, dotted-ident, string/template escape state) are
+-- faithful driver char-loops over the same WsEnum char tables — still
+-- `Pattern Char` (membership via `elem`), just imperative rather than
+-- derivative-stepped, because they need lookahead the strict derivative lacks.
+--
+-- NO new entities (decision 3 — tokens are plain records). NO laws.
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- Char access + char-class predicates (1-char Strings, eq-scan classes).
+-- -------------------------------------------------------------------------
+
+@label "Char at"
+@description "The 1-char String at index `i` of the source string `cs`, or \"\" when out of range (so downstream eq-compares are total). Implemented via `slice` (a 1-char substring) — `at` over an exploded char list returns the raw element, not a `Maybe`, and slice is O(1) + total at the boundary. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+charAt : (cs: a) -> (i: a) -> String
+charAt cs i = slice cs i (add i 1)
+
+@label "Is astral char"
+@description "True when a single code-point char `c` is an astral (supplementary-plane) char — i.e. it occupies 2 UTF-16 code units, not 1. Decided WITHOUT a code-access native via the observation that `slice c 0 1` of an astral char is a lone high surrogate (one code unit) ≠ `c`, whereas a BMP char's `slice c 0 1` equals `c`. Internal lexer helper — feeds `unitLen`. parser-substrate Phase 7k."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-7k"
+@category "engine-internal"
+isAstral : (c: String) -> Boolean
+isAstral c = not (eq (slice c 0 1) c)
+
+@label "Source code-unit length"
+@description "The UTF-16 code-UNIT length of a source string — the lexer's end bound. NOT `length` (which counts code POINTS via the `List Char` pure view): the driver indexes via code-unit `charAt`/`slice` (JS `String.slice`), so its `n` bound must be code-unit too, or the loop stops `(codeUnits − codePoints)` units early on files containing astral chars (the Phase-7k truncation bug). Code-unit length = code-POINT length (`length`) + the astral-char COUNT, since each astral char contributes exactly one code unit beyond its single code point. Uses only native `length`/`filter` (SHALLOW TS loops) — NO per-char Fenel recursion (a tail-recursive Fenel fold would overflow the interpreted stack on large files, the depth-test fence; `sum` is not in the compiled-parser native contract). For BMP-only sources the astral count is 0 ⇒ identical to `length`; only astral files differ (aligning the Fenel lexer to the code-unit TS oracle). parser-substrate Phase 7k."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-7k"
+@category "engine-internal"
+unitLen : (src: String) -> Number
+unitLen src = add (length src) (length (filter (\c -> isAstral c) (chars src)))
+
+@label "Is whitespace char"
+@description "True for the lexer's inline-whitespace chars (space, tab, carriage-return) — all SKIPPED with no token (`fenel-parser.ts:90`). CR uses the codepoint bridge so lexer bootstrap does not depend on its own escape decoding. Newline is handled separately (it emits a `nl`). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+isWsChar : (c: String) -> Boolean
+isWsChar c = or (eq c " ") (or (eq c "\t") (eq c (charFromCode 13)))
+
+@label "Is digit char"
+@description "True for ASCII decimal digits 0–9. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+isDigit : (c: String) -> Boolean
+isDigit c = elem c (chars "0123456789")
+
+@label "Is hex digit char"
+@description "True for hex digits (0–9 a–f A–F) — the `0x` radix run. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+isHexDigit : (c: String) -> Boolean
+isHexDigit c = elem c (chars "0123456789abcdefABCDEF")
+
+@label "Is octal digit char"
+@description "True for octal digits (0–7) — the `0o` radix run. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+isOctDigit : (c: String) -> Boolean
+isOctDigit c = elem c (chars "01234567")
+
+@label "Is binary digit char"
+@description "True for binary digits (0–1) — the `0b` radix run. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+isBinDigit : (c: String) -> Boolean
+isBinDigit c = elem c (chars "01")
+
+@label "Is ident-start char"
+@description "True for chars that may BEGIN an identifier (a–z A–Z _). Mirrors the TS `[\\p{L}_]` start class restricted to the ASCII the corpus uses. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+isIdentStart : (c: String) -> Boolean
+isIdentStart c = elem c (chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
+
+@label "Is ident-continue char"
+@description "True for chars that may CONTINUE an identifier (a–z A–Z 0–9 _). Mirrors the TS `[\\p{L}\\p{N}_]` continue class. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+isIdentCont : (c: String) -> Boolean
+isIdentCont c = elem c (chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
+@label "Is operator char"
+@description "True for the operator-symbol char set (`OP_CHAR` in parser-keywords.ts: `!#$%&*+./<=>?@\\^|-~:` + the Unicode set-theory operators ∈∪∩¬∅∞). The longest run of these forms a generic `op` token unless it's a reserved-multi / named-singleton. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+isOpChar : (c: String) -> Boolean
+isOpChar c = elem c (chars "!#$%&*+./<=>?@\\^|-~:∈∪∩¬∅∞")
+
+
+-- -------------------------------------------------------------------------
+-- takeRun + skip helpers (char-class runs; lookahead-friendly driver loops).
+-- -------------------------------------------------------------------------
+
+@label "Take run"
+@description "Count of consecutive chars from index `i` (bounded by `n`) satisfying predicate `pred` — the greedy char-class run length. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+takeRun : (cs: a) -> (i: a) -> (n: a) -> (pred: a) -> a
+takeRun cs i n pred =
+  if gte i n then 0
+  else if pred (charAt cs i) then add 1 (takeRun cs (add i 1) n pred)
+  else 0
+
+@label "Skip to newline"
+@description "Index of the first `\\n` at or after `i` (or `n` at EOF) — the body of a `--` line comment. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+skipToNl : (cs: a) -> (i: a) -> (n: a) -> a
+skipToNl cs i n =
+  if gte i n then i
+  else if eq (charAt cs i) "\n" then i
+  else skipToNl cs (add i 1) n
+
+@label "Skip spaces"
+@description "Index after skipping inline spaces/tabs from `i` (the backtick-infix whitespace tolerance `` ` add ` ``). Does NOT skip newlines. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+skipSpaces : (cs: a) -> (i: a) -> (n: a) -> a
+skipSpaces cs i n =
+  if and (lt i n) (or (eq (charAt cs i) " ") (eq (charAt cs i) "\t"))
+  then skipSpaces cs (add i 1) n
+  else i
+
+
+-- =========================================================================
+-- The maximal-munch driver — a `runSteps` SIBLING (decision 4).
+-- =========================================================================
+
+@label "Lex maximal"
+@description "Maximal-munch over a ref-free token pattern `root` (a `Pat`): step the chars of `cs` from `pos` (bounded by `n`) through the strict whole-grammar derivative, tracking the LAST position where the root was nullable (+ its `parseNullG` value = the winning class); on a dead (`PEmpty`) residual or EOF, return `{ len, val }` for the best match (len `-1` / val `Nothing` if none). A SIBLING of `runSteps`/`recognizeG`/`parseG` (those stay byte-untouched); the env starts empty (`[]`) — token patterns are ref-free so the fixpoints degenerate to plain recursion (decision 6, the hot path stays cheap). parser-substrate Phase 2."
+@tags "engine" "parser" "lexer" "pattern-algebra" "parser-substrate" "phase-2"
+lexMaximal : (root: (Pat Any)) -> (cs: a) -> (pos: a) -> (n: a) -> a
+lexMaximal root cs pos n = lexMaxLoop [] root cs pos n 0 (negate 1) Nothing 1
+
+@label "Lex maximal loop"
+@description "The maximal-munch step loop: at each step record the best (longest, ≥1-char) nullable position + its parseNull value, advance one char through `stepGrammar`, stop on `PEmpty` (dead) or EOF. Internal helper for `lexMaximal`."
+@tags "engine" "internal" "parser" "lexer" "pattern-algebra" "parser-substrate" "phase-2"
+@category "engine-internal"
+lexMaxLoop : (g: a) -> (root: (Pat Any)) -> (cs: a) -> (pos: a) -> (n: a) -> (consumed: a) -> (bestLen: a) -> (bestVal: a) -> (k: a) -> a
+lexMaxLoop g root cs pos n consumed bestLen bestVal k =
+  let nullableNow = and (gte consumed 1) (nullableG g root)
+  let bestLen2 = if nullableNow then consumed else bestLen
+  let bestVal2 = if nullableNow then parseNullG g root else bestVal
+  case root of
+    PEmpty -> { len = bestLen2, val = bestVal2 }
+    other ->
+      if gte pos n then { len = bestLen2, val = bestVal2 }
+      else
+        let c = charAt cs pos
+        let stepped = stepGrammar g root c k
+        lexMaxLoop stepped.g stepped.root cs (add pos 1) n (add consumed 1) bestLen2 bestVal2 (add k 1)
+
+
+-- =========================================================================
+-- Token decoders (per-class `v` semantics).
+-- =========================================================================
+
+@label "Decode string escape"
+@description "Resolve a double-quote string escape char to its value: n⇒newline, r⇒carriage-return, t⇒tab, \\⇒backslash, \"⇒quote, else the char verbatim. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+decodeEsc : (e: String) -> String
+decodeEsc e =
+  if eq e "n" then "\n"
+  else if eq e "r" then charFromCode 13
+  else if eq e "t" then "\t"
+  else if eq e "\\" then "\\"
+  else if eq e "\"" then "\""
+  else e
+
+@label "Decode template escape"
+@description "Resolve a backtick-template escape char: n⇒newline, r⇒carriage-return, t⇒tab, \\⇒backslash, `⇒backtick, $⇒dollar, else the char verbatim. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+decodeEscTmpl : (e: String) -> String
+decodeEscTmpl e =
+  if eq e "n" then "\n"
+  else if eq e "r" then charFromCode 13
+  else if eq e "t" then "\t"
+  else if eq e "\\" then "\\"
+  else if eq e "`" then "`"
+  else if eq e "$" then "$"
+  else e
+
+@label "Classify ident token type"
+@description "The TT for an identifier run's text: `bool` for true/false (`fenel-parser.ts:239`), the keyword text itself for a KW-set member (let/if/then/else/case/of/do/end/where/in/infixl/infixr/infix, `:250`), else `ident` (`:251`). No-locale path (decision 7 — locale word-op projection is Phase 5). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+classifyTT : (text: String) -> String
+classifyTT text =
+  if or (eq text "true") (eq text "false") then "bool"
+  else if elem text ["let", "if", "then", "else", "case", "of", "do", "end", "where", "in", "infixl", "infixr", "infix"] then text
+  else "ident"
+
+@label "Operator singleton token type"
+@description "The TT for a generic op-char run's text: a reserved-multi (`== != <= >= -> <- |> :: ..`) or named singleton (`+ - * / % < > | & $ = : .`) keeps its own TT; anything else is `op` (`fenel-parser.ts:262–290`). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+opTT : (text: String) -> String
+opTT text =
+  if elem text ["==", "!=", "<=", ">=", "->", "<-", "|>", "::", ".."] then text
+  else if elem text ["+", "-", "*", "/", "%", "<", ">", "|", "&", "$", "=", ":", "."] then text
+  else "op"
+
+
+-- =========================================================================
+-- Sub-lexers — each returns `{ i, ln, col, out }` (out = the token
+-- accumulator, built in FORWARD source order: `appendItem tok out` appends to
+-- the END). col is the CURRENT column; tokens carry the col at their start. ln
+-- increments only where the source dictates (newlines).
+--
+-- parser-substrate Phase 4i — every token ALSO carries `off` = the absolute
+-- START char index (`i`) of the token in the source string. ADDITIVE: every
+-- differential drops it (`fenel-lexer.test`'s `norm`/`lay` keep only
+-- {t,v,ln,col}; the expr/decl grammars `encodeTok` to `class\0value`). `off`
+-- exists for ONE consumer — `spliceSetBodies` (the SetExpr refinement slice
+-- recovery), which reads `tok.off + tok.v.length` to cut the verbatim source
+-- span (the TS `parseSetForm` arithmetic). Backtick-infix / template tokens
+-- carry a best-effort `off` (the opening backtick index) — never read by the
+-- splice (set-form bodies hold no backticks/templates).
+-- =========================================================================
+
+@label "Lex string literal"
+@description "Lex a double-quoted string from the opening quote at `i`: scan to the closing quote resolving `\\`-escapes into the DECODED `v`, emit a `str` token (`fenel-parser.ts:98–110`). `ln` is NOT incremented on an embedded newline (the TS string branch doesn't). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+lexString : (src: String) -> (cs: a) -> (n: a) -> (i: a) -> (ln: a) -> (col: a) -> (out: a) -> a
+lexString src cs n i ln col out =
+  let r = scanStr cs (add i 1) n ""
+  let consumed = sub r.endI i
+  { i = r.endI, ln = ln, col = add col consumed, out = appendItem { t = "str", v = r.v, ln = ln, col = col, off = i } out }
+
+@label "Scan string body"
+@description "Scan a double-quote string body from `i`, accumulating the DECODED value `acc`; returns `{ endI, v }` where endI is one past the closing quote (or one past EOF — the TS over-advance). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+scanStr : (cs: a) -> (i: a) -> (n: a) -> (acc: String) -> a
+scanStr cs i n acc =
+  if gte i n then { endI = add i 1, v = acc }
+  else
+    let c = charAt cs i
+    if eq c "\"" then { endI = add i 1, v = acc }
+    else if eq c "\\" then scanStr cs (add i 2) n (concat acc (decodeEsc (charAt cs (add i 1))))
+    else scanStr cs (add i 1) n (concat acc c)
+
+@label "Scan identity text"
+@description "Scan the quoted payload of an identity literal, retaining exact text and rejecting incomplete strings and unknown escapes."
+scanIdentityText : String -> Number -> Number -> String -> { endI: Number, v: String, ok: Boolean }
+scanIdentityText src i n acc =
+  if gte i n then { endI = n, v = acc, ok = false }
+  else
+    let c = charAt src i
+    if eq c "\"" then { endI = add i 1, v = acc, ok = true }
+    else if eq c "\\" then
+      let e = charAt src (add i 1)
+      if elem e ["n", "r", "t", "\\", "\""]
+      then scanIdentityText src (add i 2) n (concat acc (decodeEsc e))
+      else { endI = n, v = acc, ok = false }
+    else if or (eq c "\n") (eq c (charFromCode 13)) then { endI = n, v = acc, ok = false }
+    else scanIdentityText src (add i 1) n (concat acc c)
+
+@label "Lex identity literal"
+@description "Lex an actual UUID identity token. Quoted UUID input remains compatible; names and internal wire handles are not identity source."
+lexIdentity : String -> Number -> Number -> Number -> Number -> List Any -> { i: Number, ln: Number, col: Number, out: List Any }
+lexIdentity src n i ln col out =
+  let start = add i 2
+  let quoted = eq (charAt src start) "\""
+  let scanned = if quoted then scanIdentityText src (add start 1) n "" else
+    let size = takeRun src start n (\c -> not (eq c "}"))
+    { endI = add start size, v = slice src start (add start size), ok = true }
+  let closed = and scanned.ok (eq (charAt src scanned.endI) "}")
+  let valid = and closed (isUuid scanned.v)
+  let endI = if closed then add scanned.endI 1 else n
+  let token = { t = if valid then "identity" else "error", v = scanned.v, ln = ln, col = col, off = i }
+  { i = endI, ln = ln, col = add col (sub endI i), out = appendItem token out }
+
+@label "Lex number literal"
+@description "Lex a numeric literal from `i` (radix 0x/0o/0b, decimal with optional fractional `.`-not-`..` part and scientific exponent), emitting a `num` token whose `v` is the RAW source slice (`fenel-parser.ts:179–223`). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+lexNumber : (src: String) -> (cs: a) -> (n: a) -> (i: a) -> (ln: a) -> (col: a) -> (out: a) -> a
+lexNumber src cs n i ln col out =
+  let len = numLen cs i n
+  let text = slice src i (add i len)
+  { i = add i len, ln = ln, col = add col len, out = appendItem { t = "num", v = text, ln = ln, col = col, off = i } out }
+
+@label "Number literal length"
+@description "The length of the numeric literal starting at `i`: radix (`0x`/`0o`/`0b` + digit run) or decimal (integer + optional `.`-not-`..` fractional + optional `e`/`E` exponent). Mirrors `fenel-parser.ts:179–223`. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+numLen : (cs: a) -> (i: a) -> (n: a) -> a
+numLen cs i n =
+  let c0 = charAt cs i
+  let c1 = charAt cs (add i 1)
+  if and (eq c0 "0") (or (eq c1 "x") (eq c1 "X")) then add 2 (takeRun cs (add i 2) n (\c -> isHexDigit c))
+  else if and (eq c0 "0") (or (eq c1 "o") (eq c1 "O")) then add 2 (takeRun cs (add i 2) n (\c -> isOctDigit c))
+  else if and (eq c0 "0") (or (eq c1 "b") (eq c1 "B")) then add 2 (takeRun cs (add i 2) n (\c -> isBinDigit c))
+  else decNumLen cs i n
+
+@label "Decimal number length"
+@description "The length of a decimal numeric literal: integer digits + an optional fractional part (`.` only when the next char is NOT another `.`, so `1..5` keeps the `..` range operator) + an optional scientific exponent. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+decNumLen : (cs: a) -> (i: a) -> (n: a) -> a
+decNumLen cs i n =
+  let intRun = takeRun cs i n (\c -> isDigit c)
+  let j1 = add i intRun
+  let fracLen =
+    if and (eq (charAt cs j1) ".") (not (eq (charAt cs (add j1 1)) "."))
+    then add 1 (takeRun cs (add j1 1) n (\c -> isDigit c))
+    else 0
+  let j2 = add j1 fracLen
+  let expLen = if elem (charAt cs j2) (chars "eE") then expRun cs (add j2 1) n else 0
+  add (add intRun fracLen) expLen
+
+@label "Exponent run length"
+@description "The length of a scientific-notation exponent suffix counting the `e`/`E` (1) + optional sign (`+`/`-`) + digit run (`fenel-parser.ts:215–221`). `i` points just past the `e`/`E`. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+expRun : (cs: a) -> (i: a) -> (n: a) -> a
+expRun cs i n =
+  let signLen = if elem (charAt cs i) (chars "+-") then 1 else 0
+  add (add 1 signLen) (takeRun cs (add i signLen) n (\c -> isDigit c))
+
+@label "Lex identifier"
+@description "Lex an identifier run from `i` (greedy ident-continue chars + whitespace-free dotted `.IDENT` joins, `fenel-parser.ts:229–238`), reclassify via `classifyTT` (bool / keyword / ident) and emit the token (the raw text as `v`). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+lexIdent : (src: String) -> (cs: a) -> (n: a) -> (i: a) -> (ln: a) -> (col: a) -> (out: a) -> a
+lexIdent src cs n i ln col out =
+  let run1 = takeRun cs i n (\c -> isIdentCont c)
+  let joinLen = identJoin cs (add i run1) n
+  let len = add run1 joinLen
+  let text = slice src i (add i len)
+  { i = add i len, ln = ln, col = add col len, out = appendItem { t = classifyTT text, v = text, ln = ln, col = col, off = i } out }
+
+@label "Dotted-ident join length"
+@description "Extra length contributed by whitespace-free `.IDENT` dotted-ident joins from `j` (the `a.b.c` greedy join — a `.` followed by an ident-start char, repeated). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+identJoin : (cs: a) -> (j: a) -> (n: a) -> a
+identJoin cs j n =
+  if and (eq (charAt cs j) ".") (isIdentStart (charAt cs (add j 1)))
+  then
+    let r = takeRun cs (add j 1) n (\c -> isIdentCont c)
+    let consumed = add 1 r
+    add consumed (identJoin cs (add j consumed) n)
+  else 0
+
+@label "Lex operator"
+@description "Lex an operator/punctuation token at `i`, replicating the TS hand priority (`fenel-parser.ts:261–294`): 2-char reserved-multi first, then punctuation singletons, then `=`/`:` (non-doubled) and `.`, then the longest op-char run (via the maximal-munch driver `lexMaximal`) named by `opTT`. An unexpected char emits an `error` token (TS throws; the differential never feeds lex errors — the corpus is valid). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+lexOperator : (src: String) -> (cs: a) -> (n: a) -> (i: a) -> (ln: a) -> (col: a) -> (out: a) -> a
+lexOperator src cs n i ln col out =
+  let c = charAt cs i
+  let two = if lt (add i 1) n then slice src i (add i 2) else ""
+  if elem two ["==", "!=", "<=", ">=", "->", "<-", "|>", "::", ".."]
+  then { i = add i 2, ln = ln, col = add col 2, out = appendItem { t = two, v = two, ln = ln, col = col, off = i } out }
+  else if elem c ["(", ")", "{", "}", "[", "]", ",", ";", "\\", "@"]
+  then { i = add i 1, ln = ln, col = add col 1, out = appendItem { t = c, v = c, ln = ln, col = col, off = i } out }
+  else if and (eq c "=") (not (eq (charAt cs (add i 1)) "="))
+  then { i = add i 1, ln = ln, col = add col 1, out = appendItem { t = "=", v = "=", ln = ln, col = col, off = i } out }
+  else if and (eq c ":") (not (eq (charAt cs (add i 1)) ":"))
+  then { i = add i 1, ln = ln, col = add col 1, out = appendItem { t = ":", v = ":", ln = ln, col = col, off = i } out }
+  else if eq c "."
+  then { i = add i 1, ln = ln, col = add col 1, out = appendItem { t = ".", v = ".", ln = ln, col = col, off = i } out }
+  else if isOpChar c
+  then
+    let res = lexMaximal (PRep (PMatch { tag = "WsEnum", values = chars "!#$%&*+./<=>?@\\^|-~:∈∪∩¬∅∞" }) 1 (negate 1)) cs i n
+    let len = res.len
+    let text = slice src i (add i len)
+    { i = add i len, ln = ln, col = add col len, out = appendItem { t = opTT text, v = text, ln = ln, col = col, off = i } out }
+  else { i = add i 1, ln = ln, col = add col 1, out = appendItem { t = "error", v = c, ln = ln, col = col, off = i } out }
+
+
+-- -------------------------------------------------------------------------
+-- Backtick dual-role + template strings (the hard corner, `:118–176`).
+-- -------------------------------------------------------------------------
+
+@label "Lex backtick"
+@description "Lex a backtick at `i`: backtick-INFIX (`` x `add` y ``) when the previous token closes an expression AND a single whitespace-wrapped ident is bracketed by a closing backtick — emits THREE tokens `` ` `` ident `` ` `` (`fenel-parser.ts:118–145`); otherwise a TEMPLATE string (`lexTemplate`). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+lexBacktick : (src: String) -> (cs: a) -> (n: a) -> (i: a) -> (ln: a) -> (col: a) -> (out: a) -> a
+lexBacktick src cs n i ln col out =
+  let prevTok = at out (sub (length out) 1)
+  let prevT = if gt (length out) 0 then prevTok.t else ""
+  let prevIsExprEnd = elem prevT ["ident", "num", "str", "str_end", ")", "]", "}", "bool"]
+  if prevIsExprEnd
+  then
+    let j1 = skipSpaces cs (add i 1) n
+    if isIdentStart (charAt cs j1)
+    then
+      let idRun = takeRun cs j1 n (\c -> isIdentCont c)
+      let j2 = add j1 idRun
+      let j3 = skipSpaces cs j2 n
+      if eq (charAt cs j3) "`"
+      then
+        let idText = slice src j1 j2
+        let out1 = appendItem { t = "`", v = "`", ln = ln, col = col, off = i } out
+        let out2 = appendItem { t = "ident", v = idText, ln = ln, col = col, off = j1 } out1
+        let out3 = appendItem { t = "`", v = "`", ln = ln, col = col, off = j3 } out2
+        let consumed = sub (add j3 1) i
+        { i = add j3 1, ln = ln, col = add col consumed, out = out3 }
+      else lexTemplate src cs n i ln col out
+    else lexTemplate src cs n i ln col out
+  else lexTemplate src cs n i ln col out
+
+@label "Lex template string"
+@description "Lex a backtick template from the opening backtick at `i`: emit `str` (no interpolation) or `str_begin`/`str_mid`/`str_end` around `${}` holes, each hole RE-TOKENIZED (via `lexAll`) and its tokens spliced FLAT into the stream carrying the backtick's ln/col (`fenel-parser.ts:148–176`). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+lexTemplate : (src: String) -> (cs: a) -> (n: a) -> (i: a) -> (ln: a) -> (col: a) -> (out: a) -> a
+lexTemplate src cs n i ln col out =
+  tmplGo src cs n (add i 1) ln (add col 1) "" false col i out
+
+@label "Template scan loop"
+@description "The template body loop from `i`: accumulate the DECODED current segment `s`, on `${` emit the segment (str_begin/str_mid) + splice the re-tokenized hole, on the closing backtick (or EOF) emit the final segment (str/str_end). `isInterp` tracks whether any `${` was seen (str vs str_end, str_begin vs str_mid). `openCol` pins every emitted token's column to the backtick's. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+tmplGo : (src: String) -> (cs: a) -> (n: a) -> (i: a) -> (ln: a) -> (col: a) -> (s: String) -> (isInterp: a) -> (openCol: a) -> (openOff: a) -> (out: a) -> a
+tmplGo src cs n i ln col s isInterp openCol openOff out =
+  if gte i n
+  then { i = add i 1, ln = ln, col = add col 1, out = appendItem { t = if isInterp then "str_end" else "str", v = s, ln = ln, col = openCol, off = openOff } out }
+  else
+    let c = charAt cs i
+    if eq c "`"
+    then { i = add i 1, ln = ln, col = add col 1, out = appendItem { t = if isInterp then "str_end" else "str", v = s, ln = ln, col = openCol, off = openOff } out }
+    else if and (eq c "\\") (lt (add i 1) n)
+    then tmplGo src cs n (add i 2) ln (add col 2) (concat s (decodeEscTmpl (charAt cs (add i 1)))) isInterp openCol openOff out
+    else if and (eq c "$") (eq (charAt cs (add i 1)) "{")
+    then
+      let out1 = appendItem { t = if isInterp then "str_mid" else "str_begin", v = s, ln = ln, col = openCol, off = openOff } out
+      let holeStart = add i 2
+      let holeEnd = scanHole cs holeStart n 1
+      let holeSrc = slice src holeStart holeEnd
+      let subToks = spliceToks (lexAll holeSrc) ln openCol openOff
+      let out2 = prependAll subToks out1
+      let nextI = add holeEnd 1
+      tmplGo src cs n nextI ln (add col (sub nextI i)) "" true openCol openOff out2
+    else if eq c "\n"
+    then tmplGo src cs n (add i 1) (add ln 1) 0 (concat s c) isInterp openCol openOff out
+    else tmplGo src cs n (add i 1) ln (add col 1) (concat s c) isInterp openCol openOff out
+
+@label "Scan interpolation hole"
+@description "Index of the closing `}` of a `${ }` interpolation hole starting at `i` with brace `depth` (1 after `${`), skipping nested `\"`-strings and `` ` ``-templates so their braces don't miscount (`fenel-parser.ts:159–165`). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+scanHole : (cs: a) -> (i: a) -> (n: a) -> (depth: a) -> a
+scanHole cs i n depth =
+  if gte i n then i
+  else
+    let c = charAt cs i
+    if eq c "\"" then scanHole cs (skipDQ cs (add i 1) n) n depth
+    else if eq c "`" then scanHole cs (skipBT cs (add i 1) n) n depth
+    else if eq c "{" then scanHole cs (add i 1) n (add depth 1)
+    else if eq c "}" then (if eq depth 1 then i else scanHole cs (add i 1) n (sub depth 1))
+    else scanHole cs (add i 1) n depth
+
+@label "Skip double-quote string (depth scan)"
+@description "Index just past a `\"`-string (handling `\\`-escapes) — the naive skip the interpolation-hole brace scan uses so a `}` inside a nested string doesn't close the hole (`fenel-parser.ts:161`). `i` is just past the opening quote. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+skipDQ : (cs: a) -> (i: a) -> (n: a) -> a
+skipDQ cs i n =
+  if gte i n then i
+  else
+    let c = charAt cs i
+    if eq c "\"" then add i 1
+    else if eq c "\\" then skipDQ cs (add i 2) n
+    else skipDQ cs (add i 1) n
+
+@label "Skip backtick template (depth scan)"
+@description "Index just past a `` ` ``-template (handling `\\`-escapes) — the naive skip the interpolation-hole brace scan uses (`fenel-parser.ts:162`). `i` is just past the opening backtick. Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+skipBT : (cs: a) -> (i: a) -> (n: a) -> a
+skipBT cs i n =
+  if gte i n then i
+  else
+    let c = charAt cs i
+    if eq c "`" then add i 1
+    else if eq c "\\" then skipBT cs (add i 2) n
+    else skipBT cs (add i 1) n
+
+@label "Splice hole tokens"
+@description "Filter a re-tokenized interpolation hole's tokens (drop `eof`/`nl`) and override each token's ln/col/off to the template's (`fenel-parser.ts:168`). The `off` override is the template's opening index (best-effort — hole tokens never feed the SetExpr splice). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+spliceToks : (toks: a) -> (ln: a) -> (col: a) -> (off: a) -> a
+spliceToks toks ln col off =
+  let kept = filter (\t -> and (not (eq t.t "eof")) (not (eq t.t "nl"))) toks
+  map (\t -> { t = t.t, v = t.v, ln = ln, col = col, off = off }) kept
+
+@label "Append all"
+@description "Append each token of `items` onto the accumulator `out` in order (the spliced interpolation-hole tokens). Internal lexer helper."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+prependAll : (items: a) -> (out: a) -> a
+prependAll items out =
+  case head items of
+    Nothing -> out
+    Just it ->
+      case tail items of
+        Nothing -> appendItem it out
+        Just rest -> prependAll rest (appendItem it out)
+
+
+-- =========================================================================
+-- The driver loop + the public entry.
+-- =========================================================================
+
+@label "Lex loop"
+@description "The main lexer dispatch loop over the source string `cs` from index `i`, threading line/col + the forward-order token accumulator `out`: skip whitespace/`--`-comments, emit `nl` per newline, and dispatch strings/backticks/numbers/identifiers/operators to their sub-lexers. Appends the `eof` token at the end. Internal helper for `lexAll`."
+@tags "engine" "internal" "parser" "lexer" "parser-substrate" "phase-2"
+@category "engine-internal"
+lexGo : (src: String) -> (cs: a) -> (n: a) -> (i: a) -> (ln: a) -> (col: a) -> (out: a) -> a
+lexGo src cs n i ln col out =
+  if gte i n then appendItem { t = "eof", v = "", ln = ln, col = col, off = i } out
+  else
+    let c = charAt cs i
+    if isWsChar c then lexGo src cs n (add i 1) ln (add col 1) out
+    else if and (eq c "-") (eq (charAt cs (add i 1)) "-")
+    then
+      let i2 = skipToNl cs (add i 2) n
+      lexGo src cs n i2 ln (add col (sub i2 i)) out
+    else if eq c "\n"
+    then lexGo src cs n (add i 1) (add ln 1) 0 (appendItem { t = "nl", v = "\n", ln = ln, col = col, off = i } out)
+    else if and (eq c "@") (eq (charAt cs (add i 1)) "{")
+    then
+      let r = lexIdentity src n i ln col out
+      lexGo src cs n r.i r.ln r.col r.out
+    else if eq c "\""
+    then
+      let r = lexString src cs n i ln col out
+      lexGo src cs n r.i r.ln r.col r.out
+    else if eq c "`"
+    then
+      let r = lexBacktick src cs n i ln col out
+      lexGo src cs n r.i r.ln r.col r.out
+    else if or (isDigit c) (and (eq c ".") (isDigit (charAt cs (add i 1))))
+    then
+      let r = lexNumber src cs n i ln col out
+      lexGo src cs n r.i r.ln r.col r.out
+    else if isIdentStart c
+    then
+      let r = lexIdent src cs n i ln col out
+      lexGo src cs n r.i r.ln r.col r.out
+    else
+      let r = lexOperator src cs n i ln col out
+      lexGo src cs n r.i r.ln r.col r.out
+
+@label "Lex all"
+@description "Tokenize a Fenel source string into the `{ t, v, ln, col }` token stream (mirroring `fenel-parser.ts`'s `tokenize`, the parity oracle): run the driver loop over the source (line 1, col 0), accumulating tokens in forward source order. Emits `nl` tokens (consumed by the layout pass) and a trailing `eof`. The no-locale path (locale word-op projection is Phase 5). parser-substrate Phase 2."
+@tags "engine" "parser" "lexer" "parser-substrate" "phase-2"
+lexAll : (src: String) -> a
+lexAll src =
+  let n = unitLen src
+  lexGo src src n 0 1 0 []

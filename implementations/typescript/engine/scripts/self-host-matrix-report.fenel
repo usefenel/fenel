@@ -1,0 +1,996 @@
+module matrixreport where
+
+MatrixPresentation = MatrixPresentation verified: String verifiedAtSha: String
+
+MatrixTarget = MatrixTarget samples: Number gapPresent: Boolean gap: String status: String samplesCompared: Number reason: String
+
+MatrixFunction = MatrixFunction fnId: String bodyPresent: Boolean js: MatrixTarget wasm: MatrixTarget llvm: MatrixTarget
+
+MatrixFacetObservation = MatrixFacetObservation typeName: String fnId: String valueString: String valueStrings: List String
+
+MatrixFacetEntry = MatrixFacetEntry fnId: String categoryPresent: Boolean category: String tagsPresent: Boolean tags: List String
+
+MatrixFacetProjection = MatrixFacetProjection ok: Boolean error: String entries: List MatrixFacetEntry
+
+MatrixRow = MatrixRow fnId: String codeName: String bodyPresent: Boolean categoryPresent: Boolean category: String tagsPresent: Boolean tags: List String js: MatrixTarget wasm: MatrixTarget llvm: MatrixTarget
+
+MatrixSummary = MatrixSummary ok: Number skip: Number fail: Number gap: Number none: Number
+
+MatrixDocumentStats = MatrixDocumentStats total: Number fenelBodied: Number tsLeaf: Number js: MatrixSummary wasm: MatrixSummary llvm: MatrixSummary diagonal: Number
+
+MatrixAreaRow = MatrixAreaRow area: String row: MatrixRow
+
+MatrixAuditEntry = MatrixAuditEntry fnId: String target: String className: String declared: String observed: String
+
+MatrixEvidence = MatrixEvidence count: Number ids: List String preimage: String
+
+MatrixGroupingFact = MatrixGroupingFact fnId: String area: String
+
+MatrixAudit = MatrixAudit categoryCount: Number categoryPreimage: String tagCount: Number tagPreimage: String categorizableRepresentativeIds: List String taggableRepresentativeIds: List String rosterCount: Number rosterKeys: List String rowCount: Number declaredObservedAsymmetryCount: Number declaredObservedAsymmetries: List MatrixAuditEntry groupingFacts: List MatrixGroupingFact reportSourceDigest: String
+
+MatrixReportInput = MatrixReportInput presentation: MatrixPresentation rosterKeys: List String functions: List MatrixFunction instanceFacets: List MatrixFacetObservation reportSourceDigest: String
+
+MatrixReportOutput = MatrixReportOutput ok: Boolean error: String candidate: String rawRows: List MatrixFacetEntry audit: MatrixAudit
+
+-- Unregistered, tool-local report source.  It is loaded only by the guarded
+-- matrix worker into a lock-less registry containing std + this module.  The
+-- report never enters a product manifest, identity profile, parser corpus, or
+-- classifier roster.
+
+matrixReportSmoke : String -> String
+matrixReportSmoke token = "matrix-report-isolated-v1"
+
+-- The report, rather than its TypeScript acquisition seam, owns the curated
+-- module roster.  Order is declaration evidence and is carried into the audit.
+matrixReportRoster : Unit -> List String
+matrixReportRoster unit =
+  [ "std"
+  , "codec"
+  , "dashboard"
+  , "email-webhooks"
+  , "notify"
+  , "webhooks"
+  , "subscriptions"
+  , "proxy-links"
+  , "pages"
+  , "receipt"
+  , "inventory"
+  , "purchases"
+  , "payments"
+  , "profiles"
+  , "imports"
+  , "items"
+  , "types"
+  , "plans"
+  , "entitlements"
+  , "channels"
+  , "action-result"
+  , "auth"
+  , "authority"
+  , "telegram"
+  , "engine"
+  , "locale"
+  , "events"
+  , "time"
+  , "animation"
+  , "path"
+  , "track"
+  , "email"
+  , "picture"
+  , "sound"
+  , "algebra"
+  , "compile-js"
+  , "compile-wasm"
+  , "compile-llvm"
+  , "runtime"
+  , "notion"
+  , "phase20"
+  ]
+
+-- -------------------------------------------------------------------------
+-- Canonical instance-facet projection and duplicate policy
+-- -------------------------------------------------------------------------
+
+matrixStringsEqual : List String -> List String -> Boolean
+matrixStringsEqual left right =
+  if eq (length left) (length right)
+  then matrixStringsEqualGo left right
+  else false
+
+matrixStringsEqualGo : List String -> List String -> Boolean
+matrixStringsEqualGo left right =
+  case head left of
+    Nothing -> true
+    Just lh -> case head right of
+      Nothing -> false
+      Just rh ->
+        if eq lh rh
+        then matrixStringsEqualGo (fromMaybe [] (tail left)) (fromMaybe [] (tail right))
+        else false
+
+matrixFindFacet : String -> List MatrixFacetEntry -> Maybe MatrixFacetEntry
+matrixFindFacet fnId facets =
+  find (\facet -> eq facet.fnId fnId) facets
+
+matrixReplaceFacet : MatrixFacetEntry -> List MatrixFacetEntry -> List MatrixFacetEntry
+matrixReplaceFacet replacement facets =
+  map (\facet -> if eq facet.fnId replacement.fnId then replacement else facet) facets
+
+matrixNewCategory : MatrixFacetProjection -> MatrixFacetObservation -> MatrixFacetProjection
+matrixNewCategory state observation =
+  let next =
+    { fnId = observation.fnId
+    , categoryPresent = true
+    , category = observation.valueString
+    , tagsPresent = false
+    , tags = []
+    }
+  { ok = true, error = "", entries = appendItem next state.entries }
+
+matrixExistingCategory : MatrixFacetProjection -> MatrixFacetObservation -> MatrixFacetEntry -> MatrixFacetProjection
+matrixExistingCategory state observation prior =
+  if prior.categoryPresent
+  then
+    if eq prior.category observation.valueString
+    then state
+    else
+      { ok = false
+      , error = concat "divergent Categorizable duplicate for " observation.fnId
+      , entries = state.entries
+      }
+  else
+    let replacement =
+      { fnId = prior.fnId
+      , categoryPresent = true
+      , category = observation.valueString
+      , tagsPresent = prior.tagsPresent
+      , tags = prior.tags
+      }
+    { ok = true, error = "", entries = matrixReplaceFacet replacement state.entries }
+
+matrixAddCategory : MatrixFacetProjection -> MatrixFacetObservation -> MatrixFacetProjection
+matrixAddCategory state observation =
+  case matrixFindFacet observation.fnId state.entries of
+    Nothing -> matrixNewCategory state observation
+    Just prior -> matrixExistingCategory state observation prior
+
+matrixNewTags : MatrixFacetProjection -> MatrixFacetObservation -> MatrixFacetProjection
+matrixNewTags state observation =
+  let next =
+    { fnId = observation.fnId
+    , categoryPresent = false
+    , category = ""
+    , tagsPresent = true
+    , tags = observation.valueStrings
+    }
+  { ok = true, error = "", entries = appendItem next state.entries }
+
+matrixExistingTags : MatrixFacetProjection -> MatrixFacetObservation -> MatrixFacetEntry -> MatrixFacetProjection
+matrixExistingTags state observation prior =
+  if prior.tagsPresent
+  then
+    if matrixStringsEqual prior.tags observation.valueStrings
+    then state
+    else
+      { ok = false
+      , error = concat "divergent Taggable duplicate for " observation.fnId
+      , entries = state.entries
+      }
+  else
+    let replacement =
+      { fnId = prior.fnId
+      , categoryPresent = prior.categoryPresent
+      , category = prior.category
+      , tagsPresent = true
+      , tags = observation.valueStrings
+      }
+    { ok = true, error = "", entries = matrixReplaceFacet replacement state.entries }
+
+matrixAddTags : MatrixFacetProjection -> MatrixFacetObservation -> MatrixFacetProjection
+matrixAddTags state observation =
+  case matrixFindFacet observation.fnId state.entries of
+    Nothing -> matrixNewTags state observation
+    Just prior -> matrixExistingTags state observation prior
+
+matrixAddFacetObservation : (MatrixFacetProjection, MatrixFacetObservation) -> MatrixFacetProjection
+matrixAddFacetObservation state observation =
+  if state.ok
+  then
+    if eq observation.typeName "Categorizable"
+    then matrixAddCategory state observation
+    else if eq observation.typeName "Taggable"
+    then matrixAddTags state observation
+    else state
+  else state
+
+-- Exported for a direct hostile/synthetic migration oracle.  TypeScript also
+-- fails divergent duplicates at its descriptor-safe ingress; this independent
+-- report judgment prevents the host seam from becoming semantic authority.
+matrixProjectFacetsSequential : List MatrixFacetObservation -> MatrixFacetProjection
+matrixProjectFacetsSequential observations =
+  fold matrixAddFacetObservation { ok = true, error = "", entries = [] } observations
+
+-- Group admitted observations once, retaining the original duplicate judgment.
+-- The prefix excludes ordinary prototype and numeric enumeration keys from
+-- the existing grouping representation.
+matrixProjectFacets : List MatrixFacetObservation -> MatrixFacetProjection
+matrixProjectFacets observations =
+  let relevant = filter (\observation -> eq observation.typeName "Categorizable" or eq observation.typeName "Taggable") observations
+  let groups = entries (groupBy (\observation -> concat "facet:" observation.fnId) relevant)
+  let projections = map (\group -> matrixProjectFacetsSequential group.value) groups
+  if all projections (\projection -> projection.ok)
+  then
+    { ok = true
+    , error = ""
+    , entries = flatMap (\projection -> projection.entries) projections
+    }
+  -- Group order can differ from the order of FIRST divergent duplicates.
+  -- Replaying the original judgment preserves its exact refusal text and
+  -- partially accumulated entries, including other groups' cutoff values.
+  else matrixProjectFacetsSequential observations
+
+
+-- -------------------------------------------------------------------------
+-- Stable ordering and row projection
+-- -------------------------------------------------------------------------
+
+-- Binary partitioning keeps the report's authored recursion logarithmic at
+-- repository-roster scale.  The lower bound (rather than upper bound) also
+-- preserves the stable left-before-right relation for equal keys.
+matrixLowerBoundStrings : String -> List String -> Number
+matrixLowerBoundStrings needle values =
+  if eq (length values) 0
+  then 0
+  else
+    let midpoint = floor (div (length values) 2)
+    let pivot = at values midpoint
+    if lt (strCompare pivot needle) 0
+    then add (add midpoint 1) (matrixLowerBoundStrings needle (drop (add midpoint 1) values))
+    else matrixLowerBoundStrings needle (take midpoint values)
+
+matrixMergeStrings : List String -> List String -> List String
+matrixMergeStrings left right =
+  if eq (length left) 0
+  then right
+  else
+    let midpoint = floor (div (length left) 2)
+    let pivot = at left midpoint
+    let rightMidpoint = matrixLowerBoundStrings pivot right
+    concat
+      (matrixMergeStrings (take midpoint left) (take rightMidpoint right))
+      (concat [pivot] (matrixMergeStrings (drop (add midpoint 1) left) (drop rightMidpoint right)))
+
+matrixSortStrings : List String -> List String
+matrixSortStrings values =
+  if lte (length values) 1
+  then values
+  else
+    let midpoint = floor (div (length values) 2)
+    matrixMergeStrings
+      (matrixSortStrings (take midpoint values))
+      (matrixSortStrings (drop midpoint values))
+
+matrixLowerBoundRows : String -> List MatrixRow -> Number
+matrixLowerBoundRows needle rows =
+  if eq (length rows) 0
+  then 0
+  else
+    let midpoint = floor (div (length rows) 2)
+    let pivot = at rows midpoint
+    if lt (strCompare pivot.fnId needle) 0
+    then add (add midpoint 1) (matrixLowerBoundRows needle (drop (add midpoint 1) rows))
+    else matrixLowerBoundRows needle (take midpoint rows)
+
+matrixMergeRows : List MatrixRow -> List MatrixRow -> List MatrixRow
+matrixMergeRows left right =
+  if eq (length left) 0
+  then right
+  else
+    let midpoint = floor (div (length left) 2)
+    let pivot = at left midpoint
+    let rightMidpoint = matrixLowerBoundRows pivot.fnId right
+    concat
+      (matrixMergeRows (take midpoint left) (take rightMidpoint right))
+      (concat [pivot] (matrixMergeRows (drop (add midpoint 1) left) (drop rightMidpoint right)))
+
+matrixSortRows : List MatrixRow -> List MatrixRow
+matrixSortRows rows =
+  if lte (length rows) 1
+  then rows
+  else
+    let midpoint = floor (div (length rows) 2)
+    matrixMergeRows
+      (matrixSortRows (take midpoint rows))
+      (matrixSortRows (drop midpoint rows))
+
+matrixCodeName : String -> String
+matrixCodeName fnId =
+  case tail (split fnId ":") of
+    Nothing -> fnId
+    Just rest -> if eq (length rest) 0 then fnId else join rest ":"
+
+matrixAttachFacet : (String -> Maybe MatrixFacetEntry) -> MatrixFunction -> MatrixRow
+matrixAttachFacet findFacet fn =
+  case findFacet fn.fnId of
+    Nothing ->
+      { fnId = fn.fnId
+      , codeName = matrixCodeName fn.fnId
+      , bodyPresent = fn.bodyPresent
+      , categoryPresent = false
+      , category = ""
+      , tagsPresent = false
+      , tags = []
+      , js = fn.js
+      , wasm = fn.wasm
+      , llvm = fn.llvm
+      }
+    Just facet ->
+      { fnId = fn.fnId
+      , codeName = matrixCodeName fn.fnId
+      , bodyPresent = fn.bodyPresent
+      , categoryPresent = facet.categoryPresent
+      , category = facet.category
+      , tagsPresent = facet.tagsPresent
+      , tags = facet.tags
+      , js = fn.js
+      , wasm = fn.wasm
+      , llvm = fn.llvm
+      }
+
+matrixBuildRows : List MatrixFunction -> List MatrixFacetEntry -> List MatrixRow
+matrixBuildRows functions facets =
+  -- Projection has already checked duplicate observations. Build the read-only
+  -- index once; fromEntries keeps the same first match as matrixFindFacet.
+  let facetIndex = fromEntries (map (\facet -> { key = facet.fnId, value = facet }) facets)
+  let findFacet = \fnId -> mapGet facetIndex fnId
+  matrixSortRows (map (matrixAttachFacet findFacet) functions)
+
+-- -------------------------------------------------------------------------
+-- Area ownership, cells, summaries, and asymmetries
+-- -------------------------------------------------------------------------
+
+matrixPrefix : String -> String
+matrixPrefix fnId =
+  if contains fnId ":" then fromMaybe "" (head (split fnId ":")) else ""
+
+matrixStdArea : MatrixRow -> String
+matrixStdArea row =
+  if row.categoryPresent and not (eq row.category "")
+  then concat "std:" row.category
+  else "std:uncategorised"
+
+matrixArea : MatrixRow -> String
+matrixArea row =
+  let prefix = matrixPrefix row.fnId
+  if eq prefix "compile-js" then "compile-js wrapper"
+  else if eq prefix "compile-wasm" then "compile-wasm wrapper"
+  else if eq prefix "compile-llvm" then "compile-llvm wrapper"
+  else if eq prefix "engine" then matrixEngineArea row
+  else if eq prefix "std" then matrixStdArea row
+  else if eq prefix "telegram" then "telegram"
+  else if eq prefix "phase20" then "synthetic canary"
+  else if row.categoryPresent then row.category else "other"
+
+matrixEngineWasmArea : String -> String
+matrixEngineWasmArea codeName =
+  if startsWith codeName "encodeWasm" then "engine: Wasm serialiser"
+  else if startsWith codeName "wasm" then "engine: Wasm serialiser"
+  else if startsWith codeName "lowerToWasm" then "engine: Wasm lowering"
+  else if startsWith codeName "lowerWasm" then "engine: Wasm lowering"
+  else if startsWith codeName "inferDomains"
+  then "engine: Wasm domain inference"
+  else "engine: Wasm helper"
+
+matrixEngineLlvmArea : String -> String
+matrixEngineLlvmArea codeName =
+  if startsWith codeName "emitLlvm" then "engine: LLVM serialiser"
+  else if startsWith codeName "serializeLlvm" then "engine: LLVM serialiser"
+  else if startsWith codeName "lowerToLlvm" then "engine: LLVM lowering"
+  else if startsWith codeName "lowerLlvm" then "engine: LLVM lowering"
+  else if startsWith codeName "inferLlvm"
+  then "engine: LLVM domain inference"
+  else "engine: LLVM helper"
+
+matrixEngineIsJsSerialiser : String -> Boolean
+matrixEngineIsJsSerialiser codeName =
+  if eq codeName "emitJs" then true
+  else if startsWith codeName "emit" then true
+  else if startsWith codeName "serializeJs" then true
+  else if startsWith codeName "fold" then true
+  else startsWith codeName "build"
+
+matrixEngineIsNormalise : String -> Boolean
+matrixEngineIsNormalise codeName =
+  if eq codeName "normaliseToCore" then true else startsWith codeName "lower"
+
+matrixEngineIsEffects : String -> Boolean
+matrixEngineIsEffects codeName =
+  if eq codeName "makeEffectsExplicit" then true
+  else if startsWith codeName "scan" then true
+  else eq codeName "parseEffectFnId"
+
+matrixEngineIsClosures : String -> Boolean
+matrixEngineIsClosures codeName =
+  if eq codeName "makeClosuresExplicit" then true
+  else if startsWith codeName "collectFree" then true
+  else if startsWith codeName "convert" then true
+  else if contains codeName "FreeVar" then true
+  else contains codeName "Capture"
+
+matrixEnginePlainArea : String -> String
+matrixEnginePlainArea codeName =
+  if matrixEngineIsJsSerialiser codeName
+  then "engine: JS serialiser"
+  else if matrixEngineIsNormalise codeName
+  then "engine: normalise → Core"
+  else if matrixEngineIsEffects codeName
+  then "engine: effects-explicit pass"
+  else if matrixEngineIsClosures codeName
+  then "engine: closures-explicit pass"
+  else "engine: helper"
+
+matrixEngineArea : MatrixRow -> String
+matrixEngineArea row =
+  if includes row.tags "wasm" then matrixEngineWasmArea row.codeName
+  else if includes row.tags "llvm" then matrixEngineLlvmArea row.codeName
+  else matrixEnginePlainArea row.codeName
+
+matrixIsAstral : String -> Boolean
+matrixIsAstral char = not (eq (slice char 0 1) char)
+
+matrixUtf16Length : String -> Number
+matrixUtf16Length value =
+  add (length value) (length (filter matrixIsAstral (chars value)))
+
+matrixTruncate : String -> String
+matrixTruncate value =
+  if lte (matrixUtf16Length value) 60
+  then value
+  else concat (slice value 0 59) "…"
+
+-- Complete table-cell escaping.  HTML entities avoid Markdown's code-span
+-- backtick ambiguity while keeping every transformed byte deterministic.
+matrixMarkdownText : String -> String
+matrixMarkdownText value =
+  let ampersands = replaceAll value "&" "&amp;"
+  let slashes = replaceAll ampersands "\\" "&#92;"
+  let pipes = replaceAll slashes "|" "&#124;"
+  let ticks = replaceAll pipes "`" "&#96;"
+  let less = replaceAll ticks "<" "&lt;"
+  let greater = replaceAll less ">" "&gt;"
+  let crlf = replaceAll greater (concat (charFromCode 13) "\n") "<br>"
+  let returns = replaceAll crlf (charFromCode 13) "<br>"
+  replaceAll returns "\n" "<br>"
+
+matrixTargetCell : MatrixTarget -> String
+matrixTargetCell target =
+  if target.gapPresent then "GAP"
+  else if eq target.status "OK" then concat "OK (" (concat (toString target.samplesCompared) ")")
+  else if eq target.status "SKIP" then concat "SKIP: " (matrixMarkdownText (matrixTruncate target.reason))
+  else if eq target.status "FAIL" then concat "FAIL: " (matrixMarkdownText (matrixTruncate target.reason))
+  else "—"
+
+matrixRenderRow : MatrixRow -> String
+matrixRenderRow row =
+  join
+    [ "| `"
+    , matrixMarkdownText row.fnId
+    , "` | "
+    , if row.bodyPresent then "Fenel" else "TS-leaf"
+    , " | "
+    , matrixTargetCell row.js
+    , " | "
+    , matrixTargetCell row.wasm
+    , " | "
+    , matrixTargetCell row.llvm
+    , " |"
+    ]
+    ""
+
+matrixRenderTable : List MatrixRow -> String
+matrixRenderTable rows =
+  let headers =
+    [ "| fnId | Body | JS | Wasm | LLVM |"
+    , "|---|---|---|---|---|"
+    ]
+  join (concat headers (map matrixRenderRow rows)) "\n"
+
+matrixSummaryGap : MatrixSummary -> MatrixSummary
+matrixSummaryGap state =
+  { ok = state.ok, skip = state.skip, fail = state.fail, gap = add state.gap 1, none = state.none }
+
+matrixSummaryOk : MatrixSummary -> MatrixSummary
+matrixSummaryOk state =
+  { ok = add state.ok 1, skip = state.skip, fail = state.fail, gap = state.gap, none = state.none }
+
+matrixSummarySkip : MatrixSummary -> MatrixSummary
+matrixSummarySkip state =
+  { ok = state.ok, skip = add state.skip 1, fail = state.fail, gap = state.gap, none = state.none }
+
+matrixSummaryFail : MatrixSummary -> MatrixSummary
+matrixSummaryFail state =
+  { ok = state.ok, skip = state.skip, fail = add state.fail 1, gap = state.gap, none = state.none }
+
+matrixSummaryNone : MatrixSummary -> MatrixSummary
+matrixSummaryNone state =
+  { ok = state.ok, skip = state.skip, fail = state.fail, gap = state.gap, none = add state.none 1 }
+
+matrixTargetSummaryStep : MatrixSummary -> MatrixTarget -> MatrixSummary
+matrixTargetSummaryStep state target =
+  if target.gapPresent then matrixSummaryGap state
+  else if eq target.status "OK" then matrixSummaryOk state
+  else if eq target.status "SKIP" then matrixSummarySkip state
+  else if eq target.status "FAIL" then matrixSummaryFail state
+  else matrixSummaryNone state
+
+matrixTargetOf : String -> MatrixRow -> MatrixTarget
+matrixTargetOf targetName row =
+  if eq targetName "js" then row.js else if eq targetName "wasm" then row.wasm else row.llvm
+
+matrixTargetSummary : List MatrixRow -> String -> MatrixSummary
+matrixTargetSummary rows targetName =
+  fold
+    (\state row ->
+      if row.bodyPresent
+      then matrixTargetSummaryStep state (matrixTargetOf targetName row)
+      else state)
+    { ok = 0, skip = 0, fail = 0, gap = 0, none = 0 }
+    rows
+
+matrixAllThreeOk : MatrixRow -> Boolean
+matrixAllThreeOk row =
+  row.bodyPresent and eq row.js.status "OK" and eq row.wasm.status "OK" and eq row.llvm.status "OK"
+
+matrixDescribeDeclared : MatrixTarget -> String
+matrixDescribeDeclared target =
+  if target.gapPresent
+  then concat "GAP (\"" (concat (matrixTruncate target.gap) "\")")
+  else if lt 0 target.samples
+  then concat "samples=" (concat (toString target.samples) ", no gap")
+  else "no samples, no gap"
+
+matrixDescribeObserved : MatrixTarget -> String
+matrixDescribeObserved target =
+  if eq target.status "OK" then concat "OK (" (concat (toString target.samplesCompared) ")")
+  else if eq target.status "SKIP" then concat "SKIP (" (concat (matrixTruncate target.reason) ")")
+  else if eq target.status "FAIL" then concat "FAIL (" (concat (matrixTruncate target.reason) ")")
+  else "NO_SAMPLES"
+
+matrixAuditEntry : String -> String -> String -> MatrixTarget -> MatrixAuditEntry
+matrixAuditEntry fnId targetName className target =
+  { fnId = fnId
+  , target = targetName
+  , className = className
+  , declared = matrixDescribeDeclared target
+  , observed = matrixDescribeObserved target
+  }
+
+matrixTargetAudit : String -> String -> MatrixTarget -> List MatrixAuditEntry
+matrixTargetAudit fnId targetName target =
+  if target.gapPresent and eq target.status "OK" and lt 0 target.samplesCompared
+  then [matrixAuditEntry fnId targetName "stale-gap" target]
+  else if not target.gapPresent and lt 0 target.samples and eq target.status "SKIP"
+  then [matrixAuditEntry fnId targetName "silent-skip" target]
+  else if not target.gapPresent and lt 0 target.samples and eq target.status "FAIL"
+  then [matrixAuditEntry fnId targetName "escaped-fail" target]
+  else []
+
+matrixAuditRowsFor : MatrixRow -> List MatrixAuditEntry
+matrixAuditRowsFor row =
+  if row.bodyPresent
+  then
+    let jsAudit = matrixTargetAudit row.fnId "js" row.js
+    let wasmAudit = matrixTargetAudit row.fnId "wasm" row.wasm
+    let llvmAudit = matrixTargetAudit row.fnId "llvm" row.llvm
+    concat jsAudit (concat wasmAudit llvmAudit)
+  else []
+
+matrixDeclaredAudit : List MatrixRow -> List MatrixAuditEntry
+matrixDeclaredAudit rows = flatMap matrixAuditRowsFor rows
+
+matrixRenderAuditRow : MatrixAuditEntry -> String
+matrixRenderAuditRow audit =
+  join
+    [ "| `"
+    , matrixMarkdownText audit.fnId
+    , "` | "
+    , matrixMarkdownText audit.target
+    , " | "
+    , matrixMarkdownText audit.className
+    , " | "
+    , matrixMarkdownText audit.declared
+    , " | "
+    , matrixMarkdownText audit.observed
+    , " |"
+    ]
+    ""
+
+matrixRenderAudit : List MatrixAuditEntry -> String
+matrixRenderAudit audit =
+  if eq (length audit) 0
+  then "_None — declared status matches observed status on every cell._"
+  else
+    let headers =
+      [ "| fnId | Target | Class | Declared | Observed |"
+      , "|---|---|---|---|---|"
+      ]
+    join (concat headers (map matrixRenderAuditRow audit)) "\n"
+
+matrixGapTruthy : MatrixTarget -> Boolean
+matrixGapTruthy target = target.gapPresent and not (eq target.gap "")
+
+matrixCrossTargetAsymmetry : MatrixRow -> Boolean
+matrixCrossTargetAsymmetry row =
+  if not row.bodyPresent then false
+  else
+    let targets = [row.js, row.wasm, row.llvm]
+    let hasSample = fold (\found target -> found or (lt 0 target.samples and not (matrixGapTruthy target))) false targets
+    let hasGap = fold (\found target -> found or matrixGapTruthy target) false targets
+    let hasNone = fold (\found target -> found or (eq target.samples 0 and not (matrixGapTruthy target))) false targets
+    hasSample and (hasGap or hasNone)
+
+matrixRenderCrossTarget : List MatrixRow -> String
+matrixRenderCrossTarget rows =
+  let asymmetric = filter matrixCrossTargetAsymmetry rows
+  if eq (length asymmetric) 0
+  then "_None — every Fenel-bodied fnId with a sample on one target either has a sample on every target or a documented gap on the others._"
+  else matrixRenderTable asymmetric
+
+-- -------------------------------------------------------------------------
+-- Grouping and complete document
+-- -------------------------------------------------------------------------
+
+matrixContainsString : String -> List String -> Boolean
+matrixContainsString needle values =
+  fold (\found value -> found or eq needle value) false values
+
+matrixUniqueAreaStep : (List String, MatrixRow) -> List String
+matrixUniqueAreaStep areas row =
+  let area = matrixArea row
+  if matrixContainsString area areas then areas else appendItem area areas
+
+matrixFixedAreas : String -> List String
+matrixFixedAreas token =
+  [ "engine: normalise → Core"
+  , "engine: effects-explicit pass"
+  , "engine: closures-explicit pass"
+  , "engine: JS serialiser"
+  , "engine: Wasm lowering"
+  , "engine: Wasm domain inference"
+  , "engine: Wasm serialiser"
+  , "engine: Wasm helper"
+  , "engine: LLVM lowering"
+  , "engine: LLVM domain inference"
+  , "engine: LLVM serialiser"
+  , "engine: LLVM helper"
+  , "engine: helper"
+  , "compile-js wrapper"
+  , "compile-wasm wrapper"
+  , "compile-llvm wrapper"
+  , "synthetic canary"
+  ]
+
+matrixAreaRows : String -> List MatrixRow -> List MatrixRow
+matrixAreaRows area rows = filter (\row -> eq (matrixArea row) area) rows
+
+matrixRenderSection : List MatrixRow -> String -> String
+matrixRenderSection rows area =
+  let selected = matrixAreaRows area rows
+  if eq (length selected) 0
+  then ""
+  else join ["### ", matrixMarkdownText area, "\n\n", matrixRenderTable selected, "\n"] ""
+
+matrixIsStdArea : String -> Boolean
+matrixIsStdArea area = startsWith area "std:"
+
+matrixIsLooseArea : String -> Boolean
+matrixIsLooseArea area =
+  not (matrixContainsString area (matrixFixedAreas "v1")) and not (matrixIsStdArea area) and not (eq area "telegram")
+
+matrixOrderedAreas : List MatrixRow -> List String
+matrixOrderedAreas rows =
+  matrixOrderAreaNames (fold matrixUniqueAreaStep [] rows)
+
+matrixOrderAreaNames : List String -> List String
+matrixOrderAreaNames areas =
+  let fixed = filter (\area -> matrixContainsString area areas) (matrixFixedAreas "v1")
+  let stdAreas = matrixSortStrings (filter matrixIsStdArea areas)
+  let telegram = if matrixContainsString "telegram" areas then ["telegram"] else []
+  let looseAreas = filter matrixIsLooseArea areas
+  let other = looseAreas
+  concat fixed (concat stdAreas (concat telegram other))
+
+matrixRenderSections : List MatrixRow -> String
+matrixRenderSections rows =
+  let decorated = map matrixDecorateArea rows
+  let grouped = groupBy (\item -> concat "matrix-area/" item.area) decorated
+  let areas = unique (map (\item -> item.area) decorated)
+  let selectRows = \area -> map (\item -> item.row) (fromMaybe [] (mapGet grouped (concat "matrix-area/" area)))
+  join (filter (\section -> not (eq section "")) (map (matrixRenderSelectedSection selectRows) (matrixOrderAreaNames areas))) "\n"
+
+matrixDecorateArea : MatrixRow -> MatrixAreaRow
+matrixDecorateArea row = { area = matrixArea row, row = row }
+
+matrixRenderSelectedSection : (String -> List MatrixRow) -> String -> String
+matrixRenderSelectedSection selectRows area =
+  let selected = selectRows area
+  if eq (length selected) 0
+  then ""
+  else join ["### ", matrixMarkdownText area, "\n\n", matrixRenderTable selected, "\n"] ""
+
+matrixSummaryLine : String -> MatrixSummary -> Number -> String
+matrixSummaryLine targetName summary fenelBodied =
+  join
+    [ "  - "
+    , targetName
+    , ": "
+    , toString summary.ok
+    , " OK + "
+    , toString summary.skip
+    , " SKIP + "
+    , toString summary.fail
+    , " FAIL + "
+    , toString summary.gap
+    , " GAP + "
+    , toString summary.none
+    , " no-samples out of "
+    , toString fenelBodied
+    , " Fenel-bodied."
+    ]
+    ""
+
+matrixDocumentHeader : MatrixPresentation -> String
+matrixDocumentHeader presentation =
+  join
+    [ "---\n"
+    , "verified: ", presentation.verified, "\n"
+    , "verified_at_sha: ", presentation.verifiedAtSha, "\n"
+    , "covers:\n"
+    , "  - implementations/typescript/engine/src/modules/engine.ts\n"
+    , "  - implementations/typescript/engine/src/modules/compile-js.ts\n"
+    , "  - implementations/typescript/engine/src/modules/compile-wasm.ts\n"
+    , "  - implementations/typescript/engine/src/modules/compile-llvm.ts\n"
+    , "  - implementations/typescript/engine/src/modules/std.ts\n"
+    , "  - implementations/typescript/engine/src/self-host-samples.ts\n"
+    , "  - implementations/typescript/engine/src/compile-js-self-host-classifier.ts\n"
+    , "  - implementations/typescript/engine/src/compile-wasm-self-host-classifier.ts\n"
+    , "  - implementations/typescript/engine/src/compile-llvm-self-host-classifier.ts\n"
+    , "  - implementations/typescript/engine/src/self-host-wasm-llvm-bootstrap.ts\n"
+    , "---\n\n"
+    , "# Self-Host Matrix\n\n"
+    , "How much of Fenel is bodied in Fenel itself, per compilation target.\n\n"
+    , "**Phase 5b30** — cells render OBSERVED runtime status from each per-target\n"
+    , "classifier (`compile-{js,wasm,llvm}-self-host-classifier.ts`'s\n"
+    , "`classifyFnId`), not inferred from declared samples + EXPECTED_GAPS. The\n"
+    , "new audit section \"Matrix-vs-declared asymmetries\" surfaces stale GAPs,\n"
+    , "silent-skip cases, and escaped-CI FAILs in one place.\n\n"
+    ]
+    ""
+
+matrixDocumentLegend : String -> String
+matrixDocumentLegend unit =
+  join
+    [ "## Status legend\n\n"
+    , "| Symbol | Meaning |\n"
+    , "|---|---|\n"
+    , "| **Fenel** | Function has a registered `body` — same source executes through the engine evaluator and through every per-target lowering. |\n"
+    , "| **TS-leaf** | TS-side native impl only. Either an irreducible IO primitive (state / network / fs) or a runtime-helper sentinel; not a self-hosting candidate. |\n"
+    , "| **OK (N)** | The per-target classifier observed N samples compared engine ≡ compiled byte-for-byte. |\n"
+    , "| **SKIP: \\<reason\\>** | The classifier observed a pre-execution skip (no samples, compile failed, serialise failed, eval failed, effect-stub setup failed). |\n"
+    , "| **FAIL: \\<reason\\>** | The classifier observed a per-sample runtime error or engine-vs-compiled mismatch. |\n"
+    , "| **GAP** | A documented per-target gap in `self-host-samples.ts`'s `*_EXPECTED_GAPS`. The audit section below cross-checks whether the gap is still load-bearing or stale. |\n"
+    , "| **—** | No samples declared for this fnId on this target. |\n\n"
+    ]
+    ""
+
+matrixDocumentStats : List MatrixRow -> MatrixDocumentStats
+matrixDocumentStats rows =
+  let total = length rows
+  let fenelBodied = length (filter (\row -> row.bodyPresent) rows)
+  { total = total
+  , fenelBodied = fenelBodied
+  , tsLeaf = sub total fenelBodied
+  , js = matrixTargetSummary rows "js"
+  , wasm = matrixTargetSummary rows "wasm"
+  , llvm = matrixTargetSummary rows "llvm"
+  , diagonal = length (filter matrixAllThreeOk rows)
+  }
+
+matrixDocumentSummary : List MatrixRow -> String
+matrixDocumentSummary rows =
+  let stats = matrixDocumentStats rows
+  join
+    [ "## Summary\n\n"
+    , "- **", toString stats.total, " functions** registered across engine + std + per-target compile + synthetic canaries.\n"
+    , "- **", toString stats.fenelBodied, " have Fenel bodies** (the rest, ", toString stats.tsLeaf, ", are TS-native primitives or thin TS shells delegating to engine bodies).\n"
+    , "- **Per-target observed status** (from the per-target classifiers):\n"
+    , matrixSummaryLine "JS" stats.js stats.fenelBodied, "\n"
+    , matrixSummaryLine "Wasm" stats.wasm stats.fenelBodied, "\n"
+    , matrixSummaryLine "LLVM" stats.llvm stats.fenelBodied, "\n"
+    , "- **", toString stats.diagonal, " fnIds observe OK across all three targets** (the diagonal).\n\n"
+    ]
+    ""
+
+matrixDocumentAudits : List MatrixRow -> List MatrixAuditEntry -> String
+matrixDocumentAudits rows audit =
+  join
+    [ "## Matrix-vs-declared asymmetries\n\n"
+    , "Cells where the declared signal (samples + EXPECTED_GAPS entry) disagrees with the OBSERVED classifier status. Three classes:\n\n"
+    , "- **stale-gap** — gap declared, but the runtime classifier behaviorally compares at least one sample and reports OK. An LLVM `OK (0)` is IR-shape-only evidence, not a closed runtime gap.\n"
+    , "- **silent-skip** — declared OK (samples > 0, no gap), but the runtime classifier reports SKIP. The matrix used to lie at this cell; the gap inventory needs an entry OR the harness-runtime needs a follow-up fix.\n"
+    , "- **escaped-fail** — declared OK, but the runtime classifier reports FAIL. A regression escaped CI.\n\n"
+    , matrixRenderAudit audit, "\n\n"
+    , "## Per-target asymmetries\n\n"
+    , "Fenel-bodied fnIds with a sample on one target but missing / gapped on another. Diagnostic value: every row here is either a sample-coverage gap worth closing or a documented per-target deferment.\n\n"
+    , matrixRenderCrossTarget rows, "\n\n"
+    ]
+    ""
+
+matrixDocumentTail : List MatrixRow -> String
+matrixDocumentTail rows =
+  join
+    [ "## By area\n\n"
+    , matrixRenderSections rows, "\n\n"
+    , "## How to refresh\n\n"
+    , "```\n"
+    , "bun --no-env-file implementations/typescript/engine/scripts/self-host-matrix-controller.ts --check\n"
+    , "```\n\n"
+    , "The raw generator is an internal guarded worker. The controller owns capture, reproduction, audit, and publication; use its explicit adoption flow when `--check` reports repair is due. Add `--progress` for per-target progress on slow local runs; it changes logging only.\n\n"
+    , "## Caveats\n\n"
+    , "- The matrix is a **snapshot** of HEAD at the noted `verified_at_sha`. Run `git log <verified_at_sha>..HEAD` over the covered files to detect drift.\n"
+    , "- TS-leaf rows aren't failures — `std:add` / `state:tryCreateInstance` / `state:appendEvent` are intentionally TS-side. The matrix surfaces them so a reader can confirm a fnId is _expected_ to be TS-only vs accidentally so.\n"
+    , "- The synthetic `phase20:effectfulCanary` is hand-written in each self-host harness; it isn't a real registered engine function. Listed here for parity with what the canary report enumerates.\n"
+    , "- `$effect:<Class>:<method>` sentinel fnIds are dispatched via the typeclass substrate rather than the function registry — they don't appear in the matrix.\n"
+    , "- LLVM cell observations are environment-dependent — without clang, `OK (0)` records an IR-shape-only pass and never marks a runtime gap stale. On clang-available machines, a behavioral `OK (N > 0)` can surface genuine gap drift.\n"
+    ]
+    ""
+
+matrixRenderDocument : MatrixPresentation -> List MatrixRow -> List MatrixAuditEntry -> String
+matrixRenderDocument presentation rows audit =
+  join
+    [ matrixDocumentHeader presentation
+    , matrixDocumentLegend "v1"
+    , matrixDocumentSummary rows
+    , matrixDocumentAudits rows audit
+    , matrixDocumentTail rows
+    ]
+    ""
+
+-- -------------------------------------------------------------------------
+-- Canonical raw facets and semantic audit
+-- -------------------------------------------------------------------------
+
+matrixRawFacet : MatrixRow -> MatrixFacetEntry
+matrixRawFacet row =
+  { fnId = row.fnId
+  , categoryPresent = row.categoryPresent
+  , category = row.category
+  , tagsPresent = row.tagsPresent
+  , tags = row.tags
+  }
+
+matrixUtf8Length : String -> Number
+matrixUtf8Length value = length (utf8Bytes value)
+
+matrixCategoryPreimageRow : MatrixRow -> String
+matrixCategoryPreimageRow row =
+  join
+    [ toString (matrixUtf8Length row.fnId)
+    , ":"
+    , row.fnId
+    , toString (matrixUtf8Length row.category)
+    , ":"
+    , row.category
+    , "\n"
+    ]
+    ""
+
+matrixTagPreimageTag : String -> String
+matrixTagPreimageTag tag = concat (toString (matrixUtf8Length tag)) (concat ":" tag)
+
+matrixTagPreimageRow : MatrixRow -> String
+matrixTagPreimageRow row =
+  join
+    [ toString (matrixUtf8Length row.fnId)
+    , ":"
+    , row.fnId
+    , toString (length row.tags)
+    , "\n"
+    , join (map matrixTagPreimageTag row.tags) ""
+    , "\n"
+    ]
+    ""
+
+matrixGroupingFact : List MatrixRow -> String -> Maybe MatrixGroupingFact
+matrixGroupingFact rows fnId =
+  case head (filter (\row -> eq row.fnId fnId) rows) of
+    Nothing -> Nothing
+    Just row -> Just { fnId = fnId, area = matrixArea row }
+
+matrixAppendMaybe : (List a, Maybe a) -> List a
+matrixAppendMaybe out value =
+  case value of
+    Nothing -> out
+    Just item -> appendItem item out
+
+matrixCollectMaybe : List (Maybe a) -> List a
+matrixCollectMaybe values = fold matrixAppendMaybe [] values
+
+matrixEvidenceHeader : String -> Number -> String
+matrixEvidenceHeader domain count =
+  concat domain (concat (toString count) "\n")
+
+matrixCategoryEvidence : List MatrixRow -> MatrixEvidence
+matrixCategoryEvidence rows =
+  let categorized = filter (\row -> row.categoryPresent) rows
+  let categoryIds = map (\row -> row.fnId) categorized
+  let categoryCount = length categorized
+  let categoryPreimage = concat (matrixEvidenceHeader "fenel.self-host-matrix.category.v1\n" categoryCount) (join (map matrixCategoryPreimageRow categorized) "")
+  { count = categoryCount, ids = categoryIds, preimage = categoryPreimage }
+
+matrixTagEvidence : List MatrixRow -> MatrixEvidence
+matrixTagEvidence rows =
+  let tagged = filter (\row -> row.tagsPresent) rows
+  let tagIds = map (\row -> row.fnId) tagged
+  let tagCount = length tagged
+  let tagPreimage = concat (matrixEvidenceHeader "fenel.self-host-matrix.tags.v1\n" tagCount) (join (map matrixTagPreimageRow tagged) "")
+  { count = tagCount, ids = tagIds, preimage = tagPreimage }
+
+matrixAuditGroupingFacts : List MatrixRow -> List MatrixGroupingFact
+matrixAuditGroupingFacts rows =
+  matrixCollectMaybe
+    [ matrixGroupingFact rows "engine:llvmDomainToValType"
+    , matrixGroupingFact rows "std:."
+    ]
+
+matrixBuildAudit : MatrixReportInput -> List MatrixRow -> List MatrixAuditEntry -> MatrixAudit
+matrixBuildAudit input rows declaredAudit =
+  let category = matrixCategoryEvidence rows
+  let tags = matrixTagEvidence rows
+  let unitValue = ()
+  let rosterKeys = matrixReportRoster unitValue
+  { categoryCount = category.count
+  , categoryPreimage = category.preimage
+  , tagCount = tags.count
+  , tagPreimage = tags.preimage
+  , categorizableRepresentativeIds = category.ids
+  , taggableRepresentativeIds = tags.ids
+  , rosterCount = length rosterKeys
+  , rosterKeys = rosterKeys
+  , rowCount = length rows
+  , declaredObservedAsymmetryCount = length declaredAudit
+  , declaredObservedAsymmetries = declaredAudit
+  , groupingFacts = matrixAuditGroupingFacts rows
+  , reportSourceDigest = input.reportSourceDigest
+  }
+
+-- Full pure report entry.  The host receives only closed plain records and
+-- supplies no clock, Git, cwd, locale, filesystem, or source-discovery power.
+matrixRejectReport : MatrixReportInput -> String -> MatrixReportOutput
+matrixRejectReport input error =
+  { ok = false
+  , error = error
+  , candidate = ""
+  , rawRows = []
+  , audit = matrixBuildAudit input [] []
+  }
+
+matrixReport : MatrixReportInput -> MatrixReportOutput
+matrixReport input =
+  let unitValue = ()
+  let rosterKeys = matrixReportRoster unitValue
+  if not (matrixStringsEqual rosterKeys input.rosterKeys)
+  then matrixRejectReport input "matrix acquisition keys do not equal the Fenel roster"
+  else
+    let projection = matrixProjectFacets input.instanceFacets
+    if projection.ok
+    then
+      let rows = matrixBuildRows input.functions projection.entries
+      let declaredAudit = matrixDeclaredAudit rows
+      { ok = true
+      , error = ""
+      , candidate = matrixRenderDocument input.presentation rows declaredAudit
+      , rawRows = map matrixRawFacet rows
+      , audit = matrixBuildAudit input rows declaredAudit
+      }
+    else matrixRejectReport input projection.error

@@ -1,0 +1,291 @@
+module dashboard where
+
+-- =========================================================================
+-- Dashboard /types + /functions registry merging — Fenel-bodied route
+-- bodies + the shared helpers they consume.
+--
+-- Phase 12a sub-step 4 of the ts-elimination workstream. Consumes the
+-- new 12a-4 substrate primitives:
+--   - state:listTypes / state:getType
+--   - state:listFunctions / state:getFunction
+--   - dispatch:listSystemEntities / listModuleEntities / listModuleFunctions
+--   - engine:getLabel / getDescription (already exist, returning Maybe LocaleString)
+--   - engine:getDefaultView / getDefaultInlineView (Maybe String — view names)
+--   - std.canonical (existing English-first LocaleString → String projection)
+--
+-- Wire-shape decisions:
+--   * Anonymous records throughout (matches the legacy JSON output).
+--   * `module` field on system-synth rows is the literal string "system".
+--   * defaultTemplate / defaultTemplateInline are String-typed (view name
+--     identifiers), with null for the absent case. Mirrors the legacy
+--     `getDefaultView(...) ?? null` rendering.
+--   * The DB type-row enrichment preserves every other key the row has
+--     (createdAt, updatedAt, isSystem, defaultTemplate, defaultTemplateInline,
+--     type, accountId, id, name) by right-biased mergeRecords with the
+--     override `{ label, description }`.
+--
+-- Note: parseApp doesn't continue argument lists across newlines
+-- (12a-3 surprise #1) — multi-line conditional logic is extracted to
+-- top-level helpers; calls use parenthesized form `f(a, b)` where
+-- argument lists are otherwise ambiguous with infix operator binding.
+-- 0-arg calls use `f()` (a bare ident parses as a var lookup, not a call).
+-- =========================================================================
+
+-- labelOrName — read Labelable for a type/function name, projecting to
+-- an English-first plain String. Falls through to the bare name when no Labelable
+-- instance is registered (matches the legacy `lab ? canonical(lab) :
+-- r.name` ternary).
+@label "Label or name"
+@description "Read Labelable for a type/function name, projecting LocaleString through the existing std.canonical method. Preserves its English-first selection and empty-map behavior. Falls through to the bare name when no Labelable instance is registered."
+@tags "dashboard" "registry" "representation" "pure"
+labelOrName : (name: String) -> String
+labelOrName name =
+  case getLabel name of
+    Just l -> std.canonical l
+    _ -> name
+
+-- descriptionOrNull — read Describable, projecting to an English-first String or
+-- null when no instance is registered (matches the legacy
+-- `desc ? canonical(desc) : null` ternary).
+@label "Description or null"
+@description "Read Describable for a type/function name, projecting LocaleString through the existing std.canonical method. Preserves its English-first selection and empty-map behavior. Returns null when no Describable instance is registered."
+@tags "dashboard" "registry" "representation" "pure"
+descriptionOrNull : (name: String) -> String
+descriptionOrNull name =
+  case getDescription name of
+    Just d -> std.canonical d
+    _ -> null
+
+-- defaultViewOrNull / defaultInlineViewOrNull — read the Viewable
+-- typeclass methods, projecting Maybe<String> down to String-or-null.
+@label "Default view or null"
+@description "Read the Viewable.defaultView typeclass method, projecting Maybe<String> to String-or-null. Mirrors `getDefaultView(id) ?? null`."
+@tags "dashboard" "registry" "representation" "pure"
+defaultViewOrNull : (name: String) -> String
+defaultViewOrNull name =
+  case getDefaultView name of
+    Just v -> v
+    _ -> null
+
+@label "Default inline view or null"
+@description "Read the Viewable.defaultInlineView typeclass method, projecting Maybe<String> to String-or-null. Mirrors `getDefaultInlineView(id) ?? null`."
+@tags "dashboard" "registry" "representation" "pure"
+defaultInlineViewOrNull : (name: String) -> String
+defaultInlineViewOrNull name =
+  case getDefaultInlineView name of
+    Just v -> v
+    _ -> null
+
+-- enrichTypeRow — DB type row → enriched legacy wire shape. Preserves
+-- every other field of the row (createdAt, updatedAt, isSystem, type,
+-- defaultTemplate, defaultTemplateInline, accountId, id, name) via
+-- right-biased mergeRecords; the override record carries the
+-- typeclass-resolved label + description (the legacy types row dropped
+-- those columns post-Phase-6 — they now live in typeclass instances).
+@label "Enrich type row with representations"
+@description "DB type row → enriched legacy wire shape. Preserves every other field of the row via right-biased mergeRecords; the override record carries the typeclass-resolved label + description. The legacy types row dropped those columns post-Phase-6 — they now live in typeclass instances."
+@tags "dashboard" "registry" "type" "enrichment" "pure"
+enrichTypeRow : (row: {}) -> {}
+enrichTypeRow row =
+  mergeRecords row {
+    label = labelOrName row.name,
+    description = descriptionOrNull row.name
+  }
+
+-- synthesizeSystemTypeRow — convert a system entity ({id, type?, module})
+-- to the legacy /types wire shape with the `system:` id prefix +
+-- Labelable / Describable / Viewable defaults.
+@label "Synthesize system-entity type row"
+@description "Convert a system entity ({id, type?, module}) to the legacy /types wire shape with the `system:` id prefix + Labelable / Describable / Viewable defaults. Used by listTypesMerged + getTypeDetail."
+@tags "dashboard" "registry" "type" "synth" "pure"
+synthesizeSystemTypeRow : (accountId: String) -> (e: {}) -> {}
+synthesizeSystemTypeRow accountId e = {
+  id = concat "system:" e.id,
+  accountId = accountId,
+  name = e.id,
+  label = labelOrName e.id,
+  description = descriptionOrNull e.id,
+  type = e.type,
+  module = "system",
+  defaultTemplate = defaultViewOrNull e.id,
+  defaultTemplateInline = defaultInlineViewOrNull e.id,
+  isSystem = True
+}
+
+-- synthesizeModuleTypeRow — convert a module entity ({id, type, module})
+-- to the /types wire shape. The `id` is the MODULE-QUALIFIED name
+-- `<module>.<id>` (e.g. `engine.CompileSource`) — the canonical identity in
+-- the module-qualified model, and what the /types detail links + the
+-- getCatalogEntry qualified index address. (The old `module:` colon prefix
+-- dropped the real module and used a literal word — retired.) The label is
+-- the bare `e.id`; description / defaultTemplate / defaultTemplateInline are
+-- null (no Labelable vocabulary for module entities yet).
+@label "Synthesize module-entity type row"
+@description "Convert a module entity ({id, type, module}) to the /types wire shape. The `id` is the module-qualified `<module>.<id>` name (e.g. engine.CompileSource) — the canonical identity that the /types detail links + getCatalogEntry qualified index address. The label is the bare `e.id`; description / defaultTemplate / defaultTemplateInline are null."
+@tags "dashboard" "registry" "type" "synth" "pure"
+synthesizeModuleTypeRow : (accountId: String) -> (e: {}) -> {}
+synthesizeModuleTypeRow accountId e = {
+  id = concat (concat e.module ".") e.id,
+  accountId = accountId,
+  name = e.id,
+  label = e.id,
+  description = null,
+  type = e.type,
+  module = e.module,
+  defaultTemplate = null,
+  defaultTemplateInline = null,
+  isSystem = True
+}
+
+-- synthesizeModuleFunctionRow — convert a module FenelFunction record
+-- to the legacy /functions wire shape with the `module:` id prefix.
+-- The legacy emits the entire FenelFunction record nested under `function`
+-- (the DB rows have the same shape — `row.function` is the spec record).
+@label "Synthesize module-function row"
+@description "Convert a module FenelFunction record to the legacy /functions wire shape with the `module:` id prefix. The entire FenelFunction record is nested under `function` (mirrors the DB row shape)."
+@tags "dashboard" "registry" "function" "synth" "pure"
+synthesizeModuleFunctionRow : (accountId: String) -> (f: {}) -> {}
+synthesizeModuleFunctionRow accountId f = {
+  id = concat "module:" f.id,
+  accountId = accountId,
+  name = f.id,
+  function = f,
+  active = True,
+  isSystem = True
+}
+
+-- nameMatchesAny — predicate. True when `name` appears as the `name`
+-- field of any row in `rows`. Used to filter out system / module
+-- entities already represented by a DB row.
+@label "Name matches any row"
+@description "Predicate. True when `name` appears as the `name` field of any row. Used by the merge filters to suppress synth rows for entities already represented by DB rows."
+@tags "dashboard" "registry" "predicate" "pure"
+nameMatchesAny : (rows: List ({})) -> (name: String) -> Boolean
+nameMatchesAny rows name =
+  std.some rows (\r -> eq r.name name)
+
+-- idMatchesAny — predicate. True when `id` appears as the `id` field
+-- of any row in `rows`. Used to filter out module entities already
+-- represented by a system entity (the merge order is DB → system →
+-- module, so module entities check against both prior layers).
+@label "Id matches any row"
+@description "Predicate. True when `id` appears as the `id` field of any row. Used to filter out module entities already represented by a system entity."
+@tags "dashboard" "registry" "predicate" "pure"
+idMatchesAny : (rows: List ({})) -> (id: String) -> Boolean
+idMatchesAny rows id =
+  std.some rows (\r -> eq r.id id)
+
+-- fnIdInDbRows — predicate over `function` rows (DB shape). True when
+-- `id` matches any row.function.id (the legacy `dbIds.has(f.id)` check
+-- where dbIds = new Set(rows.map(r => r.function.id))).
+@label "Function id appears in DB rows"
+@description "Predicate over function rows (DB shape). True when `id` matches any row.function.id (the legacy `dbIds.has(f.id)` check)."
+@tags "dashboard" "registry" "predicate" "pure"
+fnIdInDbRows : (rows: List ({})) -> (id: String) -> Boolean
+fnIdInDbRows rows id =
+  std.some rows (\r -> eq r.function.id id)
+
+-- keepSystemNotInDb — predicate for the system-entities filter. True
+-- when the system entity's id is NOT already a DB row name (the
+-- `e => !dbNames.has(e.id)` check in the legacy /types body).
+@label "Keep system entity not in DB"
+@description "Filter predicate for the system-entities pass. True when the system entity's id is NOT already a DB row name."
+@tags "dashboard" "registry" "predicate" "pure"
+keepSystemNotInDb : (dbRows: List ({})) -> (e: {}) -> Boolean
+keepSystemNotInDb dbRows e =
+  not (nameMatchesAny dbRows e.id)
+
+-- keepModuleNotInDbOrSys — predicate for the module-entities filter.
+-- True when the module entity's id is neither in DB rows nor in
+-- systemEntities (the legacy `e => !dbNames.has(e.id) &&
+-- !systemEntities.some(s => s.id === e.id)`). Chained if/else if
+-- avoids the parseApp / infix ambiguity for multi-line predicates.
+@label "Keep module entity not in DB or system"
+@description "Filter predicate for the module-entities pass. True when the module entity's id is neither in DB rows nor in systemEntities. Chained if/else if avoids the parseApp / infix ambiguity for multi-line predicates."
+@tags "dashboard" "registry" "predicate" "pure"
+keepModuleNotInDbOrSys : (dbRows: List ({})) -> (sysEntities: List ({})) -> (e: {}) -> Boolean
+keepModuleNotInDbOrSys dbRows sysEntities e =
+  if nameMatchesAny dbRows e.id then False
+  else if idMatchesAny sysEntities e.id then False
+  else True
+
+-- keepFnNotInDb — predicate for the module-functions filter.
+@label "Keep module function not in DB"
+@description "Filter predicate for the module-functions pass. True when the function's id is NOT represented by any DB row's `function.id`."
+@tags "dashboard" "registry" "predicate" "pure"
+keepFnNotInDb : (dbRows: List ({})) -> (f: {}) -> Boolean
+keepFnNotInDb dbRows f =
+  not (fnIdInDbRows dbRows f.id)
+
+-- listTypesMerged — GET /types route body. Read the 3 sources, enrich
+-- DB rows, synthesize system + module rows for entities not already
+-- covered by DB rows. Returns one merged list.
+--
+-- Order matches the legacy: DB rows first, then system rows, then
+-- module rows.
+@label "List types (merged DB + system + module)"
+@description "GET /types route body. Reads 3 sources (DB type rows + system entities + module entities), enriches DB rows with typeclass-resolved label/description, synthesizes system + module rows for entries not already covered by DB rows. Returns one merged list in legacy order (DB → system → module)."
+@tags "dashboard" "types" "route" "list" "registry"
+listTypesMerged : (accountId: String) -> List ({})
+listTypesMerged accountId =
+  let dbRows = listTypes()
+  let sysEntities = listSystemEntities()
+  let modEntities = listModuleEntities()
+  let enrichedDb = map enrichTypeRow dbRows
+  let sysSynth = map (synthesizeSystemTypeRow accountId) (filter (keepSystemNotInDb dbRows) sysEntities)
+  let modSynth = map (synthesizeModuleTypeRow accountId) (filter (keepModuleNotInDbOrSys dbRows sysEntities) modEntities)
+  concat enrichedDb (concat sysSynth modSynth)
+
+-- getTypeDetail — GET /types/:name route body. Three-stage fallback:
+--   1. DB row matching name → enrich + return.
+--   2. Module entity matching name → synthesize → return.
+--   3. Otherwise Nothing (the TS wrapper maps to 404).
+--
+-- System entities (compile-time) are NOT looked up by name here — the
+-- legacy /types/:name only checks DB row + module-entity. System
+-- entities only surface via /types/seed (which materialises them as DB
+-- rows) or via the /types list. Preserves legacy semantics.
+@label "Get type detail (merged)"
+@description "GET /types/:name route body. Three-stage fallback: DB row → enrich; else module-entity → synthesize; else Nothing (TS wrapper maps to 404). System entities are NOT looked up by name here — the legacy /types/:name only checks DB + module-entity (system entities only surface via /types/seed or /types list). Preserves legacy semantics."
+@tags "dashboard" "types" "route" "get" "registry"
+getTypeDetail : (accountId: String) -> (name: String) -> Maybe ({})
+getTypeDetail accountId name =
+  case getType name of
+    Just row -> Just (enrichTypeRow row)
+    _ ->
+      let modEntities = listModuleEntities()
+      case find (\e -> eq e.id name) modEntities of
+        Just e -> Just (synthesizeModuleTypeRow accountId e)
+        _ -> Nothing
+
+-- listFunctionsMerged — GET /functions route body. Reads DB function
+-- rows + module functions; synthesizes module-function rows for fns
+-- not already represented as a DB row (legacy check: `dbIds.has(f.id)`
+-- where dbIds is the set of `row.function.id` values).
+@label "List functions (merged DB + module)"
+@description "GET /functions route body. Reads DB function rows + module functions; synthesizes module-function rows for fns not already represented as a DB row. Returns one merged list."
+@tags "dashboard" "functions" "route" "list" "registry"
+listFunctionsMerged : (accountId: String) -> List ({})
+listFunctionsMerged accountId =
+  let dbRows = listFunctions()
+  let modFns = listModuleFunctions()
+  -- Index once instead of scanning every DB row for each module function.
+  let dbIds = fromEntries (map (\row -> { key = row.function.id, value = True }) (filter (\row -> isString row.function.id) dbRows))
+  let modSynth = map (synthesizeModuleFunctionRow accountId) (filter (\f -> if isString f.id then not (fromMaybe False (mapGet dbIds f.id)) else keepFnNotInDb dbRows f) modFns)
+  concat dbRows modSynth
+
+-- getFunctionDetail — GET /functions/:name route body. Two-stage
+-- fallback: DB row → return; else module function → synthesize → return;
+-- else Nothing.
+@label "Get function detail (merged)"
+@description "GET /functions/:name route body. Two-stage fallback: DB row → return; else module function → synthesize → return; else Nothing."
+@tags "dashboard" "functions" "route" "get" "registry"
+getFunctionDetail : (accountId: String) -> (name: String) -> Maybe ({})
+getFunctionDetail accountId name =
+  case getFunction name of
+    Just row -> Just row
+    _ ->
+      let modFns = listModuleFunctions()
+      case find (\f -> eq f.id name) modFns of
+        Just f -> Just (synthesizeModuleFunctionRow accountId f)
+        _ -> Nothing

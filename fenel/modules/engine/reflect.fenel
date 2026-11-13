@@ -1,0 +1,734 @@
+module engine where
+
+-- =========================================================================
+-- reflect.fenel — the reader-owned reflection boundary (recipe-functions S2;
+-- `workstreams/recipe-functions/ledger.md` §5, §12, §13 C0).
+--
+-- `reflectFunction f` (a context native of the consuming module, wired to
+-- `dispatchedReifyInReader` in engine-bodies-dispatch.ts) answers a typed
+-- `ReifyOutcome` for ANY function value the requesting reader can name: a
+-- source closure, a named definition (by `{$ref}`), a partial application, a
+-- native. The host side only OBSERVES the value (own-data descriptors, dense
+-- arrays, no getter) and marshals it into a `ReflectCarrier`; it answers a
+-- named identity only through the reader's own `getFunction` with the
+-- exact-owner check (`spec.id` is the identity, or the reader's own UUID for
+-- that id), and a miss is `ReflectMissing`, never a global or
+-- compiler-metadata fallback.
+--
+-- ADMITTED VALUES. Every captured value, definition lexical value and partial
+-- argument crosses the host's admitted-value snapshot boundary: supported
+-- Fenel data (plain records and dense lists of scalars, constructors, Fenel
+-- closures, partials and references) is deep-copied and frozen, so a later
+-- mutation of the original never changes an earlier reflection; anything else
+-- (a host function, an opaque handle, an authority handle, a non-plain object,
+-- an accessor, a cycle) is NOT admitted. Each entry arrives as
+-- `{ name, value, admitted, callables }`. Policy here: a capture the reified
+-- body actually uses that was not admitted makes the whole reflection
+-- `Unavailable` (`Err Unsupported` on the old `reify` path); an unused one is
+-- dropped with the rest of the unused scope.
+-- Trusted-ingress invariant: evaluator values are never host Proxies; the
+-- observation reads descriptors, which would run a Proxy's descriptor traps.
+--
+-- Everything else is here, in Fenel:
+--   * the lift (`jsonLogicToExpr`, the proven adapter — never re-derived);
+--   * import closing (`reifyCloseLexicalNames`, which keeps `lit` and every
+--     other field of a node);
+--   * capture filtering: the body's free names (match guards included), with
+--     their ORIGIN (a closure's captured scope, a definition's lexical data, a
+--     partial's argument);
+--   * partial reconstruction: the collected arguments become `PartialArgument`
+--     captures named by the leading parameters, the remaining parameters stay;
+--     a collected argument shadows any captured value of the same name;
+--   * the constructor map: every written spelling gets an outcome — the one
+--     target it denotes (`ConstructorRef`), several (`ConstructorAmbiguous`) or
+--     none (`ConstructorUnknown`); nothing is guessed and nothing is dropped;
+--   * the helper-dependency walk, ONE LEVEL AT A TIME: every free reference of
+--     a body (call heads and variables not bound by a parameter, capture,
+--     lambda or pattern, whatever their spelling: a qualified name, a UUID, a
+--     bare alias) and every callable reached through an admitted capture value
+--     (a `{$ref}`, a captured closure's own references, a partial's base) is
+--     asked of the reader separately and recorded once, with its own outcome,
+--     in a flat list on the ROOT package. A nested dependency's package keeps
+--     `dependencies = []`: that means "consult the root graph", not "none";
+--   * outcome policy: missing and inaccessible are the same `Unavailable`; a
+--     body without source (native) or one the adapter cannot lift is
+--     `OpaqueBody` with the identity (empty for an anonymous closure) and the
+--     ordered parameters. A closure carrying a recursion self-binding (`fix`)
+--     or a captured source-function coordinate (`sourceFunction`) is also
+--     `OpaqueBody`: the package has no slot for either, so reflection abstains
+--     rather than return a body that would evaluate differently. `OpaqueBody`
+--     is an abstention, never an implementation fingerprint.
+--
+-- Reflection executes nothing: no recipe, capture, getter or effect. Capture
+-- values ride as data. No authority, frame or host handle enters the package.
+-- =========================================================================
+
+-- The heterogeneous payload slot is the existing universal type, complement
+-- Void. Like std.recordType, this source helper uses the existing dynamic-key
+-- boundary for its Type envelope. The value argument selects the shipped
+-- dependent-type path; the real alias keeps public field types ground.
+@category "engine-internal"
+reflectionValueType : (unused: Number) -> Type
+reflectionValueType unused = std.assocRecord {} "$complement" (std.assocRecord {} "$void" true)
+
+ReflectionValue = (reflectionValueType 0) | if true then true else true
+
+@label "Reified function"
+@description "A function value read back as data: its ordered parameters (unused ones included), its body as an Expr closed over its imports, the captured values it actually uses with their origin, where it came from, the helper functions it references (each with its own outcome; on a nested dependency package the list is empty and the root package's list is the graph), the constructor spellings its body writes with their resolution, and a generation slot that a live reading leaves empty (two readings are the same when their content is)."
+ReifiedFunction = ReifiedFunction params: List String body: (Expr ReflectionValue) captures: List ReifiedCapture source: FunctionSource dependencies: List ReifiedDependency constructors: List ConstructorRef generation: Maybe Number
+
+@label "Reified capture"
+@description "One captured name the reified body uses, its value (an admitted immutable snapshot, never executed) and where the value came from."
+ReifiedCapture = ReifiedCapture name: String value: ReflectionValue origin: CaptureOrigin
+
+@label "Capture origin"
+@description "Where a captured value came from: the scope a closure was created in, a named definition's own lexical data, or the argument at a given position of a partial application."
+CaptureOrigin = ClosureScope | DefinitionLexical | PartialArgument index: Number
+
+@label "Function source"
+@description "Where a reified function came from: a named definition (by identity), an anonymous closure, or a partial application of another source with a number of collected arguments."
+FunctionSource = NamedDefinition identity: String | SourceClosure | PartialOf base: FunctionSource collected: Number
+
+@label "Reified dependency"
+@description "A function the reified body references (by its written identity) or reaches through a captured value, with the outcome of reflecting it in the same reader. Its content is its version."
+ReifiedDependency = ReifiedDependency identity: String outcome: ReifyOutcome
+
+@label "Constructor reference"
+@description "A constructor spelling written in the body and its resolution in the reader: the one constructor target it denotes, several targets (ambiguous), or none (unknown)."
+ConstructorRef = ConstructorRef written: String target: String | ConstructorAmbiguous written: String targets: List String | ConstructorUnknown written: String
+
+@label "Reify outcome"
+@description "The result of reflecting a function value in a reader: its reified package; an opaque body (a native, or a body reflection cannot read faithfully) with its identity and parameters; or unavailable in this reader (missing, inaccessible and unadmitted captures are the same answer)."
+ReifyOutcome = Reified package: ReifiedFunction | OpaqueBody identity: String params: List String | Unavailable
+
+-- The host observation of one function value, as data. `body` is the
+-- marshalled JSON-Logic node; `env` a list of admitted entries
+-- `{ name, value, admitted, callables }`; `collected` a list of admitted
+-- entries `{ value, admitted, callables }`; `lexicalNames` the import frame's
+-- name -> identity record. Internal: never leaves the reflection boundary.
+@category "engine-internal"
+ReflectCarrier = ReflectClosure params: List String body: a env: a lexicalNames: a fix: Maybe String sourceFunction: Maybe String
+  | ReflectNamed identity: String params: List String body: a env: a lexicalNames: a
+  | ReflectNative identity: String params: List String
+  | ReflectReference identity: String
+  | ReflectPartial base: a collected: a
+  | ReflectMissing
+
+-- A callable the host found inside one admitted value: a function identity
+-- in call position (a partial's base), a `{$ref}` (a function or a type), a
+-- top-level String value (a callee only if the body calls it), or a captured
+-- closure / partial observed through the same boundary.
+@category "engine-internal"
+ReflectCallable = CallableIdentity identity: String | CallableRef identity: String | CallableIfCalled identity: String | CallableCarrier carrier: ReflectCarrier
+
+-- One pending step of the dependency walk.
+@category "engine-internal"
+ReflectWork = WorkIdentity identity: String | WorkCarrier carrier: ReflectCarrier
+
+-- Host leaf (A2): the requesting reader's observation of one identity, by the
+-- exact-owner rule. Supplied only by a reflection dispatch's private frame;
+-- outside it the call fails and the whole reflection answers Unavailable.
+@native
+@category "engine-internal"
+reflectReaderCarrier : (identity: String) -> ReflectCarrier
+
+-- Host leaf (A2): binding facts of one written name — the identity the
+-- reader's own lookup answers for it (exact data of the spec it returns),
+-- the identity the curated harness answers for the proposed harness name,
+-- whether the reader's answer declares effects, whether the reader holds a
+-- type of that name, and whether the actual selected pure plain native and
+-- formal parameters match at those heads. No native is executed.
+@native
+@category "engine-internal"
+reflectReaderNameFacts : (name: String) -> (harnessName: String) -> { readerOwner: Maybe String, harnessOwner: Maybe String, effectful: Boolean, isType: Boolean, samePlainNative: Boolean }
+
+-- The reader entry: shallow reflection of the value, then the dependency walk.
+@label "Reflect function carrier"
+@description "Reflect one observed function value into a ReifyOutcome, then walk the helper identities its body references and the callables its admitted captures reach, one level at a time, asking the reader for each identity and recording each once with its own outcome on the root package."
+@category "engine-internal"
+reflectCarrier : (carrier: ReflectCarrier) -> (rctx: { ctorDefs: List CtorDefEntry, ctorRows: List ({ target: String, wireName: String }), nullValue: a, generation: Maybe Number }) -> ReifyOutcome
+reflectCarrier carrier rctx =
+  let shallow = reflectShallow carrier rctx
+  case shallow.outcome of
+    Reified { package = pkg } ->
+      let own = reflectSourceIdentity pkg.source
+      let deps = reflectDependencyWalk shallow.work [own] [] rctx
+      Reified { package = mapSet pkg "dependencies" deps }
+    other -> other
+
+-- One value, no dependency walk: its outcome and the work it reaches.
+@category "engine-internal"
+reflectShallow : (carrier: ReflectCarrier) -> (rctx: a) -> { outcome: ReifyOutcome, work: List ReflectWork }
+reflectShallow carrier rctx =
+  case carrier of
+    ReflectMissing -> { outcome = Unavailable, work = [] }
+    ReflectReference { identity = i } -> reflectShallow (reflectReaderCarrier i) rctx
+    ReflectNative { identity = i, params = ps } -> { outcome = OpaqueBody { identity = i, params = ps }, work = [] }
+    ReflectClosure { params = ps, body = b, env = env, lexicalNames = names, fix = fixName, sourceFunction = sourceFn } ->
+      if reflectClosureFaithful fixName sourceFn
+      then reflectLift SourceClosure "" ps b env names ClosureScope rctx
+      else { outcome = OpaqueBody { identity = "", params = ps }, work = [] }
+    ReflectNamed { identity = i, params = ps, body = b, env = env, lexicalNames = names } ->
+      reflectLift (NamedDefinition { identity = i }) i ps b env names DefinitionLexical rctx
+    ReflectPartial { base = base, collected = collected } ->
+      let inner = reflectShallow base rctx
+      let outcome = if reflectAllAdmitted collected then reflectPartial inner.outcome collected else Unavailable
+      let dyn = case inner.outcome of
+        Reified { package = pkg } -> reflectDynNames pkg.body []
+        OpaqueBody {} -> []
+        Unavailable -> []
+      let params = case inner.outcome of
+        Reified { package = pkg } -> pkg.params
+        OpaqueBody { params = ps } -> ps
+        Unavailable -> []
+      { outcome = outcome, work = concat inner.work (reflectCollectedWork params collected dyn []) }
+
+-- A closure the package can represent faithfully: no `fix` self-binding and
+-- no captured source-function coordinate.
+@category "engine-internal"
+reflectClosureFaithful : (fixName: Maybe String) -> (sourceFn: Maybe String) -> Boolean
+reflectClosureFaithful fixName sourceFn =
+  case fixName of
+    Just f -> False
+    Nothing ->
+      case sourceFn of
+        Just s -> False
+        Nothing -> True
+
+@category "engine-internal"
+reflectAllAdmitted : (entries: List a) -> Boolean
+reflectAllAdmitted entries = eq (length (filter (\entry -> not (reflectAdmitted entry)) entries)) 0
+
+-- An entry without the flag (a hand-built legacy input) counts as admitted.
+@category "engine-internal"
+reflectAdmitted : (entry: a) -> Boolean
+reflectAdmitted entry =
+  case lookup entry "admitted" of
+    Nothing -> True
+    Just flag -> flag
+
+-- Lift, close over imports, filter captures, map constructors, gather work.
+@category "engine-internal"
+reflectLift : (source: FunctionSource) -> (identity: String) -> (params: List String) -> (body: a) -> (env: a) -> (names: a) -> (origin: CaptureOrigin) -> (rctx: a) -> { outcome: ReifyOutcome, work: List ReflectWork }
+reflectLift source identity params body env names origin rctx =
+  case jsonLogicToExpr body rctx.ctorDefs rctx.nullValue of
+    Err e -> { outcome = OpaqueBody { identity = identity, params = params }, work = [] }
+    Ok expr ->
+      let bound = concat params (map (\entry -> entry.name) env)
+      let closed = if eq (length (entries names)) 0 then expr else reifyCloseLexicalNames expr names bound
+      let free = collectFreeVars closed params []
+      let kept = reifyFilterCaptures env free []
+      if not (reflectAllAdmitted kept) then { outcome = Unavailable, work = [] }
+      else
+        let captures = map (\entry -> ReifiedCapture { name = entry.name, value = entry.value, origin = origin }) kept
+        let dyn = reflectDynNames closed []
+        let refs = reflectReferences closed bound []
+        let work = concat (map (\r -> WorkIdentity { identity = r }) refs) (reflectEnvWork kept dyn [])
+        -- Only rows whose wire name or target is a written constructor can
+        -- answer reflectResolveConstructor for that name: keep them (in order)
+        -- in one pass instead of two passes over every row per name.
+        let written = reflectWrittenConstructors closed []
+        let rows = if eq (length written) 0 then [] else filter (\row -> elem row.wireName written || elem row.target written) rctx.ctorRows
+        { outcome = Reified { package = ReifiedFunction {
+            params = params,
+            body = closed,
+            captures = captures,
+            source = source,
+            dependencies = [],
+            constructors = reflectConstructorRefs written rows [],
+            generation = rctx.generation
+          } }, work = work }
+
+-- Work reached through kept captures: each callable of each entry.
+@category "engine-internal"
+reflectEnvWork : (kept: List a) -> (dyn: List String) -> (acc: List ReflectWork) -> List ReflectWork
+reflectEnvWork kept dyn acc =
+  case head kept of
+    Nothing -> acc
+    Just entry -> reflectEnvWork (reflectRest kept) dyn (reflectCallablesWork entry.name (reflectCallablesOf entry) dyn acc)
+
+-- Work reached through a partial's collected arguments; argument i is bound
+-- to parameter i, which names it for the `$dyn:` callee check.
+@category "engine-internal"
+reflectCollectedWork : (params: List String) -> (collected: List a) -> (dyn: List String) -> (acc: List ReflectWork) -> List ReflectWork
+reflectCollectedWork params collected dyn acc =
+  case head collected of
+    Nothing -> acc
+    Just entry ->
+      let name = fromMaybe "" (head params)
+      reflectCollectedWork (reflectRest params) (reflectRest collected) dyn (reflectCallablesWork name (reflectCallablesOf entry) dyn acc)
+
+@category "engine-internal"
+reflectCallablesOf : (entry: a) -> List ReflectCallable
+reflectCallablesOf entry =
+  case lookup entry "callables" of
+    Nothing -> []
+    Just callables -> callables
+
+@category "engine-internal"
+reflectCallablesWork : (name: String) -> (callables: List ReflectCallable) -> (dyn: List String) -> (acc: List ReflectWork) -> List ReflectWork
+reflectCallablesWork name callables dyn acc =
+  case head callables of
+    Nothing -> acc
+    Just callable ->
+      let next = case callable of
+        CallableIdentity { identity = i } -> appendItem (WorkIdentity { identity = i }) acc
+        CallableRef { identity = i } -> if reflectRefIsTypeOnly i then acc else appendItem (WorkIdentity { identity = i }) acc
+        CallableIfCalled { identity = i } -> if elem name dyn then appendItem (WorkIdentity { identity = i }) acc else acc
+        CallableCarrier { carrier = c } -> appendItem (WorkCarrier { carrier = c }) acc
+      reflectCallablesWork name (reflectRest callables) dyn next
+
+-- A `{$ref}` names a type rather than a function when the reader answers no
+-- function for it and does hold a type of that name.
+@category "engine-internal"
+reflectRefIsTypeOnly : (identity: String) -> Boolean
+reflectRefIsTypeOnly identity =
+  let facts = reflectReaderNameFacts identity identity
+  case facts.readerOwner of
+    Just owner -> False
+    Nothing -> facts.isType
+
+-- Names called through a variable head (`$dyn:<name>`), each once.
+@category "engine-internal"
+reflectDynNames : (expr: Expr) -> (acc: List String) -> List String
+reflectDynNames expr acc =
+  case expr of
+    ELit {} -> acc
+    EVar {} -> acc
+    ECall { fnId = fnId, args = args } ->
+      let withHead = if startsWith fnId "$dyn:" then reflectAddName (slice fnId 5 (length fnId)) acc else acc
+      reflectDynList args withHead
+    ELambda { body = body } -> reflectDynNames body acc
+    EConstruct { args = args } -> reflectDynList args acc
+    ERecord { fields = fields } -> reflectDynList (map (\field -> field.value) fields) acc
+    EMatch { scrutinee = scrutinee, arms = arms } -> reflectDynList (reflectArmExprs arms []) (reflectDynNames scrutinee acc)
+
+@category "engine-internal"
+reflectDynList : (exprs: List Expr) -> (acc: List String) -> List String
+reflectDynList exprs acc =
+  case head exprs of
+    Nothing -> acc
+    Just e -> reflectDynList (reflectRest exprs) (reflectDynNames e acc)
+
+-- Every arm body and guard, in order.
+@category "engine-internal"
+reflectArmExprs : (arms: a) -> (acc: List Expr) -> List Expr
+reflectArmExprs arms acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let withBody = appendItem arm.body acc
+      let withGuard = case lookup arm "guard" of
+        Nothing -> withBody
+        Just guard -> appendItem guard withBody
+      reflectArmExprs (reflectRest arms) withGuard
+
+-- Partial reconstruction: the collected arguments bind the leading
+-- parameters, in order, as PartialArgument captures; the rest stay parameters.
+-- The base package's captures never hold a parameter's name (parameters are
+-- not free), so a collected argument cannot be shadowed by a captured value.
+-- A partial that collected as many arguments as its base takes (or more) is a
+-- malformed carrier.
+@category "engine-internal"
+reflectPartial : (base: ReifyOutcome) -> (collected: List a) -> ReifyOutcome
+reflectPartial base collected =
+  let n = length collected
+  case base of
+    Unavailable -> Unavailable
+    OpaqueBody { identity = i, params = ps } ->
+      if lt n (length ps) then OpaqueBody { identity = i, params = reflectDrop n ps } else Unavailable
+    Reified { package = pkg } ->
+      if lt n (length pkg.params)
+      then Reified { package = ReifiedFunction {
+        params = reflectDrop n pkg.params,
+        body = pkg.body,
+        captures = concat (filter (\c -> not (elem c.name (reflectTake n pkg.params))) pkg.captures) (reflectPartialCaptures pkg.params collected 0 []),
+        source = PartialOf { base = pkg.source, collected = n },
+        dependencies = pkg.dependencies,
+        constructors = pkg.constructors,
+        generation = pkg.generation
+      } }
+      else Unavailable
+
+@category "engine-internal"
+reflectPartialCaptures : (params: List String) -> (collected: List a) -> (index: Number) -> (acc: List ReifiedCapture) -> List ReifiedCapture
+reflectPartialCaptures params collected index acc =
+  case head collected of
+    Nothing -> acc
+    Just entry ->
+      case head params of
+        Nothing -> acc
+        Just name ->
+          let next = appendItem (ReifiedCapture { name = name, value = entry.value, origin = PartialArgument { index = index } }) acc
+          reflectPartialCaptures (reflectRest params) (reflectRest collected) (add index 1) next
+
+@category "engine-internal"
+reflectRest : (xs: List a) -> List a
+reflectRest xs =
+  case tail xs of
+    Nothing -> []
+    Just rest -> rest
+
+@category "engine-internal"
+reflectDrop : (n: Number) -> (xs: List a) -> List a
+reflectDrop n xs = if lte n 0 then xs else reflectDrop (sub n 1) (reflectRest xs)
+
+@category "engine-internal"
+reflectTake : (n: Number) -> (xs: List a) -> List a
+reflectTake n xs =
+  if lte n 0 then []
+  else case head xs of
+    Nothing -> []
+    Just x -> concat [x] (reflectTake (sub n 1) (reflectRest xs))
+
+@category "engine-internal"
+reflectSourceIdentity : (source: FunctionSource) -> String
+reflectSourceIdentity source =
+  case source of
+    NamedDefinition { identity = i } -> i
+    SourceClosure -> ""
+    PartialOf { base = base } -> reflectSourceIdentity base
+
+-- The dependency walk: a queue of work, a visited list of identities (seeded
+-- with the reflected function's own identity, so self-recursion is not a
+-- dependency), and the flat accumulator. Each identity is reflected shallowly
+-- and recorded once; its work joins the queue, so the list is the transitive
+-- helper closure in discovery order. A captured closure is reflected for its
+-- work only (its content already rides in the capture value). Terminates:
+-- identities are visited at most once among the reader's finitely many, and a
+-- captured closure's work comes from a strictly smaller admitted snapshot
+-- (snapshots are finite and acyclic).
+@category "engine-internal"
+reflectDependencyWalk : (queue: List ReflectWork) -> (visited: List String) -> (acc: List ReifiedDependency) -> (rctx: a) -> List ReifiedDependency
+reflectDependencyWalk queue visited acc rctx =
+  case head queue of
+    Nothing -> acc
+    Just work ->
+      let rest = reflectRest queue
+      case work of
+        WorkCarrier { carrier = c } ->
+          let shallow = reflectShallow c rctx
+          -- An anonymous captured occurrence has no identity to invent or
+          -- deduplicate. Keep every abstention explicitly; an empty identity
+          -- means an occurrence, never a key into the named dependency graph.
+          let next = case shallow.outcome of
+            Reified {} -> acc
+            other -> appendItem (ReifiedDependency { identity = "", outcome = other }) acc
+          reflectDependencyWalk (concat rest shallow.work) visited next rctx
+        WorkIdentity { identity = identity } ->
+          if elem identity visited
+          then reflectDependencyWalk rest visited acc rctx
+          else
+            let shallow = reflectShallow (reflectReaderCarrier identity) rctx
+            let entry = ReifiedDependency { identity = identity, outcome = shallow.outcome }
+            reflectDependencyWalk (concat rest shallow.work) (appendItem identity visited) (appendItem entry acc) rctx
+
+-- References of a closed body: every call head and variable whose name no
+-- parameter, capture, lambda or pattern binds, whatever its spelling. Not
+-- references: `$`-sentinels (`$dyn:`, `$effect:`, the `$` application
+-- vehicle) and the core's structural heads (`if`, `and`, `or`, `ann`, and
+-- the list-literal `appendItem` carrying the `lit` mark).
+@category "engine-internal"
+reflectReferences : (expr: Expr) -> (bound: List String) -> (acc: List String) -> List String
+reflectReferences expr bound acc =
+  case expr of
+    ELit {} -> acc
+    EVar { name = name } -> reflectAddReference name bound acc
+    ECall { fnId = fnId, args = args } ->
+      let withHead = if reflectStructuralHead expr fnId then acc else reflectAddReference fnId bound acc
+      reflectReferencesList args bound withHead
+    ELambda { params = params, body = body } -> reflectReferences body (concat params bound) acc
+    EConstruct { args = args } -> reflectReferencesList args bound acc
+    ERecord { fields = fields } -> reflectReferencesList (map (\field -> field.value) fields) bound acc
+    EMatch { scrutinee = scrutinee, arms = arms } -> reflectReferencesArms arms bound (reflectReferences scrutinee bound acc)
+
+@category "engine-internal"
+reflectStructuralHead : (expr: Expr) -> (fnId: String) -> Boolean
+reflectStructuralHead expr fnId =
+  if startsWith fnId "$" then True
+  else if eq fnId "if" then not (eq (lookup expr "structural") (Just false))
+  else if eq fnId "?:" then eq (lookup expr "structural") (Just true)
+  else if eq fnId "ann" then True
+  else if elem fnId ["and", "or"] then eq (lookup expr "structural") (Just true)
+  else if eq fnId "appendItem" then reflectLitMarked expr
+  else False
+
+@category "engine-internal"
+reflectLitMarked : (expr: Expr) -> Boolean
+reflectLitMarked expr =
+  case lookup expr "lit" of
+    Nothing -> False
+    Just mark -> mark
+
+-- Is the Maybe exactly `Just value`? (No structural `eq` on ADT values.)
+@category "engine-internal"
+reflectIsJust : (m: Maybe String) -> (value: String) -> Boolean
+reflectIsJust m value =
+  case m of
+    Nothing -> False
+    Just x -> eq x value
+
+@category "engine-internal"
+reflectAddReference : (name: String) -> (bound: List String) -> (acc: List String) -> List String
+reflectAddReference name bound acc =
+  if startsWith name "$" then acc
+  else if elem (dottedHead name) bound then acc
+  else reflectAddName name acc
+
+@category "engine-internal"
+reflectReferencesList : (exprs: List Expr) -> (bound: List String) -> (acc: List String) -> List String
+reflectReferencesList exprs bound acc =
+  case head exprs of
+    Nothing -> acc
+    Just e -> reflectReferencesList (reflectRest exprs) bound (reflectReferences e bound acc)
+
+@category "engine-internal"
+reflectReferencesArms : (arms: a) -> (bound: List String) -> (acc: List String) -> List String
+reflectReferencesArms arms bound acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let local = collectPatternBindings arm.pattern bound
+      let withBody = reflectReferences arm.body local acc
+      let withGuard = case lookup arm "guard" of
+        Nothing -> withBody
+        Just guard -> reflectReferences guard local withBody
+      reflectReferencesArms (reflectRest arms) bound withGuard
+
+-- Constructor spellings written in the body (EConstruct heads and constructor
+-- patterns), each once, in first-occurrence order.
+@category "engine-internal"
+reflectWrittenConstructors : (expr: Expr) -> (acc: List String) -> List String
+reflectWrittenConstructors expr acc =
+  case expr of
+    ELit {} -> acc
+    EVar {} -> acc
+    ECall { args = args } -> reflectWrittenList args acc
+    ELambda { body = body } -> reflectWrittenConstructors body acc
+    EConstruct { ctor = ctor, args = args } -> reflectWrittenList args (reflectAddName ctor acc)
+    ERecord { fields = fields } -> reflectWrittenList (map (\field -> field.value) fields) acc
+    EMatch { scrutinee = scrutinee, arms = arms } -> reflectWrittenArms arms (reflectWrittenConstructors scrutinee acc)
+
+@category "engine-internal"
+reflectAddName : (name: String) -> (acc: List String) -> List String
+reflectAddName name acc = if elem name acc then acc else appendItem name acc
+
+@category "engine-internal"
+reflectWrittenList : (exprs: List Expr) -> (acc: List String) -> List String
+reflectWrittenList exprs acc =
+  case head exprs of
+    Nothing -> acc
+    Just e -> reflectWrittenList (reflectRest exprs) (reflectWrittenConstructors e acc)
+
+@category "engine-internal"
+reflectWrittenArms : (arms: a) -> (acc: List String) -> List String
+reflectWrittenArms arms acc =
+  case head arms of
+    Nothing -> acc
+    Just arm ->
+      let withPattern = reflectPatternConstructors arm.pattern acc
+      let withBody = reflectWrittenConstructors arm.body withPattern
+      let withGuard = case lookup arm "guard" of
+        Nothing -> withBody
+        Just guard -> reflectWrittenConstructors guard withBody
+      reflectWrittenArms (reflectRest arms) withGuard
+
+@category "engine-internal"
+reflectPatternConstructors : (pattern: a) -> (acc: List String) -> List String
+reflectPatternConstructors pattern acc =
+  case pattern of
+    PatConstruct { ctor = ctor, args = args } -> reflectPatternList args (reflectAddName ctor acc)
+    PatLit {} -> acc
+    PatVar {} -> acc
+    PatWildcard -> acc
+
+@category "engine-internal"
+reflectPatternList : (patterns: a) -> (acc: List String) -> List String
+reflectPatternList patterns acc =
+  case head patterns of
+    Nothing -> acc
+    Just p -> reflectPatternList (reflectRest patterns) (reflectPatternConstructors p acc)
+
+-- Every written spelling gets an outcome. The candidates are the reader's
+-- snapshot rows whose wire spelling is the written name and whose target is a
+-- distinct (qualified) identity: exactly one maps (`ConstructorRef`); several
+-- are `ConstructorAmbiguous` with every target. With none, a spelling that is
+-- itself a target of the reader's table (a qualified spelling, or a legacy
+-- unqualified row) denotes that target; anything else is `ConstructorUnknown`.
+@category "engine-internal"
+reflectConstructorRefs : (written: List String) -> (rows: List ({ target: String, wireName: String })) -> (acc: List ConstructorRef) -> List ConstructorRef
+reflectConstructorRefs written rows acc =
+  case head written of
+    Nothing -> acc
+    Just name ->
+      reflectConstructorRefs (reflectRest written) rows (appendItem (reflectResolveConstructor name rows) acc)
+
+@category "engine-internal"
+reflectResolveConstructor : (name: String) -> (rows: List ({ target: String, wireName: String })) -> ConstructorRef
+reflectResolveConstructor name rows =
+  let targets = map (\row -> row.target) (filter (\row -> and (eq row.wireName name) (not (eq row.target name))) rows)
+  let self = filter (\row -> eq row.target name) rows
+  if eq (length targets) 1 then ConstructorRef { written = name, target = fromMaybe name (head targets) }
+  else if gt (length targets) 1 then ConstructorAmbiguous { written = name, targets = targets }
+  else if gt (length self) 0 then ConstructorRef { written = name, target = name }
+  else ConstructorUnknown { written = name }
+
+-- The old `reify` Result contract over the same observation: the 8 solver
+-- consumers keep their `{ body, params, env, lexicalNames }` input, now built
+-- from the reader's carrier. A partial becomes its base with the collected
+-- arguments moved from the parameters into the environment; every captured
+-- entry a base parameter shadows is removed first (invocation binds the
+-- parameters over the captured scope), so a collected argument always wins.
+-- A closure the package cannot represent faithfully (`fix`, `sourceFunction`)
+-- has no body here. Env entries keep their `admitted` flag: `reify` refuses a
+-- kept capture that was not admitted.
+@category "engine-internal"
+reflectCarrierReifyInput : (carrier: ReflectCarrier) -> { body: Maybe a, params: List String, env: List ({ name: String, value: a }), lexicalNames: a }
+reflectCarrierReifyInput carrier =
+  case carrier of
+    ReflectClosure { params = ps, body = b, env = env, lexicalNames = names, fix = fixName, sourceFunction = sourceFn } ->
+      if reflectClosureFaithful fixName sourceFn
+      then { body = Just b, params = ps, env = env, lexicalNames = names }
+      else { body = Nothing, params = [], env = [], lexicalNames = {} }
+    ReflectNamed { params = ps, body = b, env = env, lexicalNames = names } ->
+      { body = Just b, params = ps, env = env, lexicalNames = names }
+    ReflectNative {} -> { body = Nothing, params = [], env = [], lexicalNames = {} }
+    ReflectReference {} -> { body = Nothing, params = [], env = [], lexicalNames = {} }
+    ReflectMissing -> { body = Nothing, params = [], env = [], lexicalNames = {} }
+    ReflectPartial { base = base, collected = collected } ->
+      let input = reflectCarrierReifyInput base
+      let n = length collected
+      case input.body of
+        Nothing -> { body = Nothing, params = [], env = [], lexicalNames = {} }
+        Just b ->
+          if lt n (length input.params)
+          then {
+            body = Just b,
+            params = reflectDrop n input.params,
+            env = concat (filter (\entry -> not (elem entry.name input.params)) input.env) (reflectPartialEnv input.params collected []),
+            lexicalNames = input.lexicalNames
+          }
+          else { body = Nothing, params = [], env = [], lexicalNames = {} }
+
+@category "engine-internal"
+reflectPartialEnv : (params: List String) -> (collected: List a) -> (acc: List a) -> List a
+reflectPartialEnv params collected acc =
+  case head collected of
+    Nothing -> acc
+    Just entry ->
+      case head params of
+        Nothing -> acc
+        Just name ->
+          let next = appendItem { name = name, value = entry.value, admitted = reflectAdmitted entry, callables = reflectCallablesOf entry } acc
+          reflectPartialEnv (reflectRest params) (reflectRest collected) next
+
+-- A snapshot faithfully records callable data, including sharing INSIDE the
+-- snapshot. It cannot preserve a closure/partial's identity against the
+-- original reader's external values. Legacy reasoning must therefore abstain
+-- when a USED capture/partial argument contains such a copy: `eq x captured`
+-- must never return the copy as a witness the original invocation rejects.
+-- Ordinary reflection keeps the data; only reasoning consumers use this gate.
+@category "engine-internal"
+reflectSolverSnapshotInput : (input: a) -> (ctorDefs: List CtorDefEntry) -> (nullValue: b) -> a
+reflectSolverSnapshotInput input ctorDefs nullValue =
+  case input.body of
+    Nothing -> input
+    Just body ->
+      case jsonLogicToExpr body ctorDefs nullValue of
+        Err e -> input
+        Ok expr ->
+          let kept = reifyFilterCaptures input.env (collectFreeVars expr input.params []) []
+          let copied = filter (\entry -> reflectCopiedCallable (reflectCallablesOf entry)) kept
+          if gt (length copied) 0 then mapSet input "body" Nothing else input
+
+@category "engine-internal"
+reflectCopiedCallable : (callables: List ReflectCallable) -> Boolean
+reflectCopiedCallable callables =
+  case head callables of
+    Nothing -> False
+    Just callable -> case callable of
+      CallableCarrier {} -> True
+      CallableIdentity {} -> True
+      _ -> reflectCopiedCallable (reflectRest callables)
+
+-- READER SEMANTICS FOR THE SOLVER CONSUMERS (recipe-functions S2 item 8).
+-- The solver bodies run in the curated harness and read primitive heads by
+-- their harness spelling (`eq`, `lt`, …). With a reader, every free name of
+-- the closed body (the same reference notion as the dependency walk) is
+-- checked against the reader's own binding facts before the harness reads it:
+--   * the reader's exact identity `o` for the name (a closed import, a written
+--     identity): when the harness resolves the identity's last `:`-segment to
+--     EXACTLY `o`, the name is written as that segment (an imported `eq` that
+--     closes to `std:eq` is the harness's `eq`); otherwise it stays `o`, which
+--     no primitive recognition matches;
+--   * a bare alias the reader resolves to another owner `o`: unchanged when
+--     the harness resolves it to the same `o`; otherwise rewritten to `o`;
+--   * a name the reader does not resolve but the harness does: the harness
+--     would give it a meaning the reader lacks, so the input is refused
+--     (`body = Nothing`, i.e. `Err Unsupported`, i.e. no answer);
+--   * reader-effectful names (after the rewrite) are listed in `effectIds`
+--     for the symbolic consumer.
+-- The rewrite table rides on the input as `readerHeads`; `reify` applies it
+-- to free names only. Owner equality is necessary, never sufficient: a head
+-- the harness knows with that owner is admitted only when the actual direct,
+-- requires-free plain native and its formal parameters match. Changed bodies,
+-- native overrides, context natives and mediated routes refuse, including
+-- unchanged bare heads. No prefix is stripped without both checks.
+@category "engine-internal"
+reflectReaderSolverInput : (carrier: ReflectCarrier) -> (rctx: a) -> a
+reflectReaderSolverInput carrier rctx =
+  let input = reflectCarrierReifyInput carrier
+  let refused = { body = Nothing, params = [], env = [], lexicalNames = {}, readerHeads = [], effectIds = [] }
+  case input.body of
+    Nothing -> refused
+    Just b ->
+      case jsonLogicToExpr b rctx.ctorDefs rctx.nullValue of
+        Err e -> mapSet (mapSet input "readerHeads" []) "effectIds" []
+        Ok expr ->
+          let bound = concat input.params (map (\entry -> entry.name) input.env)
+          let closed = if eq (length (entries input.lexicalNames)) 0 then expr else reifyCloseLexicalNames expr input.lexicalNames bound
+          let decisions = map (\name -> reflectSolverHead name) (reflectReferences closed bound [])
+          if gt (length (filter (\d -> d.refuse) decisions)) 0 then refused
+          else
+            let heads = map (\d -> { from = d.from, to = d.to }) (filter (\d -> not (eq d.from d.to)) decisions)
+            let effects = map (\d -> d.to) (filter (\d -> d.effectful) decisions)
+            mapSet (mapSet input "readerHeads" heads) "effectIds" effects
+
+@category "engine-internal"
+reflectSolverHead : (name: String) -> { from: String, to: String, refuse: Boolean, effectful: Boolean }
+reflectSolverHead name =
+  let facts = reflectReaderNameFacts name name
+  case facts.readerOwner of
+    Nothing ->
+      case facts.harnessOwner of
+        Nothing -> { from = name, to = name, refuse = False, effectful = False }
+        Just h -> { from = name, to = name, refuse = True, effectful = False }
+    Just owner ->
+      let to = if eq owner name then reflectSolverIdentityName name owner else (if reflectIsJust facts.harnessOwner owner then name else owner)
+      let target = reflectReaderNameFacts name to
+      let refuse = case target.harnessOwner of
+        Nothing -> False
+        Just harnessOwner -> not (and (eq harnessOwner owner) target.samePlainNative)
+      { from = name, to = to, refuse = refuse, effectful = facts.effectful }
+
+-- The reader's exact identity `owner`, written as its last `:`-segment only
+-- when the harness resolves that segment to exactly the same identity.
+@category "engine-internal"
+reflectSolverIdentityName : (name: String) -> (owner: String) -> String
+reflectSolverIdentityName name owner =
+  let short = reflectLastSegment name
+  let shortFacts = reflectReaderNameFacts short short
+  if eq short name then name
+  else if reflectIsJust shortFacts.harnessOwner owner then short
+  else name
+
+@category "engine-internal"
+reflectLastSegment : (name: String) -> String
+reflectLastSegment name = reflectLastOf (split name ":") name
+
+@category "engine-internal"
+reflectLastOf : (xs: List String) -> (fallback: String) -> String
+reflectLastOf xs fallback =
+  case head xs of
+    Nothing -> fallback
+    Just x -> reflectLastOf (reflectRest xs) x

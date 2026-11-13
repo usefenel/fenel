@@ -1,0 +1,195 @@
+module engine where
+
+-- makeEffectsExplicit — recognise $effect:<Class>:<method> dispatch sites
+-- in a CoreExpr body, surface them in structured form alongside a
+-- deduplicated effect inventory.
+--
+-- Mirrors the TS oracle at
+-- implementations/typescript/engine/src/ir/effects-explicit.ts.
+--
+-- Phase 21.2 — first real recursive engine pass authored in Fenel. The
+-- 10-arm CoreMatch over the registered CoreExpr ADT, the state-threaded
+-- recursion via a {handlerSites, effects} record returned from each
+-- recursive call, the side-channel sites + effects accumulation, and
+-- the final lex-sort all run through the engine evaluator and (via the
+-- self-host harness's cross-Fenel-call substrate) the per-target
+-- compile + execute pipelines.
+--
+-- The two-argument signature `makeEffectsExplicit input emptyList`
+-- accepts the initial empty list as a value rather than constructing
+-- it via a bare-array literal — Core IR rejects bare arrays at
+-- expression position, so the empty bootstrap comes from the harness
+-- instead. `appendItem` plays the role of `sites.push(...)` in the TS
+-- oracle (1-element append on top of a JS array).
+
+-- CoreExpr / CorePattern — canonical declarations live in
+-- `fenel/modules/engine/ir-ast.fenel` (loaded first in engine.ts). The
+-- pass walks the registered shape via pattern matching on `$tag` + named
+-- fields; pre-4i this file redeclared both ADTs with a leaner 2-field
+-- `CoreConstruct` / `PatConstruct` (missing the Phase 21.1 `fields`
+-- named-field metadata) — those declarations are gone, the canonical
+-- 3-field shape from ir-ast.fenel wins everywhere now.
+
+-- HandlerSite / EffectsExplicitProgram — canonical declarations live in
+-- `fenel/modules/engine/ir-types.fenel` (Phase 3v.2 Axis-B dedup). Pre-3v.2
+-- this file redeclared both as inert duplicates; with the `module engine
+-- where` cross-file UNION (`loadFenelModuleUnion`) a duplicate entity id
+-- within the group is a LOAD-TIME ERROR, so the redeclarations are dropped
+-- and ir-types.fenel is the single owner. Byte-neutral for the registered
+-- entity — ir-types loaded FIRST and won the first-registration-wins dedup
+-- already (its `body: CoreExpr` shape was canonical), so nothing the catalog
+-- recorded changes. The pass below constructs both via the registered shape.
+
+-- scanForEffectCalls — walk a CoreExpr accumulating effect-dispatch
+-- sites. Returns a plain `{handlerSites, effects}` record carrying the
+-- threaded state; the caller destructures via `.handlerSites` /
+-- `.effects` field access (or a record pattern). No Result wrap —
+-- the TS oracle returns `compileOk(null)` in every well-formed branch,
+-- so collapsing to a plain record matches the only branch that ever
+-- fires and saves the Err/Ok unwrap noise at every recursive site.
+--
+-- Path conventions mirror the TS oracle's `${path}.${suffix}` form:
+--   - CoreCall args:      `path.0`, `path.1`, …
+--   - CoreIf:             `path.cond`, `path.then`, `path.else`
+--   - CoreLet bindings:   `path.let.0`, `path.let.1`, …
+--   - CoreLet body:       `path.body`
+--   - CoreDo / CoreConstruct args: `path.0`, `path.1`, …
+--   - CoreLambda body:    `path.body`
+--   - CoreRecord field:   `path.<fieldname>`
+--   - CoreMatch scrut:    `path.scrut`
+--   - CoreMatch arm body: `path.arm.0`, `path.arm.1`, …
+@label "Scan for effect calls"
+@description "Recursive walk over a CoreExpr accumulating effect-dispatch sites. Threads the (sites, effects) state forward through the {handlerSites, effects} scan record returned from each recursive call; the 10-arm CoreMatch covers every CoreExpr case. Helper to makeEffectsExplicit — exposed in the registry so the engine evaluator can dispatch the body via getFunction, but tagged `engine-internal` so the editor catalog hides it from the public function picker. Mirrors the TS oracle at implementations/typescript/engine/src/ir/effects-explicit.ts:scanForEffectCalls."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+scanForEffectCalls : (expr: Expr) -> (path: String) -> (sites: List ({ callPath: String, typeName: String, methodName: String })) -> (effects: List String) -> { handlerSites: List ({ callPath: String, typeName: String, methodName: String }), effects: List String }
+scanForEffectCalls expr path sites effects =
+  case expr of
+    -- expr-substrate Phase 4c — the live pipeline feeds `Expr` (7 cases); the
+    -- old `Core*` arms (the dead recognition cascade) were retired here. `if` /
+    -- `let` / `do` are no longer IR frames — they're `ECall "if"` / applied-
+    -- `ELambda`-via-`"$"` encodings, scanned generically as ECalls (their
+    -- effect sites get the canonical generic `.<idx>` arg paths; the callPath
+    -- has NO semantic consumer, only the oracle samples — blocker-1 re-pin).
+    -- Effect-call rewriting keys on the `$effect:` fnId, frame-agnostic.
+    ELit -> { handlerSites = sites, effects = effects }
+    EVar -> { handlerSites = sites, effects = effects }
+    ECall { fnId = fnId, args = args } ->
+      let parsed = parseEffectFnId fnId
+      let sitesNext = case parsed of
+            Nothing -> sites
+            Just p ->
+              appendItem { callPath = path, typeName = p.typeName, methodName = p.methodName } sites
+      let effectsNext = case parsed of
+            Nothing -> effects
+            Just p ->
+              if elem p.typeName effects
+              then effects
+              else appendItem p.typeName effects
+      scanIndexedExprs args path 0 sitesNext effectsNext
+    ELambda { body = bd } ->
+      scanForEffectCalls bd (concat path ".body") sites effects
+    EConstruct { args = args } ->
+      scanIndexedExprs args path 0 sites effects
+    ERecord { fields = fs } ->
+      scanNamedFields fs path sites effects
+    EMatch { scrutinee = scrut, arms = arms } ->
+      let r1 = scanForEffectCalls scrut (concat path ".scrut") sites effects
+      scanMatchArms arms path 0 r1.handlerSites r1.effects
+
+-- scanIndexedExprs — iterate over a list of CoreExpr children with
+-- numeric-index paths (`<basePath>.<idx>`). Threads (sites, effects)
+-- forward; recurses until the input list is empty.
+@label "Scan indexed exprs"
+@description "Iterate over a list of CoreExpr children with numeric-index paths (`<basePath>.<idx>`). Threading helper used by scanForEffectCalls for CoreCall.args, CoreDo.exprs, CoreConstruct.args."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+scanIndexedExprs : (exprs: List Expr) -> (basePath: String) -> (idx: Number) -> (sites: List ({ callPath: String, typeName: String, methodName: String })) -> (effects: List String) -> { handlerSites: List ({ callPath: String, typeName: String, methodName: String }), effects: List String }
+scanIndexedExprs exprs basePath idx sites effects =
+  case head exprs of
+    Nothing -> { handlerSites = sites, effects = effects }
+    Just h ->
+      let subPath = concat basePath (concat "." (toString idx))
+      let r1 = scanForEffectCalls h subPath sites effects
+      case tail exprs of
+        Nothing -> r1
+        Just rest ->
+          scanIndexedExprs rest basePath (idx + 1) r1.handlerSites r1.effects
+
+-- scanNamedFields — iterate over CoreRecord fields with name-keyed
+-- paths (`<basePath>.<fieldname>`). Each item is `{name: String,
+-- value: CoreExpr}`.
+@label "Scan named fields"
+@description "Iterate over CoreRecord fields with name-keyed paths (`<basePath>.<fieldname>`). Threading helper used by scanForEffectCalls for CoreRecord.fields."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+scanNamedFields : (fields: a) -> (basePath: String) -> (sites: List ({ callPath: String, typeName: String, methodName: String })) -> (effects: List String) -> { handlerSites: List ({ callPath: String, typeName: String, methodName: String }), effects: List String }
+scanNamedFields fields basePath sites effects =
+  case head fields of
+    Nothing -> { handlerSites = sites, effects = effects }
+    Just f ->
+      let subPath = concat basePath (concat "." f.name)
+      let r1 = scanForEffectCalls f.value subPath sites effects
+      case tail fields of
+        Nothing -> r1
+        Just rest -> scanNamedFields rest basePath r1.handlerSites r1.effects
+
+-- scanLetBindings — iterate over CoreLet bindings with `let`-prefixed
+-- indexed paths (`<basePath>.let.<idx>`). Each binding is `{name:
+-- String, value: CoreExpr}`; only the value is scanned (the name is a
+-- binding occurrence, not a sub-expression).
+@label "Scan let bindings"
+@description "Iterate over CoreLet bindings with `let`-prefixed indexed paths (`<basePath>.let.<idx>`). Threading helper used by scanForEffectCalls for CoreLet.bindings."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+scanLetBindings : (bindings: a) -> (basePath: String) -> (idx: Number) -> (sites: List ({ callPath: String, typeName: String, methodName: String })) -> (effects: List String) -> { handlerSites: List ({ callPath: String, typeName: String, methodName: String }), effects: List String }
+scanLetBindings bindings basePath idx sites effects =
+  case head bindings of
+    Nothing -> { handlerSites = sites, effects = effects }
+    Just b ->
+      let subPath = concat basePath (concat ".let." (toString idx))
+      let r1 = scanForEffectCalls b.value subPath sites effects
+      case tail bindings of
+        Nothing -> r1
+        Just rest -> scanLetBindings rest basePath (idx + 1) r1.handlerSites r1.effects
+
+-- scanMatchArms — iterate over CoreMatch arms with `arm`-prefixed
+-- indexed paths (`<basePath>.arm.<idx>`). Each arm is `{pattern:
+-- CorePattern, body: CoreExpr}`; only the body is scanned (the
+-- pattern is structural metadata, not a sub-expression to walk).
+@label "Scan match arms"
+@description "Iterate over CoreMatch arms with `arm`-prefixed indexed paths (`<basePath>.arm.<idx>`). Threading helper used by scanForEffectCalls for CoreMatch.arms."
+@tags "engine" "internal" "phase-21"
+@category "engine-internal"
+scanMatchArms : (arms: a) -> (basePath: String) -> (idx: Number) -> (sites: List ({ callPath: String, typeName: String, methodName: String })) -> (effects: List String) -> { handlerSites: List ({ callPath: String, typeName: String, methodName: String }), effects: List String }
+scanMatchArms arms basePath idx sites effects =
+  case head arms of
+    Nothing -> { handlerSites = sites, effects = effects }
+    Just arm ->
+      let subPath = concat basePath (concat ".arm." (toString idx))
+      let r1 = scanForEffectCalls arm.body subPath sites effects
+      case tail arms of
+        Nothing -> r1
+        Just rest -> scanMatchArms rest basePath (idx + 1) r1.handlerSites r1.effects
+
+-- makeEffectsExplicit — entry point. Drives the scan + final sort, and
+-- packages the output bundle wrapped in `Ok`. The `emptyList` argument
+-- is the initial accumulator state for sites + effects; the harness
+-- passes `[]` (a JS array). Core IR rejects bare-array literals at
+-- expression position, so receiving the empty list as a value rather
+-- than constructing it inline is the standard pattern for self-hosting
+-- accumulator-threaded passes.
+@label "Make effects explicit"
+@description "Walk a CoreExpr body, identify all $effect: dispatch sites, and surface them as a structured (handlerSites, effects) inventory. Returns Result CompileError EffectsExplicitProgram; the structural Ok is the only branch in well-formed input today (the TS oracle returns Err only for shapes that aren't yet produced by Phase 5+ pipelines). The `emptyList` arg is the initial accumulator state (passed by the caller as a value, since Core IR rejects bare-array literals at expression position). Mirrors the TS oracle at implementations/typescript/engine/src/ir/effects-explicit.ts. Phase 21.2 — the first real recursive engine pass authored in Fenel: a 10-arm CoreMatch over a registered ADT, state-threaded recursion via the {handlerSites, effects} scan record, side-channel accumulation through `appendItem` / `elem`, and a final `sortLex` over the deduplicated effect inventory."
+@tags "engine" "effect" "ir" "self-host" "phase-21"
+makeEffectsExplicit : (input: { name: String, params: a, body: Expr }) -> (emptyList: List a) -> Result a ({ name: String, params: a, body: Expr, effects: List String, handlerSites: List ({ callPath: String, typeName: String, methodName: String }) })
+makeEffectsExplicit input emptyList =
+  let scanResult = scanForEffectCalls input.body "0" emptyList emptyList
+  let sortedEffects = sortLex scanResult.effects
+  Ok (EffectsExplicitProgram {
+    name = input.name,
+    params = input.params,
+    body = input.body,
+    effects = sortedEffects,
+    handlerSites = scanResult.handlerSites
+  })

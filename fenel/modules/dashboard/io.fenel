@@ -1,0 +1,373 @@
+module dashboard where
+
+-- =========================================================================
+-- Dashboard /io routes — function-instance + IO dispatch.
+--
+-- Phase 12a sub-step 5 of the ts-elimination workstream. Five route bodies
+-- (listIoInstancesBase / decideInvoke / listAwaiting / resolveAwaiting /
+-- lastResult) + the centerpiece InvokeDecision ADT + per-arm helpers.
+--
+-- The InvokeDecision ADT is the architectural decision pattern of this
+-- sub-step: the body computes a 6-variant discriminated union; the TS
+-- wrapper pattern-matches $tag and executes the IO arm (startFunction-
+-- Instance / invokeIOAction). This keeps decision logic Fenel-side while
+-- letting the wrapper handle runtime-determined IO action invocation
+-- (which has no Fenel-side primitive today — invokeIOAction takes a
+-- runtime action string).
+--
+-- Substrate primitives consumed:
+--   - state:getFunction (12a-4) — DB function row by name
+--   - state:getFunctionInstance (12a-5) — function_instance row by id
+--   - state:listFunctionInstances (12a-5) — filtered instance list
+--   - state:findLastCompletedInstance (12a-5) — last completed for a fn
+--   - state:resumeWaitingInstance (12a-5) — resume + re-read
+--   - dispatch:getModuleFunction (12a-5) — module fn record by id
+--   - dispatch.lookupOne — IOInvokable fields in the active caller scope
+--
+-- parseApp doesn't continue arg lists across newlines — multi-line
+-- conditional logic is extracted to top-level helpers; multi-arg calls
+-- stay single-line (12a-3/4 surprise pattern).
+-- =========================================================================
+
+-- InvokeDecision — centerpiece ADT for /io/invoke's 4-way dispatch. Six
+-- variants — 2 error paths (NotFoundFn / NotSeededInDb), 3 success paths
+-- (DurableStart / OneShotRun / OneShotStop) + 1 misconfig path
+-- (NoActionConfigured). The TS wrapper switches on $tag and runs the
+-- matching IO (startFunctionInstance for DurableStart, invokeIOAction
+-- for OneShotRun/Stop). params live in TS scope (built from fn.params +
+-- args via the existing per-position loop); the body only carries the
+-- decision + the dispatch target.
+InvokeDecision = NotFoundFn fnId: String
+  | NotSeededInDb fnId: String
+  | DurableStart dbFnId: String
+  | OneShotRun action: String
+  | OneShotStop action: String
+  | NoActionConfigured fnId: String mode: String
+
+-- defaultToIo — null-coalesce. Local utility for the io helpers. Same shape
+-- as dashboard/helpers.fenel's defaultTo (kept local + renamed `defaultTo` →
+-- `defaultToIo` to avoid the union dup-name collision; the io module doesn't
+-- share a body with the registry/profile helpers).
+@label "Default to (io)"
+@description "Local null-coalesce for the io module's helpers. Same shape as dashboard:defaultTo (helpers.fenel) but local to io.fenel — kept separate because each .fenel file's defs are co-located with their callers; sharing would tie the load order of the two modules."
+@tags "dashboard" "io" "helper" "pure"
+defaultToIo dflt x = ifElse (isNull x) dflt x
+
+-- hasBody — predicate for the durable-vs-oneshot decision. A FenelFunction
+-- with `body !== undefined` has a Fenel-language body that the durable
+-- runtime can suspend/resume; bodyless functions must dispatch through
+-- the legacy IOInvokable.ioAction handler.
+@label "Function has body"
+@description "Predicate: true when a FenelFunction record has a Fenel-language body (fn.body !== undefined). Drives the durable-vs-oneshot decision for /io/invoke — bodied functions dispatch through the durable runtime; bodyless functions go through the IOInvokable.ioAction handler."
+@tags "dashboard" "io" "predicate" "pure"
+hasBody : (fn: Map String Any) -> Boolean
+hasBody fn = not (isNull fn.body)
+
+-- shouldDurable — combined gate: mode is "run" AND fn has body. mode
+-- "stop" always goes one-shot (the durable runtime has no "stop a
+-- waiting instance" primitive; the IOInvokable's stopAction handler
+-- is responsible for teardown semantics). Branch selection uses structural
+-- `if`, so a stop request does not evaluate the durable-path predicate.
+@label "Should use durable path"
+@description "Combined gate: mode is 'run' AND fn has body. mode 'stop' always goes one-shot (the durable runtime has no 'stop a waiting instance' primitive; the IOInvokable's stopAction handler owns teardown)."
+@tags "dashboard" "io" "predicate" "pure"
+shouldDurable : (fn: Map String Any) -> (mode: String) -> Boolean
+shouldDurable fn mode = if eq mode "run" then hasBody fn else false
+
+-- durableDecision — second-stage check for the DurableStart arm. The
+-- durable runtime needs the DB row UUID (functions.id), not the fnId
+-- slug — the slug indexes the module registry; the UUID indexes the
+-- functions table. NotSeededInDb when the system function hasn't been
+-- materialised as a DB row (e.g. a fresh module-defined fn that
+-- predates seedSystemFunctions).
+@label "Durable invocation decision"
+@description "Second-stage check for the DurableStart arm. The durable runtime needs the DB row UUID (functions.id), not the fnId slug. Returns DurableStart dbFn.id when the function is seeded; NotSeededInDb fnId otherwise."
+@tags "dashboard" "io" "decision" "phase-12a"
+durableDecision : (fnId: String) -> InvokeDecision
+durableDecision fnId =
+  case getFunction fnId of
+    Just dbFn -> DurableStart { dbFnId = dbFn.id }
+    _ -> NotSeededInDb { fnId = fnId }
+
+-- IOInvokable action fields cross the loader boundary as raw strings,
+-- canonical Maybe values, or absence. Normalize them in Fenel rather than
+-- calling the engine-only representation bodies absent from execute.
+@label "Normalize IO action name"
+@description "Normalize an IOInvokable action field to one Maybe String. Raw strings and Just strings become Just; Nothing, missing fields and non-string values become Nothing."
+@tags "dashboard" "io" "projection" "pure"
+ioActionName : (raw: Any) -> Maybe String
+ioActionName raw =
+  case raw of
+    Just name -> if isString name then Just name else Nothing
+    Nothing -> Nothing
+    _ -> if isString raw then Just raw else Nothing
+
+@label "Read IO run action"
+@description "Resolve the IOInvokable instance in the caller's scope through dispatch.lookupOne and normalize its ioAction field to Maybe String. Missing instances and missing action fields return Nothing."
+@tags "dashboard" "io" "dispatch"
+ioRunAction : (fnId: String) -> Maybe String
+ioRunAction fnId = case dispatch.lookupOne "IOInvokable" fnId of
+  Just methods -> ioActionName methods.ioAction
+  _ -> Nothing
+
+@label "Read IO stop action"
+@description "Resolve the IOInvokable instance in the caller's scope through dispatch.lookupOne and normalize its stopAction field to Maybe String. Missing instances and missing action fields return Nothing."
+@tags "dashboard" "io" "dispatch"
+ioStopAction : (fnId: String) -> Maybe String
+ioStopAction fnId = case dispatch.lookupOne "IOInvokable" fnId of
+  Just methods -> ioActionName methods.stopAction
+  _ -> Nothing
+
+@label "Read IO instance-list action"
+@description "Resolve the IOInvokable instance in the caller's scope through dispatch.lookupOne and normalize its listInstancesAction field to Maybe String. Missing instances and missing action fields return Nothing."
+@tags "dashboard" "io" "dispatch"
+ioListInstancesAction : (fnId: String) -> Maybe String
+ioListInstancesAction fnId = case dispatch.lookupOne "IOInvokable" fnId of
+  Just methods -> ioActionName methods.listInstancesAction
+  _ -> Nothing
+
+-- runDecision — one-shot run path. ioRunAction returns Maybe String;
+-- Just => OneShotRun, Nothing => NoActionConfigured.
+@label "One-shot run decision"
+@description "One-shot run path. Returns OneShotRun <action> when ioRunAction(fnId) is Just; NoActionConfigured fnId 'run' otherwise."
+@tags "dashboard" "io" "decision" "phase-12a"
+runDecision : (fnId: String) -> InvokeDecision
+runDecision fnId =
+  case ioRunAction fnId of
+    Just action -> OneShotRun { action = action }
+    _ -> NoActionConfigured { fnId = fnId, mode = "run" }
+
+-- stopDecision — one-shot stop path, with the same canonical Maybe shape.
+@label "One-shot stop decision"
+@description "One-shot stop path. Returns OneShotStop <action> when ioStopAction(fnId) is Just; NoActionConfigured fnId 'stop' otherwise."
+@tags "dashboard" "io" "decision" "phase-12a"
+stopDecision : (fnId: String) -> InvokeDecision
+stopDecision fnId =
+  case ioStopAction fnId of
+    Just action -> OneShotStop { action = action }
+    _ -> NoActionConfigured { fnId = fnId, mode = "stop" }
+
+-- oneShotDecision — fanout for non-durable cases. mode "stop" → stop,
+-- otherwise run.
+@label "One-shot decision (run or stop)"
+@description "Fanout for non-durable cases. Dispatches to runDecision for mode 'run' and stopDecision for mode 'stop'. The legacy /io/invoke had a ternary at the action-resolution line; this preserves the same fork structure."
+@tags "dashboard" "io" "decision" "phase-12a"
+oneShotDecision : (fnId: String) -> (mode: String) -> InvokeDecision
+oneShotDecision fnId mode =
+  if eq mode "stop" then stopDecision fnId else runDecision fnId
+
+-- decideInvoke — /io/invoke body. Pattern-matches the module-function
+-- record (NotFoundFn on miss); else routes to the durable or one-shot
+-- decision. The TS wrapper executes the matching IO arm.
+@label "Decide /io/invoke dispatch arm"
+@description "POST /io/invoke decision body. Pattern-matches on dispatch:getModuleFunction (NotFoundFn on miss); otherwise routes through shouldDurable to either durableDecision (DurableStart / NotSeededInDb) or oneShotDecision (OneShotRun / OneShotStop / NoActionConfigured). The TS wrapper switches on InvokeDecision.$tag and runs the matching IO arm. The decision is read-only; the wrapper holds params (built from fn.params + args) in scope."
+@tags "dashboard" "io" "route" "invoke" "phase-12a"
+decideInvoke : (fnId: String) -> (mode: String) -> InvokeDecision
+decideInvoke fnId mode =
+  case getModuleFunction fnId of
+    Just fn ->
+      if shouldDurable fn mode then durableDecision fnId else oneShotDecision fnId mode
+    _ -> NotFoundFn { fnId = fnId }
+
+-- listIoInstancesBase — /io/instances substrate-read body. Returns
+-- {runs, listAction} for the TS wrapper to format + dispatch.
+--   - runs: List of raw function_instance rows (TS does the per-row
+--     lastResult truncation + timestamp slicing — Decision U; record-
+--     key iteration has no std primitive yet).
+--   - listAction: Maybe String — the IOInvokable.listInstancesAction
+--     handler name if declared; the TS wrapper handles the
+--     runtime-determined invokeIOAction dispatch (no Fenel-side
+--     dynamic-dispatch primitive today).
+@label "List IO instances (base)"
+@description "POST /io/instances substrate-read body. Returns {runs: List Row, listAction: Maybe String}. The TS wrapper does the per-row lastResult truncation + timestamp slicing (Decision U — record-key iteration has no std primitive) AND the runtime-determined invokeIOAction dispatch for the deployments list (no Fenel-side dynamic-dispatch primitive today)."
+@tags "dashboard" "io" "route" "instances" "phase-12a"
+listIoInstancesBase : (fnName: String) -> ({ runs: List (Map String Any), listAction: Maybe String })
+listIoInstancesBase fnName =
+  case getFunction fnName of
+    Just dbFn ->
+      let runs = listFunctionInstances (Just dbFn.id) Nothing
+      let listAction = ioListInstancesAction fnName
+      { runs = runs, listAction = listAction }
+    _ ->
+      let listAction = ioListInstancesAction fnName
+      { runs = [], listAction = listAction }
+
+-- projectAwaitingRow — per-row projection for /io/awaiting. Reads
+-- variables._suspendMeta (a typed SuspendMeta variant; phase-12 of
+-- canonical-maybe retired the prior _readSchema flat-key convention).
+-- For awaiting_choice rows the variant is AwaitingChoice { schema },
+-- where `schema` carries the read handler's params (prompt / source /
+-- schema). Missing _suspendMeta → empty record; field-access on the
+-- empty record yields null per record-literal evaluation. functionName
+-- is already JOINed by the substrate primitive (state:listFunctionInstances
+-- does a leftJoin against functions); we fall through to functionId when
+-- the join produced null (orphaned row).
+@label "Project awaiting row"
+@description "Per-row projection for /io/awaiting. Reads variables._suspendMeta.schema for AwaitingChoice rows (a JSONB sub-record with prompt / source / schema). functionName is JOINed at the substrate layer (state:listFunctionInstances does a leftJoin); falls back to functionId on null."
+@tags "dashboard" "io" "projection" "pure" "phase-12a"
+-- Raw checkpoint rows and sidecars have variable keys. The public projection
+-- declares every wire field; Any preserves the existing nullable/native atoms.
+projectAwaitingRow : (r: Map String Any) -> { instanceId: String, suspensionId: Any, functionId: String, functionName: String, status: String, prompt: Any, source: Any, schema: Any, createdAt: Any }
+projectAwaitingRow r =
+  let sm = defaultToIo {} r.variables._suspendMeta
+  let rs = defaultToIo {} sm.schema
+  let rawPrompt = defaultToIo rs.prompt sm.prompt
+  let rawSource = if isNull sm.event then rs.source else concat "event:" sm.event
+  {
+    instanceId = r.id,
+    suspensionId = r.variables._suspensionId,
+    functionId = r.functionId,
+    functionName = defaultToIo r.functionId r.functionName,
+    status = r.status,
+    prompt = awaitingDisplayValue rawPrompt,
+    source = awaitingDisplayValue rawSource,
+    schema = awaitingSchema sm rs,
+    createdAt = r.startedAt
+  }
+
+-- Normalize optional display values without changing the legacy plain-value
+-- representation. Keep case expressions in their own declarations so the
+-- row projection stays inside the compiled parser's declaration budget.
+awaitingDisplayValue : Any -> Any
+awaitingDisplayValue raw =
+  case raw of
+    Just value -> value
+    Nothing -> null
+    _ -> raw
+
+awaitingSchema : (sm: Map String Any) -> (rs: Map String Any) -> Any
+awaitingSchema sm rs =
+  case sm.schema of
+    Just requestedType -> requestedType
+    Nothing -> null
+    _ -> defaultToIo sm.filter.schema rs.schema
+
+-- listAwaiting — /io/awaiting body. Filters function_instances by the
+-- 3 suspension statuses; projects each row to the legacy wire shape.
+@label "List awaiting instances"
+@description "GET /io/awaiting body. Filters function_instances by the 3 suspension statuses (awaiting_choice / waiting_event / waiting_timer); projects each row to the legacy wire shape via projectAwaitingRow."
+@tags "dashboard" "io" "route" "awaiting" "phase-12a"
+listAwaiting : List ({ instanceId: String, suspensionId: Any, functionId: String, functionName: String, status: String, prompt: Any, source: Any, schema: Any, createdAt: Any })
+listAwaiting =
+  let statuses = ["awaiting_choice", "waiting_event", "waiting_timer"]
+  let rows = listFunctionInstances Nothing (Just statuses)
+  map projectAwaitingRow rows
+
+-- projectCompletedInstance — completed-arm projection. Extracted because
+-- parseApp doesn't continue arg accumulation across newlines (12a-3
+-- surprise #1); separate helpers give each result arm its exact record type.
+@label "Project completed instance"
+@description "Completed-arm projection (value = variables._lastResult). Its declared record contains every completed-result wire field."
+@tags "dashboard" "io" "projection" "pure" "phase-12a"
+projectCompletedInstance : (inst: Map String Any) -> { ok: Boolean, value: Any, suspended: Boolean, status: Any, error: Any }
+projectCompletedInstance inst = {
+  ok = true,
+  value = inst.variables._lastResult,
+  suspended = false,
+  status = null,
+  error = null
+}
+
+-- projectSuspendedInstance — suspended-arm projection. Sister of
+-- projectCompletedInstance; carries the new suspension status.
+@label "Project suspended instance"
+@description "Suspended-arm projection (status = inst.status). Sister of projectCompletedInstance."
+@tags "dashboard" "io" "projection" "pure" "phase-12a"
+projectSuspendedInstance : (inst: Map String Any) -> { ok: Boolean, suspended: Boolean, status: String, suspensionId: Any, value: Any, error: Any }
+projectSuspendedInstance inst = {
+  ok = true,
+  suspended = true,
+  status = inst.status,
+  suspensionId = inst.variables._suspensionId,
+  value = null,
+  error = null
+}
+
+-- projectResumedInstance — post-resume row → wire shape. Completed →
+-- value field projected from _lastResult; suspended → status field
+-- carries the new suspension state. The two wire key sets remain distinct;
+-- their shared result uses a map, while each projection has an exact record.
+@label "Project resumed instance"
+@description "Post-resume row → wire shape. Selects the completed or suspended projection based on inst.status, evaluating only the selected branch."
+@tags "dashboard" "io" "projection" "pure" "phase-12a"
+projectResumedInstance : (inst: Map String Any) -> Map String Any
+projectResumedInstance inst =
+  if eq inst.status "completed" then projectCompletedInstance inst else projectSuspendedInstance inst
+
+-- resolveAwaitingErr — produce the error envelope used by both the
+-- "instance not found" early-404 path and the resume-throw 500 path.
+-- The TS wrapper discriminates on `error` string for the 404 vs 500
+-- response code.
+@label "Resolve awaiting error envelope"
+@description "Error envelope used by both 'instance not found' and resume-throw cases. The TS wrapper discriminates 404 vs 500 by the error message string."
+@tags "dashboard" "io" "error" "pure" "phase-12a"
+resolveAwaitingErr : (msg: String) -> { ok: Boolean, error: String, suspended: Boolean, status: Any, value: Any }
+resolveAwaitingErr msg = {
+  ok = False,
+  error = msg,
+  suspended = False,
+  status = null,
+  value = null
+}
+
+-- resolveAwaitingResumed — second-stage of resolveAwaiting. The resume
+-- IO returns {ok, instance?, error?}; on ok=True, project the post-
+-- resume row; on ok=False, surface the error.
+@label "Resolve awaiting (resumed projection)"
+@description "Second-stage of resolveAwaiting: project the post-resume row via projectResumedInstance, or surface the resume error."
+@tags "dashboard" "io" "projection" "pure" "phase-12a"
+resolveAwaitingResumed : (resumed: Map String Any) -> Map String Any
+resolveAwaitingResumed resumed =
+  case resumed.instance of
+    Just inst -> projectResumedInstance inst
+    _ -> resolveAwaitingErr (defaultToIo "resume failed" resumed.error)
+
+-- resolveAwaiting — /io/awaiting/:id/resolve body. Three stages: (1)
+-- existence + accountId-scoped lookup via state:getFunctionInstance
+-- (handler scopes to ctx.accountId); (2) resume via state:resume-
+-- WaitingInstance (handler does resume + re-read); (3) project the
+-- post-resume row OR surface the error. Per-arm errors are encoded as
+-- the {ok, error, suspended, status, value} envelope; the TS wrapper
+-- discriminates the legacy wire shape (404 / 500 / 200) by reading
+-- ok + error.
+@label "Resolve awaiting instance"
+@description "POST /io/awaiting/:id/resolve body. Three stages: (1) existence + accountId-scoped lookup; (2) resume + re-read; (3) project the post-resume row OR surface the error. Returns {ok, value?, suspended?, status?, error?}; the TS wrapper maps to 404 / 500 / 200 response codes."
+@tags "dashboard" "io" "route" "awaiting" "resolve" "phase-12a"
+resolveAwaiting : (instanceId: String) -> (value: a) -> (expectedSuspensionId: Maybe String) -> Map String Any
+resolveAwaiting instanceId value expectedSuspensionId =
+  case getFunctionInstance instanceId of
+    Just _inst ->
+      let resumed = resumeWaitingInstance instanceId { choice = value } expectedSuspensionId
+      if resumed.ok then resolveAwaitingResumed resumed else resolveAwaitingErr (defaultToIo "resume failed" resumed.error)
+    _ -> resolveAwaitingErr "Instance not found"
+
+-- projectLastResult — last-completed function_instance row → /io/last-
+-- result wire shape. The legacy /io/last-result emits `{id, value,
+-- startedAt, completedAt}`; value comes from variables._lastResult.
+@label "Project last-result instance"
+@description "Last-completed function_instance row → /io/last-result wire shape. Emits {id, value, startedAt, completedAt}."
+@tags "dashboard" "io" "projection" "pure" "phase-12a"
+projectLastResult : (inst: Map String Any) -> { id: String, value: Any, startedAt: Any, completedAt: Any }
+projectLastResult inst = {
+  id = inst.id,
+  value = inst.variables._lastResult,
+  startedAt = inst.startedAt,
+  completedAt = inst.completedAt
+}
+
+-- lastResult — /io/last-result body. Two-stage Maybe: (1) DB function
+-- row by name (state:getFunction); (2) last completed instance by DB
+-- fn UUID (state:findLastCompletedInstance). Returns Maybe<projection>
+-- — the TS wrapper maps Nothing → {ok: true, instance: null}, Just →
+-- {ok: true, instance: <projection>}.
+@label "Last result for a function"
+@description "GET /io/last-result body. Two-stage Maybe lookup: DB function row by name, then last-completed instance by DB UUID. Returns Maybe<{id, value, startedAt, completedAt}>; the TS wrapper maps Nothing → {ok: true, instance: null}."
+@tags "dashboard" "io" "route" "last-result" "phase-12a"
+lastResult : (fnName: String) -> Maybe ({ id: String, value: Any, startedAt: Any, completedAt: Any })
+lastResult fnName =
+  case getFunction fnName of
+    Just dbFn ->
+      case findLastCompletedInstance dbFn.id of
+        Just inst -> Just (projectLastResult inst)
+        _ -> Nothing
+    _ -> Nothing

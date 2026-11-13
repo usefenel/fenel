@@ -1,0 +1,338 @@
+module engine where
+
+-- call-site-membership.fenel — modules-as-values Phase 2d: the membership
+-- expansion behind the registry's call-site `member` hook.
+--
+-- The typed call path checks values by strict membership in a call-site type
+-- (a written annotation, or a type the call-site rule solved). Such a type
+-- names nominal owners by SEMANTIC IDENTITY: the host boundary attaches the
+-- resolved `nominalIdentity` to each TtNamed / TtApp node. The set projection
+-- (`typeToSetProjection`) reads structure and spellings, not owners, so this
+-- module first closes the type over its owners, then projects it:
+--
+--   * A non-opaque owner is replaced by its declaration body — a TraversalType
+--     whose own nominal identities the host resolved in the declaration's own
+--     frame — with its binders substituted by the application's arguments
+--     (unfolded first, in the caller's scope). A recursive occurrence of an
+--     application being unfolded becomes the μ variable of that unfolding; the
+--     parser's bare self-reference inside a parameterized declaration (`Tree a`
+--     written `Tree` in Tree's own body) is that same application.
+--   * An opaque owner has a membership face only through a spelling, and the
+--     spelling is admitted only for the EXACT system owner of that spelling
+--     (the host fact `systemSpelling`): the system String is the named String
+--     face; a private opaque spelled `String` has no face, so the judgment
+--     abstains. An identity is never traded back for its source spelling.
+--   * A spelling with no identity is admitted only at the top level of the
+--     call-site type, and only as the intrinsic compatibility spelling the
+--     inference kernel admits for the system scalars
+--     (`inferenceGroundBuiltinNominalIdentity`: String, Number, Boolean), so
+--     membership agrees with the unifier that solved the type. Inside a
+--     declaration an unresolved spelling abstains.
+--   * The inline `$opaque List` the parser emits for `List a` is kept: its pure
+--     view is the tagged cons chain, which the judgment decides. A host array
+--     is NOT read as that chain: the constructor face abstains on an array
+--     against Nil, Cons or the anonymous record former (tcb-ledger row
+--     mem.ctor), because runtime pattern matching does not read the List host
+--     carrier either. Any other inline opaque abstains outright.
+--   * Every binder (a μ, an inline opaque, each synthesized unfolding) is
+--     renamed to a fresh name indexed by its nesting depth, so a substituted
+--     argument can never be captured by a binder of the declaration it enters.
+--
+-- Nothing means no verdict (the hook answers "unknown"). The host supplies only
+-- declaration facts (ts-exceptions-ledger B3) and runs `contains` on the
+-- projected set with the frame's account.
+
+@label "Call-site membership projection"
+@description "modules-as-values Phase 2d — close a call-site ground type (a TraversalType whose TtNamed / TtApp nodes carry the host-attached `nominalIdentity`) over its nominal owners and project it for strict membership: every non-opaque owner is unfolded into its declaration (binders substituted, recursion through a synthesized μ), the exact system owner of a scalar spelling keeps its named face, and anything else (an opaque owner that is not the exact system owner of its spelling, an unresolved spelling inside a declaration, a value-dependent or malformed node, an inline opaque other than the parser's List) abstains. `facts` holds one record per reachable owner identity: { identity, opaque, systemSpelling (\"\" unless the identity is the exact system owner of its own spelling), binders, body }. Just the typeToSetProjection envelope, or Nothing (no verdict)."
+@tags "engine" "call-site" "membership" "modules-as-values" "phase-2d"
+callSiteMembershipProjection : (type: TraversalType) -> (facts: List a) -> Maybe ({ set: SetExpr, degraded: Boolean })
+callSiteMembershipProjection type facts =
+  let env = { scope = [], active = [], selfIdentity = "", selfArgs = [], depth = 0, envFacts = facts, admitRaw = true }
+  case callSiteMembershipWalk type env of
+    Nothing -> Nothing
+    Just closed -> Just (typeToSetProjection closed)
+
+@label "Call-site membership walk"
+@description "modules-as-values Phase 2d — close one TraversalType node over its nominal owners (see callSiteMembershipProjection). env: { scope (binder name ⇒ replacement), active (applications being unfolded ⇒ their μ variable), selfIdentity / selfArgs (the declaration whose body is being walked), depth (binder nesting, for fresh names and the bound), envFacts, admitRaw (top level only) }. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipWalk : (node: TraversalType) -> (env: a) -> Maybe TraversalType
+callSiteMembershipWalk node env =
+  if gt env.depth 256 then Nothing
+  else case node of
+    TtNamed { name = name, origin = origin } ->
+      case callSiteMembershipScopeLookup name env.scope of
+        Just bound -> Just bound
+        Nothing ->
+          if isString node.nominalIdentity
+          then callSiteMembershipNominal node.nominalIdentity [] false node env
+          else callSiteMembershipRawSpelling node name origin env
+    TtVar { name = name } ->
+      case callSiteMembershipScopeLookup name env.scope of
+        Just bound -> Just bound
+        Nothing -> Nothing
+    TtApp { args = args } ->
+      if isString node.nominalIdentity
+      then
+        case callSiteMembershipWalkTypes args env of
+          Nothing -> Nothing
+          Just walked -> callSiteMembershipNominal node.nominalIdentity walked true node env
+      else Nothing
+    TtMu { var = binder, body = body } ->
+      let fresh = callSiteMembershipFreshName env.depth
+      case callSiteMembershipWalk body (callSiteMembershipBind binder fresh node env) of
+        Nothing -> Nothing
+        Just walked -> Just (TtMu { body = walked, raw = node.raw, var = fresh })
+    TtOpaque { name = binder, pure = pure } ->
+      if not (eq binder "List") then Nothing
+      else
+        let fresh = callSiteMembershipFreshName env.depth
+        case callSiteMembershipWalk pure (callSiteMembershipBind binder fresh node env) of
+          Nothing -> Nothing
+          Just walked -> Just (TtOpaque { pure = walked, name = fresh, raw = node.raw })
+    TtRecord { fields = fields } ->
+      case callSiteMembershipWalkFields fields env of
+        Nothing -> Nothing
+        Just walked -> Just (TtRecord { fields = walked, raw = node.raw })
+    TtVariant { cases = cases, discriminator = discriminator } ->
+      case callSiteMembershipWalkCases cases env of
+        Nothing -> Nothing
+        Just walked -> Just (TtVariant { cases = walked, discriminator = discriminator, raw = node.raw })
+    TtArrow { params = params, returns = returns } ->
+      case callSiteMembershipWalkParams params env of
+        Nothing -> Nothing
+        Just walkedParams ->
+          case callSiteMembershipWalk returns env of
+            Nothing -> Nothing
+            Just walkedReturns -> Just (TtArrow { params = walkedParams, returns = walkedReturns, raw = node.raw })
+    TtTuple { items = items } ->
+      case callSiteMembershipWalkTypes items env of
+        Nothing -> Nothing
+        Just walked -> Just (TtTuple { items = walked, raw = node.raw })
+    TtMap { keys = keys, canonicalKeys = canonicalKeys, values = values } ->
+      case callSiteMembershipWalk values env of
+        Nothing -> Nothing
+        Just walked -> Just (TtMap { keys = keys, canonicalKeys = canonicalKeys, values = walked, raw = node.raw })
+    TtRefined { base = base, set = refinement, setView = setView } ->
+      case callSiteMembershipWalk base env of
+        Nothing -> Nothing
+        Just walked -> Just (TtRefined { base = walked, set = refinement, setView = setView, raw = node.raw })
+    TtTagged { value = value, phantom = phantom } ->
+      case callSiteMembershipWalk value env of
+        Nothing -> Nothing
+        Just walkedValue ->
+          case callSiteMembershipWalk phantom env of
+            Nothing -> Nothing
+            Just walkedPhantom -> Just (TtTagged { value = walkedValue, phantom = walkedPhantom, raw = node.raw })
+    TtUnion { branches = branches } ->
+      case callSiteMembershipWalkTypes branches env of
+        Nothing -> Nothing
+        Just walked -> Just (TtUnion { branches = walked, raw = node.raw })
+    TtIntersect { branches = branches } ->
+      case callSiteMembershipWalkTypes branches env of
+        Nothing -> Nothing
+        Just walked -> Just (TtIntersect { branches = walked, raw = node.raw })
+    TtComplement { inner = inner } ->
+      case callSiteMembershipWalk inner env of
+        Nothing -> Nothing
+        Just walked -> Just (TtComplement { inner = walked, raw = node.raw })
+    TtUnit -> Just node
+    TtVoid -> Just node
+    TtTypeUniverse -> Just node
+    TtEl -> Nothing
+    TtUnknown -> Nothing
+    _ -> Nothing
+
+@label "Call-site membership nominal"
+@description "modules-as-values Phase 2d — one resolved owner occurrence (a TtNamed with no arguments, or a TtApp with its unfolded arguments). No fact ⇒ Nothing. An opaque owner ⇒ its named face only when it is nullary and the exact system owner of its spelling (TtNamed spelling), else Nothing. A non-opaque owner ⇒ the μ variable of an enclosing unfolding of the same application, else its declaration unfolded (callSiteMembershipUnfold); a bare reference to the parameterized declaration being walked is its own application (the parser's self-reference). An argument count that differs from the declared binders ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipNominal : (identity: String) -> (args: List TraversalType) -> (applied: Boolean) -> (node: TraversalType) -> (env: a) -> Maybe TraversalType
+callSiteMembershipNominal identity args applied node env =
+  case callSiteMembershipFact identity env.envFacts of
+    Nothing -> Nothing
+    Just fact ->
+      if fact.opaque
+      then
+        if applied then Nothing
+        else if eq fact.systemSpelling "" then Nothing
+        else Just (TtNamed { name = fact.systemSpelling, origin = "ref", raw = node.raw })
+      else
+        let selfApplication = and (not applied) (and (gt (length fact.binders) 0) (eq identity env.selfIdentity))
+        let effective = if selfApplication then env.selfArgs else args
+        if not (eq (length effective) (length fact.binders)) then Nothing
+        else
+          case callSiteMembershipActive identity effective env.active of
+            Just muVar -> Just (TtVar { name = muVar, raw = node.raw })
+            Nothing -> callSiteMembershipUnfold identity effective fact node env
+
+@label "Call-site membership unfold"
+@description "modules-as-values Phase 2d — unfold one application of a non-opaque owner: walk its declaration body in a scope holding ONLY its binders (bound to the already unfolded arguments), with the application pushed as active under a fresh μ variable; wrap the result in that μ when the body refers back to it. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipUnfold : (identity: String) -> (args: List TraversalType) -> (fact: b) -> (node: TraversalType) -> (env: a) -> Maybe TraversalType
+callSiteMembershipUnfold identity args fact node env =
+  let muVar = callSiteMembershipFreshName env.depth
+  let inner = {
+    scope = callSiteMembershipBinderScope fact.binders args,
+    active = concat [{ unfoldedIdentity = identity, unfoldedArgs = args, unfoldedVar = muVar }] env.active,
+    selfIdentity = identity,
+    selfArgs = args,
+    depth = add env.depth 1,
+    envFacts = env.envFacts,
+    admitRaw = false
+  }
+  case callSiteMembershipWalk fact.body inner of
+    Nothing -> Nothing
+    Just body ->
+      if typeToSetUsesName body muVar
+      then Just (TtMu { body = body, raw = node.raw, var = muVar })
+      else Just body
+
+@label "Call-site membership raw spelling"
+@description "modules-as-values Phase 2d — a TtNamed with no identity and no binder: admitted unchanged only at the top level of the call-site type, only as a `$ref`, and only as the intrinsic compatibility spelling the inference kernel equates with the system scalar owner (inferenceGroundBuiltinNominalIdentity: String, Number, Boolean); Nothing otherwise. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipRawSpelling : (node: TraversalType) -> (name: String) -> (origin: String) -> (env: a) -> Maybe TraversalType
+callSiteMembershipRawSpelling node name origin env =
+  if and env.admitRaw (and (eq origin "ref") (inferenceGroundBuiltinNominalIdentity name name))
+  then Just node
+  else Nothing
+
+@label "Call-site membership bind"
+@description "modules-as-values Phase 2d — the environment under a μ or inline-opaque binder: the binder's source name now denotes the fresh variable, and the depth grows by one. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipBind : (binder: String) -> (fresh: String) -> (node: TraversalType) -> (env: a) -> a
+callSiteMembershipBind binder fresh node env = {
+  scope = concat [{ name = binder, type = TtVar { name = fresh, raw = node.raw } }] env.scope,
+  active = env.active,
+  selfIdentity = env.selfIdentity,
+  selfArgs = env.selfArgs,
+  depth = add env.depth 1,
+  envFacts = env.envFacts,
+  admitRaw = env.admitRaw
+}
+
+@label "Call-site membership fresh name"
+@description "modules-as-values Phase 2d — the fresh binder name for nesting depth n: `call-site μ` followed by n primes (built without rendering a number, so it is the same under every dispatch context). Two binders on one nesting chain never share a name, and an argument unfolded at depth n refers only to binders of smaller depth, so substitution cannot capture. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipFreshName : (depth: Number) -> String
+callSiteMembershipFreshName depth =
+  if lt depth 1 then "call-site μ"
+  else concat (callSiteMembershipFreshName (sub depth 1)) "'"
+
+@label "Call-site membership fact"
+@description "modules-as-values Phase 2d — the declaration fact of one owner identity, or Nothing. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipFact : (identity: String) -> (facts: List a) -> Maybe a
+callSiteMembershipFact identity facts =
+  case head facts of
+    Nothing -> Nothing
+    Just fact -> if eq fact.identity identity then Just fact else callSiteMembershipFact identity (eufRest facts)
+
+@label "Call-site membership active"
+@description "modules-as-values Phase 2d — the μ variable of the innermost enclosing unfolding of the same application (same owner identity, structurally equal arguments), or Nothing. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipActive : (identity: String) -> (args: List TraversalType) -> (active: List a) -> Maybe String
+callSiteMembershipActive identity args active =
+  case head active of
+    Nothing -> Nothing
+    Just entry ->
+      if and (eq entry.unfoldedIdentity identity) (eq entry.unfoldedArgs args)
+      then Just entry.unfoldedVar
+      else callSiteMembershipActive identity args (eufRest active)
+
+@label "Call-site membership scope lookup"
+@description "modules-as-values Phase 2d — the innermost replacement bound to a source name, or Nothing. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipScopeLookup : (name: String) -> (scope: List a) -> Maybe TraversalType
+callSiteMembershipScopeLookup name scope =
+  case head scope of
+    Nothing -> Nothing
+    Just entry -> if eq entry.name name then Just entry.type else callSiteMembershipScopeLookup name (eufRest scope)
+
+@label "Call-site membership binder scope"
+@description "modules-as-values Phase 2d — pair a declaration's binders with an application's arguments, in order. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipBinderScope : (binders: List String) -> (args: List TraversalType) -> List a
+callSiteMembershipBinderScope binders args =
+  case head binders of
+    Nothing -> []
+    Just binder ->
+      case head args of
+        Nothing -> []
+        Just arg -> concat [{ name = binder, type = arg }] (callSiteMembershipBinderScope (eufRest binders) (eufRest args))
+
+@label "Call-site membership walk types"
+@description "modules-as-values Phase 2d — callSiteMembershipWalk over a list of TraversalTypes; any Nothing ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipWalkTypes : (types: List TraversalType) -> (env: a) -> Maybe (List TraversalType)
+callSiteMembershipWalkTypes types env =
+  case head types of
+    Nothing -> Just []
+    Just first ->
+      case callSiteMembershipWalk first env of
+        Nothing -> Nothing
+        Just walked ->
+          case callSiteMembershipWalkTypes (eufRest types) env of
+            Nothing -> Nothing
+            Just rest -> Just (concat [walked] rest)
+
+@label "Call-site membership walk fields"
+@description "modules-as-values Phase 2d — callSiteMembershipWalk over the types of a TtField list, every other slot kept; any Nothing ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipWalkFields : (fields: List TtField) -> (env: a) -> Maybe (List TtField)
+callSiteMembershipWalkFields fields env =
+  case head fields of
+    Nothing -> Just []
+    Just field ->
+      case callSiteMembershipWalk field.type env of
+        Nothing -> Nothing
+        Just walked ->
+          case callSiteMembershipWalkFields (eufRest fields) env of
+            Nothing -> Nothing
+            Just rest ->
+              let rebuilt = TtField { name = field.name, key = field.key, semanticKey = field.semanticKey, wireName = field.wireName, token = field.token, type = walked, raw = field.raw }
+              Just (concat [rebuilt] rest)
+
+@label "Call-site membership walk params"
+@description "modules-as-values Phase 2d — callSiteMembershipWalk over the types of a TtArrowParam list, every other slot kept; any Nothing ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipWalkParams : (params: List TtArrowParam) -> (env: a) -> Maybe (List TtArrowParam)
+callSiteMembershipWalkParams params env =
+  case head params of
+    Nothing -> Just []
+    Just param ->
+      case callSiteMembershipWalk param.type env of
+        Nothing -> Nothing
+        Just walked ->
+          case callSiteMembershipWalkParams (eufRest params) env of
+            Nothing -> Nothing
+            Just rest ->
+              let rebuilt = TtArrowParam { name = param.name, key = param.key, semanticKey = param.semanticKey, wireName = param.wireName, token = param.token, type = walked, raw = param.raw }
+              Just (concat [rebuilt] rest)
+
+@label "Call-site membership walk cases"
+@description "modules-as-values Phase 2d — callSiteMembershipWalkFields over every case of a TtVariant; any Nothing ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "call-site" "membership" "modules-as-values" "phase-2d"
+@category "engine-internal"
+callSiteMembershipWalkCases : (cases: List TtVariantCase) -> (env: a) -> Maybe (List TtVariantCase)
+callSiteMembershipWalkCases cases env =
+  case head cases of
+    Nothing -> Just []
+    Just current ->
+      case callSiteMembershipWalkFields current.fields env of
+        Nothing -> Nothing
+        Just walked ->
+          case callSiteMembershipWalkCases (eufRest cases) env of
+            Nothing -> Nothing
+            Just rest -> Just (concat [TtVariantCase { name = current.name, fields = walked }] rest)

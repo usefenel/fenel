@@ -1,0 +1,94 @@
+-- =========================================================================
+-- Channels — create_channel.
+--
+-- ts-elimination-completion Phase 2b (dedicated-table collapse). Ports the
+-- `(E)`-misclassified handler in core/actions/channels.ts (createChannelHandler)
+-- from live TS orchestration (`config ?? {}` default + `db.insert(channels)`
+-- + `appendEvent`) to a Fenel body over `state:*`, reducing the TS handler to
+-- a thin `validateActionParams` + Maybe-marshalling + `invokeIOAction` +
+-- `actionResultAdtToTs` delegator.
+--
+-- This is a NEW module (channels had no `.fenel` source before) — created
+-- directly in the `module … where` + `@facet` format proven on
+-- profiles / inventory / items (module-substrate is CLOSED; no workstream to
+-- coordinate with — just use its format). The thin `engine/src/modules/
+-- channels.ts` seam loads this file; `channelsModule` is registered at the
+-- same FIVE boot sites itemsModule is (system-entities, type-catalog,
+-- runtime evaluator, engine package.json exports, self-host matrix).
+--
+-- The header keeps the LEGACY lowercase `channels:` id-prefix + `channels`
+-- category + the `"channel"` entity-type string. Migration 0073 moves the
+-- `channels` table rows into `entity_instances` (entity_type='channel') and
+-- drops the table — so `state:tryCreateInstanceByName "channel"` (which IS
+-- the `entity_instances` leaf) is now the only write path; the dedicated
+-- table no longer exists. Decision 3 — no PascalCase rename (deferred sweep).
+--
+-- Substrate consumed:
+--   - state:tryCreateInstanceByName "channel" data  ({ok, value, error})
+--   - state:appendEvent type payload …              (write-only event log)
+--
+-- ActionResult ADT (ActionOk { data, aggregateType, aggregateId,
+-- profileId } | ActionErr { message }) is the return; the wrapper's
+-- `actionResultAdtToTs` translates it (ActionErr → throw).
+--
+-- parseApp doesn't continue arg lists across newlines — multi-arg calls
+-- stay single-line.
+-- =========================================================================
+
+module channels where
+
+-- action-subsumption Phase 2 (2026-06-08) — `createChannel` IS the public
+-- `create_channel` action now (D1 COLLAPSE): its params carry the public
+-- contract directly (`slug`, `type`, `config?`, `adapter`) — the old
+-- `channelType`/`configM` marshalling renames are gone. Dispatch validates the
+-- incoming params against `paramRecordOf(createChannel)` (D2 — no
+-- `create_channel_params` mirror entity), so the sig carries the refinements
+-- the deleted entity mirrored byte-identically: `slug : NonEmptyStr`, `type :
+-- ChannelType` (the `$enum` below), `config : Maybe ({})`. The TS handler in
+-- core/actions/channels.ts is deleted; `adapter` stays an explicit param (D4).
+
+-- ChannelType — the `$enum` `create_channel_params.type` carried inline, now
+-- named so the function param projects a byte-identical `$refined` node:
+-- {$refined: {base: String, set: {$enum: ["telegram_group","webhook","email"]}}}.
+ChannelType = String | value ∈ {"telegram_group", "webhook", "email"}
+
+-- buildChannelData — pre-port `{ slug, type, config: config ?? {} }`. base
+-- record; config defaults to an empty record when absent (Nothing). The
+-- `type` field is named via `channelType` param to dodge the `type` keyword
+-- in var position (sister of items.fenel's itemType).
+buildChannelData : String -> String -> Maybe ({}) -> {}
+@label "Build channel data"
+@description "ts-elimination-completion Phase 2b — pure helper. Composes the channel entity_instances data record: {slug, type, config} with config defaulting to {} when Nothing (mirrors pre-port `config ?? {}`)."
+@tags "channel" "pure" "ts-elimination"
+buildChannelData slug channelType configM =
+  let config = case configM of
+    Nothing -> {}
+    Just c -> c
+  { slug = slug, type = channelType, config = config }
+
+-- createChannel — main body. Builds the data record, persists via
+-- state:tryCreateInstanceByName, then emits channel_created + returns the
+-- channelId/slug payload. On insert failure surfaces ActionErr.
+createChannel : NonEmptyStr -> ChannelType -> Maybe ({}) -> String -> ActionResult
+@label "Create channel"
+@description "ts-elimination-completion Phase 2b / action-subsumption Phase 2 — the public create_channel action (no separate TS handler). Params ARE the public contract (slug, type, config?, adapter). Builds the channel data record (buildChannelData), persists via state:tryCreateInstanceByName 'channel', emits channel_created, returns ActionOk { data = {channelId, slug}, aggregateType = Just 'channel', aggregateId = Just channelId }. Insert failure → ActionErr."
+@tags "channel" "create" "ts-elimination" "action"
+@ioAction "channels.create_channel"
+createChannel slug type config adapter =
+  let data = buildChannelData slug type config
+  let r = tryCreateInstanceByName "channel" data
+  if r.ok
+  then createChannelEmit r.value slug type adapter
+  else ActionErr { message = r.error }
+
+-- createChannelEmit — successful-create tail. Writes channel_created with the
+-- {slug, type, adapter} payload (no profileId — channels aren't profile-
+-- scoped); returns the Ok payload.
+createChannelEmit : String -> String -> String -> String -> ActionResult
+@label "Create channel (emit)"
+@description "ts-elimination-completion Phase 2b — successful-create tail of createChannel. Writes channel_created via state:appendEvent (aggregateType=Just 'channel', aggregateId=Just channelId, profileId=Nothing) and returns ActionOk { data = {channelId, slug} }."
+@tags "channel" "create" "ts-elimination"
+createChannelEmit channelId slug channelType adapter =
+  let payload = { slug = slug, type = channelType, adapter = adapter }
+  let _e = appendEvent "channel_created" payload (Just "channel") (Just channelId) Nothing
+  ActionOk { data = { channelId = channelId, slug = slug }, aggregateType = Just "channel", aggregateId = Just channelId, profileId = Nothing }

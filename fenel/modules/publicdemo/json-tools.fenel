@@ -1,0 +1,153 @@
+module ImportDemo where
+
+using std (fold, map, all, unique, appendItem, length, join, repeat, isString, isArray, numberIsFinite, not)
+using codec (JsonValue, JsonObjectEntry, JsonObject, JsonBool, JsonString, JsonNumber, jsonDecodeBounded, jsonEncode)
+
+-- GP-62: general bounded JSON tools reuse the existing codec and JsonValue.
+-- Fenel owns traversal, formatting and limits; the codec owns JSON syntax and
+-- scalar quoting/number spelling. Object pair lists are rendered directly:
+-- the host object encoder's __proto__ assignment must not discard a JSON key.
+-- JSON.parse normalizes repeated keys (last wins), integer-key ordering and
+-- Number precision; encoded -0 prints as 0. These are value-node counts,
+-- not source token counts.
+-- No CSV/YAML conversion, source duplicate-key detection or exact-decimal claim.
+
+@label "JSON inspection"
+@description "The decoded ordinary JsonValue tree, compact and two-space-indented JSON, and data-node count/depth. The root is depth zero and object keys are not separate value nodes."
+JsonInspection = JsonInspection parsed: JsonValue compact: String formatted: String nodeCount: Nat maximumDepth: Nat
+
+JsonToolRendered = JsonToolRendered compact: String formatted: String nodeCount: Nat maximumDepth: Nat
+JsonToolParts = JsonToolParts compact: List String formatted: List String compactSize: Nat formattedSize: Nat nodeCount: Nat maximumDepth: Nat
+
+jsonToolTextAdmitted : (text: String) -> Bool
+jsonToolTextAdmitted text = isString text && length text <= 4096
+
+jsonToolOutputAdmitted : (text: String) -> Bool
+jsonToolOutputAdmitted text = isString text && length text <= 16384
+
+jsonToolOutputFailure : String
+jsonToolOutputFailure = "Each formatted JSON output must fit 16384 Unicode code points."
+
+jsonToolScalar : (depth: Nat) -> (text: String) -> Result String JsonToolRendered
+jsonToolScalar depth text =
+  if jsonToolOutputAdmitted text then Ok (JsonToolRendered { compact = text, formatted = text, nodeCount = 1, maximumDepth = depth })
+  else Err (jsonToolOutputFailure ())
+
+jsonToolQuoted : (text: String) -> Result String String
+jsonToolQuoted text =
+  if jsonToolTextAdmitted text then codec.jsonEncode (JsonString { value = text })
+  else Err "JSON strings and keys must fit 4096 Unicode code points."
+
+jsonToolAddPart : (depth: Nat) -> (budget: Nat) -> (render: (Nat -> a -> Result String JsonToolRendered)) -> (state: Result String JsonToolParts) -> (item: a) -> Result String JsonToolParts
+jsonToolAddPart depth budget render state item = case state of
+  Err reason -> Err reason
+  Ok parts -> case render (budget - parts.nodeCount) item of
+    Err reason -> Err reason
+    Ok child ->
+      let indentation = repeat "  " (depth + 1)
+      let compactSize = parts.compactSize + length child.compact + 1
+      let formattedSize = parts.formattedSize + length indentation + length child.formatted + 2
+      if compactSize > 16384 || formattedSize > 16384 then Err (jsonToolOutputFailure ())
+      else Ok (JsonToolParts { compact = appendItem child.compact parts.compact, formatted = appendItem (join [indentation, child.formatted] "") parts.formatted, compactSize = compactSize, formattedSize = formattedSize, nodeCount = parts.nodeCount + child.nodeCount, maximumDepth = if child.maximumDepth > parts.maximumDepth then child.maximumDepth else parts.maximumDepth })
+
+jsonToolContainer : (opening: String) -> (closing: String) -> (depth: Nat) -> (budget: Nat) -> (render: (Nat -> a -> Result String JsonToolRendered)) -> (items: List a) -> Result String JsonToolRendered
+jsonToolContainer opening closing depth budget render items =
+  if not (isArray items) then Err "JSON arrays and object pairs must be lists."
+  else if length items >= budget then Err "Use at most 256 JSON value nodes."
+  else
+    let initial = JsonToolParts { compact = [], formatted = [], compactSize = 0, formattedSize = 0, nodeCount = 1, maximumDepth = depth }
+    case fold (jsonToolAddPart depth budget render) (Ok initial) items of
+      Err reason -> Err reason
+      Ok parts ->
+        let compactSize = if length items == 0 then 2 else 1 + parts.compactSize
+        let formattedSize = if length items == 0 then 2 else 2 + parts.formattedSize + length (repeat "  " depth)
+        if compactSize > 16384 || formattedSize > 16384 then Err (jsonToolOutputFailure ())
+        else
+          let compact = join [opening, join parts.compact ",", closing] ""
+          let formatted = if length items == 0 then compact else join [opening, "\n", join parts.formatted ",\n", "\n", repeat "  " depth, closing] ""
+          Ok (JsonToolRendered { compact = compact, formatted = formatted, nodeCount = parts.nodeCount, maximumDepth = parts.maximumDepth })
+
+jsonToolObjectField : (depth: Nat) -> (budget: Nat) -> (pair: JsonObjectEntry) -> Result String JsonToolRendered
+jsonToolObjectField depth budget pair = case jsonToolQuoted pair.key of
+  Err reason -> Err reason
+  Ok key -> case jsonToolRender depth budget pair.value of
+    Err reason -> Err reason
+    Ok child ->
+      let compactSize = length key + 1 + length child.compact
+      let formattedSize = length key + 2 + length child.formatted
+      if compactSize > 16384 || formattedSize > 16384 then Err (jsonToolOutputFailure ())
+      else Ok (JsonToolRendered { compact = join [key, ":", child.compact] "", formatted = join [key, ": ", child.formatted] "", nodeCount = child.nodeCount, maximumDepth = child.maximumDepth })
+
+jsonToolRender : (depth: Nat) -> (budget: Nat) -> (value: JsonValue) -> Result String JsonToolRendered
+jsonToolRender depth budget value =
+  if depth > 16 then Err "Use JSON with maximum value depth 16; the root has depth zero."
+  else if budget < 1 then Err "Use at most 256 JSON value nodes."
+  else case value of
+    JsonNull -> jsonToolScalar depth "null"
+    JsonBool { value = boolean } ->
+      if boolean == true then jsonToolScalar depth "true"
+      else if boolean == false then jsonToolScalar depth "false"
+      else Err "A JSON boolean must be true or false."
+    JsonNumber { value = number } ->
+      if not (numberIsFinite number) then Err "JSON numbers must fit the finite Number representation; overflowing exponents refuse."
+      else case codec.jsonEncode (JsonNumber { value = number }) of
+        Err reason -> Err reason
+        Ok text -> jsonToolScalar depth text
+    JsonString { value = text } -> case jsonToolQuoted text of
+      Err reason -> Err reason
+      Ok quoted -> jsonToolScalar depth quoted
+    JsonArray { items = items } -> jsonToolContainer "[" "]" depth budget (jsonToolRender (depth + 1)) items
+    JsonObject { pairs = pairs } ->
+      if not (isArray pairs) then Err "JSON object pairs must be a list."
+      else if length pairs > 255 then Err "Use at most 256 JSON value nodes."
+      else if not (all pairs (\pair -> isString pair.key)) then Err "JSON object keys must be Strings."
+      else if length (unique (map (\pair -> pair.key) pairs)) != length pairs then Err "Authored JSON object pairs must have distinct keys; text parsing uses the codec's last-key-wins policy."
+      else jsonToolContainer "{" "}" depth budget (jsonToolObjectField (depth + 1)) pairs
+    _ -> Err "Expected ordinary JsonValue data."
+
+@label "Inspect JSON data"
+@description "Format the existing JsonValue tree directly. Preserve all distinct object keys, including __proto__, without a host object projection. Refuse nonfinite numbers, repeated authored keys, depth over 16, over 256 value nodes, strings/keys over 4096 code points or either output over 16384. The root has depth zero. Numbers use the current approximate Number representation and -0 prints as 0."
+@tags "utility" "json" "format" "data"
+inspectJsonValue : (value: JsonValue) -> Result String JsonInspection
+inspectJsonValue value = case jsonToolRender 0 256 value of
+  Err reason -> Err reason
+  Ok rendered -> Ok (JsonInspection { parsed = value, compact = rendered.compact, formatted = rendered.formatted, nodeCount = rendered.nodeCount, maximumDepth = rendered.maximumDepth })
+
+@label "Inspect JSON text"
+@description "Decode at most 4096 Unicode code points through the existing JSON codec, then inspect the bounded ordinary tree, compact JSON and two-space formatting. Malformed syntax and unsupported size/depth/Number results return Err. Duplicate text keys keep the last value; numeric precision, -0 and integer-like key ordering follow the codec. This is JSON data normalization, not preservation of original spelling or duplicate keys."
+inspectJsonText : (text: String) -> Result String JsonInspection
+inspectJsonText text =
+  if not (jsonToolTextAdmitted text) then Err "Paste JSON text with at most 4096 Unicode code points."
+  else case codec.jsonDecodeBounded 16 text of
+    Err reason -> Err reason
+    Ok parsed -> inspectJsonValue parsed
+
+@label "Inspect JSON"
+@description "Paste JSON into the shared multiline input. Inspect its ordinary JsonValue tree, compact/indented text, value-node count and depth. Source is bounded at 4096 code points, tree at 256 value nodes and depth 16, each output at 16384. Repeated text keys use last-key-wins; Number precision, -0 and integer-like key ordering follow the existing codec. Syntax errors and unsupported results remain Err."
+@tags "utility" "json" "parse" "validate"
+inspectJsonInput : (input: ImportTextInput) -> Result String JsonInspection
+inspectJsonInput input = inspectJsonText input.text
+
+@label "Format JSON"
+@description "Write two-space-indented JSON through the same bounded JSON inspection. Refuse invalid syntax, nonfinite numbers and exceeded source/tree/output limits. Preserve decoded data, not original key duplication, Number precision or spelling; duplicate text keys keep the last value."
+@tags "utility" "json" "format"
+formatJsonInput : (input: ImportTextInput) -> Result String String
+formatJsonInput input = case inspectJsonText input.text of
+  Err reason -> Err reason
+  Ok inspected -> Ok inspected.formatted
+
+@label "Minify JSON"
+@description "Write compact JSON through the same bounded JSON inspection. Remove formatting whitespace while preserving decoded data, including all distinct keys. Invalid syntax, nonfinite numbers and exceeded limits refuse; duplicate text keys keep the last value and Number precision/-0 follow the existing codec."
+@tags "utility" "json" "format" "minify"
+minifyJsonInput : (input: ImportTextInput) -> Result String String
+minifyJsonInput input = case inspectJsonText input.text of
+  Err reason -> Err reason
+  Ok inspected -> Ok inspected.compact
+
+jsonDemoStartingInputs : List ({ function: Any, arguments: List Any })
+jsonDemoStartingInputs = [
+  { function = inspectJsonInput, arguments = [ImportTextInput { text = "{\"name\":\"Fenel\",\"items\":[1,true,null,{\"text\":\"Hello 🦊\"}]}" }] },
+  { function = formatJsonInput, arguments = [ImportTextInput { text = "{\"name\":\"Fenel\",\"items\":[1,true,null]}" }] },
+  { function = minifyJsonInput, arguments = [ImportTextInput { text = "{\n  \"name\": \"Fenel\",\n  \"items\": [1, true, null]\n}" }] },
+  { function = inspectJsonValue, arguments = [JsonObject { pairs = [JsonObjectEntry { key = "message", value = JsonString { value = "Hello 🦊" } }, JsonObjectEntry { key = "active", value = JsonBool { value = true } }] }] }
+]

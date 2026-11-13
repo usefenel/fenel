@@ -1,0 +1,298 @@
+module engine where
+
+-- =========================================================================
+-- verifyProof — the kernel's three proof-term rules, Fenel-bodied.
+-- expr-substrate Phase 6b0 (brief:
+-- `workstreams/expr-substrate/briefs/phase-6b0-prover-fenel-port.md`).
+--
+-- THE TRUST BOUNDARY, PORTED. `engine/src/kernel.ts`'s `verify` (Phase 4,
+-- pre-ts-elimination TS) re-checks a proof term against a proposition. The
+-- RULE LOGIC — dispatch on the proof-term tag, the Refl equality ladder,
+-- the DecidableSetResult kind↔proposition agreement + witness re-check
+-- routing + re-decide consumption, the SampleTestResult shape checks —
+-- lives HERE now. The TS `verify` is a thin delegate that (a) extracts the
+-- two `$tag`s, (b) pre-computes Fenel value equality for Refl and structural
+-- representation equality for anti-repurpose witnesses at the host boundary,
+-- (c) pre-computes
+-- the set-algebra re-decide for the proposition's shape (`isSubset` /
+-- `isDisjoint` / `decideEmpty` — the re-run CALL is the justified bridge;
+-- the TS set-algebra dispatchers themselves already route through the
+-- Fenel `set-algebra-deciders.fenel` mirrors where ported), and (d) maps
+-- the outcome marker back to the `VerifyResult` `$tag` shapes.
+--
+-- OUTCOME MARKERS (plain records, the P5/6a `$`-key barrier — a `.fenel`
+-- body cannot author `{$tag: …}` shapes, and EpistemicStatus stays TS-side
+-- output grading per the 6b Q1 lock):
+--   { tag = "Ok",  status = "Proven" | "SolverChecked" }
+--   { tag = "Ok",  status = "SampleTested", samples = n }
+--   { tag = "Err", etag = "WitnessRejected" | "UnknownRule", reason }
+--   { tag = "Err", etag = "ShapeMismatch", reason, propositionTag, proofTag }
+--   { tag = "Err", etag = "NonTotal", reason }   (unified-static-analysis 3g)
+--
+-- PRE-COMPUTED FACTS (the `eqs` record + `decision` string + `verdict` string):
+--   eqs.lhsRhs       — structuralEq(prop.lhs, prop.rhs)        (Refl)
+--   eqs.lhsValue     — structuralEq(prop.lhs, proof.value)     (Refl)
+--   eqs.witnessLeft  — deepEqual(prop.s, proof.witness.left)    (DecidableSet)
+--   eqs.witnessRight — deepEqual(prop.t, proof.witness.right)   (DecidableSet)
+--   decision         — "true" | "false" | "unknown" — the re-decide outcome
+--                      for the proposition's own (s, t) per its $tag (read
+--                      ONLY after the shape + witness checks pass, exactly
+--                      like the TS original's post-check re-run)
+--   verdict          — "Total" | "Unknown" | "Partial" | "" — the SUBJECT
+--                      function's totality verdict TAG (unified-static-analysis
+--                      Phase 3g — THE SOUNDNESS PAYLOAD). Computed by the shipped
+--                      Fenel `analyze`/`totalityVerdict` (TS marshal seam:
+--                      `subjectTotalityVerdict`); the SampleTestResult/PropForall
+--                      arm REJECTS when it is "Unknown" or "Partial" (a ∀ proven
+--                      by sampling a non-total function is unsound — the samples
+--                      may diverge or the "all passed" is vacuous). "" = no
+--                      subject function declared (the proof names no Fenel
+--                      function whose totality is in question — the gate is
+--                      inert, exactly as for Refl over arbitrary host values).
+--                      The OTHER proof rules (Refl / DecidableSetResult) do NOT
+--                      consult it — neither quantifies over a function's
+--                      totality (D-3g-2: the gate is SampleTestResult-only).
+--
+-- The TS-quirk PRESERVED: when `proof.kind` is none of subset/disjoint/
+-- empty, the original falls past the three kind-guards straight into the
+-- proposition-$tag switch (a bogus kind with a matching witness still
+-- re-checks). `vpDecidable`'s final else mirrors that, byte-faithfully.
+--
+-- NO ENTITY DECLS HERE: outcome markers stay plain records. The ONE new
+-- entity — the `Judgment` currency (JEmpty / JInhabited) — lives in the sibling
+-- `judgment.fenel`, alongside the decomposition iso
+-- (`judgmentOfProposition` / `evidenceOfProofTerm`), the single `verifyJudgment`
+-- core, and the kernel-primary `verifyWitnessMembership` singleton face.
+--
+-- decide-substrate Phase 2 (K1) — THE CUT. The 4-case decidable-set switch
+-- (`vpDecideTwo`/`vpDecideOne`/`vpDecideInhabited`) is RETIRED, subsumed by the
+-- one lattice judgment: `verifyProof` is now the presentation dispatcher over
+-- (Judgment, Evidence); `vpDecidableSwitch` builds the judgment + delegates the
+-- re-check to `verifyJudgment`. Refl + SampleTestResult stay presentation rules
+-- (constraints §1.1 shallow-enum-eq / §1.4 unmaterialised ⟦P⟧). Wire UNCHANGED
+-- (Proposition/ProofTerm still cross every boundary) ⇒ byte-identical markers.
+--
+-- decide-substrate Phase 2 (K3) — the kernel ACCEPTS JUDGMENT CLAIMS. The
+-- ReDecide evidence arm dispatches on the claim's nature (`vpReDecide`): a
+-- JEmpty/JInhabited claim (the judgment-native currency the producers emit
+-- since K2) routes to `vpJudgment` — the shared shape recognizer
+-- (`recheckPlan`, judgment.fenel) recovers the plan {kind, s, t}, the
+-- kind↔shape agreement guards mirror vpDecidable's, and the claim goes
+-- STRAIGHT to `verifyJudgment` (it IS the judgment — no iso rebuild). The
+-- K1-landed witness-membership rule is WIRED here: `DecidableSetResult{kind:
+-- "witness", witness: {left: w}}` proves a JInhabited claim by the {w} ⊆ s
+-- re-check (verifyWitnessMembership). Closed-sum Prop* claims keep the
+-- vpDecidable presentation path (compat — retires at K4). Refl/Sample evidence
+-- over a judgment claim flows through the existing propTag guards (natural
+-- ShapeMismatch). The eqs facts for judgment claims are computed by the TS
+-- delegate from the SAME plan (witness anti-repurpose against the recognized
+-- original (s, t)).
+-- =========================================================================
+
+@label "Verify proof"
+@description "The kernel's trust-boundary re-checker, Fenel-bodied (expr-substrate Phase 6b0; re-derived onto the one lattice judgment decide-substrate Phase 2). The PRESENTATION DISPATCHER: classifies the proof term via evidenceOfProofTerm (Refl / ReDecide / Sample / Unknown), then Refl proves PropEq via the pre-computed structural-equality facts (the singleton-equality presentation); ReDecide (DecidableSetResult) decomposes the proposition to a JEmpty/JInhabited judgment (judgmentOfProposition) and re-checks it through the single verifyJudgment core (kind↔proposition agreement + witness re-check + the pre-computed tri-precision decision); Sample (SampleTestResult) proves PropForall via the totality gate + propertyId/allPassed/samplesChecked shape checks. Returns a plain-record outcome marker ({ tag = Ok, status } / { tag = Err, etag, reason }); the TS delegate maps it to VerifyResult and grades EpistemicStatus (TS-side output grading, the 6b Q1 lock). Unknown proof-term tags ⇒ the UnknownRule TCB guard."
+@tags "engine" "kernel" "prover" "expr-substrate" "phase-6b0"
+verifyProof : (propTag: String) -> (proofTag: String) -> (prop: a) -> (proof: a) -> (eqs: a) -> (decision: String) -> (verdict: String) -> a
+verifyProof propTag proofTag prop proof eqs decision verdict =
+  let ev = evidenceOfProofTerm proofTag
+  if eq ev "Refl" then vpRefl propTag eqs
+  else if eq ev "ReDecide" then vpReDecide propTag proofTag prop proof eqs decision
+  else if eq ev "Sample" then vpSample propTag proofTag prop proof verdict
+  else { tag = "Err", etag = "UnknownRule", reason = concat "kernel: no rule for proof term '" (concat proofTag "' (Phase 4 supports Refl / DecidableSetResult / SampleTestResult only)") }
+
+-- vpReDecide — the ReDecide evidence dispatcher (decide-substrate Phase 2 K3):
+-- a JUDGMENT claim (JEmpty / JInhabited — the K3-native currency the producers
+-- emit) routes to the judgment-claim rule (vpJudgment); a closed-sum Prop*
+-- claim routes to the compat presentation path (vpDecidable — dies at K4).
+@label "kernel: vpReDecide"
+@description "decide-substrate Phase 2 K3 — the ReDecide evidence dispatcher: JEmpty/JInhabited claims (the judgment-native currency) route to vpJudgment (shape-recognized re-check + the witness-membership arm); closed-sum Prop* claims route to vpDecidable (the compat presentation path, retiring at K4). Internal helper."
+@tags "engine" "internal" "kernel" "prover" "judgment" "decide-substrate" "phase-2"
+@category "engine-internal"
+vpReDecide : (propTag: String) -> (proofTag: String) -> (prop: a) -> (proof: a) -> (eqs: a) -> (decision: String) -> a
+vpReDecide propTag proofTag prop proof eqs decision =
+  if eq propTag "JEmpty"
+  then vpJudgment propTag proofTag prop proof eqs decision
+  else if eq propTag "JInhabited"
+  then vpJudgment propTag proofTag prop proof eqs decision
+  else vpDecidable propTag proofTag prop proof eqs decision
+
+-- vpJudgment — the JUDGMENT-claim ReDecide rule (decide-substrate Phase 2 K3).
+-- The claim IS the judgment (no iso rebuild); the plan (shape + original (s,t))
+-- comes from the shared recognizer (recheckPlan, judgment.fenel). Arms:
+--   kind "witness"  ⇒ THE witness-membership rule (K1-landed, WIRED here):
+--                     requires a JInhabited claim; re-checks {w} ⊆ s via
+--                     verifyWitnessMembership (proof.witness.left carries the
+--                     ELEMENT w; the claim's set is plan.s). SolverChecked.
+--   kind "mu-induction" ⇒ THE Park (Knaster-Tarski) rule (decide-substrate
+--                     Phase 8μ.2 — the first new trusted-kernel rule since the
+--                     witness rule): requires a subset-shaped JEmpty claim
+--                     (plan.kind "subset"); re-checks μv.F ⊆ T via
+--                     verifyMuInduction — which RE-DERIVES the premise F[v:=T]
+--                     from the claim's recognized (s = μv.F, t = T), so a bogus
+--                     proposer witness is never consulted. SolverChecked.
+--   kind subset/disjoint/empty/nonempty ⇒ kind↔shape agreement (the vpDecidable
+--                     guard discipline over the RECOGNIZED shape), then the
+--                     polarity-gated re-check (vpJudgmentGo → verifyJudgment).
+--   unrecognized kind ⇒ falls straight to the re-check (the preserved TS quirk:
+--                     a bogus kind with a matching witness still re-checks).
+@label "kernel: vpJudgment"
+@description "decide-substrate Phase 2 K3 — the judgment-claim ReDecide rule: fetch the shared recheck plan (shape + original (s,t)); kind witness ⇒ the witness-membership rule (JInhabited only — re-checks {w} ⊆ s via verifyWitnessMembership, the K1-landed singleton face now WIRED); kinds subset/disjoint/empty/nonempty ⇒ kind↔recognized-shape agreement then the polarity-gated verifyJudgment re-check; unrecognized kinds fall through to the re-check (the preserved quirk). Internal helper."
+@tags "engine" "internal" "kernel" "prover" "judgment" "witness" "decide-substrate" "phase-2"
+@category "engine-internal"
+vpJudgment : (propTag: String) -> (proofTag: String) -> (prop: a) -> (proof: a) -> (eqs: a) -> (decision: String) -> a
+vpJudgment propTag proofTag prop proof eqs decision =
+  let plan = recheckPlan propTag prop
+  if eq proof.kind "witness"
+  then
+    if eq propTag "JInhabited"
+    then verifyWitnessMembership proof.witness.left plan.s
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:witness} proves an inhabited (JInhabited) claim, not an emptiness claim"
+  else if eq proof.kind "mu-induction"
+  then
+    if eq plan.kind "subset"
+    then verifyMuInduction plan.s plan.t
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:mu-induction} requires a subset-shaped JEmpty claim (μX.F ⊆ T)"
+  else if eq proof.kind "subset"
+  then
+    if eq plan.kind "subset"
+    then vpJudgmentGo prop plan eqs decision
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:subset} requires a subset-shaped JEmpty claim (s ∩ ¬t)"
+  else if eq proof.kind "disjoint"
+  then
+    if eq plan.kind "disjoint"
+    then vpJudgmentGo prop plan eqs decision
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:disjoint} requires a disjoint-shaped JEmpty claim (s ∩ t)"
+  else if eq proof.kind "empty"
+  then
+    if eq plan.kind "empty"
+    then vpJudgmentGo prop plan eqs decision
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:empty} requires a bare JEmpty claim"
+  else if eq proof.kind "nonempty"
+  then
+    if eq plan.kind "nonempty"
+    then vpJudgmentGo prop plan eqs decision
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:nonempty} requires a JInhabited claim"
+  else vpJudgmentGo prop plan eqs decision
+
+-- vpJudgmentGo — the polarity-gated re-check for a judgment claim: the claim
+-- IS the judgment, so it goes straight to verifyJudgment with the arity flag +
+-- messages keyed on the RECOGNIZED kind (the same strings vpDecidableSwitch
+-- uses — one message vocabulary across both presentation paths).
+@label "kernel: vpJudgmentGo"
+@description "decide-substrate Phase 2 K3 — the judgment claim's polarity-gated re-check: verifyJudgment over the claim itself (it IS the judgment) with twoSided + witness/recheck messages keyed on the recognized plan kind (subset/disjoint two-sided; empty/nonempty one-sided; the same message strings as the Prop* presentation path). Internal helper."
+@tags "engine" "internal" "kernel" "prover" "judgment" "decide-substrate" "phase-2"
+@category "engine-internal"
+vpJudgmentGo : (prop: a) -> (plan: a) -> (eqs: a) -> (decision: String) -> a
+vpJudgmentGo prop plan eqs decision =
+  if eq plan.kind "subset"
+  then verifyJudgment prop eqs decision true "DecidableSetResult{kind:subset} witness must match the proposition's (s, t)" "isSubset re-check did not return `Just true` for the witnessed pair"
+  else if eq plan.kind "disjoint"
+  then verifyJudgment prop eqs decision true "DecidableSetResult{kind:disjoint} witness must match the proposition's (s, t)" "isDisjoint re-check did not return `Just true` for the witnessed pair"
+  else if eq plan.kind "empty"
+  then verifyJudgment prop eqs decision false "DecidableSetResult{kind:empty} witness must match the proposition's s" "decideEmpty re-check did not return `Just true` for the witnessed set"
+  else verifyJudgment prop eqs decision false "DecidableSetResult{kind:nonempty} witness must match the proposition's s" "decideEmpty re-check did not return `Just false` (set is empty / undecided) for the witnessed set"
+
+-- vpRefl — Rule 1: Refl x proves PropEq T x x (structural equality).
+@label "kernel: vpRefl"
+@description "Phase 6b0 — the Refl rule: requires a PropEq proposition, lhs ≡ rhs, and the proof's carried value ≡ lhs (the pre-computed Fenel value-equality facts). Ok ⇒ Proven. Internal helper."
+@tags "engine" "internal" "kernel" "prover" "expr-substrate" "phase-6b0"
+@category "engine-internal"
+vpRefl : (propTag: String) -> (eqs: a) -> a
+vpRefl propTag eqs =
+  if not (eq propTag "PropEq")
+  then { tag = "Err", etag = "ShapeMismatch", reason = concat "Refl is a proof of PropEq, not " propTag, propositionTag = propTag, proofTag = "Refl" }
+  else if not eqs.lhsRhs
+  then { tag = "Err", etag = "WitnessRejected", reason = "Refl requires lhs ≡ rhs (structural equality), but the operands differ" }
+  else if not eqs.lhsValue
+  then { tag = "Err", etag = "WitnessRejected", reason = "Refl carries a `value` that must equal both PropEq operands" }
+  else { tag = "Ok", status = "Proven" }
+
+-- vpDecidable — Rule 2: the three kind-guards, then the proposition switch.
+@label "kernel: vpDecidable"
+@description "Phase 6b0 — the DecidableSetResult rule's kind↔proposition agreement guards: kind subset/disjoint/empty/nonempty each requires the matching Prop* tag (nonempty ⇒ PropInhabited, expr-substrate Phase 6b); a non-matching pair ⇒ ShapeMismatch. Past the guards (including the preserved TS quirk: an unrecognised kind falls straight through), routes to the proposition-tag switch. Internal helper."
+@tags "engine" "internal" "kernel" "prover" "expr-substrate" "phase-6b0"
+@category "engine-internal"
+vpDecidable : (propTag: String) -> (proofTag: String) -> (prop: a) -> (proof: a) -> (eqs: a) -> (decision: String) -> a
+vpDecidable propTag proofTag prop proof eqs decision =
+  if eq proof.kind "subset"
+  then
+    if eq propTag "PropSubset"
+    then vpDecidableSwitch propTag proofTag prop eqs decision
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:subset} requires a PropSubset proposition"
+  else if eq proof.kind "disjoint"
+  then
+    if eq propTag "PropDisjoint"
+    then vpDecidableSwitch propTag proofTag prop eqs decision
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:disjoint} requires a PropDisjoint proposition"
+  else if eq proof.kind "empty"
+  then
+    if eq propTag "PropEmpty"
+    then vpDecidableSwitch propTag proofTag prop eqs decision
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:empty} requires a PropEmpty proposition"
+  else if eq proof.kind "nonempty"
+  then
+    if eq propTag "PropInhabited"
+    then vpDecidableSwitch propTag proofTag prop eqs decision
+    else vpMismatch propTag proofTag "DecidableSetResult{kind:nonempty} requires a PropInhabited proposition"
+  else vpDecidableSwitch propTag proofTag prop eqs decision
+
+-- vpDecidableSwitch — the proposition-$tag switch, re-derived onto the one
+-- lattice judgment (decide-substrate Phase 2). Each decidable-set shape builds
+-- its judgment via `judgmentOfProposition` (subset ⇒ JEmpty (s ∩ ¬t); disjoint
+-- ⇒ JEmpty (s ∩ t); empty ⇒ JEmpty s; inhabited ⇒ JInhabited s) and hands it to
+-- the single `verifyJudgment` core with the arity flag (subset/disjoint =
+-- two-sided witness) + the per-shape witness/recheck messages. The retired
+-- `vpDecideTwo`/`vpDecideOne`/`vpDecideInhabited` cluster is subsumed: one core,
+-- byte-identical markers. Any other proposition tag ⇒ the 'not a proof of'
+-- ShapeMismatch.
+@label "kernel: vpDecidableSwitch"
+@description "decide-substrate Phase 2 — the DecidableSetResult rule's proposition switch, re-derived onto the one lattice judgment: each decidable-set shape decomposes via judgmentOfProposition (subset/disjoint/empty ⇒ JEmpty, inhabited ⇒ JInhabited) and routes to the single verifyJudgment core (two-sided witness for subset/disjoint; polarity-gated tri-precision decision — JEmpty accepts \"true\", JInhabited accepts \"false\"); any other proposition tag ⇒ the 'not a proof of' ShapeMismatch. Subsumes the retired vpDecideTwo/vpDecideOne/vpDecideInhabited cluster. Internal helper."
+@tags "engine" "internal" "kernel" "prover" "judgment" "decide-substrate" "phase-2"
+@category "engine-internal"
+vpDecidableSwitch : (propTag: String) -> (proofTag: String) -> (prop: a) -> (eqs: a) -> (decision: String) -> a
+vpDecidableSwitch propTag proofTag prop eqs decision =
+  if eq propTag "PropSubset" then verifyJudgment (judgmentOfProposition propTag prop) eqs decision true "DecidableSetResult{kind:subset} witness must match the proposition's (s, t)" "isSubset re-check did not return `Just true` for the witnessed pair"
+  else if eq propTag "PropDisjoint" then verifyJudgment (judgmentOfProposition propTag prop) eqs decision true "DecidableSetResult{kind:disjoint} witness must match the proposition's (s, t)" "isDisjoint re-check did not return `Just true` for the witnessed pair"
+  else if eq propTag "PropEmpty" then verifyJudgment (judgmentOfProposition propTag prop) eqs decision false "DecidableSetResult{kind:empty} witness must match the proposition's s" "decideEmpty re-check did not return `Just true` for the witnessed set"
+  else if eq propTag "PropInhabited" then verifyJudgment (judgmentOfProposition propTag prop) eqs decision false "DecidableSetResult{kind:nonempty} witness must match the proposition's s" "decideEmpty re-check did not return `Just false` (set is empty / undecided) for the witnessed set"
+  else vpMismatch propTag proofTag (concat "DecidableSetResult is not a proof of " propTag)
+
+-- vpSample — Rule 3: SampleTestResult proves PropForall.
+-- unified-static-analysis Phase 3g — THE KERNEL GATE. The `verdict` pre-computed
+-- fact is the SUBJECT function's totality verdict tag. A `PropForall x. P(x)`
+-- proven by SAMPLE-TESTING `P` is UNSOUND when `P` (or a function it tests) is
+-- non-total: the samples may diverge (never counted), or the "all passed" rests
+-- on a function with no well-defined values. So a verdict of "Unknown" or
+-- "Partial" REJECTS the proof BEFORE any shape check — a non-total subject is
+-- never certified, regardless of the claim's shape validity. "Total" (proven
+-- terminating) and "" (no Fenel-function subject declared ⇒ gate inert, the
+-- synthetic/abstract-property case) proceed to the existing shape checks. This
+-- is the ONLY rule that consults `verdict` (D-3g-2: SampleTestResult-only).
+@label "kernel: vpSample"
+@description "Phase 6b0 + 3g — the SampleTestResult rule: requires a PropForall proposition, matching propertyId, allPassed = true, and at least one sample checked. Phase 3g gates it on the SUBJECT function's totality verdict (the pre-computed `verdict` fact): \"Unknown\"/\"Partial\" ⇒ Err NonTotal (a ∀ sample-tested over a non-total function is unsound), checked BEFORE the shape checks; \"Total\"/\"\" proceed. Ok ⇒ SampleTested with the sample count (the kernel verifies the claim's SHAPE — it doesn't re-iterate; empirical evidence stays graded SampleTested, not Proven). Internal helper."
+@tags "engine" "internal" "kernel" "prover" "expr-substrate" "unified-static-analysis" "phase-3g"
+@category "engine-internal"
+vpSample : (propTag: String) -> (proofTag: String) -> (prop: a) -> (proof: a) -> (verdict: String) -> a
+vpSample propTag proofTag prop proof verdict =
+  if eq verdict "Unknown"
+  then { tag = "Err", etag = "NonTotal", reason = "SampleTestResult cannot prove a universal over a subject function whose totality is Unknown — the checker has not proven it terminates, so the sampled `∀` may be vacuous (diverging samples are never counted)" }
+  else if eq verdict "Partial"
+  then { tag = "Err", etag = "NonTotal", reason = "SampleTestResult cannot prove a universal over a subject function that is Partial (declared @partial / provably non-total) — the universal rests on a function with no well-defined values everywhere" }
+  else if not (eq propTag "PropForall")
+  then { tag = "Err", etag = "ShapeMismatch", reason = concat "SampleTestResult is a proof of PropForall, not " propTag, propositionTag = propTag, proofTag = proofTag }
+  else if not (eq prop.propertyId proof.propertyId)
+  then { tag = "Err", etag = "WitnessRejected", reason = concat "SampleTestResult propertyId '" (concat proof.propertyId (concat "' does not match the proposition's '" (concat prop.propertyId "'"))) }
+  else if not proof.allPassed
+  then { tag = "Err", etag = "WitnessRejected", reason = "SampleTestResult reports allPassed = false (a counterexample exists)" }
+  else if lte proof.samplesChecked 0
+  then { tag = "Err", etag = "WitnessRejected", reason = "SampleTestResult requires at least one sample checked" }
+  else { tag = "Ok", status = "SampleTested", samples = proof.samplesChecked }
+
+-- vpMismatch — the four-field ShapeMismatch marker builder.
+@label "kernel: vpMismatch"
+@description "Phase 6b0 — build the ShapeMismatch outcome marker carrying reason + propositionTag + proofTag (the structured fields callers branch on). Internal helper."
+@tags "engine" "internal" "kernel" "prover" "expr-substrate" "phase-6b0"
+@category "engine-internal"
+vpMismatch : (propTag: String) -> (proofTag: String) -> (reason: String) -> a
+vpMismatch propTag proofTag reason =
+  { tag = "Err", etag = "ShapeMismatch", reason = reason, propositionTag = propTag, proofTag = proofTag }

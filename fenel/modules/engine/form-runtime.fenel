@@ -1,0 +1,353 @@
+module engine where
+
+-- form-runtime — Fenel-owned form/value lifecycle planning.
+--
+-- TypeScript supplies boundary facts that are still host-owned or registry
+-- blocked today: already-extracted FieldDef rows (via the Fenel-bodied
+-- formDefinitionFields helper), registry-derived default values, canonicalized
+-- LocaleString labels, and child-field facts from the field edit plan. This
+-- module owns the pure form-session decisions over those facts.
+
+@category "engine-internal"
+formFirstNonEmpty : (a: String) -> (b: String) -> (c: String) -> (fallback: String) -> String
+formFirstNonEmpty a b c fallback =
+  if not (eq a "") then a
+  else if not (eq b "") then b
+  else if not (eq c "") then c
+  else fallback
+
+@category "engine-internal"
+formSubmitLabel : (priority: String) -> (overrideLabel: String) -> (configLabel: String) -> (legacyLabel: String) -> (fallback: String) -> String
+formSubmitLabel priority overrideLabel configLabel legacyLabel fallback =
+  if eq priority "definition-first"
+  then formFirstNonEmpty configLabel overrideLabel legacyLabel fallback
+  else formFirstNonEmpty overrideLabel configLabel legacyLabel fallback
+
+@category "engine-internal"
+formSavingLabel : (overrideLabel: String) -> (fallback: String) -> String
+formSavingLabel overrideLabel fallback =
+  if eq overrideLabel "" then fallback else overrideLabel
+
+@category "engine-internal"
+formPath : (prefix: String) -> (name: String) -> String
+formPath prefix name =
+  if eq prefix "" then name else concat prefix (concat "." name)
+
+@category "engine-internal"
+formLookupParts : (value: a) -> (parts: List String) -> Maybe a
+formLookupParts value parts = case head parts of
+  Nothing -> Just value
+  Just part -> case mapGet value part of
+    Nothing -> Nothing
+    Just child -> case tail parts of
+      Nothing -> Just child
+      Just rest -> formLookupParts child rest
+
+@category "engine-internal"
+formLookupPathMaybe : (values: a) -> (path: String) -> Maybe a
+formLookupPathMaybe values path =
+  case mapGet values path of
+    Just v -> Just v
+    Nothing -> formLookupParts values (split path ".")
+
+@category "engine-internal"
+formValueAt : (values: a) -> (path: String) -> a
+formValueAt values path = case formLookupPathMaybe values path of
+  Just v -> v
+  Nothing -> null
+
+@label "form-runtime: fields plan"
+@description "Fenel-owned form field ordering plan. The wrapper supplies fields resolved through the Fenel-bodied formDefinitionFields helper; this body is the canonical form-runtime field list entrypoint."
+@tags "engine" "form-runtime" "ux-parity" "phase-15"
+formFieldsPlan : (input: a) -> List a
+formFieldsPlan input = input.fields
+
+@category "engine-internal"
+formDefaultValuesGo : (fields: List a) -> (acc: a) -> a
+formDefaultValuesGo fields acc = case head fields of
+  Nothing -> acc
+  Just f ->
+    let acc2 = if f.hasDefault then mapSet acc f.name f.defaultValue else acc
+    case tail fields of
+      Nothing -> acc2
+      Just rest -> formDefaultValuesGo rest acc2
+
+@label "form-runtime: defaults plan"
+@description "Fenel-owned default record construction from field default facts. Registry HasDefault lookup is still supplied by the TS wrapper as a named boundary blocker; Fenel owns omission and record assembly semantics."
+@tags "engine" "form-runtime" "defaults" "ux-parity" "phase-15"
+formDefaultsPlan : (input: a) -> a
+formDefaultsPlan input =
+  formDefaultValuesGo input.fields {}
+
+@category "engine-internal"
+formApplyValuesGo : (fields: List a) -> (acc: a) -> (values: a) -> a
+formApplyValuesGo fields acc values = case head fields of
+  Nothing -> acc
+  Just f ->
+    let acc2 = case formLookupPathMaybe values f.name of
+      Nothing -> acc
+      Just v -> mapSet acc f.name v
+    case tail fields of
+      Nothing -> acc2
+      Just rest -> formApplyValuesGo rest acc2 values
+
+@category "engine-internal"
+formApplyValues : (fields: List a) -> (base: a) -> (values: a) -> a
+formApplyValues fields base values =
+  formApplyValuesGo fields base values
+
+@category "engine-internal"
+formValidationErrorsGo : (errors: List a) -> (acc: a) -> a
+formValidationErrorsGo errors acc = case head errors of
+  Nothing -> acc
+  Just e ->
+    let acc2 = mapSet acc e.path e.message
+    case tail errors of
+      Nothing -> acc2
+      Just rest -> formValidationErrorsGo rest acc2
+
+@label "form-runtime: validation plan"
+@description "Fenel-owned validation display projection. Converts stable path-addressed errors into an error map and summary facts shared by admin, widget, public, and slide renderers."
+@tags "engine" "form-runtime" "validation" "ux-parity" "phase-15"
+formValidationPlan : (input: a) -> a
+formValidationPlan input =
+  let errorMap = formValidationErrorsGo input.errors {}
+  { errors = input.errors
+  , errorMap = errorMap
+  , hasErrors = gt (length input.errors) 0
+  }
+
+@category "engine-internal"
+formLookupError : (errorMap: a) -> (path: String) -> Maybe String
+formLookupError errorMap path = case mapGet errorMap path of
+  Nothing -> Nothing
+  Just e -> Just e
+
+@category "engine-internal"
+formFieldSessionPlan : (f: a) -> (values: a) -> (errorMap: a) -> a
+formFieldSessionPlan f values errorMap =
+  { name = f.name
+  , label = f.label
+  , field = f.field
+  , value = formValueAt values f.name
+  , error = formLookupError errorMap f.name
+  , columns = f.columns
+  , drillable = gt (length f.children) 0
+  }
+
+@category "engine-internal"
+formFieldSessionPlansGo : (fields: List a) -> (values: a) -> (errorMap: a) -> (acc: List a) -> List a
+formFieldSessionPlansGo fields values errorMap acc = case head fields of
+  Nothing -> acc
+  Just f ->
+    let acc2 = appendItem (formFieldSessionPlan f values errorMap) acc
+    case tail fields of
+      Nothing -> acc2
+      Just rest -> formFieldSessionPlansGo rest values errorMap acc2
+
+@category "engine-internal"
+formRenderMode : (requested: String) -> (hasLayout: Bool) -> String
+formRenderMode requested hasLayout =
+  if eq requested "slide" then "slide"
+  else if eq requested "layout" then (if hasLayout then "layout" else "sequential")
+  else if eq requested "sequential" then "sequential"
+  else if hasLayout then "layout"
+  else "sequential"
+
+@label "form-runtime: session plan"
+@description "Fenel-owned form session plan. Owns default/initial/current value merge, submit/saving label precedence, validation error projection, render-mode fallback, and field session rows. Solid maps the plan to JSX and host IO leaves."
+@tags "engine" "form-runtime" "session" "ux-parity" "phase-15"
+formSessionPlan : (input: a) -> a
+formSessionPlan input =
+  let fields = formFieldsPlan input
+  let defaults = formDefaultsPlan { fields = fields }
+  let initialized = formApplyValues fields defaults input.initialValues
+  let values = formApplyValues fields initialized input.currentValues
+  let validation = formValidationPlan { errors = input.errors }
+  let mode = formRenderMode input.requestedMode input.hasLayout
+  { fields = formFieldSessionPlansGo fields values validation.errorMap []
+  , values = values
+  , validation = validation
+  , submitLabel = formSubmitLabel input.submitLabelPriority input.submitLabelOverride input.configSubmitLabel input.legacySubmitLabel input.defaultSubmitLabel
+  , savingLabel = formSavingLabel input.savingLabelOverride input.defaultSavingLabel
+  , renderMode = mode
+  , layout = input.layout
+  }
+
+@category "engine-internal"
+formMapString : (value: a) -> (key: String) -> Maybe String
+formMapString value key = case mapGet value key of
+  Nothing -> Nothing
+  Just v -> if isString v then Just v else Nothing
+
+@category "engine-internal"
+formSuccessLinkLabel : (value: a) -> String
+formSuccessLinkLabel value =
+  case mapGet value "label" of
+    Just label ->
+      if isString label
+      then label
+      else case mapGet label "$tag" of
+        Just tag -> if eq tag "Just"
+          then case mapGet label "_0" of
+            Just txt -> if isString txt then txt else "Continue"
+            Nothing -> "Continue"
+          else "Continue"
+        Nothing -> "Continue"
+    Nothing -> "Continue"
+
+@category "engine-internal"
+formSuccessLinkUrl : (value: a) -> Maybe String
+formSuccessLinkUrl value =
+  case formMapString value "$tag" of
+    Just tag -> if eq tag "Link" then formMapString value "url" else Nothing
+    Nothing -> Nothing
+
+@label "form-runtime: success plan"
+@description "Fenel-owned post-submit success display choice. Link typed values become link plans; other returned typed values become typed-read plans; missing values become thank-you plans."
+@tags "engine" "form-runtime" "success" "ux-parity" "phase-15"
+formSuccessPlan : (input: a) -> a
+formSuccessPlan input =
+  if not input.submitted
+  then { kind = "none" }
+  else if not input.hasValue
+  then { kind = "thank-you", text = input.thankYouText }
+  else case formSuccessLinkUrl input.value of
+    Just url -> { kind = "link", url = url, label = formSuccessLinkLabel input.value }
+    Nothing -> { kind = "typed-read-plan", value = input.value, text = input.thankYouText }
+
+@category "engine-internal"
+formFindField : (fields: List a) -> (name: String) -> Maybe a
+formFindField fields name = case head fields of
+  Nothing -> Nothing
+  Just f ->
+    if eq f.name name
+    then Just f
+    else case tail fields of
+      Nothing -> Nothing
+      Just rest -> formFindField rest name
+
+@category "engine-internal"
+formSlideField : (f: a) -> (values: a) -> (errorMap: a) -> a
+formSlideField f values errorMap =
+  formFieldSessionPlan f values errorMap
+
+@category "engine-internal"
+formAppendSlideFieldByName : (name: String) -> (fields: List a) -> (values: a) -> (errorMap: a) -> (acc: List a) -> List a
+formAppendSlideFieldByName name fields values errorMap acc =
+  case formFindField fields name of
+    Nothing -> acc
+    Just f -> appendItem (formSlideField f values errorMap) acc
+
+@category "engine-internal"
+formSlideFieldsFromNames : (names: List String) -> (fields: List a) -> (values: a) -> (errorMap: a) -> (acc: List a) -> List a
+formSlideFieldsFromNames names fields values errorMap acc = case head names of
+  Nothing -> acc
+  Just name ->
+    let acc2 = formAppendSlideFieldByName name fields values errorMap acc
+    case tail names of
+      Nothing -> acc2
+      Just rest -> formSlideFieldsFromNames rest fields values errorMap acc2
+
+@category "engine-internal"
+formExplicitSlidesGo : (slides: List a) -> (fields: List a) -> (values: a) -> (errorMap: a) -> (acc: List a) -> List a
+formExplicitSlidesGo slides fields values errorMap acc = case head slides of
+  Nothing -> acc
+  Just s ->
+    let slide = { title = s.title, fields = formSlideFieldsFromNames s.fields fields values errorMap [] }
+    let acc2 = appendItem slide acc
+    case tail slides of
+      Nothing -> acc2
+      Just rest -> formExplicitSlidesGo rest fields values errorMap acc2
+
+@category "engine-internal"
+formSectionSlotsFields : (slots: List a) -> (fields: List a) -> (values: a) -> (errorMap: a) -> (acc: List a) -> List a
+formSectionSlotsFields slots fields values errorMap acc = case head slots of
+  Nothing -> acc
+  Just slot ->
+    let acc2 = formAppendSlideFieldByName slot.field fields values errorMap acc
+    case tail slots of
+      Nothing -> acc2
+      Just rest -> formSectionSlotsFields rest fields values errorMap acc2
+
+@category "engine-internal"
+formSectionRowsFields : (rows: List a) -> (fields: List a) -> (values: a) -> (errorMap: a) -> (acc: List a) -> List a
+formSectionRowsFields rows fields values errorMap acc = case head rows of
+  Nothing -> acc
+  Just row ->
+    let acc2 = formSectionSlotsFields row.slots fields values errorMap acc
+    case tail rows of
+      Nothing -> acc2
+      Just rest -> formSectionRowsFields rest fields values errorMap acc2
+
+@category "engine-internal"
+formLayoutSlidesGo : (sections: List a) -> (fields: List a) -> (values: a) -> (errorMap: a) -> (acc: List a) -> List a
+formLayoutSlidesGo sections fields values errorMap acc = case head sections of
+  Nothing -> acc
+  Just section ->
+    let slide = { title = section.title, fields = formSectionRowsFields section.rows fields values errorMap [] }
+    let acc2 = appendItem slide acc
+    case tail sections of
+      Nothing -> acc2
+      Just rest -> formLayoutSlidesGo rest fields values errorMap acc2
+
+@category "engine-internal"
+formOneSlidePerFieldGo : (fields: List a) -> (values: a) -> (errorMap: a) -> (acc: List a) -> List a
+formOneSlidePerFieldGo fields values errorMap acc = case head fields of
+  Nothing -> acc
+  Just f ->
+    let slide = { title = f.label, fields = [formSlideField f values errorMap] }
+    let acc2 = appendItem slide acc
+    case tail fields of
+      Nothing -> acc2
+      Just rest -> formOneSlidePerFieldGo rest values errorMap acc2
+
+@label "form-runtime: slide plan"
+@description "Fenel-owned slide/group plan for progressive forms. Owns explicit-slide resolution, layout-section grouping, and one-slide-per-field fallback."
+@tags "engine" "form-runtime" "slides" "ux-parity" "phase-15"
+formSlidePlan : (input: a) -> a
+formSlidePlan input =
+  let validation = formValidationPlan { errors = input.errors }
+  let slides =
+        if gt (length input.slides) 0
+        then formExplicitSlidesGo input.slides input.fields input.values validation.errorMap []
+        else if gt (length input.layout.sections) 0
+        then formLayoutSlidesGo input.layout.sections input.fields input.values validation.errorMap []
+        else formOneSlidePerFieldGo input.fields input.values validation.errorMap []
+  { slides = slides }
+
+@category "engine-internal"
+formPrefixFieldFact : (parent: String) -> (f: a) -> a
+formPrefixFieldFact parent f =
+  let name = formPath parent f.name
+  { name = name
+  , label = f.label
+  , field = mapSet f.field "name" name
+  , columns = f.columns
+  , children = f.children
+  , hasDefault = f.hasDefault
+  , defaultValue = f.defaultValue
+  }
+
+@category "engine-internal"
+formDrillSlidesGo : (children: List a) -> (parent: String) -> (values: a) -> (errorMap: a) -> (acc: List a) -> List a
+formDrillSlidesGo children parent values errorMap acc = case head children of
+  Nothing -> acc
+  Just child ->
+    let f = formPrefixFieldFact parent child
+    let slide = { title = f.label, fields = [formSlideField f values errorMap] }
+    let acc2 = appendItem slide acc
+    case tail children of
+      Nothing -> acc2
+      Just rest -> formDrillSlidesGo rest parent values errorMap acc2
+
+@label "form-runtime: record drill plan"
+@description "Fenel-owned drill-in plan for record fields in slide forms. Child field facts are supplied by the Fenel field edit plan; this body owns parent-path prefixing and sub-slide grouping."
+@tags "engine" "form-runtime" "slides" "record" "ux-parity" "phase-15"
+formRecordDrillPlan : (input: a) -> a
+formRecordDrillPlan input =
+  let validation = formValidationPlan { errors = input.errors }
+  { label = input.parentLabel
+  , prefix = input.parentName
+  , slides = formDrillSlidesGo input.children input.parentName input.values validation.errorMap []
+  }

@@ -1,0 +1,578 @@
+-- field-providers — structurally scoped field-value and SetExpr-constraint
+-- provider policy (field-identity Phase 3, Step 7).
+--
+-- A provider binding is identified by ProviderFieldTarget: explicit registry
+-- scope + owner + UUID-backed FieldRef. Current field codenames never enter a
+-- registration, lookup, cache, or batching key. Both provider families share
+-- the token/equality/duplicate/conflict policy below. The dispatch substrate is
+-- only the scoped storage/index; this module owns registration and selection.
+-- Async provider invocation remains the narrow TypeScript IO leaf.
+
+module engine where
+
+ProviderScope =
+  RepositoryProviderScope registryId: String
+  | AccountProviderScope accountId: String registryId: String
+
+ProviderFieldTarget = ProviderFieldTarget scope: ProviderScope owner: String field: FieldRef
+
+FieldProvider = FieldProvider name: String
+FieldBinding = FieldBinding target: ProviderFieldTarget provider: String keyField: FieldRef
+ConstraintProvider = ConstraintProvider name: String
+ConstraintBinding = ConstraintBinding target: ProviderFieldTarget provider: String
+
+ProviderRegistrationOutcome =
+  ProviderRegistered value: a
+  | ProviderDuplicate value: a
+  | ProviderConflict message: String
+  | ProviderInvalid message: String
+
+ProviderLookupOutcome =
+  ProviderFound value: a
+  | ProviderMissing message: String
+  | ProviderAmbiguous message: String
+
+ResolveFieldDecision =
+  FetchFromProvider provider: a binding: a
+  | NoBinding message: String
+  | NoProvider message: String
+  | AmbiguousProviderBinding message: String
+
+ResolveBatchDecision =
+  NoProviderOrBinding message: String
+  | BatchPlan provider: a binding: a keysToFetch: a
+
+ProviderBatchMode =
+  ProviderGetBatch
+  | ProviderGetScalar
+
+ResolveEntityDecision =
+  NoVirtualFields
+  | ResolvePlan resolutions: a
+
+EntityMergeDecision =
+  EntityMergeRows rows: a
+  | EntityMergeConflict message: String
+
+ConstraintResolveDecision =
+  ConstraintFetch target: a provider: a binding: a
+  | ConstraintUnavailable target: a message: String
+
+ConstraintResolvePlan = ConstraintResolvePlan tasks: a errors: a
+
+@category "engine-internal"
+providerSized : String -> String
+providerSized value = concat (toString (length value)) (concat ":" value)
+
+@category "engine-internal"
+providerScopeError : ProviderScope -> Maybe String
+providerScopeError scope =
+  case scope of
+    RepositoryProviderScope { registryId = registryId } ->
+      if eq registryId "" then Just "provider scope: empty repository registry id" else Nothing
+    AccountProviderScope { accountId = accountId, registryId = registryId } ->
+      if eq accountId ""
+      then Just "provider scope: empty account id"
+      else if eq registryId "" then Just "provider scope: empty account registry id" else Nothing
+
+@category "engine-internal"
+providerScopeEq : ProviderScope -> ProviderScope -> Bool
+providerScopeEq left right =
+  case left of
+    RepositoryProviderScope { registryId = leftRegistry } ->
+      case right of
+        RepositoryProviderScope { registryId = rightRegistry } -> eq leftRegistry rightRegistry
+        AccountProviderScope -> false
+    AccountProviderScope { accountId = leftAccount, registryId = leftRegistry } ->
+      case right of
+        RepositoryProviderScope -> false
+        AccountProviderScope { accountId = rightAccount, registryId = rightRegistry } ->
+          and (eq leftAccount rightAccount) (eq leftRegistry rightRegistry)
+
+@category "engine-internal"
+providerScopeToken : ProviderScope -> String
+providerScopeToken scope =
+  case scope of
+    RepositoryProviderScope { registryId = registryId } -> concat "r|" (providerSized registryId)
+    AccountProviderScope { accountId = accountId, registryId = registryId } ->
+      concat "a|" (concat (providerSized accountId) (concat "|" (providerSized registryId)))
+
+@category "engine-internal"
+providerDispatchScope : ProviderScope -> Maybe String
+providerDispatchScope scope = Just (concat "provider|" (providerScopeToken scope))
+
+@category "engine-internal"
+providerFieldRefHandle : FieldRef -> String
+providerFieldRefHandle ref =
+  case ref of
+    FieldRef { handle = handle } -> handle
+
+@category "engine-internal"
+providerFieldRefValid : FieldRef -> Bool
+providerFieldRefValid ref = fieldIdentityIsUuid (providerFieldRefHandle ref)
+
+@category "engine-internal"
+providerFieldRefEq : FieldRef -> FieldRef -> Bool
+providerFieldRefEq left right =
+  let leftHandle = lower (providerFieldRefHandle left)
+  let rightHandle = lower (providerFieldRefHandle right)
+  and (providerFieldRefValid left) (and (providerFieldRefValid right) (eq leftHandle rightHandle))
+
+@category "engine-internal"
+providerFieldRefToken : FieldRef -> String
+providerFieldRefToken ref =
+  let handle = lower (providerFieldRefHandle ref)
+  concat "n:" handle
+
+@category "engine-internal"
+providerTargetError : ProviderFieldTarget -> Maybe String
+providerTargetError target =
+  case providerScopeError target.scope of
+    Just message -> Just message
+    Nothing ->
+      if eq target.owner ""
+      then Just "provider target: empty owner"
+      else if providerFieldRefValid target.field
+      then Nothing
+      else Just "provider target: invalid UUID-backed FieldRef"
+
+@category "engine-internal"
+providerTargetEq : ProviderFieldTarget -> ProviderFieldTarget -> Bool
+providerTargetEq left right =
+  and (providerScopeEq left.scope right.scope)
+    (and (eq left.owner right.owner) (providerFieldRefEq left.field right.field))
+
+@category "engine-internal"
+providerTargetToken : ProviderFieldTarget -> String
+providerTargetToken target =
+  let scopeToken = providerScopeToken target.scope
+  let ownerToken = providerSized target.owner
+  let fieldToken = providerFieldRefToken target.field
+  concat "target|" (concat scopeToken (concat "|owner|" (concat ownerToken (concat "|field|" fieldToken))))
+
+@category "engine-internal"
+providerNameToken : ProviderScope -> String -> String -> String
+providerNameToken scope family name =
+  concat family (concat "|" (concat (providerScopeToken scope) (concat "|name|" (providerSized name))))
+
+@category "engine-internal"
+providerLookupRows : List a -> String -> ProviderLookupOutcome
+providerLookupRows rows missingMessage =
+  case head rows of
+    Nothing -> ProviderMissing { message = missingMessage }
+    Just value ->
+      case head (tailOr rows) of
+        Nothing -> ProviderFound { value = value }
+        Just _ -> ProviderAmbiguous { message = concat missingMessage " (duplicate registrations)" }
+
+@category "engine-internal"
+fieldBindingEq : FieldBinding -> FieldBinding -> Bool
+fieldBindingEq left right =
+  and (providerTargetEq left.target right.target)
+    (and (eq left.provider right.provider) (providerFieldRefEq left.keyField right.keyField))
+
+@category "engine-internal"
+constraintBindingEq : ConstraintBinding -> ConstraintBinding -> Bool
+constraintBindingEq left right =
+  and (providerTargetEq left.target right.target) (eq left.provider right.provider)
+
+@category "engine-internal"
+registerProviderFamily : String -> ProviderScope -> a -> ProviderRegistrationOutcome
+registerProviderFamily family scope provider =
+  case providerScopeError scope of
+    Just message -> ProviderInvalid { message = message }
+    Nothing ->
+      if eq provider.name ""
+      then ProviderInvalid { message = "provider registration: empty provider name" }
+      else
+        let token = providerNameToken scope family provider.name
+        let rows = dispatchLookupAll family token
+        case head rows of
+          Just existing -> ProviderDuplicate { value = existing }
+          Nothing ->
+            let registered = dispatchRegister family (ByType { target = token }) provider (providerDispatchScope scope)
+            ProviderRegistered { value = provider }
+
+@category "engine-internal"
+registerFieldBindingKernel : FieldBinding -> ProviderRegistrationOutcome
+registerFieldBindingKernel binding =
+  case providerTargetError binding.target of
+    Just message -> ProviderInvalid { message = message }
+    Nothing -> registerFieldBindingChecked binding
+
+@category "engine-internal"
+registerFieldBindingChecked : FieldBinding -> ProviderRegistrationOutcome
+registerFieldBindingChecked binding =
+  if eq binding.provider ""
+  then ProviderInvalid { message = "field binding: empty provider name" }
+  else if not (providerFieldRefValid binding.keyField)
+  then ProviderInvalid { message = "field binding: invalid UUID-backed key FieldRef" }
+  else
+    let token = providerTargetToken binding.target
+    registerFieldBindingRows binding token (dispatchLookupAll "FieldBinding" token)
+
+@category "engine-internal"
+registerFieldBindingRows : FieldBinding -> String -> List FieldBinding -> ProviderRegistrationOutcome
+registerFieldBindingRows binding token rows =
+  case head rows of
+    Nothing ->
+      let registered = dispatchRegister "FieldBinding" (ByType { target = token }) binding (providerDispatchScope binding.target.scope)
+      ProviderRegistered { value = binding }
+    Just existing -> registerFieldBindingExisting binding existing (tailOr rows)
+
+@category "engine-internal"
+registerFieldBindingExisting : FieldBinding -> FieldBinding -> List FieldBinding -> ProviderRegistrationOutcome
+registerFieldBindingExisting binding existing remaining =
+  case head remaining of
+    Just _ -> ProviderConflict { message = "field binding: ambiguous existing registrations" }
+    Nothing ->
+      if fieldBindingEq existing binding
+      then ProviderDuplicate { value = existing }
+      else ProviderConflict { message = "field binding: target already has a different provider or key FieldRef" }
+
+@category "engine-internal"
+registerConstraintBindingKernel : ConstraintBinding -> ProviderRegistrationOutcome
+registerConstraintBindingKernel binding =
+  case providerTargetError binding.target of
+    Just message -> ProviderInvalid { message = message }
+    Nothing -> registerConstraintBindingChecked binding
+
+@category "engine-internal"
+registerConstraintBindingChecked : ConstraintBinding -> ProviderRegistrationOutcome
+registerConstraintBindingChecked binding =
+  if eq binding.provider ""
+  then ProviderInvalid { message = "constraint binding: empty provider name" }
+  else
+    let token = providerTargetToken binding.target
+    registerConstraintBindingRows binding token (dispatchLookupAll "ConstraintBinding" token)
+
+@category "engine-internal"
+registerConstraintBindingRows : ConstraintBinding -> String -> List ConstraintBinding -> ProviderRegistrationOutcome
+registerConstraintBindingRows binding token rows =
+  case head rows of
+    Nothing ->
+      let registered = dispatchRegister "ConstraintBinding" (ByType { target = token }) binding (providerDispatchScope binding.target.scope)
+      ProviderRegistered { value = binding }
+    Just existing -> registerConstraintBindingExisting binding existing (tailOr rows)
+
+@category "engine-internal"
+registerConstraintBindingExisting : ConstraintBinding -> ConstraintBinding -> List ConstraintBinding -> ProviderRegistrationOutcome
+registerConstraintBindingExisting binding existing remaining =
+  case head remaining of
+    Just _ -> ProviderConflict { message = "constraint binding: ambiguous existing registrations" }
+    Nothing ->
+      if constraintBindingEq existing binding
+      then ProviderDuplicate { value = existing }
+      else ProviderConflict { message = "constraint binding: target already has a different provider" }
+
+@label "Register field-value provider"
+@description "Register a field-value provider under an explicit structural registry scope. Duplicate names are deterministic and never overwrite another scope."
+@tags "engine" "field-providers" "field-identity" "phase-3"
+registerProvider : ProviderScope -> a -> ProviderRegistrationOutcome
+registerProvider scope provider = registerProviderFamily "FieldProvider" scope provider
+
+unregisterProvider : ProviderScope -> String -> Unit
+unregisterProvider scope name = dispatchUnregister "FieldProvider" (providerNameToken scope "FieldProvider" name)
+
+getProvider : ProviderScope -> String -> ProviderLookupOutcome
+getProvider scope name =
+  providerLookupRows (dispatchLookupAll "FieldProvider" (providerNameToken scope "FieldProvider" name))
+    (concat "field provider missing: " name)
+
+registerBinding : FieldBinding -> ProviderRegistrationOutcome
+registerBinding binding = registerFieldBindingKernel binding
+
+registerBindings : List FieldBinding -> List ProviderRegistrationOutcome
+registerBindings bindings =
+  case head bindings of
+    Nothing -> []
+    Just binding ->
+      let outcome = registerBinding binding
+      case tail bindings of
+        Nothing -> [outcome]
+        Just rest -> appendItem outcome (registerBindings rest)
+
+unregisterBinding : ProviderFieldTarget -> Unit
+unregisterBinding target = dispatchUnregister "FieldBinding" (providerTargetToken target)
+
+getBinding : ProviderFieldTarget -> ProviderLookupOutcome
+getBinding target =
+  case providerTargetError target of
+    Just message -> ProviderMissing { message = message }
+    Nothing -> providerLookupRows (dispatchLookupAll "FieldBinding" (providerTargetToken target)) "field binding missing"
+
+listBindings : ProviderScope -> List FieldBinding
+listBindings scope =
+  let all = map (\inst -> inst.methods) (dispatchListAllInstances "FieldBinding")
+  filter (\binding -> providerScopeEq binding.target.scope scope) all
+
+@label "Field bindings for owner"
+@description "Select field-value bindings for one exact structural scope and owner. This is the sole owner-selection policy used by entity resolution; TypeScript receives only the selected rows."
+@tags "engine" "field-providers" "field-identity" "phase-3"
+fieldBindingsFor : ProviderScope -> String -> List FieldBinding
+fieldBindingsFor scope owner =
+  filter (\binding -> eq binding.target.owner owner) (listBindings scope)
+
+hasBinding : ProviderFieldTarget -> Bool
+hasBinding target =
+  case getBinding target of
+    ProviderFound -> true
+    ProviderMissing -> false
+    ProviderAmbiguous -> false
+
+clearSessionCache : Unit
+clearSessionCache = True
+
+clearAllCaches : Unit
+clearAllCaches = True
+
+@label "Register constraint provider"
+@description "Constraint-provider sibling of registerProvider using the same explicit scope/token policy."
+@tags "engine" "constraint-providers" "field-identity" "phase-3"
+registerConstraintProvider : ProviderScope -> a -> ProviderRegistrationOutcome
+registerConstraintProvider scope provider = registerProviderFamily "ConstraintProvider" scope provider
+
+unregisterConstraintProvider : ProviderScope -> String -> Unit
+unregisterConstraintProvider scope name = dispatchUnregister "ConstraintProvider" (providerNameToken scope "ConstraintProvider" name)
+
+getConstraintProvider : ProviderScope -> String -> ProviderLookupOutcome
+getConstraintProvider scope name =
+  providerLookupRows (dispatchLookupAll "ConstraintProvider" (providerNameToken scope "ConstraintProvider" name))
+    (concat "constraint provider missing: " name)
+
+registerConstraintBinding : ConstraintBinding -> ProviderRegistrationOutcome
+registerConstraintBinding binding = registerConstraintBindingKernel binding
+
+registerConstraintBindings : List ConstraintBinding -> List ProviderRegistrationOutcome
+registerConstraintBindings bindings =
+  case head bindings of
+    Nothing -> []
+    Just binding ->
+      let outcome = registerConstraintBinding binding
+      case tail bindings of
+        Nothing -> [outcome]
+        Just rest -> appendItem outcome (registerConstraintBindings rest)
+
+unregisterConstraintBinding : ProviderFieldTarget -> Unit
+unregisterConstraintBinding target = dispatchUnregister "ConstraintBinding" (providerTargetToken target)
+
+getConstraintBinding : ProviderFieldTarget -> ProviderLookupOutcome
+getConstraintBinding target =
+  case providerTargetError target of
+    Just message -> ProviderMissing { message = message }
+    Nothing -> providerLookupRows (dispatchLookupAll "ConstraintBinding" (providerTargetToken target)) "constraint binding missing"
+
+listConstraintBindings : ProviderScope -> List ConstraintBinding
+listConstraintBindings scope =
+  let all = map (\inst -> inst.methods) (dispatchListAllInstances "ConstraintBinding")
+  filter (\binding -> providerScopeEq binding.target.scope scope) all
+
+@label "Constraint bindings for owner"
+@description "Select constraint bindings for one exact structural scope and owner. Current field codenames are never consulted or returned."
+@tags "engine" "constraint-providers" "field-identity" "phase-3"
+constraintBindingsFor : ProviderScope -> String -> List ConstraintBinding
+constraintBindingsFor scope owner =
+  filter (\binding -> eq binding.target.owner owner) (listConstraintBindings scope)
+
+@label "Constraint fields for owner"
+@description "Project identity-bearing targets from Fenel-selected constraint bindings for one exact scope and owner."
+@tags "engine" "constraint-providers" "field-identity" "phase-3"
+constraintFieldsFor : ProviderScope -> String -> List ProviderFieldTarget
+constraintFieldsFor scope owner =
+  map (\binding -> binding.target) (constraintBindingsFor scope owner)
+
+hasConstraintBinding : ProviderFieldTarget -> Bool
+hasConstraintBinding target =
+  case getConstraintBinding target of
+    ProviderFound -> true
+    ProviderMissing -> false
+    ProviderAmbiguous -> false
+
+resolveFieldDecision : ProviderFieldTarget -> ResolveFieldDecision
+resolveFieldDecision target =
+  case getBinding target of
+    ProviderMissing { message = message } -> NoBinding { message = message }
+    ProviderAmbiguous { message = message } -> AmbiguousProviderBinding { message = message }
+    ProviderFound { value = binding } ->
+      case getProvider target.scope binding.provider of
+        ProviderMissing { message = message } -> NoProvider { message = message }
+        ProviderAmbiguous { message = message } -> AmbiguousProviderBinding { message = message }
+        ProviderFound { value = provider } -> FetchFromProvider { provider = provider, binding = binding }
+
+@category "engine-internal"
+providerKeyMember : String -> List String -> Bool
+providerKeyMember key keys =
+  case head keys of
+    Nothing -> false
+    Just candidate ->
+      if eq key candidate then true else providerKeyMember key (tailOr keys)
+
+@category "engine-internal"
+providerUniqueKeysAcc : List String -> List String -> List String
+providerUniqueKeysAcc keys acc =
+  case head keys of
+    Nothing -> acc
+    Just key ->
+      let next = if providerKeyMember key acc then acc else appendItem key acc
+      providerUniqueKeysAcc (tailOr keys) next
+
+@category "engine-internal"
+providerUniqueKeys : List String -> List String
+providerUniqueKeys keys = providerUniqueKeysAcc keys []
+
+resolveBatchDecision : ProviderFieldTarget -> List String -> ResolveBatchDecision
+resolveBatchDecision target entityKeys =
+  case resolveFieldDecision target of
+    FetchFromProvider { provider = provider, binding = binding } ->
+      BatchPlan { provider = provider, binding = binding, keysToFetch = providerUniqueKeys entityKeys }
+    NoBinding { message = message } -> NoProviderOrBinding { message = message }
+    NoProvider { message = message } -> NoProviderOrBinding { message = message }
+    AmbiguousProviderBinding { message = message } -> NoProviderOrBinding { message = message }
+
+@label "Choose provider batch invocation"
+@description "Choose getBatch versus scalar fallback from the host-projected capability fact. TypeScript may observe whether the optional IO closure exists, but this Fenel body owns the invocation policy."
+@tags "engine" "field-providers" "batch" "field-identity" "phase-3"
+providerBatchMode : Bool -> ProviderBatchMode
+providerBatchMode hasBatch = if hasBatch then ProviderGetBatch else ProviderGetScalar
+
+@category "engine-internal"
+providerFindResolvedValue : String -> List a -> Maybe a
+providerFindResolvedValue entityKey rows =
+  case head rows of
+    Nothing -> Nothing
+    Just row ->
+      if eq row.entityKey entityKey
+      then row.value
+      else providerFindResolvedValue entityKey (tailOr rows)
+
+@category "engine-internal"
+providerSelectResolvedRowsAcc : List String -> List a -> List b -> List b
+providerSelectResolvedRowsAcc requestedKeys rows acc =
+  case head requestedKeys of
+    Nothing -> acc
+    Just entityKey ->
+      let next = case providerFindResolvedValue entityKey rows of
+        Nothing -> acc
+        Just value -> appendItem { entityKey = entityKey, value = value } acc
+      providerSelectResolvedRowsAcc (tailOr requestedKeys) rows next
+
+@label "Select provider batch results"
+@description "Return only requested, defined provider rows in requested-key order. Extra keys, absent keys, duplicate requested keys, and explicit undefined/Nothing rows are resolved here, never by host object iteration policy."
+@tags "engine" "field-providers" "batch" "field-identity" "phase-3"
+providerSelectResolvedRows : List String -> List a -> List b
+providerSelectResolvedRows requestedKeys rows =
+  providerSelectResolvedRowsAcc (providerUniqueKeys requestedKeys) rows []
+
+@category "engine-internal"
+providerAppendEntityCandidate : a -> List b -> List b
+providerAppendEntityCandidate candidate acc =
+  case candidate.entityKey of
+    Nothing -> acc
+    Just entityKey ->
+      case candidate.wireName of
+        Nothing -> acc
+        Just wireName ->
+          if or (eq entityKey "") (eq wireName "")
+          then acc
+          else appendItem { binding = candidate.binding, entityKey = entityKey, wireName = wireName } acc
+
+@category "engine-internal"
+providerSelectEntityCandidates : List a -> List b -> List b
+providerSelectEntityCandidates candidates acc =
+  case head candidates of
+    Nothing -> acc
+    Just candidate ->
+      providerSelectEntityCandidates (tailOr candidates) (providerAppendEntityCandidate candidate acc)
+
+resolveEntityDecision : List a -> ResolveEntityDecision
+resolveEntityDecision candidates =
+  let resolutions = providerSelectEntityCandidates candidates []
+  case head resolutions of
+    Nothing -> NoVirtualFields
+    Just _ -> ResolvePlan { resolutions = resolutions }
+
+@category "engine-internal"
+providerEntityMergeAcc : List a -> List b -> List String -> EntityMergeDecision
+providerEntityMergeAcc resolved selected wireNames =
+  case head resolved of
+    Nothing -> EntityMergeRows { rows = selected }
+    Just row ->
+      case row.value of
+        Nothing -> providerEntityMergeAcc (tailOr resolved) selected wireNames
+        Just value ->
+          if eq row.wireName ""
+          then providerEntityMergeAcc (tailOr resolved) selected wireNames
+          else if providerKeyMember row.wireName wireNames
+          then EntityMergeConflict { message = concat "field provider entity merge: duplicate wire projection " row.wireName }
+          else
+            providerEntityMergeAcc (tailOr resolved)
+              (appendItem { wireName = row.wireName, value = value } selected)
+              (appendItem row.wireName wireNames)
+
+@label "Select entity provider merge rows"
+@description "Select defined entity-provider rows and reject duplicate current wire projections before the host authors a dynamic wire-keyed object. The decision is computed only after all async leaves have completed, preserving atomic merge."
+@tags "engine" "field-providers" "entity-merge" "field-identity" "phase-3"
+providerEntityMergeDecision : List a -> EntityMergeDecision
+providerEntityMergeDecision resolved = providerEntityMergeAcc resolved [] []
+
+@category "engine-internal"
+constraintResolveDecision : ProviderFieldTarget -> ConstraintResolveDecision
+constraintResolveDecision target =
+  case getConstraintBinding target of
+    ProviderMissing { message = message } -> ConstraintUnavailable { target = target, message = message }
+    ProviderAmbiguous { message = message } -> ConstraintUnavailable { target = target, message = message }
+    ProviderFound { value = binding } -> constraintResolveProvider target binding
+
+@category "engine-internal"
+constraintResolveProvider : ProviderFieldTarget -> ConstraintBinding -> ConstraintResolveDecision
+constraintResolveProvider target binding =
+  case getConstraintProvider target.scope binding.provider of
+    ProviderMissing { message = message } -> ConstraintUnavailable { target = target, message = message }
+    ProviderAmbiguous { message = message } -> ConstraintUnavailable { target = target, message = message }
+    ProviderFound { value = provider } -> ConstraintFetch { target = target, provider = provider, binding = binding }
+
+constraintResolvePlan : List ProviderFieldTarget -> ConstraintResolvePlan
+constraintResolvePlan targets = constraintResolvePlanAcc targets [] []
+
+@category "engine-internal"
+constraintAppendTask : ConstraintResolveDecision -> List a -> List a
+constraintAppendTask decision tasks =
+  case decision of
+    ConstraintFetch -> appendItem decision tasks
+    ConstraintUnavailable -> tasks
+
+@category "engine-internal"
+constraintAppendError : ConstraintResolveDecision -> List a -> List a
+constraintAppendError decision errors =
+  case decision of
+    ConstraintFetch -> errors
+    ConstraintUnavailable -> appendItem decision errors
+
+@category "engine-internal"
+constraintResolvePlanAcc : List ProviderFieldTarget -> List a -> List b -> ConstraintResolvePlan
+constraintResolvePlanAcc targets tasks errors =
+  case head targets of
+    Nothing -> ConstraintResolvePlan { tasks = tasks, errors = errors }
+    Just target ->
+      let decision = constraintResolveDecision target
+      let nextTasks = constraintAppendTask decision tasks
+      let nextErrors = constraintAppendError decision errors
+      case tail targets of
+        Nothing -> ConstraintResolvePlan { tasks = nextTasks, errors = nextErrors }
+        Just rest -> constraintResolvePlanAcc rest nextTasks nextErrors
+
+constraintMergeResolved : List a -> List b
+constraintMergeResolved resolved = constraintMergeResolvedAcc resolved []
+
+@category "engine-internal"
+constraintMergeResolvedAcc : List a -> List b -> List b
+constraintMergeResolvedAcc resolved acc =
+  case head resolved of
+    Nothing -> acc
+    Just row ->
+      let next = case row.constraint of
+        Nothing -> acc
+        Just constraint -> appendItem { target = row.target, constraint = constraint } acc
+      case tail resolved of
+        Nothing -> next
+        Just rest -> constraintMergeResolvedAcc rest next

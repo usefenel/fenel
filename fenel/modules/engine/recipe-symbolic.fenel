@@ -1,0 +1,1366 @@
+module engine where
+
+-- Recipe-functions S3. This is an untrusted symbolic proposer, never an
+-- execution engine or proof gate. The checker reconstructs the transitions
+-- against a fresh reader snapshot. Values retain lexical environments and
+-- branch sharing; no recipe is run on an enumerated collection of pantries.
+
+@label "Propose symbolic function application"
+proposeRecipeApplication : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (arguments: List RecipeSymbolicValue) -> (budget: Nat) -> RecipeApplicationProposal
+proposeRecipeApplication snapshot source arguments budget =
+  recipeProposeApplicationOwned snapshot source (recipeSourceApplicationOwner snapshot source) arguments budget
+
+@label "Propose indexed symbolic function application"
+proposeRecipeApplicationAt : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (index: Nat) -> (arguments: List RecipeSymbolicValue) -> (budget: Nat) -> RecipeApplicationProposal
+proposeRecipeApplicationAt snapshot source index arguments budget =
+  recipeProposeApplicationOwned snapshot source (recipeSourceApplicationOwnerAt snapshot source index) arguments budget
+
+@category "engine-internal"
+recipeProposeApplicationOwned : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (selectedOwner: Maybe RecipeSourceOwner) -> (arguments: List RecipeSymbolicValue) -> (budget: Nat) -> RecipeApplicationProposal
+recipeProposeApplicationOwned snapshot source selectedOwner arguments budget =
+  recipeProposeApplicationPrepared snapshot source (recipeProposeApplicationSetup snapshot source selectedOwner budget) arguments budget
+
+-- The part of a proposal that does not depend on the arguments: the owner's
+-- occurrence, the source admission and the captured bindings. Several
+-- applications of one source share it (recipes lane 2, Nov 8: the admission
+-- compare cost 19 s of a card's 45 family proposals).
+@category "engine-internal"
+recipeProposeApplicationSetup : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (selectedOwner: Maybe RecipeSourceOwner) -> (budget: Nat) -> { occurrence: RecipeOccurrence, refusal: Maybe RecipeRefusal, admitted: Bool, captured: List RecipeSymbolicBinding }
+recipeProposeApplicationSetup snapshot source selectedOwner budget =
+  let occurrence = RecipeOccurrence { owner = fromMaybe RootSource selectedOwner, path = [], invocation = [] }
+  let refusal = case selectedOwner of
+        Nothing -> Just RecipeUnavailable
+        Just owner -> recipeSourceRefusal snapshot source
+  let admitted = case refusal of
+        Nothing -> true
+        Just reason -> false
+  let captured = if budget <= 0 || not admitted then [] else recipeCaptureBindings snapshot source.captures occurrence
+  { occurrence = occurrence, refusal = refusal, admitted = admitted, captured = captured }
+
+-- One proposal per argument list, sharing recipeProposeApplicationSetup:
+-- each equals proposeRecipeApplicationAt snapshot source index arguments budget.
+@category "engine-internal"
+proposeRecipeApplicationsAt : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (index: Nat) -> (argumentLists: List (List RecipeSymbolicValue)) -> (budget: Nat) -> List RecipeApplicationProposal
+proposeRecipeApplicationsAt snapshot source index argumentLists budget =
+  let setup = recipeProposeApplicationSetup snapshot source (recipeSourceApplicationOwnerAt snapshot source index) budget
+  map (\arguments -> recipeProposeApplicationPrepared snapshot source setup arguments budget) argumentLists
+
+@category "engine-internal"
+recipeProposeApplicationPrepared : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (setup: { occurrence: RecipeOccurrence, refusal: Maybe RecipeRefusal, admitted: Bool, captured: List RecipeSymbolicBinding }) -> (arguments: List RecipeSymbolicValue) -> (budget: Nat) -> RecipeApplicationProposal
+recipeProposeApplicationPrepared snapshot source setup arguments budget =
+  let occurrence = setup.occurrence
+  let initial = { snapshot = snapshot, remaining = budget, transitions = [], residuals = [], origins = [], active = [] }
+  let refusal = setup.refusal
+  let admitted = setup.admitted
+  let captured = setup.captured
+  let bound = recipeBindArguments source.params arguments captured
+  let evaluated =
+        if not admitted then recipeEmitResidual initial occurrence [] RcAll source.body (fromMaybe RecipeOpaque refusal)
+        else if length source.params == length arguments
+        then recipeWalk initial occurrence bound.bindings RcAll source.body
+        else recipeEmitResidual initial occurrence bound.bindings RcAll source.body RecipeUnsupported
+  RecipeApplicationProposal {
+    source = source, arguments = arguments, result = evaluated.value, snapshot = snapshot,
+    transitions = evaluated.state.transitions, origins = evaluated.state.origins,
+    residuals = evaluated.state.residuals
+  }
+
+@label "Propose recipe analysis"
+proposeRecipeAnalysis : (snapshot: RecipeAnalysisSnapshot) -> (budget: Nat) -> RecipeExtraction
+proposeRecipeAnalysis snapshot budget =
+  let root = snapshot.recipe
+  let occurrence = RecipeOccurrence { owner = RootSource, path = [], invocation = [] }
+  let initial = { snapshot = snapshot, remaining = budget, transitions = [], residuals = [], origins = [], active = [] }
+  let refusal = recipeSourceRefusal snapshot root
+  let admitted = case refusal of
+        Nothing -> true
+        Just reason -> false
+  let captured = if budget <= 0 || not admitted then [] else recipeCaptureBindings snapshot root.captures occurrence
+  let bindings = case head root.params of
+        Just pantry -> concat [RecipeSymbolicBinding { name = pantry, value = RvPantry }] captured
+        Nothing -> captured
+  let evaluated =
+        if not admitted then recipeEmitResidual initial occurrence [] RcAll root.body (fromMaybe RecipeOpaque refusal)
+        else if length root.params == 1
+        then recipeWalk initial occurrence bindings RcAll root.body
+        else recipeEmitResidual initial occurrence bindings RcAll root.body RecipeUnsupported
+  let lowered = recipeOutcomes evaluated.value RcAll evaluated.state occurrence root.body
+  RecipeExtraction {
+    source = root, snapshot = snapshot, outcomes = lowered.outcomes,
+    residuals = lowered.state.residuals, origins = lowered.state.origins,
+    transitions = lowered.state.transitions
+  }
+
+@category "engine-internal"
+recipeChild : (parent: RecipeOccurrence) -> (ordinal: Nat) -> RecipeOccurrence
+recipeChild parent ordinal = RecipeOccurrence { owner = parent.owner, path = appendItem ordinal parent.path, invocation = parent.invocation }
+
+@category "engine-internal"
+recipeInvocation : (parent: RecipeOccurrence) -> (owner: RecipeSourceOwner) -> RecipeOccurrence
+recipeInvocation parent owner = RecipeOccurrence { owner = owner, path = [], invocation = concat parent.invocation (concat [length parent.path] parent.path) }
+
+@category "engine-internal"
+recipeSummaryOccurrence : (parent: RecipeOccurrence) -> (ordinal: Nat) -> RecipeOccurrence
+recipeSummaryOccurrence parent ordinal = RecipeOccurrence {
+  owner = parent.owner, path = parent.path,
+  invocation = concat parent.invocation (concat [length parent.path + 1] (appendItem ordinal parent.path))
+}
+
+@category "engine-internal"
+recipeCorrelation : (occurrence: RecipeOccurrence) -> String
+recipeCorrelation occurrence = concat (recipeSourceOwnerKey occurrence.owner) (concat "/" (concat (toString occurrence.invocation) (concat "/" (toString occurrence.path))))
+
+@category "engine-internal"
+recipeAnd : (left: RecipeConstraint) -> (right: RecipeConstraint) -> RecipeConstraint
+recipeAnd left right = case left of
+  RcNone -> RcNone
+  RcAll -> right
+  _ -> case right of
+    RcNone -> RcNone
+    RcAll -> left
+    _ -> RcAnd { terms = [left, right] }
+
+@category "engine-internal"
+recipeOr : (left: RecipeConstraint) -> (right: RecipeConstraint) -> RecipeConstraint
+recipeOr left right = case left of
+  RcAll -> RcAll
+  RcNone -> right
+  _ -> case right of
+    RcAll -> RcAll
+    RcNone -> left
+    _ -> RcOr { terms = [left, right] }
+
+@category "engine-internal"
+recipeNot : (constraint: RecipeConstraint) -> RecipeConstraint
+recipeNot constraint = case constraint of
+  RcAll -> RcNone
+  RcNone -> RcAll
+  RcNot { inner = inner } -> inner
+  _ -> RcNot { inner = constraint }
+
+@category "engine-internal"
+recipeIsNone : (constraint: RecipeConstraint) -> Bool
+recipeIsNone constraint = case constraint of
+  RcNone -> true
+  _ -> false
+
+@category "engine-internal"
+recipeMapMaybe : (transform: a -> b) -> (value: Maybe a) -> Maybe b
+recipeMapMaybe transform value = case value of
+  Nothing -> Nothing
+  Just present -> Just (transform present)
+
+@category "engine-internal"
+recipeFinish : (state: a) -> (rule: RecipeTransitionRule) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (value: RecipeSymbolicValue) -> (premises: List Nat) -> b
+recipeFinish state rule occurrence bindings condition expression value premises =
+  let ordinal = length state.transitions
+  let transition = RecipeTransition { rule = rule, occurrence = occurrence, expression = expression, bindings = bindings, condition = condition, result = value, premises = premises }
+  let noted = case value of
+        RvResidual { residual = residual } -> recipeRecordResidual state residual
+        _ -> state
+  { value = value, state = mapSet noted "transitions" (appendItem transition noted.transitions), ordinal = ordinal }
+
+@category "engine-internal"
+recipeRecordResidual : (state: a) -> (residual: RecipeResidual) -> a
+recipeRecordResidual state residual =
+  if std.some state.residuals (\row -> row.correlation == residual.correlation && engine.deepEqValue row.reason residual.reason) then state else mapSet state "residuals" (appendItem residual state.residuals)
+
+@category "engine-internal"
+recipeEmitResidual : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (reason: RecipeRefusal) -> b
+recipeEmitResidual state occurrence bindings condition expression reason =
+  let residual = RecipeResidual { occurrence = occurrence, expression = expression, reason = reason, correlation = recipeCorrelation occurrence }
+  let next = mapSet state "residuals" (appendItem residual state.residuals)
+  recipeFinish next RtResidual occurrence bindings condition expression (RvResidual { residual = residual }) []
+
+@category "engine-internal"
+recipeLookup : (bindings: List RecipeSymbolicBinding) -> (name: String) -> Maybe RecipeSymbolicValue
+recipeLookup bindings name = case head bindings of
+  Nothing -> Nothing
+  Just binding -> if binding.name == name then Just binding.value else recipeLookup (reflectRest bindings) name
+
+@category "engine-internal"
+recipePackage : (snapshot: RecipeAnalysisSnapshot) -> (identity: String) -> ReifyOutcome
+recipePackage snapshot identity = recipeSourceNamedOutcome snapshot identity
+
+@category "engine-internal"
+recipeSourceAdmitted : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> Bool
+recipeSourceAdmitted snapshot source = case recipeSourceRefusal snapshot source of
+  Nothing -> true
+  Just reason -> false
+
+@category "engine-internal"
+recipeSourceRefusal : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> Maybe RecipeRefusal
+recipeSourceRefusal snapshot source = recipeSourceRows snapshot.sources (mapSet source "dependencies" []) 0 false 4096
+
+@category "engine-internal"
+recipeSourceRows : (rows: List RecipeSourceAdmission) -> (core: ReifiedFunction) -> (matches: Nat) -> (admitted: Bool) -> (budget: Nat) -> Maybe RecipeRefusal
+recipeSourceRows rows core matches admitted budget = case head rows of
+  Nothing -> if matches == 1 && admitted then Nothing else Just RecipeOpaque
+  Just row ->
+    let compared = engine.deepEqValueTriStructural (mapSet row.source "dependencies" []) core budget 128
+    case compared.verdict of
+      Nothing -> Just RecipeBudgetExhausted
+      Just true ->
+        let inspectAdmission = \unit -> case lookup row "admitted" of
+              Just true -> true
+              _ -> false
+        recipeSourceRows (reflectRest rows) core (matches + 1) (inspectAdmission 0) compared.remaining
+      Just false -> recipeSourceRows (reflectRest rows) core matches admitted compared.remaining
+
+@category "engine-internal"
+recipeCallableOwner : (observation: RecipeCallableObservation) -> RecipeSourceOwner
+recipeCallableOwner observation = recipeSourceCapturedOwner observation
+
+@category "engine-internal"
+recipeOwnerPackage : (snapshot: RecipeAnalysisSnapshot) -> (owner: RecipeSourceOwner) -> Maybe ReifiedFunction
+recipeOwnerPackage snapshot owner = recipeSourcePackage snapshot owner
+
+@category "engine-internal"
+recipeConstructor : (snapshot: RecipeAnalysisSnapshot) -> (owner: RecipeSourceOwner) -> (written: String) -> Maybe String
+recipeConstructor snapshot owner written =
+  case recipeOwnerPackage snapshot owner of
+    Nothing -> Nothing
+    Just package -> case find (\row -> row.written == written) package.constructors of
+      Just (ConstructorRef { target = target }) -> case recipeConstructorIdentity snapshot target of
+        Just identity -> if recipeRepresentationAdmitted snapshot identity then Just identity else Nothing
+        Nothing -> Nothing
+      _ -> Nothing
+
+@category "engine-internal"
+recipeConstructorIdentity : (snapshot: RecipeAnalysisSnapshot) -> (target: String) -> Maybe String
+recipeConstructorIdentity snapshot target =
+  let mapped = unique (map (\row -> row.functionId) (filter (\row -> row.target == target) snapshot.constructorIdentities))
+  if length mapped == 1 then Just (at mapped 0)
+  else if length mapped > 1 then Nothing
+  else if std.some snapshot.constructorIdentities (\row -> row.functionId == target) then Just target
+  else Nothing
+
+@category "engine-internal"
+recipeRepresentationAdmitted : (snapshot: RecipeAnalysisSnapshot) -> (constructor: String) -> Bool
+recipeRepresentationAdmitted snapshot constructor =
+  let matching = filter (\row -> row.constructor == constructor) snapshot.representations
+  if length matching != 1 then false
+  else case lookup (at matching 0) "admitted" of
+    Just true -> true
+    _ -> false
+
+@category "engine-internal"
+recipeFood : (snapshot: RecipeAnalysisSnapshot) -> (identity: String) -> Maybe Nat
+recipeFood snapshot identity = case find (\food -> food.identity == identity) snapshot.domain.foods of
+  Nothing -> Nothing
+  Just food -> Just food.rank
+
+@category "engine-internal"
+recipeCaptureBindings : (snapshot: RecipeAnalysisSnapshot) -> (captures: List ReifiedCapture) -> (occurrence: RecipeOccurrence) -> List RecipeSymbolicBinding
+recipeCaptureBindings snapshot captures occurrence = recipeCaptureBindingsSeen snapshot captures occurrence (recipeOwnerCycleKeys snapshot occurrence.owner)
+
+@category "engine-internal"
+recipeOwnerCycleKeys : (snapshot: RecipeAnalysisSnapshot) -> (owner: RecipeSourceOwner) -> List String
+recipeOwnerCycleKeys snapshot owner =
+  let key = recipeSourceOwnerKey owner
+  case recipeOwnerPackage snapshot owner of
+    Nothing -> [key]
+    Just package ->
+      let identity = reflectSourceIdentity package.source
+      if identity == "" then [key] else [key, recipeSourceOwnerKey (NamedSource { identity = identity })]
+
+@category "engine-internal"
+recipeCaptureBindingsSeen : (snapshot: RecipeAnalysisSnapshot) -> (captures: List ReifiedCapture) -> (occurrence: RecipeOccurrence) -> (visited: List String) -> List RecipeSymbolicBinding
+recipeCaptureBindingsSeen snapshot captures occurrence visited =
+  let captured = recipeCaptureBindingsBounded snapshot captures occurrence visited 4096 []
+  captured.bindings
+
+@category "engine-internal"
+recipeCaptureBindingsBounded : (snapshot: RecipeAnalysisSnapshot) -> (captures: List ReifiedCapture) -> (occurrence: RecipeOccurrence) -> (visited: List String) -> (budget: Nat) -> (acc: List RecipeSymbolicBinding) -> a
+recipeCaptureBindingsBounded snapshot captures occurrence visited budget acc = case head captures of
+  Nothing -> { bindings = acc, remaining = budget }
+  Just capture ->
+    let lifted = recipeLiftCaptureBounded snapshot occurrence capture.name [] capture.value visited budget
+    recipeCaptureBindingsBounded snapshot (reflectRest captures) occurrence visited lifted.remaining (appendItem (RecipeSymbolicBinding { name = capture.name, value = lifted.value }) acc)
+
+@category "engine-internal"
+recipeLiftCaptureBounded : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (capture: String) -> (path: List String) -> (value: Any) -> (visited: List String) -> (budget: Nat) -> a
+recipeLiftCaptureBounded snapshot occurrence capture path value visited budget =
+  if budget <= 0 then { value = recipeResidualValue occurrence (EVar { name = capture }) RecipeBudgetExhausted, remaining = 0 }
+  else case find (\observation -> engine.deepEqValue observation.owner occurrence.owner && observation.capture == capture && engine.deepEqValue observation.path path) snapshot.callables of
+    Just observation -> case observation.outcome of
+      Reified { package = package } ->
+        let owner = recipeCallableOwner observation
+        let source = RecipeOccurrence { owner = owner, path = [], invocation = occurrence.invocation }
+        let keys = recipeOwnerCycleKeys snapshot owner
+        if std.some keys (\key -> elem key visited) then { value = recipeResidualValue occurrence (EVar { name = capture }) RecipeRecursive, remaining = budget - 1 }
+        else
+          let seen = concat keys visited
+          let captured = recipeCaptureBindingsBounded snapshot package.captures source seen (budget - 1) []
+          { value = RvClosure { params = package.params, body = package.body, bindings = captured.bindings, occurrence = source }, remaining = captured.remaining }
+      OpaqueBody {} -> { value = recipeResidualValue occurrence (EVar { name = capture }) RecipeOpaque, remaining = budget - 1 }
+      Unavailable -> { value = recipeResidualValue occurrence (EVar { name = capture }) RecipeUnavailable, remaining = budget - 1 }
+    Nothing ->
+      if recipeRawCallable value then { value = RvLiteral { value = value }, remaining = budget - 1 }
+      else case find (\food -> recipeRepresentationAdmitted snapshot food.identity && engine.deepEqValue food.value value) snapshot.domain.foods of
+        Just food -> { value = RvFood { rank = food.rank }, remaining = budget - 1 }
+        Nothing -> case representationValueSnapshot value of
+          SnapshotRecord fields ->
+            let lifted = recipeLiftCaptureFields snapshot occurrence capture path fields [] visited (budget - 1)
+            { value = RvRecord { fields = lifted.fields }, remaining = lifted.remaining }
+          SnapshotArray items -> recipeLiftCaptureItems snapshot occurrence capture path items 0 [] visited (budget - 1)
+          _ -> { value = recipeLiftValue snapshot occurrence value, remaining = budget - 1 }
+
+@category "engine-internal"
+recipeLiftCaptureFields : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (capture: String) -> (path: List String) -> (fields: List RepresentationOwnField) -> (acc: List RecipeSymbolicField) -> (visited: List String) -> (budget: Nat) -> a
+recipeLiftCaptureFields snapshot occurrence capture path fields acc visited budget = case head fields of
+  Nothing -> { fields = acc, remaining = budget }
+  Just field ->
+    let lifted = recipeLiftCaptureBounded snapshot occurrence capture (appendItem field.name path) field.value visited budget
+    recipeLiftCaptureFields snapshot occurrence capture path (reflectRest fields) (appendItem (RecipeSymbolicField { name = field.name, value = lifted.value }) acc) visited lifted.remaining
+
+@category "engine-internal"
+recipeLiftCaptureItems : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (capture: String) -> (path: List String) -> (items: List Any) -> (index: Nat) -> (acc: List RecipeSymbolicValue) -> (visited: List String) -> (budget: Nat) -> a
+recipeLiftCaptureItems snapshot occurrence capture path items index acc visited budget = case head items of
+  Nothing -> { value = RvList { items = acc }, remaining = budget }
+  Just item ->
+    let lifted = recipeLiftCaptureBounded snapshot occurrence capture (appendItem (toString index) path) item visited budget
+    recipeLiftCaptureItems snapshot occurrence capture path (reflectRest items) (index + 1) (appendItem lifted.value acc) visited lifted.remaining
+
+@category "engine-internal"
+recipeLiftValue : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (value: Any) -> RecipeSymbolicValue
+recipeLiftValue snapshot occurrence value =
+  case find (\food -> recipeRepresentationAdmitted snapshot food.identity && engine.deepEqValue food.value value) snapshot.domain.foods of
+    Just food -> RvFood { rank = food.rank }
+    Nothing -> case representationValueSnapshot value of
+      SnapshotBoolean boolean -> RvBoolean { constraint = if boolean then RcAll else RcNone }
+      SnapshotArray items -> RvList { items = map (recipeLiftValue snapshot occurrence) items }
+      _ -> RvLiteral { value = value }
+
+@category "engine-internal"
+recipeWalk : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> b
+recipeWalk state occurrence bindings condition expression =
+  if state.remaining <= 0 then recipeEmitResidual state occurrence bindings condition expression RecipeBudgetExhausted
+  else
+    let next = mapSet state "remaining" (state.remaining - 1)
+    case expression of
+      ELit { value = value } -> recipeFinish next RtLiteral occurrence bindings condition expression (recipeLiftValue state.snapshot occurrence value) []
+      EVar { name = name } -> case recipeResolveVariable next.snapshot occurrence bindings name of
+        Just value -> recipeFinish next RtVariable occurrence bindings condition expression value []
+        Nothing -> recipeEmitResidual next occurrence bindings condition expression RecipeUnavailable
+      ELambda { params = params, body = body } -> recipeFinish next RtLambda occurrence bindings condition expression (RvClosure { params = params, body = body, bindings = bindings, occurrence = recipeChild occurrence 0 }) []
+      ERecord { fields = fields } ->
+        let children = recipeWalkFields next occurrence bindings condition fields 0 [] []
+        recipeFinish children.state RtRecord occurrence bindings condition expression (RvRecord { fields = children.fields }) children.premises
+      EConstruct { ctor = ctor, args = args } ->
+        case recipeConstructor next.snapshot occurrence.owner ctor of
+          Nothing -> recipeEmitResidual next occurrence bindings condition expression RecipeConstructorUnresolved
+          Just identity ->
+            let children = recipeWalkList next occurrence bindings condition args 0 [] []
+            let names = recipeSemanticSlotsFromWire (fromMaybe [] (lookup expression "fields"))
+            let value = case recipeFood next.snapshot identity of
+                  Just rank -> if length args == 0 && length names == 0 then RvFood { rank = rank } else RvConstruct { identity = identity, args = children.values, fields = names }
+                  Nothing ->
+                    if length args == 0 && length names == 0 then
+                      case recipeBooleanConstructor next.snapshot identity of
+                        Just constraint -> RvBoolean { constraint = constraint }
+                        Nothing -> RvConstruct { identity = identity, args = children.values, fields = names }
+                    else RvConstruct { identity = identity, args = children.values, fields = names }
+            recipeFinish children.state RtConstructor occurrence bindings condition expression value children.premises
+      ECall { fnId = fnId, args = args } -> recipeWalkCall next occurrence bindings condition expression fnId args
+      EMatch { scrutinee = scrutinee, arms = arms } ->
+        let value = recipeWalk next (recipeChild occurrence 0) bindings condition scrutinee
+        let matched = recipeMatchArms value.state occurrence bindings condition expression value.value arms 0
+        recipeFinish matched.state RtMatch occurrence bindings condition expression matched.value (concat [value.ordinal] matched.premises)
+
+@category "engine-internal"
+recipeResolveVariable : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (name: String) -> Maybe RecipeSymbolicValue
+recipeResolveVariable snapshot occurrence bindings name =
+  let pieces = split name "."
+  let base = fromMaybe name (head pieces)
+  let direct = if length pieces == 1 then recipeLookup bindings name else Nothing
+  case direct of
+    Just value -> Just value
+    Nothing -> case recipeLookup bindings base of
+      Just value -> recipeProject snapshot occurrence value (reflectRest pieces)
+      Nothing -> case recipePackage snapshot name of
+        Reified { package = package } -> Just (recipePackageClosure snapshot occurrence name package)
+        OpaqueBody {} -> Just (RvLiteral { value = name })
+        Unavailable -> Nothing
+
+@category "engine-internal"
+recipeProject : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (value: RecipeSymbolicValue) -> (path: List String) -> Maybe RecipeSymbolicValue
+recipeProject snapshot occurrence value path = case head path of
+  Nothing -> Just value
+  Just name -> case value of
+    RvRecord { fields = fields } -> case find (\field -> field.name == name) fields of
+      Nothing -> Nothing
+      Just field -> recipeProject snapshot occurrence field.value (reflectRest path)
+    RvConstruct { args = args, fields = fields } ->
+      let actualFields = if length fields == 0 then recipePositionalSlots (length args) 0 [] else fields
+      let index = findIndex (\field -> field.wireName == name) actualFields
+      if index < 0 then Nothing else recipeProject snapshot occurrence (at args index) (reflectRest path)
+    RvLiteral { value = raw } -> case representationSnapshotField (representationValueSnapshot raw) name of
+      Nothing -> Nothing
+      Just field -> recipeProject snapshot occurrence (recipeLiftValue snapshot occurrence field) (reflectRest path)
+    RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> case recipeProject snapshot occurrence yes path of
+      Nothing -> Nothing
+      Just projectedYes -> case recipeProject snapshot occurrence no path of
+        Nothing -> Nothing
+        Just projectedNo -> Just (RvConditional { condition = c, whenTrue = projectedYes, whenFalse = projectedNo })
+    _ -> Nothing
+
+@category "engine-internal"
+recipePackageClosure : (snapshot: RecipeAnalysisSnapshot) -> (caller: RecipeOccurrence) -> (identity: String) -> (package: ReifiedFunction) -> RecipeSymbolicValue
+recipePackageClosure snapshot caller identity package =
+  let occurrence = recipeInvocation caller (NamedSource { identity = identity })
+  RvClosure { params = package.params, body = package.body, bindings = recipeCaptureBindings snapshot package.captures occurrence, occurrence = occurrence }
+
+@category "engine-internal"
+recipeWalkList : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expressions: List Expr) -> (index: Nat) -> (values: List RecipeSymbolicValue) -> (premises: List Nat) -> b
+recipeWalkList state occurrence bindings condition expressions index values premises = case head expressions of
+  Nothing -> { values = values, state = state, premises = premises }
+  Just expression ->
+    let evaluated = recipeWalk state (recipeChild occurrence index) bindings condition expression
+    recipeWalkList evaluated.state occurrence bindings condition (reflectRest expressions) (index + 1) (appendItem evaluated.value values) (appendItem evaluated.ordinal premises)
+
+@category "engine-internal"
+recipeWalkFields : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (fields: a) -> (index: Nat) -> (values: List RecipeSymbolicField) -> (premises: List Nat) -> b
+recipeWalkFields state occurrence bindings condition fields index values premises = case head fields of
+  Nothing -> { fields = values, state = state, premises = premises }
+  Just field ->
+    let evaluated = recipeWalk state (recipeChild occurrence index) bindings condition field.value
+    recipeWalkFields evaluated.state occurrence bindings condition (reflectRest fields) (index + 1) (appendItem (RecipeSymbolicField { name = field.name, value = evaluated.value }) values) (appendItem evaluated.ordinal premises)
+
+@category "engine-internal"
+recipeWalkCall : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (fnId: String) -> (args: List Expr) -> b
+recipeWalkCall state occurrence bindings condition expression fnId args =
+  if (fnId == "if" || fnId == "?:") && recipeStructuralBoolean expression then recipeIfChain state occurrence bindings condition expression args 0
+  else if (fnId == "and" || fnId == "or") && recipeStructuralBoolean expression then recipeShortCircuit state occurrence bindings condition expression args 0 (fnId == "and")
+  else if fnId == "ann" && length args == 2 then
+    let evaluated = recipeWalk state (recipeChild occurrence 0) bindings condition (at args 0)
+    recipeFinish evaluated.state RtApply occurrence bindings condition expression evaluated.value [evaluated.ordinal]
+  else
+    let evaluated = recipeWalkList state occurrence bindings condition args 0 [] []
+    if fnId == "$" then case head evaluated.values of
+      Nothing -> recipeEmitResidual evaluated.state occurrence bindings condition expression RecipeUnsupported
+      Just callable ->
+        let applied = recipeApply evaluated.state occurrence bindings condition expression callable (reflectRest evaluated.values)
+        recipeFinish applied.state RtApply occurrence bindings condition expression applied.value (concat evaluated.premises applied.premises)
+    else if fnId == "appendItem" && reflectLitMarked expression then
+      let value = if length evaluated.values == 2 then recipeAppend (at evaluated.values 0) (at evaluated.values 1) else recipeResidualValue occurrence expression RecipeUnsupported
+      recipeFinish evaluated.state RtPrimitive occurrence bindings condition expression value evaluated.premises
+    else
+      let dynamic = startsWith fnId "$dyn:"
+      let name = if dynamic then slice fnId 5 (length fnId) else fnId
+      let shadowed = case recipeLookup bindings (dottedHead name) of
+            Just value -> true
+            Nothing -> false
+      if not dynamic && shadowed then recipeEmitResidual evaluated.state occurrence bindings condition expression RecipeUnsupported
+      else case recipeResolveVariable state.snapshot occurrence (if dynamic then bindings else []) name of
+        Just callable ->
+          case recipePrimitiveRole state.snapshot fnId bindings of
+            Just role -> recipePrimitive evaluated.state occurrence bindings condition expression role evaluated.values evaluated.premises
+            Nothing ->
+              let applied = recipeApply evaluated.state occurrence bindings condition expression callable evaluated.values
+              recipeFinish applied.state RtHelper occurrence bindings condition expression applied.value (concat evaluated.premises applied.premises)
+        Nothing -> case recipePrimitiveRole state.snapshot fnId bindings of
+          Just role -> recipePrimitive evaluated.state occurrence bindings condition expression role evaluated.values evaluated.premises
+          Nothing -> recipeEmitResidual evaluated.state occurrence bindings condition expression RecipeUnavailable
+
+@category "engine-internal"
+recipeStructuralBoolean : (expression: Expr) -> Bool
+recipeStructuralBoolean expression = case lookup expression "structural" of
+  Nothing -> true
+  Just structural -> eq structural true
+
+@category "engine-internal"
+recipeResidualValue : (occurrence: RecipeOccurrence) -> (expression: Expr) -> (reason: RecipeRefusal) -> RecipeSymbolicValue
+recipeResidualValue occurrence expression reason = RvResidual { residual = RecipeResidual { occurrence = occurrence, expression = expression, reason = reason, correlation = recipeCorrelation occurrence } }
+
+@category "engine-internal"
+recipePrimitiveRole : (snapshot: RecipeAnalysisSnapshot) -> (identity: String) -> (bindings: List RecipeSymbolicBinding) -> Maybe RecipePrimitiveAdmission
+recipePrimitiveRole snapshot identity bindings = case recipeLookup bindings (dottedHead identity) of
+  Just local -> Nothing
+  Nothing -> case find (\admission -> admission.identity == identity && admission.admitted) snapshot.primitives of
+    Just admission -> Just admission
+    Nothing -> Nothing
+
+@category "engine-internal"
+recipeBoolean : (occurrence: RecipeOccurrence) -> (value: RecipeSymbolicValue) -> RecipeConstraint
+recipeBoolean occurrence value = case value of
+  RvBoolean { constraint = constraint } -> constraint
+  RvLiteral { value = raw } -> case representationValueSnapshot raw of
+    SnapshotBoolean boolean -> if boolean then RcAll else RcNone
+    _ -> RcUnknown { identity = recipeCorrelation occurrence, reason = RecipeUnsupported }
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeOr (recipeAnd c (recipeBoolean occurrence yes)) (recipeAnd (recipeNot c) (recipeBoolean occurrence no))
+  RvResidual { residual = residual } -> RcUnknown { identity = residual.correlation, reason = residual.reason }
+  _ -> RcUnknown { identity = recipeCorrelation occurrence, reason = RecipeUnsupported }
+
+@category "engine-internal"
+recipeOrigin : (state: a) -> (occurrence: RecipeOccurrence) -> (expression: Expr) -> (constraint: RecipeConstraint) -> a
+recipeOrigin state occurrence expression constraint =
+  let enclosing = case recipeOwnerPackage state.snapshot occurrence.owner of
+        Just package -> if reflectSourceIdentity package.source != "" then Just (reflectSourceIdentity package.source) else Nothing
+        Nothing -> Nothing
+  let helper = case expression of
+        ECall { fnId = identity } -> case recipePackage state.snapshot identity of
+          Reified { package = package } -> Just (if reflectSourceIdentity package.source == "" then identity else reflectSourceIdentity package.source)
+          _ -> enclosing
+        _ -> enclosing
+  let origin = RecipeConditionOrigin { occurrence = occurrence, expression = expression, constraint = constraint, helper = helper, family = Nothing, facts = [] }
+  mapSet state "origins" (appendItem origin state.origins)
+
+@category "engine-internal"
+recipeConditional : (constraint: RecipeConstraint) -> (yes: RecipeSymbolicValue) -> (no: RecipeSymbolicValue) -> RecipeSymbolicValue
+recipeConditional constraint yes no = case constraint of
+  RcAll -> yes
+  RcNone -> no
+  _ -> RvConditional { condition = constraint, whenTrue = yes, whenFalse = no }
+
+@category "engine-internal"
+recipeIfChain : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (args: List Expr) -> (index: Nat) -> b
+recipeIfChain state occurrence bindings condition expression args index =
+  if length args == 1 then
+    let evaluated = recipeWalk state (recipeChild occurrence index) bindings condition (at args 0)
+    recipeFinish evaluated.state RtBranch occurrence bindings condition expression evaluated.value [evaluated.ordinal]
+  else if length args < 2 then recipeEmitResidual state occurrence bindings condition expression RecipeUnsupported
+  else
+    let tested = recipeWalk state (recipeChild occurrence index) bindings condition (at args 0)
+    let constraint = recipeBoolean (recipeChild occurrence index) tested.value
+    let noted = recipeOrigin tested.state (recipeChild occurrence index) (at args 0) constraint
+    let yes =
+          if recipeIsNone constraint then { value = RvBoolean { constraint = RcNone }, state = noted, premises = [] }
+          else let evaluated = recipeWalk noted (recipeChild occurrence (index + 1)) bindings (recipeAnd condition constraint) (at args 1)
+               { value = evaluated.value, state = evaluated.state, premises = [evaluated.ordinal] }
+    let no =
+          if recipeIsNone (recipeNot constraint) then { value = RvBoolean { constraint = RcNone }, state = yes.state, premises = [] }
+          else let evaluated = recipeIfChain yes.state occurrence bindings (recipeAnd condition (recipeNot constraint)) expression (reflectRest (reflectRest args)) (index + 2)
+               { value = evaluated.value, state = evaluated.state, premises = [evaluated.ordinal] }
+    recipeFinish no.state RtBranch occurrence bindings condition expression (recipeConditional constraint yes.value no.value) (concat [tested.ordinal] (concat yes.premises no.premises))
+
+@category "engine-internal"
+recipeShortCircuit : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (args: List Expr) -> (index: Nat) -> (conjunction: Bool) -> b
+recipeShortCircuit state occurrence bindings condition expression args index conjunction = case head args of
+  Nothing -> recipeFinish state RtBranch occurrence bindings condition expression (RvBoolean { constraint = if conjunction then RcAll else RcNone }) []
+  Just arg ->
+    let tested = recipeWalk state (recipeChild occurrence index) bindings condition arg
+    if length args == 1 then recipeFinish tested.state RtBranch occurrence bindings condition expression tested.value [tested.ordinal]
+    else
+      let constraint = recipeBoolean (recipeChild occurrence index) tested.value
+      let demand = if conjunction then constraint else recipeNot constraint
+      let noted = recipeOrigin tested.state (recipeChild occurrence index) arg constraint
+      if recipeIsNone demand then recipeFinish noted RtBranch occurrence bindings condition expression tested.value [tested.ordinal]
+      else
+        let rest = recipeShortCircuit noted occurrence bindings (recipeAnd condition demand) expression (reflectRest args) (index + 1) conjunction
+        let combined = if conjunction then recipeConditional constraint rest.value tested.value else recipeConditional constraint tested.value rest.value
+        recipeFinish rest.state RtBranch occurrence bindings condition expression combined [tested.ordinal, rest.ordinal]
+
+@category "engine-internal"
+recipeBindArguments : (params: List String) -> (arguments: List RecipeSymbolicValue) -> (bindings: List RecipeSymbolicBinding) -> a
+recipeBindArguments params arguments bindings = case head params of
+  Nothing -> { params = [], arguments = arguments, bindings = bindings }
+  Just param -> case head arguments of
+    Nothing -> { params = params, arguments = [], bindings = bindings }
+    Just argument -> recipeBindArguments (reflectRest params) (reflectRest arguments) (concat [RecipeSymbolicBinding { name = param, value = argument }] bindings)
+
+@category "engine-internal"
+recipeApply : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (callable: RecipeSymbolicValue) -> (arguments: List RecipeSymbolicValue) -> b
+recipeApply state occurrence bindings condition expression callable arguments = case callable of
+  RvPrimitive { admission = admission, collected = collected } ->
+    let applied = recipePrimitive state occurrence bindings condition expression admission (concat collected arguments) []
+    { value = applied.value, state = applied.state, premises = [applied.ordinal] }
+  RvClosure { params = params, body = body, bindings = captured, occurrence = defined } ->
+    let bound = recipeBindArguments params arguments captured
+    let refusal = case recipeOwnerPackage state.snapshot defined.owner of
+          Just package -> recipeSourceRefusal state.snapshot package
+          Nothing -> Just RecipeOpaque
+    let sourceAdmitted = case refusal of
+          Nothing -> true
+          Just reason -> false
+    if not sourceAdmitted then
+      let residual = recipeEmitResidual state occurrence bindings condition expression (fromMaybe RecipeOpaque refusal)
+      { value = residual.value, state = residual.state, premises = [residual.ordinal] }
+    else if recipeMayReorderArguments arguments params then
+      let residual = recipeEmitResidual state occurrence bindings condition expression RecipeUnsupported
+      { value = residual.value, state = residual.state, premises = [residual.ordinal] }
+    else if length bound.params > 0 then { value = RvClosure { params = bound.params, body = body, bindings = bound.bindings, occurrence = defined }, state = state, premises = [] }
+    else if length defined.path == 0 && std.some (recipeOwnerCycleKeys state.snapshot defined.owner) (\key -> elem key state.active) then
+      let residual = recipeEmitResidual state occurrence bindings condition expression RecipeRecursive
+      { value = residual.value, state = residual.state, premises = [residual.ordinal] }
+    else
+      let entering = mapSet state "active" (if length defined.path != 0 then state.active else concat (recipeOwnerCycleKeys state.snapshot defined.owner) state.active)
+      let called = recipeWalk entering (RecipeOccurrence { owner = defined.owner, path = defined.path, invocation = concat occurrence.invocation (concat [length occurrence.path] occurrence.path) }) bound.bindings condition body
+      let restored = mapSet called.state "active" state.active
+      if length bound.arguments == 0 then { value = called.value, state = restored, premises = [called.ordinal] }
+      else
+        let remaining = recipeApply restored occurrence bindings condition expression called.value bound.arguments
+        { value = remaining.value, state = remaining.state, premises = concat [called.ordinal] remaining.premises }
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } ->
+    let appliedYes = recipeApply state occurrence bindings (recipeAnd condition c) expression yes arguments
+    let appliedNo = recipeApply appliedYes.state occurrence bindings (recipeAnd condition (recipeNot c)) expression no arguments
+    { value = recipeConditional c appliedYes.value appliedNo.value, state = appliedNo.state, premises = concat appliedYes.premises appliedNo.premises }
+  RvLiteral { value = raw } -> recipeApplyRaw state occurrence bindings condition expression raw arguments
+  RvResidual { residual = residual } -> { value = callable, state = state, premises = [] }
+  _ ->
+    let residual = recipeEmitResidual state occurrence bindings condition expression RecipeUnsupported
+    { value = residual.value, state = residual.state, premises = [residual.ordinal] }
+
+@category "engine-internal"
+recipeApplyRaw : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (raw: Any) -> (arguments: List RecipeSymbolicValue) -> b
+recipeApplyRaw state occurrence bindings condition expression raw arguments =
+  let observed = representationValueSnapshot raw
+  let partial = fromMaybe false (representationSnapshotField observed "__fenelPartial")
+  if eq partial true then
+    -- Reflected partials were lifted with their exact admitted package above.
+    -- A remaining raw partial has no occurrence-owned reflection package.
+    let residual = recipeEmitResidual state occurrence bindings condition expression RecipeOpaque
+    { value = residual.value, state = residual.state, premises = [residual.ordinal] }
+  else
+    let identity = case observed of
+          SnapshotString name -> Just name
+          _ -> representationSnapshotField observed "$ref"
+    case identity of
+      Just owner -> case recipePrimitiveRole state.snapshot owner [] of
+        Just role ->
+          let primitive = recipePrimitive state occurrence bindings condition expression role arguments []
+          { value = primitive.value, state = primitive.state, premises = [primitive.ordinal] }
+        Nothing -> case recipePackage state.snapshot owner of
+          Reified { package = package } -> recipeApply state occurrence bindings condition expression (recipePackageClosure state.snapshot occurrence owner package) arguments
+          OpaqueBody {} ->
+            let residual = recipeEmitResidual state occurrence bindings condition expression RecipeOpaque
+            { value = residual.value, state = residual.state, premises = [residual.ordinal] }
+          Unavailable ->
+            let residual = recipeEmitResidual state occurrence bindings condition expression RecipeUnavailable
+            { value = residual.value, state = residual.state, premises = [residual.ordinal] }
+      Nothing ->
+        -- Captured source closures do not carry their own constructor outcomes
+        -- in S2. A caller's constructor map is not their lexical context.
+        let reason = if eq (fromMaybe false (representationSnapshotField observed "__fenelFn")) true then RecipeOpaque else RecipeUnsupported
+        let residual = recipeEmitResidual state occurrence bindings condition expression reason
+        { value = residual.value, state = residual.state, premises = [residual.ordinal] }
+
+@category "engine-internal"
+recipeAppend : (item: RecipeSymbolicValue) -> (array: RecipeSymbolicValue) -> RecipeSymbolicValue
+recipeAppend item array = case array of
+  RvList { items = items } -> RvList { items = appendItem item items }
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeConditional c (recipeAppend item yes) (recipeAppend item no)
+  RvResidual {} -> array
+  _ -> array
+
+@category "engine-internal"
+recipeLiftConditional : (constraint: RecipeConstraint) -> (yes: Maybe RecipeSymbolicValue) -> (no: Maybe RecipeSymbolicValue) -> Maybe RecipeSymbolicValue
+recipeLiftConditional constraint yes no = case yes of
+  Nothing -> Nothing
+  Just y -> case no of
+    Nothing -> Nothing
+    Just n -> Just (recipeConditional constraint y n)
+
+@category "engine-internal"
+recipePrimitive : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (admission: RecipePrimitiveAdmission) -> (values: List RecipeSymbolicValue) -> (premises: List Nat) -> b
+recipePrimitive state occurrence bindings condition expression admission values premises =
+  let arity = recipePrimitiveArity admission.role
+  if recipeMayReorderArguments values [] then recipeEmitResidual state occurrence bindings condition expression RecipeUnsupported
+  else if length values < arity then recipeFinish state RtPrimitive occurrence bindings condition expression (RvPrimitive { admission = admission, collected = values }) premises
+  else if length values > arity then recipeEmitResidual state occurrence bindings condition expression RecipeUnsupported
+  else case admission.role of
+    RecipeConcat ->
+      let combined = recipeConcatBounded (at values 0) (at values 1) state.remaining
+      let next = mapSet state "remaining" combined.remaining
+      case combined.value of
+        Just value -> recipeFinish next RtPrimitive occurrence bindings condition expression value premises
+        Nothing -> recipeEmitResidual next occurrence bindings condition expression combined.reason
+    RecipeFilter -> recipeFilterSummary state occurrence bindings condition expression (at values 0) (at values 1) premises false
+    RecipeSome -> recipeFilterSummary state occurrence bindings condition expression (at values 1) (at values 0) premises true
+    RecipeAll -> recipeFiniteSummary state occurrence bindings condition expression admission.role (at values 1) (at values 0) (RvBoolean { constraint = RcAll }) premises
+    RecipeMap -> recipeFiniteSummary state occurrence bindings condition expression admission.role (at values 0) (at values 1) (RvList { items = [] }) premises
+    RecipeFold -> recipeFiniteSummary state occurrence bindings condition expression admission.role (at values 0) (at values 2) (at values 1) premises
+    _ -> case recipePrimitiveValue state.snapshot occurrence expression admission values of
+        Just value -> recipeFinish state RtPrimitive occurrence bindings condition expression value premises
+        Nothing -> recipeEmitResidual state occurrence bindings condition expression RecipeUnsupported
+
+@category "engine-internal"
+recipePrimitiveArity : (role: RecipePrimitiveRole) -> Nat
+recipePrimitiveArity role = case role of
+  RecipeHead -> 1
+  RecipeTail -> 1
+  RecipeLength -> 1
+  RecipeNot -> 1
+  RecipeUnique -> 1
+  RecipeDistinctCount -> 1
+  RecipeFold -> 3
+  _ -> 2
+
+-- Named argument reordering is an evaluator boundary. Until that boundary is
+-- represented in the certificate, never pretend a matching sole record is a
+-- positional argument. An empty params vector requests the primitive fence.
+@category "engine-internal"
+recipeMayReorderArguments : (arguments: List RecipeSymbolicValue) -> (params: List String) -> Bool
+recipeMayReorderArguments arguments params = if length arguments != 1 then false else recipeNamedRecord (at arguments 0) params
+
+@category "engine-internal"
+recipeNamedRecord : (value: RecipeSymbolicValue) -> (params: List String) -> Bool
+recipeNamedRecord value params = case value of
+  RvRecord { fields = fields } -> recipeNamedKeys (map (\field -> field.name) fields) params
+  RvLiteral { value = raw } -> case representationValueSnapshot raw of
+    SnapshotRecord fields -> if recipeRawCallable raw then false else recipeNamedKeys (map (\field -> field.name) fields) params
+    _ -> false
+  RvConditional { whenTrue = yes, whenFalse = no } -> recipeNamedRecord yes params || recipeNamedRecord no params
+  _ -> false
+
+@category "engine-internal"
+recipeNamedKeys : (keys: List String) -> (params: List String) -> Bool
+recipeNamedKeys keys params = length keys > 0 && not (std.some keys (\key -> startsWith key "$")) && (length params == 0 || all keys (\key -> elem key params))
+
+@category "engine-internal"
+recipePrimitiveReturnsBoolean : (role: RecipePrimitiveRole) -> Bool
+recipePrimitiveReturnsBoolean role = case role of
+  RecipeEq -> true
+  RecipeNot -> true
+  RecipeIncludes -> true
+  RecipeElem -> true
+  RecipeLess -> true
+  RecipeLessEqual -> true
+  RecipeGreater -> true
+  RecipeGreaterEqual -> true
+  RecipeSome -> true
+  RecipeAll -> true
+  _ -> false
+
+@category "engine-internal"
+recipeBooleanConstructor : (snapshot: RecipeAnalysisSnapshot) -> (identity: String) -> Maybe RecipeConstraint
+recipeBooleanConstructor snapshot identity =
+  let routes = filter (\admission -> admission.admitted && recipePrimitiveReturnsBoolean admission.role) snapshot.primitives
+  let present = \name -> do
+        let matchesConstructor = \admission -> case recipePrimitiveConstructor snapshot admission.constructors name of
+              Just target -> target == identity
+              Nothing -> false
+        std.some routes matchesConstructor
+  let yes = present "True"
+  let no = present "False"
+  if yes && not no then Just RcAll else (if no && not yes then Just RcNone else Nothing)
+
+@category "engine-internal"
+recipeConcatBounded : (left: RecipeSymbolicValue) -> (right: RecipeSymbolicValue) -> (budget: Nat) -> a
+recipeConcatBounded left right budget =
+  if budget <= 0 then { value = Nothing, remaining = 0, reason = RecipeBudgetExhausted }
+  else case left of
+    RvConditional { condition = c, whenTrue = yes, whenFalse = no } ->
+      let a = recipeConcatBounded yes right (budget - 1)
+      case a.value of
+        Nothing -> a
+        Just first ->
+          let b = recipeConcatBounded no right a.remaining
+          { value = recipeLiftConditional c a.value b.value, remaining = b.remaining, reason = b.reason }
+    RvList { items = xs } -> case right of
+      RvConditional { condition = c, whenTrue = yes, whenFalse = no } ->
+        let a = recipeConcatBounded left yes (budget - 1)
+        case a.value of
+          Nothing -> a
+          Just first ->
+            let b = recipeConcatBounded left no a.remaining
+            { value = recipeLiftConditional c a.value b.value, remaining = b.remaining, reason = b.reason }
+      RvList { items = ys } -> { value = Just (RvList { items = concat xs ys }), remaining = budget - 1, reason = RecipeUnsupported }
+      _ -> { value = Nothing, remaining = budget - 1, reason = RecipeUnsupported }
+    _ -> { value = Nothing, remaining = budget - 1, reason = RecipeUnsupported }
+
+@category "engine-internal"
+recipePrimitiveValue : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (expression: Expr) -> (admission: RecipePrimitiveAdmission) -> (values: List RecipeSymbolicValue) -> Maybe RecipeSymbolicValue
+recipePrimitiveValue snapshot occurrence expression admission values = case admission.role of
+  RecipeEq -> if length values == 2 then recipeMapMaybe (\constraint -> RvBoolean { constraint = constraint }) (recipeEqual occurrence (at values 0) (at values 1)) else Nothing
+  RecipeNot -> if length values == 1 then Just (RvBoolean { constraint = recipeNot (recipeBoolean occurrence (at values 0)) }) else Nothing
+  RecipeIncludes -> if length values == 2 then recipeMapMaybe (\constraint -> RvBoolean { constraint = constraint }) (recipeContains snapshot occurrence (at values 0) (at values 1)) else Nothing
+  RecipeElem -> if length values == 2 then recipeMapMaybe (\constraint -> RvBoolean { constraint = constraint }) (recipeContains snapshot occurrence (at values 1) (at values 0)) else Nothing
+  RecipeAppendItem ->
+    if length values == 2 then
+      case at values 1 of
+        RvList {} -> Just (recipeAppend (at values 0) (at values 1))
+        RvConditional {} -> Just (recipeAppend (at values 0) (at values 1))
+        _ -> Nothing
+    else Nothing
+  RecipeConcat ->
+    if length values == 2 then
+      let combined = recipeConcatBounded (at values 0) (at values 1) 4096
+      combined.value
+    else Nothing
+  RecipeLength -> if length values == 1 then recipeCountValue snapshot (at values 0) else Nothing
+  RecipeDistinctCount -> if length values == 1 then recipeDistinctCountValue snapshot occurrence (at values 0) else Nothing
+  RecipeUnique -> if length values == 1 then recipeUniqueValue snapshot occurrence (at values 0) else Nothing
+  RecipeGreaterEqual -> recipeComparison occurrence values 0
+  RecipeGreater -> recipeComparison occurrence values 1
+  RecipeLessEqual -> recipeComparison occurrence values 2
+  RecipeLess -> recipeComparison occurrence values 3
+  RecipeFromMaybe -> if length values == 2 then recipeFromMaybeValue snapshot admission.constructors (at values 0) (at values 1) else Nothing
+  RecipeHead -> if length values == 1 then recipeHeadValue snapshot admission.constructors (at values 0) else Nothing
+  RecipeTail -> if length values == 1 then recipeTailValue snapshot admission.constructors (at values 0) else Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+recipeEqual : (occurrence: RecipeOccurrence) -> (left: RecipeSymbolicValue) -> (right: RecipeSymbolicValue) -> Maybe RecipeConstraint
+recipeEqual occurrence left right = case left of
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeConditionalEquality c (recipeEqual occurrence yes right) (recipeEqual occurrence no right)
+  RvFood { rank = rank } -> case right of
+    RvFood { rank = other } -> Just (if rank == other then RcAll else RcNone)
+    RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeConditionalEquality c (recipeEqual occurrence left yes) (recipeEqual occurrence left no)
+    _ -> Nothing
+  RvLiteral { value = value } -> case right of
+    RvLiteral { value = other } -> if recipeRawContainsCallable value 256 || recipeRawContainsCallable other 256 then Nothing else Just (if engine.deepEqValue value other then RcAll else RcNone)
+    RvCount {} -> recipeEqual occurrence right left
+    RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeConditionalEquality c (recipeEqual occurrence left yes) (recipeEqual occurrence left no)
+    _ -> Nothing
+  RvBoolean { constraint = c } -> case right of
+    RvBoolean { constraint = d } -> Just (recipeOr (recipeAnd c d) (recipeAnd (recipeNot c) (recipeNot d)))
+    RvConditional { condition = d, whenTrue = yes, whenFalse = no } -> recipeConditionalEquality d (recipeEqual occurrence left yes) (recipeEqual occurrence left no)
+    _ -> Nothing
+  RvList { items = xs } -> case right of
+    RvList { items = ys } -> recipeEqualLists occurrence xs ys
+    _ -> Nothing
+  RvConstruct { identity = identity, args = args, fields = names } -> case right of
+    RvConstruct { identity = other, args = others, fields = otherNames } ->
+      if identity != other then Just RcNone
+      else if engine.deepEqValue names otherNames then recipeEqualLists occurrence args others
+      else if length names != length otherNames || length names != length args then Nothing
+      else case recipeAlignPattern others otherNames names of
+        Nothing -> Nothing
+        Just aligned -> recipeEqualLists occurrence args aligned
+    _ -> Nothing
+  RvCount { foods = foods } -> case right of
+    RvLiteral { value = number } -> case representationValueSnapshot number of
+      SnapshotNumber bound -> case recipeCountRanks foods of
+        Nothing -> Nothing
+        Just ranks -> Just (if bound != bound || bound < 0 || bound > length ranks || floor bound != bound then RcNone else RcCardinality { ranks = ranks, lower = bound, upper = bound })
+      _ -> Nothing
+    RvCount { foods = others } -> if engine.deepEqValue foods others then Just RcAll else Nothing
+    RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeConditionalEquality c (recipeEqual occurrence left yes) (recipeEqual occurrence left no)
+    _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+recipeRawCallable : (value: Any) -> Bool
+recipeRawCallable value =
+  let snapshot = representationValueSnapshot value
+  let inspectReference = \unit -> case representationSnapshotField snapshot "$ref" of
+        Just identity -> true
+        Nothing -> false
+  eq (fromMaybe false (representationSnapshotField snapshot "__fenelFn")) true || eq (fromMaybe false (representationSnapshotField snapshot "__fenelPartial")) true || inspectReference 0
+
+@category "engine-internal"
+recipeRawContainsCallable : (value: Any) -> (budget: Nat) -> Bool
+recipeRawContainsCallable value budget =
+  if budget <= 0 || recipeRawCallable value then true
+  else case representationValueSnapshot value of
+    SnapshotArray values -> std.some values (\item -> recipeRawContainsCallable item (budget - 1))
+    SnapshotRecord fields -> std.some fields (\field -> recipeRawContainsCallable field.value (budget - 1))
+    SnapshotUnreadable -> true
+    SnapshotOther -> true
+    _ -> false
+
+@category "engine-internal"
+recipeEqualLists : (occurrence: RecipeOccurrence) -> (left: List RecipeSymbolicValue) -> (right: List RecipeSymbolicValue) -> Maybe RecipeConstraint
+recipeEqualLists occurrence left right =
+  if length left != length right then Just RcNone
+  else case head left of
+    Nothing -> Just RcAll
+    Just first -> case recipeEqual occurrence first (at right 0) of
+      Nothing -> Nothing
+      Just c -> case recipeEqualLists occurrence (reflectRest left) (reflectRest right) of
+        Nothing -> Nothing
+        Just d -> Just (recipeAnd c d)
+
+@category "engine-internal"
+recipeConditionalEquality : (constraint: RecipeConstraint) -> (yes: Maybe RecipeConstraint) -> (no: Maybe RecipeConstraint) -> Maybe RecipeConstraint
+recipeConditionalEquality constraint yes no = case yes of
+  Nothing -> Nothing
+  Just y -> case no of
+    Nothing -> Nothing
+    Just n -> Just (recipeOr (recipeAnd constraint y) (recipeAnd (recipeNot constraint) n))
+
+@category "engine-internal"
+recipeContains : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (array: RecipeSymbolicValue) -> (needle: RecipeSymbolicValue) -> Maybe RecipeConstraint
+recipeContains snapshot occurrence array needle = case needle of
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeConditionalEquality c (recipeContains snapshot occurrence array yes) (recipeContains snapshot occurrence array no)
+  _ -> recipeContainsArray snapshot occurrence array needle
+
+@category "engine-internal"
+recipeContainsArray : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (array: RecipeSymbolicValue) -> (needle: RecipeSymbolicValue) -> Maybe RecipeConstraint
+recipeContainsArray snapshot occurrence array needle = case array of
+  RvPantry -> case needle of
+    RvFood { rank = rank } -> Just (RcHasFood { rank = rank })
+    _ -> Nothing
+  RvFiltered { foods = foods } -> case needle of
+    RvFood { rank = rank } -> case find (\food -> food.rank == rank) foods of
+      Just food -> Just food.included
+      Nothing -> Just RcNone
+    _ -> Nothing
+  RvList { items = items } -> recipeContainsList occurrence items needle
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeConditionalEquality c (recipeContains snapshot occurrence yes needle) (recipeContains snapshot occurrence no needle)
+  _ -> Nothing
+
+@category "engine-internal"
+recipeContainsList : (occurrence: RecipeOccurrence) -> (items: List RecipeSymbolicValue) -> (needle: RecipeSymbolicValue) -> Maybe RecipeConstraint
+recipeContainsList occurrence items needle = case head items of
+  Nothing -> Just RcNone
+  Just first -> case recipeEqual occurrence first needle of
+    Nothing -> Nothing
+    Just c -> case recipeContainsList occurrence (reflectRest items) needle of
+      Nothing -> Nothing
+      Just d -> Just (recipeOr c d)
+
+@category "engine-internal"
+recipePantryFoods : (snapshot: RecipeAnalysisSnapshot) -> List RecipeFoodSelection
+recipePantryFoods snapshot = map (\food -> RecipeFoodSelection { rank = food.rank, included = RcHasFood { rank = food.rank } }) snapshot.domain.foods
+
+@category "engine-internal"
+recipeCountValue : (snapshot: RecipeAnalysisSnapshot) -> (value: RecipeSymbolicValue) -> Maybe RecipeSymbolicValue
+recipeCountValue snapshot value = case value of
+  RvList { items = items } -> Just (RvLiteral { value = length items })
+  RvFiltered { foods = foods } -> Just (RvCount { foods = foods })
+  RvPantry -> Just (RvCount { foods = recipePantryFoods snapshot })
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeLiftConditional c (recipeCountValue snapshot yes) (recipeCountValue snapshot no)
+  _ -> Nothing
+
+@category "engine-internal"
+recipeDistinctCountValue : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (value: RecipeSymbolicValue) -> Maybe RecipeSymbolicValue
+recipeDistinctCountValue snapshot occurrence value = case recipeUniqueValue snapshot occurrence value of
+  Nothing -> Nothing
+  Just unique -> recipeCountValue snapshot unique
+
+@category "engine-internal"
+recipeUniqueValue : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (value: RecipeSymbolicValue) -> Maybe RecipeSymbolicValue
+recipeUniqueValue snapshot occurrence value = case value of
+  RvPantry -> Just value
+  RvFiltered {} -> Just value
+  RvList { items = items } -> case recipeUniqueItems occurrence items [] of
+    Nothing -> Nothing
+    Just unique -> Just (RvList { items = unique })
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeLiftConditional c (recipeUniqueValue snapshot occurrence yes) (recipeUniqueValue snapshot occurrence no)
+  _ -> Nothing
+
+@category "engine-internal"
+recipeUniqueItems : (occurrence: RecipeOccurrence) -> (items: List RecipeSymbolicValue) -> (seen: List RecipeSymbolicValue) -> Maybe (List RecipeSymbolicValue)
+recipeUniqueItems occurrence items seen = case head items of
+  Nothing -> Just seen
+  Just first -> case recipeContainsList occurrence seen first of
+    Just RcAll -> recipeUniqueItems occurrence (reflectRest items) seen
+    Just RcNone -> recipeUniqueItems occurrence (reflectRest items) (appendItem first seen)
+    _ -> Nothing
+
+@category "engine-internal"
+recipeCountRanks : (foods: List RecipeFoodSelection) -> Maybe (List Nat)
+recipeCountRanks foods = case head foods of
+  Nothing -> Just []
+  Just food -> case food.included of
+    RcNone -> recipeCountRanks (reflectRest foods)
+    RcHasFood { rank = rank } -> if rank != food.rank then Nothing else case recipeCountRanks (reflectRest foods) of
+      Nothing -> Nothing
+      Just rest -> Just (concat [rank] rest)
+    _ -> Nothing
+
+@category "engine-internal"
+recipeComparison : (occurrence: RecipeOccurrence) -> (values: List RecipeSymbolicValue) -> (mode: Nat) -> Maybe RecipeSymbolicValue
+recipeComparison occurrence values mode =
+  if length values != 2 then Nothing
+  else recipeCompareValues occurrence (at values 0) (at values 1) mode
+
+@category "engine-internal"
+recipeCompareValues : (occurrence: RecipeOccurrence) -> (left: RecipeSymbolicValue) -> (right: RecipeSymbolicValue) -> (mode: Nat) -> Maybe RecipeSymbolicValue
+recipeCompareValues occurrence left right mode = case left of
+  RvCount { foods = foods } -> case right of
+    RvLiteral { value = number } -> case representationValueSnapshot number of
+      SnapshotNumber bound ->
+        if bound != bound then Just (RvBoolean { constraint = RcNone })
+        else case recipeCountRanks foods of
+          Nothing -> Nothing
+          Just ranks ->
+            let lower = if mode == 0 then ceil bound else (if mode == 1 then floor bound + 1 else 0)
+            let upper = if mode == 2 then floor bound else (if mode == 3 then ceil bound - 1 else length ranks)
+            let constraint = if upper < 0 || lower > length ranks then RcNone else RcCardinality { ranks = ranks, lower = max 0 lower, upper = min (length ranks) upper }
+            Just (RvBoolean { constraint = constraint })
+      _ -> Nothing
+    _ -> Nothing
+  RvLiteral { value = a } -> case right of
+    RvCount {} -> recipeCompareValues occurrence right left (if mode == 0 then 2 else (if mode == 1 then 3 else (if mode == 2 then 0 else 1)))
+    RvLiteral { value = b } -> case representationValueSnapshot a of
+      SnapshotNumber n -> case representationValueSnapshot b of
+        SnapshotNumber m -> Just (RvBoolean { constraint = if (if mode == 0 then n >= m else (if mode == 1 then n > m else (if mode == 2 then n <= m else n < m))) then RcAll else RcNone })
+        _ -> Nothing
+      _ -> Nothing
+    RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeLiftConditional c (recipeCompareValues occurrence left yes mode) (recipeCompareValues occurrence left no mode)
+    _ -> Nothing
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeLiftConditional c (recipeCompareValues occurrence yes right mode) (recipeCompareValues occurrence no right mode)
+  _ -> Nothing
+
+-- Returned constructors come from the selected primitive's own observation,
+-- never from the caller's possibly shadowed Just/Nothing spellings.
+@category "engine-internal"
+recipePrimitiveConstructor : (snapshot: RecipeAnalysisSnapshot) -> (constructors: List ConstructorRef) -> (written: String) -> Maybe String
+recipePrimitiveConstructor snapshot constructors written = case find (\row -> row.written == written) constructors of
+  Just (ConstructorRef { target = target }) -> case recipeConstructorIdentity snapshot target of
+    Just identity -> if recipeRepresentationAdmitted snapshot identity then Just identity else Nothing
+    Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+recipeFromMaybeValue : (snapshot: RecipeAnalysisSnapshot) -> (constructors: List ConstructorRef) -> (fallback: RecipeSymbolicValue) -> (value: RecipeSymbolicValue) -> Maybe RecipeSymbolicValue
+recipeFromMaybeValue snapshot constructors fallback value = case value of
+  RvConstruct { identity = identity, args = args, fields = fields } -> case recipePrimitiveConstructor snapshot constructors "Nothing" of
+    Nothing -> Nothing
+    Just absent -> if identity == absent && length args == 0 && length fields == 0 then Just fallback else case recipePrimitiveConstructor snapshot constructors "Just" of
+      Nothing -> Nothing
+      Just present -> if identity == present && length args == 1 && recipeMaybeFields fields then Just (at args 0) else Nothing
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeLiftConditional c (recipeFromMaybeValue snapshot constructors fallback yes) (recipeFromMaybeValue snapshot constructors fallback no)
+  _ -> Nothing
+
+@category "engine-internal"
+recipeMaybeFields : (fields: List RecipeSemanticSlot) -> Bool
+recipeMaybeFields fields =
+  if length fields == 0 then true
+  else if length fields != 1 then false
+  else
+    let slot = at fields 0
+    let inspectPosition = \unit -> case slot.key of
+          PositionalField { index = index } -> index == 0
+          _ -> false
+    slot.wireName == "_0" && inspectPosition 0
+
+@category "engine-internal"
+recipeHeadValue : (snapshot: RecipeAnalysisSnapshot) -> (constructors: List ConstructorRef) -> (value: RecipeSymbolicValue) -> Maybe RecipeSymbolicValue
+recipeHeadValue snapshot constructors value = case value of
+  RvList { items = items } -> case head items of
+    Nothing -> recipeMapMaybe (\identity -> RvConstruct { identity = identity, args = [], fields = [] }) (recipePrimitiveConstructor snapshot constructors "Nothing")
+    Just first -> recipeMapMaybe (\identity -> RvConstruct { identity = identity, args = [first], fields = [] }) (recipePrimitiveConstructor snapshot constructors "Just")
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeLiftConditional c (recipeHeadValue snapshot constructors yes) (recipeHeadValue snapshot constructors no)
+  _ -> Nothing
+
+@category "engine-internal"
+recipeTailValue : (snapshot: RecipeAnalysisSnapshot) -> (constructors: List ConstructorRef) -> (value: RecipeSymbolicValue) -> Maybe RecipeSymbolicValue
+recipeTailValue snapshot constructors value = case value of
+  RvList { items = items } -> case head items of
+    Nothing -> recipeMapMaybe (\identity -> RvConstruct { identity = identity, args = [], fields = [] }) (recipePrimitiveConstructor snapshot constructors "Nothing")
+    Just first -> recipeMapMaybe (\identity -> RvConstruct { identity = identity, args = [RvList { items = reflectRest items }], fields = [] }) (recipePrimitiveConstructor snapshot constructors "Just")
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeLiftConditional c (recipeTailValue snapshot constructors yes) (recipeTailValue snapshot constructors no)
+  _ -> Nothing
+
+@category "engine-internal"
+recipeFiniteSummary : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (role: RecipePrimitiveRole) -> (callback: RecipeSymbolicValue) -> (array: RecipeSymbolicValue) -> (initial: RecipeSymbolicValue) -> (premises: List Nat) -> b
+recipeFiniteSummary state occurrence bindings condition expression role callback array initial premises =
+  let summarized = recipeFiniteSequence state occurrence bindings condition expression role callback array initial []
+  if summarized.ok then recipeFinish summarized.state RtSummary occurrence bindings condition expression summarized.value (concat premises summarized.premises)
+  else recipeEmitResidual summarized.state occurrence bindings condition expression summarized.reason
+
+@category "engine-internal"
+recipeFiniteEntries : (snapshot: RecipeAnalysisSnapshot) -> (array: RecipeSymbolicValue) -> Maybe (List RecipeSummaryEntry)
+recipeFiniteEntries snapshot array = case array of
+  RvList { items = items } -> Just (map (\value -> RecipeSummaryEntry { value = value, included = RcAll }) items)
+  RvPantry -> Just (map (\food -> RecipeSummaryEntry { value = RvFood { rank = food.rank }, included = RcHasFood { rank = food.rank } }) snapshot.domain.foods)
+  RvFiltered { foods = foods } -> Just (map (\food -> RecipeSummaryEntry { value = RvFood { rank = food.rank }, included = food.included }) foods)
+  _ -> Nothing
+
+@category "engine-internal"
+recipeFiniteSize : (snapshot: RecipeAnalysisSnapshot) -> (array: RecipeSymbolicValue) -> Maybe Nat
+recipeFiniteSize snapshot array = case array of
+  RvList { items = items } -> Just (length items)
+  RvPantry -> Just (length snapshot.domain.foods)
+  RvFiltered { foods = foods } -> Just (length foods)
+  _ -> Nothing
+
+@category "engine-internal"
+recipeFiniteSequence : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (role: RecipePrimitiveRole) -> (callback: RecipeSymbolicValue) -> (array: RecipeSymbolicValue) -> (initial: RecipeSymbolicValue) -> (premises: List Nat) -> b
+recipeFiniteSequence state occurrence bindings condition expression role callback array initial premises =
+  if state.remaining <= 0 then { ok = false, value = initial, state = state, premises = premises, reason = RecipeBudgetExhausted }
+  else
+    let next = mapSet state "remaining" (state.remaining - 1)
+    case array of
+      RvConditional { condition = c, whenTrue = yes, whenFalse = no } ->
+        let left = recipeFiniteSequence next (recipeSummaryOccurrence occurrence 0) bindings (recipeAnd condition c) expression role callback yes initial premises
+        if not left.ok then left
+        else
+          let right = recipeFiniteSequence left.state (recipeSummaryOccurrence occurrence 1) bindings (recipeAnd condition (recipeNot c)) expression role callback no initial left.premises
+          { ok = right.ok, value = recipeConditional c left.value right.value, state = right.state, premises = right.premises, reason = right.reason }
+      _ -> case recipeFiniteSize state.snapshot array of
+        Nothing -> { ok = false, value = initial, state = next, premises = premises, reason = RecipeUnsupported }
+        Just size ->
+          if size > next.remaining then { ok = false, value = initial, state = next, premises = premises, reason = RecipeBudgetExhausted }
+          else case recipeFiniteEntries state.snapshot array of
+            Nothing -> { ok = false, value = initial, state = next, premises = premises, reason = RecipeUnsupported }
+            Just entries -> recipeFiniteItems next occurrence bindings condition expression role callback entries 0 initial premises
+
+@category "engine-internal"
+recipeFiniteItems : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (role: RecipePrimitiveRole) -> (callback: RecipeSymbolicValue) -> (entries: List RecipeSummaryEntry) -> (index: Nat) -> (accumulator: RecipeSymbolicValue) -> (premises: List Nat) -> b
+recipeFiniteItems state occurrence bindings condition expression role callback entries index accumulator premises = case head entries of
+  Nothing -> { ok = true, value = accumulator, state = state, premises = premises, reason = RecipeUnsupported }
+  Just entry ->
+    if state.remaining <= 0 then { ok = false, value = accumulator, state = state, premises = premises, reason = RecipeBudgetExhausted }
+    else
+      let next = mapSet state "remaining" (state.remaining - 1)
+      let universal = deepEqValue role RecipeAll
+      let existential = deepEqValue role RecipeSome
+      let filtering = deepEqValue role RecipeFilter
+      let progress = if universal then recipeBoolean occurrence accumulator else (if existential then recipeNot (recipeBoolean occurrence accumulator) else RcAll)
+      let demand = recipeAnd condition (recipeAnd entry.included progress)
+      if recipeIsNone demand then recipeFiniteItems next occurrence bindings condition expression role callback (reflectRest entries) (index + 1) accumulator premises
+      else
+        let callbackOccurrence = recipeSummaryOccurrence occurrence index
+        let arguments = if deepEqValue role RecipeFold then [accumulator, entry.value] else [entry.value]
+        let applied = recipeApply next callbackOccurrence bindings demand expression callback arguments
+        let proofs = concat premises applied.premises
+        if universal || existential then
+          let constraint = recipeBoolean callbackOccurrence applied.value
+          let noted = recipeOrigin applied.state callbackOccurrence expression constraint
+          let combined = if universal then recipeAnd progress (recipeOr (recipeNot entry.included) constraint) else recipeOr (recipeBoolean occurrence accumulator) (recipeAnd entry.included constraint)
+          recipeFiniteItems noted occurrence bindings condition expression role callback (reflectRest entries) (index + 1) (RvBoolean { constraint = combined }) proofs
+        else if deepEqValue role RecipeFold then
+          let updated = recipeConditional entry.included applied.value accumulator
+          recipeFiniteItems applied.state occurrence bindings condition expression role callback (reflectRest entries) (index + 1) updated proofs
+        else
+          let kept = if filtering then recipeAnd entry.included (recipeBoolean callbackOccurrence applied.value) else entry.included
+          let noted = if filtering then recipeOrigin applied.state callbackOccurrence expression (recipeBoolean callbackOccurrence applied.value) else applied.state
+          let appended = recipeConcatBounded accumulator (RvList { items = [if filtering then entry.value else applied.value] }) noted.remaining
+          let built = mapSet noted "remaining" appended.remaining
+          case appended.value of
+            Nothing -> { ok = false, value = accumulator, state = built, premises = proofs, reason = appended.reason }
+            Just mapped -> recipeFiniteItems built occurrence bindings condition expression role callback (reflectRest entries) (index + 1) (recipeConditional kept mapped accumulator) proofs
+
+@category "engine-internal"
+recipeFilterSummary : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (predicate: RecipeSymbolicValue) -> (array: RecipeSymbolicValue) -> (premises: List Nat) -> (existential: Bool) -> b
+recipeFilterSummary state occurrence bindings condition expression predicate array premises existential = case array of
+  RvConditional {} -> recipeFiniteSummary state occurrence bindings condition expression (if existential then RecipeSome else RecipeFilter) predicate array (if existential then RvBoolean { constraint = RcNone } else RvList { items = [] }) premises
+  RvPantry ->
+    let filtered = recipeFilterFoods state occurrence bindings condition expression predicate (recipePantryFoods state.snapshot) 0 [] premises RcNone existential
+    let value = if existential then RvBoolean { constraint = filtered.matched } else RvFiltered { foods = filtered.foods }
+    recipeFinish filtered.state RtSummary occurrence bindings condition expression value filtered.premises
+  RvFiltered { foods = foods } ->
+    let filtered = recipeFilterFoods state occurrence bindings condition expression predicate foods 0 [] premises RcNone existential
+    let value = if existential then RvBoolean { constraint = filtered.matched } else RvFiltered { foods = filtered.foods }
+    recipeFinish filtered.state RtSummary occurrence bindings condition expression value filtered.premises
+  RvList { items = items } ->
+    let filtered = recipeFilterItems state occurrence bindings condition expression predicate items 0 [] premises existential
+    recipeFinish filtered.state RtSummary occurrence bindings condition expression filtered.value filtered.premises
+  _ -> recipeEmitResidual state occurrence bindings condition expression RecipeUnsupported
+
+@category "engine-internal"
+recipeFilterFoods : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (predicate: RecipeSymbolicValue) -> (foods: List RecipeFoodSelection) -> (index: Nat) -> (acc: List RecipeFoodSelection) -> (premises: List Nat) -> (matched: RecipeConstraint) -> (existential: Bool) -> b
+recipeFilterFoods state occurrence bindings condition expression predicate foods index acc premises matched existential = case head foods of
+  Nothing -> { state = state, foods = acc, premises = premises, matched = matched }
+  Just food ->
+    let demanded = recipeAnd condition (recipeAnd food.included (if existential then recipeNot matched else RcAll))
+    if recipeIsNone demanded then recipeFilterFoods state occurrence bindings condition expression predicate (reflectRest foods) (index + 1) (appendItem (RecipeFoodSelection { rank = food.rank, included = RcNone }) acc) premises matched existential
+    else
+      -- This synthetic callback call uses the admitted predicate value, not a
+      -- spelling-based dispatch. Its body retains its own source occurrence.
+      let callbackOccurrence = recipeSummaryOccurrence occurrence index
+      let applied = recipeApply state callbackOccurrence bindings demanded expression predicate [RvFood { rank = food.rank }]
+      let constraint = recipeBoolean callbackOccurrence applied.value
+      let included = recipeAnd food.included constraint
+      let noted = recipeOrigin applied.state callbackOccurrence expression constraint
+      let nextMatched = recipeOr matched included
+      recipeFilterFoods noted occurrence bindings condition expression predicate (reflectRest foods) (index + 1) (appendItem (RecipeFoodSelection { rank = food.rank, included = included }) acc) (concat premises applied.premises) nextMatched existential
+
+@category "engine-internal"
+recipeFilterItems : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (predicate: RecipeSymbolicValue) -> (items: List RecipeSymbolicValue) -> (index: Nat) -> (acc: List RecipeSymbolicValue) -> (premises: List Nat) -> (existential: Bool) -> b
+recipeFilterItems state occurrence bindings condition expression predicate items index acc premises existential = case head items of
+  Nothing -> { state = state, value = if existential then RvBoolean { constraint = RcNone } else RvList { items = acc }, premises = premises }
+  Just item ->
+    let callbackOccurrence = recipeSummaryOccurrence occurrence index
+    let applied = recipeApply state callbackOccurrence bindings condition expression predicate [item]
+    let constraint = recipeBoolean callbackOccurrence applied.value
+    let noted = recipeOrigin applied.state callbackOccurrence expression constraint
+    if existential && recipeIsNone (recipeNot constraint) then { state = noted, value = RvBoolean { constraint = RcAll }, premises = concat premises applied.premises }
+    else
+      let rest = recipeFilterItems noted occurrence bindings (if existential then recipeAnd condition (recipeNot constraint) else condition) expression predicate (reflectRest items) (index + 1) acc (concat premises applied.premises) existential
+      if existential then { state = rest.state, value = RvBoolean { constraint = recipeOr constraint (recipeBoolean occurrence rest.value) }, premises = rest.premises }
+      else { state = rest.state, value = recipeConditional constraint (recipePrepend item rest.value) rest.value, premises = rest.premises }
+
+@category "engine-internal"
+recipePrepend : (item: RecipeSymbolicValue) -> (array: RecipeSymbolicValue) -> RecipeSymbolicValue
+recipePrepend item array = case array of
+  RvList { items = items } -> RvList { items = concat [item] items }
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> recipeConditional c (recipePrepend item yes) (recipePrepend item no)
+  _ -> array
+
+@category "engine-internal"
+recipeMatchArms : (state: a) -> (occurrence: RecipeOccurrence) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> (expression: Expr) -> (scrutinee: RecipeSymbolicValue) -> (arms: a) -> (index: Nat) -> b
+recipeMatchArms state occurrence bindings condition expression scrutinee arms index = case head arms of
+  Nothing ->
+    let residual = recipeEmitResidual state occurrence bindings condition expression RecipeUnsupported
+    { value = residual.value, state = residual.state, premises = [residual.ordinal] }
+  Just arm ->
+    let matched = recipeMatchPattern state.snapshot occurrence scrutinee arm.pattern bindings
+    let patternCondition = matched.condition
+    let patterned = recipeOrigin state occurrence expression patternCondition
+    if recipeIsNone patternCondition then recipeMatchArms patterned occurrence bindings condition expression scrutinee (reflectRest arms) (index + 1)
+    else
+      let guard = case lookup arm "guard" of
+            Nothing -> { value = RvBoolean { constraint = RcAll }, state = patterned, premises = [] }
+            Just guardExpression ->
+              let guardOccurrence = recipeChild occurrence (1 + 2 * index)
+              let evaluated = recipeWalk patterned guardOccurrence matched.bindings (recipeAnd condition patternCondition) guardExpression
+              let noted = recipeOrigin evaluated.state guardOccurrence guardExpression (recipeBoolean guardOccurrence evaluated.value)
+              { value = evaluated.value, state = noted, premises = [evaluated.ordinal] }
+      let guarded = recipeBoolean (recipeChild occurrence (1 + 2 * index)) guard.value
+      let taken = recipeAnd patternCondition guarded
+      let yes =
+            if recipeIsNone taken then { value = recipeResidualValue occurrence expression RecipeUnsupported, state = guard.state, premises = [] }
+            else let evaluated = recipeWalk guard.state (recipeChild occurrence (2 + 2 * index)) matched.bindings (recipeAnd condition taken) arm.body
+                 { value = evaluated.value, state = evaluated.state, premises = [evaluated.ordinal] }
+      let no =
+            if recipeIsNone (recipeNot taken) then { value = recipeResidualValue occurrence expression RecipeUnsupported, state = yes.state, premises = [] }
+            else recipeMatchArms yes.state occurrence bindings (recipeAnd condition (recipeNot taken)) expression scrutinee (reflectRest arms) (index + 1)
+      { value = recipeConditional taken yes.value no.value, state = no.state, premises = concat guard.premises (concat yes.premises no.premises) }
+
+@category "engine-internal"
+recipeMatchPattern : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (value: RecipeSymbolicValue) -> (pattern: Pattern) -> (bindings: List RecipeSymbolicBinding) -> a
+recipeMatchPattern snapshot occurrence value pattern bindings = case pattern of
+  PatWildcard -> { condition = RcAll, bindings = bindings }
+  PatVar { name = name } -> { condition = RcAll, bindings = concat [RecipeSymbolicBinding { name = name, value = value }] bindings }
+  PatLit { value = literal } -> { condition = fromMaybe (RcUnknown { identity = recipeCorrelation occurrence, reason = RecipeUnsupported }) (recipeEqual occurrence value (recipeLiftValue snapshot occurrence literal)), bindings = bindings }
+  PatConstruct { ctor = ctor, args = args } -> case recipeConstructor snapshot occurrence.owner ctor of
+    Nothing -> { condition = RcUnknown { identity = recipeCorrelation occurrence, reason = RecipeConstructorUnresolved }, bindings = bindings }
+    Just identity -> case value of
+      RvFood { rank = rank } -> case recipeFood snapshot identity of
+        Just expected -> { condition = if rank == expected && length args == 0 then RcAll else RcNone, bindings = bindings }
+        Nothing -> { condition = RcNone, bindings = bindings }
+      RvConstruct { identity = target, args = values, fields = names } ->
+        if identity != target then { condition = RcNone, bindings = bindings }
+        else
+          let patternNames = recipeSemanticSlotsFromWire (fromMaybe [] (lookup pattern "fields"))
+          let actualFields = if length names == 0 then recipePositionalSlots (length values) 0 [] else names
+          let requested = if length patternNames == 0 then recipePositionalSlots (length args) 0 [] else patternNames
+          let aligned = recipeAlignPattern values actualFields requested
+          case aligned of
+            Nothing -> { condition = RcUnknown { identity = recipeCorrelation occurrence, reason = RecipeUnsupported }, bindings = bindings }
+            Just ordered -> recipeMatchArguments snapshot occurrence ordered args bindings RcAll
+      RvConditional { condition = c, whenTrue = yes, whenFalse = no } ->
+        let a = recipeMatchPattern snapshot occurrence yes pattern bindings
+        let b = recipeMatchPattern snapshot occurrence no pattern bindings
+        if recipeIsNone a.condition then { condition = recipeAnd (recipeNot c) b.condition, bindings = b.bindings }
+        else if recipeIsNone b.condition then { condition = recipeAnd c a.condition, bindings = a.bindings }
+        else if not (recipeConstraintKnown a.condition && recipeConstraintKnown b.condition) then { condition = RcUnknown { identity = recipeCorrelation occurrence, reason = RecipeUnsupported }, bindings = bindings }
+        else {
+          condition = recipeOr (recipeAnd c a.condition) (recipeAnd (recipeNot c) b.condition),
+          bindings = recipeMergePatternBindings (recipePatternNames pattern []) c a.bindings b.bindings bindings
+        }
+      _ -> { condition = RcUnknown { identity = recipeCorrelation occurrence, reason = RecipeUnsupported }, bindings = bindings }
+
+@category "engine-internal"
+recipeAlignPattern : (values: List RecipeSymbolicValue) -> (names: List RecipeSemanticSlot) -> (requested: List RecipeSemanticSlot) -> Maybe (List RecipeSymbolicValue)
+recipeAlignPattern values names requested = case head requested of
+  Nothing -> Just []
+  Just slot ->
+    let index = findIndex (\field -> engine.deepEqValue field.key slot.key && field.wireName == slot.wireName) names
+    if index < 0 || index >= length values then Nothing
+    else case recipeAlignPattern values names (reflectRest requested) of
+      Nothing -> Nothing
+      Just rest -> Just (concat [at values index] rest)
+
+@category "engine-internal"
+recipeSemanticSlotFromWire : (slot: CompileFieldSlot) -> RecipeSemanticSlot
+recipeSemanticSlotFromWire slot = RecipeSemanticSlot { key = slot.key, wireName = slot.wireName, type = lookup slot "type" }
+
+@category "engine-internal"
+recipeSemanticSlotsFromWire : (slots: List CompileFieldSlot) -> List RecipeSemanticSlot
+recipeSemanticSlotsFromWire slots = std.map recipeSemanticSlotFromWire slots
+
+@category "engine-internal"
+recipePositionalSlots : (count: Nat) -> (index: Nat) -> (acc: List RecipeSemanticSlot) -> List RecipeSemanticSlot
+recipePositionalSlots count index acc =
+  if index >= count then acc
+  else recipePositionalSlots count (index + 1) (appendItem (RecipeSemanticSlot { key = PositionalField { index = index }, wireName = concat "_" (toString index), type = Nothing }) acc)
+
+@category "engine-internal"
+recipeMatchArguments : (snapshot: RecipeAnalysisSnapshot) -> (occurrence: RecipeOccurrence) -> (values: List RecipeSymbolicValue) -> (patterns: List Pattern) -> (bindings: List RecipeSymbolicBinding) -> (condition: RecipeConstraint) -> a
+recipeMatchArguments snapshot occurrence values patterns bindings condition = case head patterns of
+  Nothing -> { condition = condition, bindings = bindings }
+  Just pattern -> case head values of
+    Nothing -> { condition = RcNone, bindings = bindings }
+    Just value ->
+      let matched = recipeMatchPattern snapshot occurrence value pattern bindings
+      recipeMatchArguments snapshot occurrence (reflectRest values) (reflectRest patterns) matched.bindings (recipeAnd condition matched.condition)
+
+@category "engine-internal"
+recipeConstraintKnown : (constraint: RecipeConstraint) -> Bool
+recipeConstraintKnown constraint = case constraint of
+  RcUnknown {} -> false
+  RcAnd { terms = terms } -> all terms recipeConstraintKnown
+  RcOr { terms = terms } -> all terms recipeConstraintKnown
+  RcNot { inner = inner } -> recipeConstraintKnown inner
+  _ -> true
+
+@category "engine-internal"
+recipePatternNames : (pattern: Pattern) -> (names: List String) -> List String
+recipePatternNames pattern names = case pattern of
+  PatVar { name = name } -> if elem name names then names else appendItem name names
+  PatConstruct { args = args } -> fold (\acc child -> recipePatternNames child acc) names args
+  _ -> names
+
+@category "engine-internal"
+recipeMergePatternBindings : (names: List String) -> (constraint: RecipeConstraint) -> (yes: List RecipeSymbolicBinding) -> (no: List RecipeSymbolicBinding) -> (base: List RecipeSymbolicBinding) -> List RecipeSymbolicBinding
+recipeMergePatternBindings names constraint yes no base = case head names of
+  Nothing -> base
+  Just name -> case recipeLookup yes name of
+    Nothing -> base
+    Just a -> case recipeLookup no name of
+      Nothing -> base
+      Just b -> recipeMergePatternBindings (reflectRest names) constraint yes no (concat [RecipeSymbolicBinding { name = name, value = recipeConditional constraint a b }] base)
+
+@category "engine-internal"
+recipeOutcomes : (value: RecipeSymbolicValue) -> (condition: RecipeConstraint) -> (state: a) -> (occurrence: RecipeOccurrence) -> (expression: Expr) -> b
+recipeOutcomes value condition state occurrence expression = case value of
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } ->
+    let left = recipeOutcomes yes (recipeAnd condition c) state occurrence expression
+    let right = recipeOutcomes no (recipeAnd condition (recipeNot c)) left.state occurrence expression
+    { outcomes = concat left.outcomes right.outcomes, state = right.state }
+  RvList { items = preparations } ->
+    let lowered = recipePreparations preparations RcAll state occurrence expression []
+    { outcomes = [RecipeOutcome { condition = condition, preparations = lowered.preparations }], state = lowered.state }
+  RvResidual { residual = residual } -> { outcomes = [], state = recipeRecordResidual state residual }
+  _ -> recipeInvalidOutput state occurrence expression
+
+@category "engine-internal"
+recipeInvalidOutput : (state: a) -> (occurrence: RecipeOccurrence) -> (expression: Expr) -> b
+recipeInvalidOutput state occurrence expression =
+  let residual = RecipeResidual { occurrence = occurrence, expression = expression, reason = RecipeInvalidPreparation, correlation = recipeCorrelation occurrence }
+  { outcomes = [], state = mapSet state "residuals" (appendItem residual state.residuals) }
+
+@category "engine-internal"
+recipePreparations : (values: List RecipeSymbolicValue) -> (available: RecipeConstraint) -> (state: a) -> (occurrence: RecipeOccurrence) -> (expression: Expr) -> (acc: List RecipePreparation) -> b
+recipePreparations values available state occurrence expression acc = case head values of
+  Nothing -> { preparations = acc, state = state }
+  Just value ->
+    let lowered = recipePreparation value available state occurrence expression
+    recipePreparations (reflectRest values) available lowered.state occurrence expression (concat acc lowered.preparations)
+
+@category "engine-internal"
+recipePreparation : (value: RecipeSymbolicValue) -> (available: RecipeConstraint) -> (state: a) -> (occurrence: RecipeOccurrence) -> (expression: Expr) -> b
+recipePreparation value available state occurrence expression = case value of
+  RvList { items = foods } -> case recipeFoodEntries foods RcAll of
+    Nothing ->
+      let invalid = recipeInvalidOutput state occurrence expression
+      { preparations = [], state = invalid.state }
+    Just entries -> { preparations = [RecipePreparation { available = available, foods = entries }], state = state }
+  RvFiltered { foods = foods } -> { preparations = [RecipePreparation { available = available, foods = foods }], state = state }
+  RvPantry -> { preparations = [RecipePreparation { available = available, foods = recipePantryFoods state.snapshot }], state = state }
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } ->
+    let left = recipePreparation yes (recipeAnd available c) state occurrence expression
+    let right = recipePreparation no (recipeAnd available (recipeNot c)) left.state occurrence expression
+    { preparations = concat left.preparations right.preparations, state = right.state }
+  RvResidual { residual = residual } -> { preparations = [], state = recipeRecordResidual state residual }
+  _ ->
+    let invalid = recipeInvalidOutput state occurrence expression
+    { preparations = [], state = invalid.state }
+
+@category "engine-internal"
+recipeFoodEntries : (values: List RecipeSymbolicValue) -> (included: RecipeConstraint) -> Maybe (List RecipeFoodSelection)
+recipeFoodEntries values included = case head values of
+  Nothing -> Just []
+  Just value -> case recipeFoodEntry value included of
+    Nothing -> Nothing
+    Just entries -> case recipeFoodEntries (reflectRest values) included of
+      Nothing -> Nothing
+      Just rest -> Just (concat entries rest)
+
+@category "engine-internal"
+recipeFoodEntry : (value: RecipeSymbolicValue) -> (included: RecipeConstraint) -> Maybe (List RecipeFoodSelection)
+recipeFoodEntry value included = case value of
+  RvFood { rank = rank } -> Just [RecipeFoodSelection { rank = rank, included = included }]
+  RvConditional { condition = c, whenTrue = yes, whenFalse = no } -> case recipeFoodEntry yes (recipeAnd included c) of
+    Nothing -> Nothing
+    Just a -> case recipeFoodEntry no (recipeAnd included (recipeNot c)) of
+      Nothing -> Nothing
+      Just b -> Just (concat a b)
+  _ -> Nothing

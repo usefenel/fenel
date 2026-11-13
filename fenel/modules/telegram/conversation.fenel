@@ -1,0 +1,121 @@
+-- conversation.fenel — thin compositions of the generic state.*
+-- primitives, named so the form-fill routing / finalize bodies stay
+-- readable. NOT a new IO surface: every helper is a one-line wrap
+-- around `tryCreateInstance` / `listInstances` / `updateInstance`.
+-- Conversation lives as an entity_instances row of type "Conversation"
+-- (system entity declared in system-entities.ts) — no custom table.
+--
+-- module-substrate Phase 3o.1 (2026-05-31) — carries `module telegram where`,
+-- so it UNIONs into the `telegram` module alongside `decoders.fenel`
+-- (`loadFenelModuleUnion` groups by header — OQ3). These 11 helpers were
+-- previously surfaced via the `conversationModule.functions` spread in
+-- `engine/src/modules/telegram.ts`; they remain directive-free → Codeable-only
+-- (the Phase-3j loader default), so the form-fill routing/finalize bodies keep
+-- resolving them by codeName. Bodies UNCHANGED; only the id prefix moves
+-- (telegram-bodies:* → telegram:*), invisible to the codeName dispatch.
+
+module telegram where
+
+-- Look up the at-most-one in-flight row matching the (bot, chat, user)
+-- triple at a given status. listInstances takes a JSONB containment
+-- filter (`@>`); `head` reduces the list to Maybe<value>.
+-- The validation/SYSTEM profile deliberately omits the state IO module, so the
+-- active external leaf cannot supply an exact scheme while these wrappers are
+-- inferred. Keep the historical dynamic row carrier explicit at this boundary.
+findActiveConversation : String -> Int -> Int -> Maybe ({})
+findActiveConversation botId chatId userId =
+  let rows = listInstances "Conversation" (Just { botId = botId, chatId = chatId, userId = userId, status = Active })
+  head rows
+
+findConfirmingConversation : String -> Int -> Int -> Maybe ({})
+findConfirmingConversation botId chatId userId =
+  let rows = listInstances "Conversation" (Just { botId = botId, chatId = chatId, userId = userId, status = Confirming })
+  head rows
+
+-- Insert a new active conversation. tryCreateInstance returns the
+-- `{ok: Bool, value?: String, error?: String}` shape (legacy IO-handler
+-- convention; same shape as tryCreateInstanceByName used by
+-- finalize-conversation.fenel). Callers consume `.ok` / `.value` /
+-- `.error` directly — pattern-matching `case r of Ok / Err` does NOT
+-- work because the result isn't a canonical Result variant.
+insertConversation : ({}) -> ({})
+insertConversation row =
+  let t = now ()
+  let value = Conversation {
+    botId = row.botId,
+    chatId = row.chatId,
+    userId = row.userId,
+    formId = row.formId,
+    fields = row.fields,
+    partialValue = row.partialValue,
+    currentFieldIndex = 0,
+    status = Active,
+    completionPayload = row.completionPayload,
+    hooks = row.hooks,
+    startedAt = t.epochMs,
+    completedAt = Nothing,
+    currentFieldPromptSentAt = Nothing
+  }
+  tryCreateInstance value
+
+-- Mark / update helpers. Patch semantics: only listed fields change.
+markConversationCompleted : EntityRef<"instance"> -> Unit
+markConversationCompleted convId =
+  let t = now ()
+  updateInstance convId { status = Completed, completedAt = Just t.epochMs }
+
+markConversationCancelled : EntityRef<"instance"> -> Unit
+markConversationCancelled convId =
+  let t = now ()
+  updateInstance convId { status = Cancelled, completedAt = Just t.epochMs }
+
+markConversationConfirming : EntityRef<"instance"> -> Unit
+markConversationConfirming convId =
+  updateInstance convId { status = Confirming }
+
+markConversationActive : EntityRef<"instance"> -> Unit
+markConversationActive convId =
+  updateInstance convId { status = Active }
+
+updateConversationProgress : EntityRef<"instance"> -> {} -> Int -> Unit
+updateConversationProgress convId partialValue currentFieldIndex =
+  updateInstance convId { partialValue = partialValue, currentFieldIndex = currentFieldIndex }
+
+-- Stamped on every sendFieldPrompt so the routing layer can reject
+-- inbound messages whose Telegram `date` predates the prompt — the
+-- stale-message gate that prevents fast second-messages from being
+-- eaten as the next question's answer.
+stampPromptSentAt : EntityRef<"instance"> -> Unit
+stampPromptSentAt convId =
+  let t = now ()
+  updateInstance convId { currentFieldPromptSentAt = Just t.epochMs }
+
+-- True iff the user's `messageDate` (Maybe<Int> ms-since-epoch,
+-- normalised from Telegram's seconds-based `date`) predates the bot's
+-- most-recent field-prompt send. Either side being Nothing → not
+-- stale (no gate). Used by the routing bodies to skip messages that
+-- couldn't have been authored as a reply to the current prompt.
+-- Conversation is still a dynamic entity-instance row at this IO boundary;
+-- exact-record inference intentionally does not invent an open row for it.
+isStaleMessage : ({}) -> Maybe Int -> Boolean
+isStaleMessage conv messageDate =
+  case messageDate of
+    Nothing -> false
+    Just mdMs ->
+      case conv.currentFieldPromptSentAt of
+        Nothing -> false
+        Just ptMs -> mdMs < ptMs
+
+-- Draft<T> form-fill — wrap a parse outcome as Left (raw text
+-- preserved) or Right (parsed-validated value). Used by the routing
+-- body when the conversation is in asDraft mode: parse failures become
+-- Lefts and advance the form instead of reprompting.
+--
+-- `promote : Draft<T> → Maybe<T>` (the inverse) is deferred to the
+-- review-UX work — the bot's job is only to capture Lefts and Rights;
+-- the review pipeline materialises clean T instances later.
+wrapDraftField parseResult rawText =
+  case parseResult of
+    Parsed { value = v } -> Right v
+    ParseFailed { error = _ } -> Left rawText
+    _ -> Left rawText

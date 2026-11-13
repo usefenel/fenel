@@ -1,0 +1,303 @@
+module engine where
+
+-- A structural editor changes the compatibility body, not its declared
+-- binders. Existing source traversal selects occurrences; FieldKeys and case
+-- discriminators preserve their ownership while host ordinals move. Fresh
+-- generic applications use only explicitly declared binder identities/kinds.
+
+AuthoringSchemeRoot = AuthoringSchemeRoot path: List String scope: List String nominalScope: List String type: TraversalType
+AuthoringSchemePathPlan = AuthoringSchemePathPlan ok: Boolean message: String kept: Boolean path: List String
+AuthoringSchemeApplicationPlan = AuthoringSchemeApplicationPlan index: Number path: List String headVarId: String headRef: String kind: Kind argPaths: List (List String) nominalIdentity: String
+AuthoringSchemeEvidencePlan = AuthoringSchemeEvidencePlan index: Number path: List String
+AuthoringSchemeNominalCapture = AuthoringSchemeNominalCapture name: String identity: String ownerIdentity: String variables: List SchemeVar parameterNames: Maybe (List String)
+AuthoringSchemeCapturedNominal = AuthoringSchemeCapturedNominal path: List String identity: String publicName: String
+AuthoringSchemeBodyPlan = AuthoringSchemeBodyPlan ok: Boolean message: String applications: List AuthoringSchemeApplicationPlan nominals: List AuthoringSchemeEvidencePlan diagnostics: List AuthoringSchemeEvidencePlan capturedNominals: List AuthoringSchemeCapturedNominal
+
+asbRefuse : (message: String) -> AuthoringSchemeBodyPlan
+asbRefuse message = AuthoringSchemeBodyPlan { ok = false, message = message, applications = [], nominals = [], diagnostics = [], capturedNominals = [] }
+
+@label "Scheme body has no declaration evidence"
+@description "An ordinary shape edit with no binders or sidecars may retain an uninspectable type expression as data. This creates no scheme evidence or inference verdict."
+authoringSchemeBodyMayKeepShape : (variables: List SchemeVar) -> (applications: List a) -> (nominals: List b) -> (diagnostics: List c) -> Boolean
+authoringSchemeBodyMayKeepShape variables applications nominals diagnostics =
+  and (eq (length variables) 0) (and (eq (length applications) 0) (and (eq (length nominals) 0) (eq (length diagnostics) 0)))
+
+asbPath : (kept: Boolean) -> (path: List String) -> AuthoringSchemePathPlan
+asbPath kept path = AuthoringSchemePathPlan { ok = true, message = "", kept = kept, path = path }
+
+asbPathRefuse : (message: String) -> AuthoringSchemePathPlan
+asbPathRefuse message = AuthoringSchemePathPlan { ok = false, message = message, kept = false, path = [] }
+
+asbIndexed : (items: List a) -> List ({ node: a, index: Number })
+asbIndexed items = abeRows items 0
+
+asbIndex : (items: List a) -> (ordinal: String) -> Maybe ({ node: a, index: Number })
+asbIndex items ordinal = find (\row -> eq (toString row.index) ordinal) (asbIndexed items)
+
+asbRawAt : (node: JsonLogic Any) -> (path: List String) -> JsonLogic Any
+asbRawAt node path = case head path of
+  Nothing -> node
+  Just segment -> case node of
+    JlArray { items = items } -> case asbIndex items segment of
+      Nothing -> JlNull
+      Just row -> asbRawAt row.node (tailOr path)
+    _ -> asbRawAt (abeGet node segment) (tailOr path)
+
+asbPositionalField : (node: JsonLogic Any) -> Boolean
+asbPositionalField node = case abeGet node "key" of
+  JlTagged { tag = "PositionalField" } -> abeHas node "type"
+  _ -> false
+
+asbPositionalPaths : (node: JsonLogic Any) -> (path: List String) -> List (List String)
+asbPositionalPaths node path = case node of
+  JlArray { items = items } ->
+    let own = if std.some items asbPositionalField then [path] else []
+    concat own (fold (\paths row -> concat paths (asbPositionalPaths row.node (appendItem (toString row.index) path))) [] (asbIndexed items))
+  _ -> fold (\paths field -> concat paths (asbPositionalPaths field.value (appendItem field.name path))) [] (abeFields node)
+
+@label "Positional declaration origin paths"
+@description "Select positional field containers for a host reference observation. Structural equality cannot prove that equal-looking positional declarations retained their original occurrence."
+authoringSchemePositionalPaths : (body: JsonLogic Any) -> List (List String)
+authoringSchemePositionalPaths body = asbPositionalPaths body []
+
+asbArrayTarget : (old: { node: JsonLogic Any, index: Number }) -> (oldItems: List (JsonLogic Any)) -> (nextItems: List (JsonLogic Any)) -> (role: String) -> (sameOrigin: Boolean) -> Result String (Maybe ({ node: JsonLogic Any, index: Number }))
+asbArrayTarget old oldItems nextItems role sameOrigin =
+  let nextRows = asbIndexed nextItems
+  let fields = or (eq role "fields") (eq role "params")
+  if and fields (and (asbPositionalField old.node) (not sameOrigin)) then Err "Positional declaration evidence needs its original unchanged container; use an explicit declaration when replacing, deleting or reordering these slots."
+  else if and fields (not (abeRowHasKey old)) then Err "Refresh the field identities before moving declaration evidence."
+  else
+    let matches =
+      if fields then filter (abeSameRow old) nextRows
+      else if eq role "cases" then filter (\row -> eq (abeText (abeGet old.node "name")) (abeText (abeGet row.node "name"))) nextRows
+      else if eufValEq oldItems nextItems then filter (\row -> eq old.index row.index) nextRows
+      else filter (\row -> eufValEq old.node row.node) nextRows
+    if gt (length matches) 1 then Err "Repeated structural children make the declaration evidence move ambiguous."
+    else case head matches of
+      Just matched -> Ok (Just matched)
+      Nothing ->
+        if or fields (eq role "cases") then Ok Nothing
+        else Ok (find (\row -> eq old.index row.index) nextRows)
+
+asbMovePath : (old: JsonLogic Any) -> (next: JsonLogic Any) -> (path: List String) -> (prefix: List String) -> (role: String) -> (origins: List ({ oldPath: List String, nextPath: List String, sameContainer: Boolean })) -> (originalPath: List String) -> AuthoringSchemePathPlan
+asbMovePath old next path prefix role origins originalPath = case head path of
+  Nothing -> asbPath true prefix
+  Just segment -> case old of
+    JlArray { items = oldItems } -> case asbIndex oldItems segment of
+      Nothing -> asbPathRefuse "Declaration evidence points outside its original array."
+      Just oldRow -> case next of
+        JlArray { items = nextItems } ->
+          let oldPrefix = take (sub (length originalPath) (length path)) originalPath
+          let sameOrigin = std.some origins (\origin -> and origin.sameContainer (and (eq origin.oldPath oldPrefix) (eq origin.nextPath prefix)))
+          case asbArrayTarget oldRow oldItems nextItems role sameOrigin of
+          Err message -> asbPathRefuse message
+          Ok target -> case target of
+            Nothing -> asbPath false []
+            Just nextRow -> asbMovePath oldRow.node nextRow.node (tailOr path) (appendItem (toString nextRow.index) prefix) "" origins originalPath
+        _ -> asbPath false []
+    _ ->
+      if not (abeHas old segment) then asbPathRefuse "Declaration evidence points outside its original body."
+      else if not (abeHas next segment) then asbPath false []
+      else asbMovePath (abeGet old segment) (abeGet next segment) (tailOr path) (appendItem segment prefix) segment origins originalPath
+
+asbNominalRoots : (roots: List AuthoringSchemeRoot) -> Result String (List AuthoringGenericOccurrence)
+asbNominalRoots roots = case head roots of
+  Nothing -> Ok []
+  Just root -> agJoin (agScanWith true root.type root.path root.nominalScope) (asbNominalRoots (tailOr roots))
+
+@label "Scheme body annotation roots"
+@description "Select existing source traversal annotation paths and keep generic and opaque-name scopes distinct for structural scheme edits."
+authoringSchemeBodyScanPlan : (roots: List AuthoringSchemeRoot) -> { ok: Boolean, message: String, annotations: List ({ path: List String, scope: List String, nominalScope: List String }) }
+authoringSchemeBodyScanPlan roots = case agScanRoots roots of
+  Err message -> { ok = false, message = message, annotations = [] }
+  Ok rows -> case asbNominalRoots roots of
+    Err message -> { ok = false, message = message, annotations = [] }
+    Ok nominals ->
+      let projectSchemeAnnotation = \annotation -> do
+        let schemeAnnotationNominalScope =
+          case find (\row -> and row.annotation (eq row.path annotation.path)) nominals of
+            Just nominal -> nominal.scope
+            Nothing -> annotation.scope
+        { path = annotation.path, scope = annotation.scope, nominalScope = schemeAnnotationNominalScope }
+      { ok = true, message = "", annotations = map projectSchemeAnnotation (agPendingAnnotations roots rows) }
+
+asbAppRows : (rows: List AuthoringGenericOccurrence) -> List AuthoringGenericOccurrence
+asbAppRows rows = filter (\row -> and row.application (eq (take 2 row.path) ["scheme", "body"])) rows
+
+asbApplicationAt : (rows: List AuthoringGenericOccurrence) -> (path: List String) -> Maybe AuthoringGenericOccurrence
+asbApplicationAt rows path = find (\row -> eq row.path (concat ["scheme", "body"] path)) (asbAppRows rows)
+
+@label "Scheme nominal application requests"
+@description "Select nominal application heads needing captured reader declarations. Generic binder names and recursive local names never become registry lookups."
+authoringSchemeBodyNominalRequests : (roots: List AuthoringSchemeRoot) -> (variables: List SchemeVar) -> Result String (List String)
+authoringSchemeBodyNominalRequests roots variables = case agScanRoots roots of
+  Err message -> Err message
+  Ok rows ->
+    let collectSchemeNames = \names row ->
+      if or (elem row.name row.scope) (elem row.name names) then names
+      else case inferenceQuantifiedByName row.name variables of
+        Just variable -> names
+        Nothing -> appendItem row.name names
+    Ok (fold collectSchemeNames [] (asbAppRows rows))
+
+asbCapturedHead : (name: String) -> (captures: List AuthoringSchemeNominalCapture) -> Result String ({ headVarId: String, headRef: String, kind: Kind, nominalIdentity: String })
+asbCapturedHead name captures =
+  let matches = filter (\capture -> eq capture.name name) captures
+  if not (eq (length matches) 1) then Err "A new nominal type application needs its established constructor identity and kind in this reader."
+  else case head matches of
+    Nothing -> Err "The requested type constructor is unavailable in this reader."
+    Just capture ->
+      if eq capture.ownerIdentity "" then Err "The type constructor has no captured nominal owner."
+      else case typeFamilyProjection capture.identity capture.variables capture.parameterNames of
+        Err message -> Err message
+        Ok projection -> Ok { headVarId = "", headRef = name, kind = typeFamilyKind (map (\variable -> variable.kind) capture.variables), nominalIdentity = capture.ownerIdentity }
+
+asbMoveApplications : (old: JsonLogic Any) -> (next: JsonLogic Any) -> (applications: List AuthoringGenericApplication) -> (index: Number) -> (rows: List AuthoringGenericOccurrence) -> (origins: List ({ oldPath: List String, nextPath: List String, sameContainer: Boolean })) -> Result String (List ({ index: Number, path: List String, application: AuthoringGenericApplication }))
+asbMoveApplications old next applications index rows origins = case head applications of
+  Nothing -> Ok []
+  Just application ->
+    let moved = asbMovePath old next application.path [] "" origins application.path
+    if not moved.ok then Err moved.message
+    else case asbMoveApplications old next (tailOr applications) (add index 1) rows origins of
+      Err message -> Err message
+      Ok rest ->
+        if not moved.kept then Ok rest
+        else case asbApplicationAt rows moved.path of
+          Nothing -> Ok rest
+          Just row ->
+            let name = if eq application.headVarId "" then application.headRef else row.name
+            if and (eq application.headVarId "") (not (eq row.name name)) then Ok rest
+            else Ok (concat [{ index = index, path = moved.path, application = application }] rest)
+
+asbArgumentPaths : (path: List String) -> (remaining: Number) -> (index: Number) -> List (List String)
+asbArgumentPaths path remaining index =
+  if lte remaining 0 then []
+  else concat [concat path ["$el", "call", toString index]] (asbArgumentPaths path (sub remaining 1) (add index 1))
+
+asbBuildApplications : (rows: List AuthoringGenericOccurrence) -> (variables: List SchemeVar) -> (moved: List ({ index: Number, path: List String, application: AuthoringGenericApplication })) -> (captures: List AuthoringSchemeNominalCapture) -> Result String (List AuthoringSchemeApplicationPlan)
+asbBuildApplications rows variables moved captures = case head rows of
+  Nothing -> Ok []
+  Just row ->
+    let path = drop 2 row.path
+    let old = filter (\entry -> eq entry.path path) moved
+    if gt (length old) 1 then Err "Several application declarations moved onto the same type occurrence."
+    else
+      let prior = head old
+      let priorIndex = case prior of
+            Nothing -> -1
+            Just entry -> entry.index
+      let selected = inferenceQuantifiedByName row.name variables
+      let evidence = case selected of
+        Just variable ->
+          if elem row.name row.scope then Err "A recursive binder shadows this generic application; refresh its declaration."
+          else Ok { headVarId = variable.id, headRef = "", kind = variable.kind, nominalIdentity = "" }
+        Nothing -> case prior of
+          Just entry ->
+            if eq entry.application.headVarId "" then Ok { headVarId = "", headRef = entry.application.headRef, kind = entry.application.kind, nominalIdentity = "" }
+            else Err "The edited application no longer names its declared generic parameter."
+          Nothing -> asbCapturedHead row.name captures
+      case evidence of
+        Err message -> Err message
+        Ok headEvidence -> case asbBuildApplications (tailOr rows) variables moved captures of
+          Err message -> Err message
+          Ok rest -> Ok (concat [AuthoringSchemeApplicationPlan {
+            index = priorIndex,
+            path = path, headVarId = headEvidence.headVarId, headRef = headEvidence.headRef, kind = headEvidence.kind,
+            argPaths = asbArgumentPaths path (length row.args) 1, nominalIdentity = headEvidence.nominalIdentity
+          }] rest)
+
+asbCapturedNominals : (applications: List AuthoringSchemeApplicationPlan) -> (original: List ({ path: List String, identity: String, publicName: String })) -> (moved: List AuthoringSchemeEvidencePlan) -> Result String (List AuthoringSchemeCapturedNominal)
+asbCapturedNominals applications original moved = case head applications of
+  Nothing -> Ok []
+  Just application ->
+    if eq application.nominalIdentity "" then asbCapturedNominals (tailOr applications) original moved
+    else
+      let anchored = filter (\row -> eq row.path application.path) moved
+      let conflicts = case head anchored of
+            Just anchor -> case head (drop anchor.index original) of
+              Nothing -> true
+              Just nominal -> not (eq nominal.identity application.nominalIdentity)
+            Nothing -> std.some original (\nominal -> and (eq nominal.publicName application.headRef) (not (eq nominal.identity application.nominalIdentity)))
+      if or (gt (length anchored) 1) conflicts then Err "The captured constructor differs from retained nominal ownership; refresh its explicit declaration."
+      else case asbCapturedNominals (tailOr applications) original moved of
+        Err message -> Err message
+        Ok rest ->
+          if gt (length anchored) 0 then Ok rest
+          else Ok (concat [AuthoringSchemeCapturedNominal { path = application.path, identity = application.nominalIdentity, publicName = application.headRef }] rest)
+
+asbNominalPath : (row: AuthoringGenericOccurrence) -> List String
+asbNominalPath row = if row.application then drop 2 row.path else take (sub (length (drop 2 row.path)) 1) (drop 2 row.path)
+
+asbNominalAt : (rows: List AuthoringGenericOccurrence) -> (path: List String) -> List AuthoringGenericOccurrence
+asbNominalAt rows path = filter (\row -> and (not row.annotation) (eq (asbNominalPath row) path)) rows
+
+asbMoveNominals : (old: JsonLogic Any) -> (next: JsonLogic Any) -> (items: List ({ path: List String, identity: String, publicName: String })) -> (index: Number) -> (oldRows: List AuthoringGenericOccurrence) -> (nextRows: List AuthoringGenericOccurrence) -> (origins: List ({ oldPath: List String, nextPath: List String, sameContainer: Boolean })) -> Result String (List AuthoringSchemeEvidencePlan)
+asbMoveNominals old next items index oldRows nextRows origins = case head items of
+  Nothing -> Ok []
+  Just item ->
+    let original = asbNominalAt oldRows item.path
+    if not (eq (length original) 1) then Err "Nominal declaration evidence does not select one original type occurrence."
+    else
+      let originalRow = fromMaybe (AuthoringGenericOccurrence { name = "", path = [], scope = [], application = false, annotation = false, args = [] }) (head original)
+      if or (not (eq originalRow.name item.publicName)) (eq item.identity "") then Err "Nominal declaration evidence disagrees with its original type."
+      else
+        let moved = asbMovePath old next item.path [] "" origins item.path
+        if not moved.ok then Err moved.message
+        else case asbMoveNominals old next (tailOr items) (add index 1) oldRows nextRows origins of
+          Err message -> Err message
+          Ok rest ->
+            if not moved.kept then Ok rest
+            else
+              let candidates = filter (\row -> eq row.name item.publicName) (asbNominalAt nextRows moved.path)
+              if gt (length candidates) 1 then Err "Several nominal occurrences share the edited declaration path."
+              else case head candidates of
+                Nothing -> Ok rest
+                Just selected ->
+                  if not (eq (elem item.publicName originalRow.scope) (elem item.publicName selected.scope)) then Err "The edited type would change the scope of a retained nominal declaration."
+                  else Ok (concat [AuthoringSchemeEvidencePlan { index = index, path = moved.path }] rest)
+
+asbMoveDiagnostics : (old: JsonLogic Any) -> (next: JsonLogic Any) -> (items: List ({ path: List String, code: String, declaration: String, spelling: String, message: String })) -> (index: Number) -> (origins: List ({ oldPath: List String, nextPath: List String, sameContainer: Boolean })) -> Result String (List AuthoringSchemeEvidencePlan)
+asbMoveDiagnostics old next items index origins = case head items of
+  Nothing -> Ok []
+  Just item ->
+    let moved = asbMovePath old next item.path [] "" origins item.path
+    if not moved.ok then Err moved.message
+    else if and moved.kept (not (eufValEq (asbRawAt old item.path) (asbRawAt next moved.path))) then Err "Refresh source diagnostics before replacing the type they describe."
+    else case asbMoveDiagnostics old next (tailOr items) (add index 1) origins of
+      Err message -> Err message
+      Ok rest -> Ok (if moved.kept then concat [AuthoringSchemeEvidencePlan { index = index, path = moved.path }] rest else rest)
+
+@label "Reconcile authored scheme body"
+@description "Preserve explicit binders and remap application, nominal and diagnostic evidence through existing FieldKeys and structural ownership; new bound applications reuse the declared Kind and identity."
+authoringSchemeBodyPlan : (old: JsonLogic Any) -> (next: JsonLogic Any) -> (oldRoots: List AuthoringSchemeRoot) -> (nextRoots: List AuthoringSchemeRoot) -> (variables: List SchemeVar) -> (applications: List AuthoringGenericApplication) -> (nominals: List ({ path: List String, identity: String, publicName: String })) -> (diagnostics: List ({ path: List String, code: String, declaration: String, spelling: String, message: String })) -> (origins: List ({ oldPath: List String, nextPath: List String, sameContainer: Boolean })) -> (captures: List AuthoringSchemeNominalCapture) -> AuthoringSchemeBodyPlan
+authoringSchemeBodyPlan old next oldRoots nextRoots variables applications nominals diagnostics origins captures =
+  if not (agBindersValid variables [] []) then asbRefuse "The existing generic binder identities or kinds are malformed."
+  else case agScanRoots oldRoots of
+    Err message -> asbRefuse message
+    Ok oldRows -> case agApplicationRows applications oldRows variables 0 [] of
+      Err message -> asbRefuse message
+      Ok mirrors -> case agScanRoots nextRoots of
+        Err message -> asbRefuse message
+        Ok nextRows ->
+          if not (agRowsBound nextRows (map (\variable -> variable.sourceName) variables)) then asbRefuse "The edited type uses a type variable without an explicit declaration."
+          else case asbMoveApplications old next applications 0 nextRows origins of
+            Err message -> asbRefuse message
+            Ok moved -> case asbBuildApplications (asbAppRows nextRows) variables moved captures of
+              Err message -> asbRefuse message
+              Ok applicationPlan -> case asbNominalRoots oldRoots of
+                Err message -> asbRefuse message
+                Ok oldNominals -> case asbNominalRoots nextRoots of
+                  Err message -> asbRefuse message
+                  Ok nextNominals -> case asbMoveNominals old next nominals 0 oldNominals nextNominals origins of
+                    Err message -> asbRefuse message
+                    Ok nominalPlan -> case asbMoveDiagnostics old next diagnostics 0 origins of
+                      Err message -> asbRefuse message
+                      Ok diagnosticPlan -> case asbCapturedNominals applicationPlan nominals nominalPlan of
+                        Err message -> asbRefuse message
+                        Ok capturedNominals ->
+                        let priorNames = map (\nominal -> nominal.publicName) nominals
+                        let covered = fold (\valid row ->
+                          if or row.annotation (not (elem row.name priorNames)) then valid
+                          else and valid (or (std.some nominalPlan (\entry -> eq entry.path (asbNominalPath row))) (std.some capturedNominals (\entry -> eq entry.path (asbNominalPath row))))) true nextNominals
+                        if not covered then asbRefuse "A retained nominal reference moved without an established owner path; refresh its source declaration."
+                        else AuthoringSchemeBodyPlan { ok = true, message = "", applications = applicationPlan, nominals = nominalPlan, diagnostics = diagnosticPlan, capturedNominals = capturedNominals }

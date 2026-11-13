@@ -1,0 +1,179 @@
+module engine where
+
+-- Source-scope coordinates are ordinary typed metadata, never function ids.
+-- These helpers locate the already-acquired reader packages without reflecting
+-- again or borrowing the symbolic proposer's evaluation rules. The extraction
+-- checker separately validates source admissions and snapshot coherence.
+
+RecipeSourceNameBinding = RecipeSourceNameBinding identity: String outcome: ReifyOutcome
+
+@category "engine-internal"
+recipeSourceRest : (items: List a) -> List a
+recipeSourceRest items = fromMaybe [] (tail items)
+
+-- Packet equality uses the existing bounded structural judgment. It does not
+-- invoke representation methods or unfold a shared capture DAG without fuel.
+@category "engine-internal"
+recipeSourceDataEqual : (a: x) -> (b: y) -> Bool
+recipeSourceDataEqual a b =
+  -- Two Strings: the bounded judgment answers `Just (a == b)` (its scalar
+  -- arm); ask that directly (a card compares thousands of names). Only
+  -- `isString` is used: in the curated recipe frame `isNumber` also accepts
+  -- numeric-tower records, so it is not a scalar test here.
+  if isString a && isString b then a == b
+  else
+    let comparison = deepEqValueTriStructural a b 4096 128
+    case comparison.verdict of
+      Just true -> true
+      _ -> false
+
+@category "engine-internal"
+recipeSourceNamedIdentity : (source: FunctionSource) -> Maybe String
+recipeSourceNamedIdentity source = case source of
+  NamedDefinition { identity = identity } -> if isString identity && identity != "" then Just identity else Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+recipeSourceOwnerValid : (owner: RecipeSourceOwner) -> Bool
+recipeSourceOwnerValid owner = case owner of
+  RootSource -> true
+  ExtraSource { index = index } -> isNumber index && numberIsFinite index && index >= 0 && floor index == index
+  NamedSource { identity = identity } -> isString identity && identity != ""
+  CapturedSource { parent = parent, capture = capture, path = path } -> recipeSourceOwnerValid parent && isString capture && capture != "" && isArray path && std.all path isString
+  _ -> false
+
+@category "engine-internal"
+recipeSourceKeyPart : (text: String) -> String
+recipeSourceKeyPart text = concat (toString (length text)) (concat ":" text)
+
+@category "engine-internal"
+recipeSourcePathKey : (path: List String) -> String
+recipeSourcePathKey path = case head path of
+  Nothing -> ""
+  Just text -> concat (recipeSourceKeyPart text) (recipeSourcePathKey (recipeSourceRest path))
+
+-- This encoding is used only inside residual correlation coordinates. It is
+-- tagged and length-delimited, so names cannot alias a root or captured scope.
+@category "engine-internal"
+recipeSourceOwnerKey : (owner: RecipeSourceOwner) -> String
+recipeSourceOwnerKey owner = case owner of
+  RootSource -> "R"
+  ExtraSource { index = index } -> concat "E" (recipeSourceKeyPart (toString index))
+  NamedSource { identity = identity } -> concat "N" (recipeSourceKeyPart identity)
+  CapturedSource { parent = parent, capture = capture, path = path } -> concat "C" (concat (recipeSourceKeyPart (recipeSourceOwnerKey parent)) (concat (recipeSourceKeyPart capture) (recipeSourcePathKey path)))
+
+@category "engine-internal"
+recipeSourceCapturedOwner : (observation: RecipeCallableObservation) -> RecipeSourceOwner
+recipeSourceCapturedOwner observation = CapturedSource { parent = observation.owner, capture = observation.capture, path = observation.path }
+
+@category "engine-internal"
+recipeSourceDirectBindings : (outcome: ReifyOutcome) -> List RecipeSourceNameBinding
+recipeSourceDirectBindings outcome = case outcome of
+  Reified { package = package } -> case recipeSourceNamedIdentity package.source of
+    Just identity -> [RecipeSourceNameBinding { identity = identity, outcome = outcome }]
+    Nothing -> []
+  OpaqueBody { identity = identity } -> if isString identity && identity != "" then [RecipeSourceNameBinding { identity = identity, outcome = outcome }] else []
+  _ -> []
+
+@category "engine-internal"
+recipeSourceDependencyBindings : (dependency: ReifiedDependency) -> List RecipeSourceNameBinding
+recipeSourceDependencyBindings dependency = case dependency.outcome of
+  Reified { package = package } -> case recipeSourceNamedIdentity package.source of
+    Nothing -> []
+    Just actual ->
+      let direct = recipeSourceDirectBindings dependency.outcome
+      if dependency.identity == actual || not (isString dependency.identity) || dependency.identity == "" then direct
+      else concat [RecipeSourceNameBinding { identity = dependency.identity, outcome = dependency.outcome }] direct
+  _ -> recipeSourceDirectBindings dependency.outcome
+
+@category "engine-internal"
+recipeSourceOutcomeBindings : (outcome: ReifyOutcome) -> List RecipeSourceNameBinding
+recipeSourceOutcomeBindings outcome = case outcome of
+  Reified { package = package } -> fold (\acc dependency -> concat acc (recipeSourceDependencyBindings dependency)) (recipeSourceDirectBindings outcome) package.dependencies
+  _ -> recipeSourceDirectBindings outcome
+
+@category "engine-internal"
+recipeSourceAllBindings : (snapshot: RecipeAnalysisSnapshot) -> List RecipeSourceNameBinding
+recipeSourceAllBindings snapshot =
+  let root = recipeSourceOutcomeBindings (Reified { package = snapshot.recipe })
+  let extras = fold (\acc outcome -> concat acc (recipeSourceOutcomeBindings outcome)) root snapshot.functions
+  let withRule = concat extras (recipeSourceOutcomeBindings snapshot.rule)
+  fold (\acc observation -> concat acc (recipeSourceOutcomeBindings observation.outcome)) withRule snapshot.callables
+
+@category "engine-internal"
+recipeSourceSameOutcome : (a: ReifyOutcome) -> (b: ReifyOutcome) -> Bool
+recipeSourceSameOutcome a b = case a of
+  Reified { package = left } -> case b of
+    Reified { package = right } -> recipeSourceDataEqual (mapSet left "dependencies" []) (mapSet right "dependencies" [])
+    _ -> false
+  _ -> recipeSourceDataEqual a b
+
+-- A partial's base identity is provenance, not the partial's global name. Only
+-- a genuine NamedDefinition can supply a named source package. All acquired
+-- root graphs participate, including callback/rule dependencies.
+@category "engine-internal"
+recipeSourceNamedOutcome : (snapshot: RecipeAnalysisSnapshot) -> (identity: String) -> ReifyOutcome
+recipeSourceNamedOutcome snapshot identity =
+  if not (isString identity) || identity == "" then Unavailable
+  else
+    let matches = map (\row -> row.outcome) (filter (\row -> row.identity == identity) (recipeSourceAllBindings snapshot))
+    case head matches of
+      Nothing -> Unavailable
+      Just first -> if std.all matches (recipeSourceSameOutcome first) then first else Unavailable
+
+@category "engine-internal"
+recipeSourcePackage : (snapshot: RecipeAnalysisSnapshot) -> (owner: RecipeSourceOwner) -> Maybe ReifiedFunction
+recipeSourcePackage snapshot owner = case owner of
+  RootSource -> Just snapshot.recipe
+  ExtraSource { index = index } ->
+    if not (recipeSourceOwnerValid owner) || index >= length snapshot.functions then Nothing
+    else case at snapshot.functions index of
+      Reified { package = package } -> Just package
+      _ -> Nothing
+  NamedSource { identity = identity } -> case recipeSourceNamedOutcome snapshot identity of
+    Reified { package = package } -> Just package
+    _ -> Nothing
+  CapturedSource { parent = parent, capture = capture, path = path } ->
+    let matches = filter (\observation -> recipeSourceDataEqual observation.owner parent && observation.capture == capture && recipeSourceDataEqual observation.path path) snapshot.callables
+    if length matches != 1 then Nothing
+    else
+      let observation = at matches 0
+      case observation.outcome of
+        Reified { package = package } -> Just package
+        _ -> Nothing
+
+@category "engine-internal"
+recipeSourceExactOutcome : (outcome: ReifyOutcome) -> (source: ReifiedFunction) -> Bool
+recipeSourceExactOutcome outcome source = case outcome of
+  Reified { package = package } -> recipeSourceDataEqual package source
+  _ -> false
+
+@category "engine-internal"
+recipeSourceExtraOwners : (functions: List ReifyOutcome) -> (source: ReifiedFunction) -> (index: Nat) -> List RecipeSourceOwner
+recipeSourceExtraOwners functions source index = case head functions of
+  Nothing -> []
+  Just outcome -> concat (if recipeSourceExactOutcome outcome source then [ExtraSource { index = index }] else []) (recipeSourceExtraOwners (recipeSourceRest functions) source (index + 1))
+
+-- The original root never changes while checking an extra application. If a
+-- source alone cannot distinguish multiple acquired contexts, refuse instead
+-- of selecting one context's captured-callable observations by accident.
+@category "engine-internal"
+recipeSourceApplicationOwner : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> Maybe RecipeSourceOwner
+recipeSourceApplicationOwner snapshot source =
+  let root = if recipeSourceDataEqual snapshot.recipe source then [RootSource] else []
+  let extras = recipeSourceExtraOwners snapshot.functions source 0
+  let captures = filter (\observation -> recipeSourceExactOutcome observation.outcome source) snapshot.callables
+  let owners = concat root (concat extras (map recipeSourceCapturedOwner captures))
+  if length owners == 1 then head owners else Nothing
+
+-- Ordered batch callers already know which acquired extra they supplied.
+-- The coordinate selects that context only when its entire package agrees;
+-- it never substitutes another source for the requested application.
+@category "engine-internal"
+recipeSourceApplicationOwnerAt : (snapshot: RecipeAnalysisSnapshot) -> (source: ReifiedFunction) -> (index: Nat) -> Maybe RecipeSourceOwner
+recipeSourceApplicationOwnerAt snapshot source index =
+  let owner = ExtraSource { index = index }
+  if not (recipeSourceOwnerValid owner) then Nothing
+  else case recipeSourcePackage snapshot owner of
+    Nothing -> Nothing
+    Just package -> if recipeSourceDataEqual package source then Just owner else Nothing

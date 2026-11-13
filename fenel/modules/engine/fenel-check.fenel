@@ -1,0 +1,772 @@
+module engine where
+
+-- =========================================================================
+-- fenel-check.fenel — `inferExprType`, the FORWARD inference walk (bottom-up
+-- abstract interpretation over a JSON-Logic expression tree).
+-- unified-static-analysis Phase 3b-3 (brief:
+-- `workstreams/unified-static-analysis/briefs/phase-3b-3-inferexprtype-walk.md`).
+--
+-- THE PORT (the inference hot-path, slice 3 — the WALK that COMPOSES the two
+-- transfer LEAVES). Slices 1–2 ported the leaves: `propagate` (forward) +
+-- `invert` (backward), both marker-native in this same `engine` module. This
+-- slice ports the bottom-up walk that USES `propagate` at every arith / compare
+-- / min-max / cat / unary node: literals → point sets, `var` → env lookup,
+-- operators → `propagate`, `if`/array/`merge` → union-builds. The ~170 LOC of
+-- TS abstract interpretation (`inferNode` / `inferOp`, `fenel-check.ts`) retire;
+-- the TS delegate keeps ONLY the Expression→ExprMarker + env marshal seam + the
+-- ONE final `normalize`. Net: legacy TS inference retired, Fenel up — AND, since
+-- the arith/compare/min-max/cat arms call the Fenel `propagate` BY BARE NAME
+-- over markers (same module, zero re-marshalling between the walk and the
+-- leaves), the WHOLE tree walks in ONE Fenel dispatch (the latency win Phase 2
+-- projected, now realized on the live editor path).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE `$`-KEY BARRIER — the EXPRESSION side only (decide-substrate Phase 1
+-- Stage E retired the SET side). A `.fenel` body cannot walk raw JSON-Logic,
+-- because its keys (`var`, `+`, `if`, `call`, …) ARE evaluator ops (a `case
+-- node of {var:"x"} -> …` would EVALUATE a variable lookup, not read
+-- structure). So the TS delegate still marshals the Expression into a `$`-free,
+-- op-free ExprMarker the body walks structurally. The SETS, however, are now
+-- the canonical registered `$tag` `Se*` SetExpr END-TO-END: the env assoc list
+-- carries real Se* values (`setExprToTag` at the TS boundary), the body builds
+-- Se* constructors, and the propagate/invert leaf calls compose Se*-native (the
+-- `Sm*` SetMarker vocabulary + the `marshalSet`/`unmarshalSet` round-trip are
+-- RETIRED; `seTag`/`loOf`/`hiOf` — propagate.fenel — carry the old dispatch).
+--
+-- ExprMarker (TS-built, dispatched by the `tag` field — the op-free mirror of a
+-- JSON-Logic Expression, op string kept VERBATIM so the switch mirrors the
+-- legacy `inferOp` arm-for-arm; STAYS — it is the EXPR barrier, not a set):
+--   { tag = "Lit", value = v }                              — number/string/boolean/null literal → point set
+--   { tag = "Var", name, hasDefault, default }              — {var:[name, default?]} → env lookup (default when unbound)
+--   { tag = "Arr", items = [ExprMarker] }                   — array literal → union of element types
+--   { tag = "Op", op = String, args = [ExprMarker] }        — {op:[args]} — op kept verbatim
+--
+-- env (TS-built): a `$`-free assoc list [{ name = String, set = SetExpr }] —
+-- the variable→type bindings the `var` arm searches by name (`set` is canonical
+-- `$tag` Se*).
+--
+-- NORMALIZATION (D-3b-3-2 — the fallback path HELD). The brief's PRIMARY bet
+-- (defer ALL normalization to the TS delegate's ONE final normalize) cleared the
+-- distributive ops but FAILED on `min`/`max`: the leaf `propagate` returns
+-- UN-normalized sets, so `interval ⊖ enum` stays a union-of-point-intervals
+-- where the legacy's per-step normalize had merged it into a single interval,
+-- and `propMinMax`'s `propAllIntervals` guard then rejects it (⇒ $all, not the
+-- tight interval). Arithmetic / comparison distribute over unions natively, so
+-- they were fine; min/max is the lone non-distributive consumer. So this body
+-- reproduces the legacy's STEP-WISE normalize: every `propagate` output and every
+-- union-build is run through `normMarker` (= the Fenel `setAlgebraNormalize`,
+-- called directly over Se* since Stage E), in-Fenel, so the whole walk is still
+-- ONE dispatch. The TS delegate's final `normalize` is then idempotent.
+--
+-- NO ENTITY DECLS (the propagate.fenel / assignable.fenel audit-green
+-- invariant): ExprMarker is a plain record, NOT a registered ADT; the sets ARE
+-- the registered Se* ADT (no new decls) — the entity oracle + law count move
+-- +0, the audit stays exit-0. Engine FNS are safe (law +0, lock +0).
+-- =========================================================================
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- inferExprType — the public entry. Dispatch on the ExprMarker tag: literal →
+-- point set, var → env lookup, array → union of element types, op → inferOp.
+-- The TS delegate marshals the Expression shape, canonicalizes env SetExpr
+-- values, and normalizes the canonical result.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Infer expr type"
+@description "Forward inference: bottom-up abstract interpretation of a JSON-Logic expression (received as an ExprMarker) under a variable→canonical-SetExpr environment, producing the registered Se* SetExpr directly. Literals become SeEnum point sets; variables look up the env (falling back to a default arg, then SeAll); operators propagate through the Fenel transfer leaf; if/array/merge build canonical unions. The TS delegate owns only Expression→ExprMarker transport, env canonicalization, and the final normalize. unified-static-analysis Phase 3b-3 / floor-kernel Phase 4."
+@tags "engine" "inference" "unified-static-analysis" "phase-3b-3"
+inferExprType : (m: a) -> (env: b) -> (tbl: c) -> d
+inferExprType m env tbl =
+  if eq m.tag "Lit" then SeEnum { values = appendItem m.value [] }
+  else if eq m.tag "Var" then inferVar m env tbl
+  else if eq m.tag "Arr" then inferArr m.items env tbl
+  else if eq m.tag "Op" then inferOp m.op m.args env tbl
+  else SeAll
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- var — env lookup, then the optional default arg, then $all.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: var"
+@description "Resolve a variable marker: look the name up in the env; if bound, return its canonical SetExpr; else if the var carries a default arg, infer that; else SeAll. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferVar : (m: a) -> (env: b) -> (tbl: c) -> d
+inferVar m env tbl =
+  case envLookup m.name env of
+    Just s -> s
+    Nothing -> if m.hasDefault then inferExprType m.default env tbl else SeAll
+
+@label "infer: env lookup"
+@description "Search the env assoc list [{name, set}] for a binding by name, returning Just its canonical SetExpr or Nothing. The record envelope is plain transport; each set is registered Se*. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+envLookup : (name: String) -> (env: a) -> b
+envLookup name env =
+  case head env of
+    Nothing -> Nothing
+    Just e ->
+      if eq e.name name then Just e.set
+      else
+        case tail env of
+          Nothing -> Nothing
+          Just rest -> envLookup name rest
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- array — union of element types (empty ⇒ SeNone, mirroring the legacy
+-- $union/$none split).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: array"
+@description "Infer an array literal: empty ⇒ SeNone; else a canonical SeUnion of each element's inferred type, normalized through normMarker. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferArr : (items: a) -> (env: b) -> (tbl: c) -> d
+inferArr items env tbl =
+  if eq (length items) 0 then SeNone
+  else normMarker (SeUnion { branches = map (\it -> inferExprType it env tbl) items })
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- inferOp — switch on the raw JSON-Logic op string, mirroring the legacy
+-- `inferOp` arm-for-arm. (`var` never reaches here — the TS marshal routes
+-- {var:…} to a Var marker.)
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: op"
+@description "Infer an operator application from its op string + already-marshalled argument markers: arithmetic (+ - * / %, left-fold through propagate), comparison (> >= < <= == != === !==, binary propagate), and/or/in ⇒ {true,false}, !/not ⇒ propagate negation, if ⇒ then/else union, cat ⇒ string-concat fold, substr ⇒ String, merge ⇒ union of inputs, map ⇒ mapper output, filter ⇒ element type, min/max ⇒ variadic propagate. The unrecognised-op tail resolves a function application's RETURN type through the threaded fnId → TraversalType + arity table and typeToSetExpr when saturated; misses and partial applications remain conservatively unconstrained. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3" "phase-3b-6"
+@category "engine-internal"
+inferOp : (op: String) -> (args: a) -> (env: b) -> (tbl: c) -> d
+inferOp op args env tbl =
+  if propIsArith op then inferArith op args env tbl
+  else if propIsCmp op then inferCompare op args env tbl
+  else if eq op "and" then propEnumTF op
+  else if eq op "or" then propEnumTF op
+  else if eq op "!" then inferNot args env tbl
+  else if eq op "not" then inferNot args env tbl
+  else if eq op "if" then inferIf args env tbl
+  else if eq op "cat" then inferCat args env tbl
+  else if eq op "substr" then SeRef { handle = "String" }
+  else if eq op "in" then propEnumTF op
+  else if eq op "merge" then normMarker (SeUnion { branches = map (\a -> inferExprType a env tbl) args })
+  else if eq op "map" then inferMap args env tbl
+  else if eq op "filter" then inferFilter args env tbl
+  else if propIsMinMax op then propN op (map (\a -> inferExprType a env tbl) args)
+  else if eq op "call" then inferCall args env tbl
+  else if eq op "pipe" then inferPipe args env tbl
+  else inferApplied op args env tbl
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- arithmetic — unary `-` ⇒ negate; unary other ⇒ identity; ≥2 ⇒ left-fold the
+-- inferred input markers through the Fenel `propagate` (binary per step).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: arith"
+@description "Infer + - * / %: one arg ⇒ unary (`-` negates, others are identity); ≥2 args ⇒ left-fold the inferred inputs through the binary propagate transfer. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferArith : (op: String) -> (args: a) -> (env: b) -> (tbl: c) -> d
+inferArith op args env tbl =
+  if eq (length args) 1 then inferArithUnary op args env tbl
+  else inferArithFold op (map (\a -> inferExprType a env tbl) args)
+
+@label "infer: arith unary"
+@description "Unary arithmetic: `-` ⇒ propagate negate over the first arg; any other op ⇒ the first arg's type unchanged (the legacy unary-+/*/etc identity). Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferArithUnary : (op: String) -> (args: a) -> (env: b) -> (tbl: c) -> d
+inferArithUnary op args env tbl =
+  if eq op "-" then propN "negate" (appendItem (inferNth args 0 env tbl) [])
+  else inferNth args 0 env tbl
+
+@label "infer: arith fold"
+@description "Left-fold a non-empty list of inferred input markers, seeding from the first; each step applies the binary propagate transfer. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferArithFold : (op: String) -> (its: a) -> b
+inferArithFold op its =
+  case head its of
+    Nothing -> SeAll
+    Just i0 ->
+      case tail its of
+        Nothing -> i0
+        Just rest -> inferArithFoldGo op i0 rest
+
+@label "infer: arith fold go"
+@description "Accumulator-threaded left fold: propagate op [acc, t] for each remaining input t. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferArithFoldGo : (op: String) -> (acc: a) -> (its: a) -> b
+inferArithFoldGo op acc its =
+  case head its of
+    Nothing -> acc
+    Just t ->
+      let acc2 = propN op (appendItem t (appendItem acc []))
+      case tail its of
+        Nothing -> acc2
+        Just rest -> inferArithFoldGo op acc2 rest
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- comparison — binary ⇒ propagate; any other arity ⇒ the undecided {true,false}.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: compare"
+@description "Infer a comparison op: exactly two args ⇒ the binary propagate transfer over their inferred types; any other arity ⇒ the undecided {true,false}. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferCompare : (op: String) -> (args: a) -> (env: b) -> (tbl: c) -> d
+inferCompare op args env tbl =
+  let its = map (\a -> inferExprType a env tbl) args
+  if eq (length its) 2 then propN op its
+  else propEnumTF op
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- boolean negation — propagate "!" over the first arg; no args ⇒ {true,false}.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: not"
+@description "Infer !/not: ≥1 arg ⇒ propagate boolean negation over the first arg's type; no args ⇒ the undecided {true,false}. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferNot : (args: a) -> (env: b) -> (tbl: c) -> d
+inferNot args env tbl =
+  if gte (length args) 1 then propN "!" (appendItem (inferNth args 0 env tbl) [])
+  else propEnumTF args
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- conditional — 3-arg ⇒ then/else union; 2-arg ⇒ then; else ⇒ $all. (No
+-- condition-narrowing here — that's the dormant inferNodeNarrow, out of scope.)
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: if"
+@description "Infer if: ≥3 args ⇒ the union of the then-branch and else-branch types; exactly 2 ⇒ the then-branch; else ⇒ $all. No condition-narrowing (the dormant inferNodeNarrow handles that). Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferIf : (args: a) -> (env: b) -> (tbl: c) -> d
+inferIf args env tbl =
+  if gte (length args) 3 then normMarker (SeUnion { branches = appendItem (inferNth args 2 env tbl) (appendItem (inferNth args 1 env tbl) []) })
+  else if eq (length args) 2 then inferNth args 1 env tbl
+  else SeAll
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- cat — empty ⇒ {""}; single ⇒ that element (reduce-with-no-seed identity);
+-- ≥2 ⇒ the variadic propagate "cat" fold.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: cat"
+@description "Infer cat (string concatenation): no args ⇒ the empty-string point set {\"\"}; one arg ⇒ that element unchanged (the reduce-no-seed identity); ≥2 ⇒ the variadic propagate cat fold. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferCat : (args: a) -> (env: b) -> (tbl: c) -> d
+inferCat args env tbl =
+  let its = map (\a -> inferExprType a env tbl) args
+  if eq (length its) 0 then SeEnum { values = appendItem "" [] }
+  else if eq (length its) 1 then propFirstOf its
+  else propN "cat" its
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- array ops — map (mapper output), filter (element type); others fall to $all.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: map"
+@description "Infer map: ≥2 args ⇒ the inferred type of the mapper expression (arg[1]); else ⇒ $all. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferMap : (args: a) -> (env: b) -> (tbl: c) -> d
+inferMap args env tbl =
+  if gte (length args) 2 then inferNth args 1 env tbl
+  else SeAll
+
+@label "infer: filter"
+@description "Infer filter: ≥1 arg ⇒ the inferred element type (arg[0]); else ⇒ $all. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferFilter : (args: a) -> (env: b) -> (tbl: c) -> d
+inferFilter args env tbl =
+  if gte (length args) 1 then inferNth args 0 env tbl
+  else SeAll
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- nth-arg helpers — index into the arg-marker list, inferring the element (out
+-- of range ⇒ $all).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "infer: nth arg"
+@description "Index into the arg-marker list and infer the element's type; out of range ⇒ $all. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+inferNth : (args: a) -> (i: Number) -> (env: b) -> (tbl: c) -> d
+inferNth args i env tbl =
+  case nthArg args i of
+    Nothing -> SeAll
+    Just e -> inferExprType e env tbl
+
+@label "infer: nth of list"
+@description "The i-th element of a list as a Maybe (Nothing when out of range). Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+nthArg : (xs: a) -> (i: Number) -> b
+nthArg xs i =
+  if eq i 0 then head xs
+  else
+    case tail xs of
+      Nothing -> Nothing
+      Just rest -> nthArg rest (sub i 1)
+
+
+-- =========================================================================
+-- application return-types (unified-static-analysis Phase 3b-6 — the LAST
+-- inference-port slice). The forward walk's `call` / key-as-fnId / `pipe` arms
+-- used to stub `$all` because the body had no view of what a called function
+-- RETURNS. The TS seam now marshals the registry's function specs into a
+-- `$`-free return-table `tbl` — an assoc list `[{ key, ret, arity }]` where
+-- `key` is a dispatch name (the slug id OR the Codeable codeName — the strings
+-- that appear as a `{call:[name,…]}` head or a key-as-fnId op), `ret` is the
+-- declared `returns` projected once to the shared TraversalType, and `arity` is
+-- the param count. A SATURATED application (arg-count ≥ arity) resolves to
+-- `typeToSetExpr ret` (the already-Fenel lowering, called bare-name); a miss /
+-- under-application / a return that lowers to $all all fall through to $all —
+-- never worse than the legacy stub. This is a capability ADD; the known-op
+-- switch above still wins for every std arith / compare / cat / min-max op (the
+-- table is the `other` tail, BELOW the switch — `{add:…}` style std ops keep
+-- their propagate transfer).
+-- =========================================================================
+
+@label "infer: call"
+@description "Infer a {call:[fnId, ...args]} application: the fnId rides as args[0] (a Lit string), the remaining args are the actual arguments. Resolve the fnId's declared return-type from the threaded return-table when the call is saturated (actual-arg-count ≥ arity); a non-Lit head / miss / under-application ⇒ $all. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-6"
+@category "engine-internal"
+inferCall : (args: a) -> (env: b) -> (tbl: c) -> d
+inferCall args env tbl =
+  case head args of
+    Nothing -> SeAll
+    Just fnM ->
+      if eq fnM.tag "Lit" then lookupReturn fnM.value (sub (length args) 1) tbl
+      else SeAll
+
+@label "infer: applied (key-as-fnId)"
+@description "Infer a key-as-fnId application {fnId:[...args]} where the op string IS the fnId and every arg is an actual argument: resolve the fnId's declared return-type from the threaded return-table when saturated (arg-count ≥ arity); miss / under-application ⇒ $all. This is the unrecognised-op tail — placed AFTER the known arith/compare/cat/min-max/map/filter/merge/if switch so a std op never resolves through the table. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-6"
+@category "engine-internal"
+inferApplied : (op: String) -> (args: a) -> (env: b) -> (tbl: c) -> d
+inferApplied op args env tbl = lookupReturn op (length args) tbl
+
+@label "infer: pipe"
+@description "Infer a {pipe:[stage1, stage2, …]} application: the result type is the LAST stage's return-type. When the last stage is a bare fnId (a Lit string), resolve it from the return-table as a 1-arg application (the piped value is its single argument); an empty pipe / a last stage that is not a bare fnId (a lambda / partial-application marker) ⇒ $all. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-6"
+@category "engine-internal"
+inferPipe : (args: a) -> (env: b) -> (tbl: c) -> d
+inferPipe args env tbl =
+  case lastOf args of
+    Nothing -> SeAll
+    Just lastM ->
+      if eq lastM.tag "Lit" then lookupReturn lastM.value 1 tbl
+      else SeAll
+
+@label "infer: lookup return-type"
+@description "Look a fnId up in the return-table and, when the application is saturated, project its return TraversalType through typeToSetProjection; a miss, under-applied call, or degraded projection yields SeAll. Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-6"
+@category "engine-internal"
+lookupReturn : (fnId: a) -> (argc: Number) -> (tbl: b) -> c
+lookupReturn fnId argc tbl =
+  case tblLookup fnId tbl of
+    Nothing -> SeAll
+    Just spec ->
+      if gte argc spec.arity
+      then
+        let projection = typeToSetProjection spec.ret
+        if projection.degraded then SeAll else projection.set
+      else SeAll
+
+@label "infer: return-table lookup"
+@description "Look a fnId up in the return-table INDEX (a key→{key, ret, arity} record) via the O(1) opaque-map `mapGet` native (the parser-substrate 7h-S2 perf branch — the pure assoc-list scan is the conceptual definition; the JS-object index is the rep). Returns Just the entry or Nothing. decide-substrate Phase 1 Stage E fix: the previous per-entry linear-scan recursion was O(|registry|) STACK-deep in the interpreter (~1400 frames) and overflowed the bun-test worker stack on every table MISS (any unknown op / `$`-keyed literal sub-expression) — a pre-existing breakage carried since the registry outgrew the stack; mapGet makes every lookup constant-time AND constant-stack (the editor keystroke path win). Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-6" "decide-substrate" "phase-1"
+@category "engine-internal"
+tblLookup : (fnId: a) -> (tbl: b) -> c
+tblLookup fnId tbl = mapGet tbl fnId
+
+@label "infer: last of list"
+@description "The last element of a list as a Maybe (Nothing for an empty list). Internal helper used by inferPipe to read the final pipe stage."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-6"
+@category "engine-internal"
+lastOf : (xs: a) -> b
+lastOf xs =
+  case head xs of
+    Nothing -> Nothing
+    Just h ->
+      case tail xs of
+        Nothing -> Just h
+        Just rest -> if eq (length rest) 0 then Just h else lastOf rest
+
+
+-- =========================================================================
+-- normMarker — the STEP-WISE normalize point (D-3b-3-2 fallback). Reproduces
+-- the legacy's per-step `normalize` so `min`/`max`'s non-distributive
+-- `propAllIntervals` guard sees merged intervals, not union-of-points.
+-- decide-substrate Phase 1 Stage E: the body is Se*-native now, so the old
+-- SetMarker↔Se* bridge (`smToSe` / `seToSm` — the in-Fenel twin of the TS
+-- unmarshalSet∘marshalSet round-trip) is DELETED; normMarker IS
+-- `setAlgebraNormalize` (kept as the named normalize point — every union-build
+-- and propagate output routes through it, keeping the walk ONE dispatch).
+-- =========================================================================
+
+@label "infer: normalize marker"
+@description "Normalize an Se* SetExpr in-body via the Fenel setAlgebraNormalize (the legacy per-step normalize point — D-3b-3-2). The Sm* bridge (smToSe/seToSm) is retired; the body is Se*-native (decide-substrate Phase 1 Stage E). Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "decide-substrate" "phase-1"
+@category "engine-internal"
+normMarker : (m: a) -> b
+normMarker m = setAlgebraNormalize m
+
+@label "infer: normalize via propagate"
+@description "Apply the binary/variadic propagate transfer then normalize the result (the legacy per-propagate normalize point). Internal helper."
+@tags "engine" "internal" "inference" "unified-static-analysis" "phase-3b-3"
+@category "engine-internal"
+propN : (op: String) -> (inputs: a) -> b
+propN op inputs = normMarker (propagate op inputs)
+
+
+-- =========================================================================
+-- liquid-type NARROWING (unified-static-analysis Phase 3b-3c; brief:
+-- `workstreams/unified-static-analysis/briefs/phase-3b-3c-liquid-narrowing.md`).
+--
+-- THE PORT (the LAST pure-logic holdout in `fenel-check.ts`). Given an `if`
+-- condition (`age > 18`) and the current variable→type env, compute the
+-- ADDITIONAL constraints that hold in the true-branch (`age: ℤ ∩ (18,∞)`) and the
+-- false-branch (`age: ℤ ∩ (-∞,18]`). DORMANT today (only the index.ts re-export
+-- consumes it) but a genuine UNFINISHED feature — the obvious next editor
+-- capability (branch-sensitive diagnostics). Fenel-first ⇒ port it now so the
+-- whole `fenel-check.ts` file collapses to a marshal seam (no abstract-
+-- interpretation TS survives).
+--
+-- THE CORE REFORMULATION (D-3b-3c-2): the legacy MUTATES two `Map`s; this body
+-- threads an immutable env PAIR `{ trueEnv, falseEnv }` (each branch env is the
+-- SAME assoc list [{ name, set: canonical SetExpr }] the inferExprType `var` arm
+-- reads), each helper RETURNING the updated pair. `and` = left-fold the pair
+-- through each arg; `or` = left-fold ONLY the falseEnv (the true-branch can't
+-- narrow precisely — ≥1 of N true); `not`/`!` = swap-recurse-swap.
+--
+-- REUSE: the condition is the SAME JSON-Logic the inferExprType walk reads, so it
+-- arrives as the SAME ExprMarker (TS `marshalExpr`); the intersect-with-existing
+-- reuses `normMarker` (above); `envLookup` (above) reads a branch env; the
+-- constraints are the same canonical Se* values propagate/invert build. The
+-- only net-new TS is a trivial `unmarshalEnv` (assoc list → Map). NO entity decls.
+-- =========================================================================
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- narrowFromCondition — the public entry. Seed both branch envs to the input
+-- env, thread the PAIR through narrowInto. The TS delegate marshals the
+-- condition → ExprMarker + the env → assoc list in, unmarshals each returned
+-- branch env (assoc list → Map) out.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Narrow from condition"
+@description "Liquid-type narrowing: given an if-condition (as an ExprMarker) and a variable→type env (the `$`-free assoc list), compute the narrowed true-branch and false-branch envs as a pair { trueEnv, falseEnv } (both `$`-free assoc lists). Comparisons against a numeric literal tighten the variable's interval/enum (age > 18 ⇒ true (18,∞) / false (-∞,18]); == ⇒ the {lit} / complement pair); `and` narrows each conjunct into both branches; `or` narrows only the false-branch (each disjunct false); `!`/`not` swaps the branches. Two-variable comparisons + non-numeric literals are a no-op. The port of fenel-check's narrowFromCondition onto immutable env-pair threading. unified-static-analysis Phase 3b-3c."
+@tags "engine" "inference" "narrowing" "unified-static-analysis" "phase-3b-3c"
+narrowFromCondition : (cond: a) -> (env: b) -> c
+narrowFromCondition cond env = narrowInto cond { trueEnv = env, falseEnv = env }
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- narrowInto — dispatch on the ExprMarker. Only `Op` markers narrow; Lit / Var /
+-- Arr pass the pair through unchanged (the legacy's "not a single-key op object"
+-- + "var/unknown op falls through" no-ops).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "narrow: into"
+@description "Narrow a condition ExprMarker into the env pair: Op markers dispatch by op string (comparisons / and / or / !/not); everything else is a no-op. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowInto : (m: a) -> (pair: b) -> c
+narrowInto m pair =
+  if eq m.tag "Op" then narrowOp m.op m.args pair
+  else pair
+
+@label "narrow: op"
+@description "Dispatch a narrowing op: the six comparison ops ⇒ narrowCmpArm; and ⇒ fold each conjunct into both branches; or ⇒ fold each disjunct's false-narrowing into falseEnv; !/not ⇒ swap-recurse-swap; any other op ⇒ no-op. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowOp : (op: String) -> (args: a) -> (pair: b) -> c
+narrowOp op args pair =
+  if narrowIsCmp op then narrowCmpArm op args pair
+  else if eq op "and" then narrowAndFold args pair
+  else if eq op "or" then narrowOrArm args pair
+  else if eq op "!" then narrowNot args pair
+  else if eq op "not" then narrowNot args pair
+  else pair
+
+@label "narrow: is comparison?"
+@description "True for the six narrowable comparison ops (> >= < <= == ===). NOTE: !=/!== are deliberately EXCLUDED — the legacy narrowComparison switch covers only these six. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowIsCmp : (op: String) -> Bool
+narrowIsCmp op =
+  if eq op ">" then True
+  else if eq op ">=" then True
+  else if eq op "<" then True
+  else if eq op "<=" then True
+  else if eq op "==" then True
+  else if eq op "===" then True
+  else False
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- comparison — arity-2 only; var-vs-numeric-literal (either side) narrows, else
+-- no-op (two-var comparisons are the legacy's documented "future work").
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "narrow: comparison arm"
+@description "Narrow a comparison op application: exactly two args ⇒ narrowComparison over the two arg markers; any other arity ⇒ no-op. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowCmpArm : (op: String) -> (args: a) -> (pair: b) -> c
+narrowCmpArm op args pair =
+  if eq (length args) 2 then
+    case nthArg args 0 of
+      Nothing -> pair
+      Just l ->
+        case nthArg args 1 of
+          Nothing -> pair
+          Just r -> narrowComparison op l r pair
+  else pair
+
+@label "narrow: comparison"
+@description "If the left arg is a var and the right a numeric literal ⇒ applyComparisonNarrow; else if the right is a var and the left a numeric literal ⇒ flipOp then applyComparisonNarrow; else (two vars / non-numeric / two literals) ⇒ no-op. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowComparison : (op: String) -> (left: a) -> (right: a) -> (pair: b) -> c
+narrowComparison op left right pair =
+  if isVarM left then narrowLeftVar op left.name right pair
+  else if isVarM right then narrowRightVar op left right.name pair
+  else pair
+
+@label "narrow: left var"
+@description "left=var, op, right: narrow when the right arg is a numeric literal, applying the op directly. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowLeftVar : (op: String) -> (varName: String) -> (right: a) -> (pair: b) -> c
+narrowLeftVar op varName right pair =
+  if isNumLit right then applyComparisonNarrow op varName right.value pair
+  else pair
+
+@label "narrow: right var"
+@description "left, op, right=var: narrow when the left arg is a numeric literal, applying the flipped op (lit > var ≡ var < lit). Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowRightVar : (op: String) -> (left: a) -> (varName: String) -> (pair: b) -> c
+narrowRightVar op left varName pair =
+  if isNumLit left then applyComparisonNarrow (flipOp op) varName left.value pair
+  else pair
+
+@label "narrow: is var marker?"
+@description "True when an ExprMarker is a Var. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+isVarM : (m: a) -> Bool
+isVarM m = eq m.tag "Var"
+
+@label "narrow: is numeric literal marker?"
+@description "True when an ExprMarker is a Lit whose value is a number (the legacy `typeof lit === 'number'` guard). Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+isNumLit : (m: a) -> Bool
+isNumLit m = if eq m.tag "Lit" then isNumber m.value else False
+
+@label "narrow: flip op"
+@description "Flip a comparison op for the literal-on-the-left case (> ↔ <, >= ↔ <=, ==/=== unchanged). Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+flipOp : (op: String) -> String
+flipOp op =
+  if eq op ">" then "<"
+  else if eq op ">=" then "<="
+  else if eq op "<" then ">"
+  else if eq op "<=" then ">="
+  else op
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- applyComparisonNarrow — `existing = envLookup varName trueEnv` (default SeAll;
+-- the legacy reads the TRUE env for BOTH constraints), build the true / false
+-- canonical constraint SetExprs, then upsert each var as normMarker(existing ∩ c) into
+-- its branch env.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "narrow: apply comparison"
+@description "Upsert a variable's narrowed type into both branch envs from a comparison against a numeric literal: existing = the var's current trueEnv binding (default $all); trueEnv gets normMarker(existing ∩ trueConstraint), falseEnv gets normMarker(existing ∩ falseConstraint). The constraints: > ⇒ true (lit,∞) / false (-∞,lit]; >= ⇒ true [lit,∞) / false (-∞,lit); < / <= symmetric; ==/=== ⇒ true {lit} / false (all ∖ {lit}). Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+applyComparisonNarrow : (op: String) -> (varName: String) -> (lit: Number) -> (pair: a) -> b
+applyComparisonNarrow op varName lit pair =
+  let existing = case envLookup varName pair.trueEnv of
+                   Just s -> s
+                   Nothing -> SeAll
+  let trueC = narrowTrueC op lit
+  let falseC = narrowFalseC op lit
+  let newTrue = envSet varName (normMarker (SeIntersect { branches = appendItem trueC (appendItem existing []) })) pair.trueEnv
+  let newFalse = envSet varName (normMarker (SeIntersect { branches = appendItem falseC (appendItem existing []) })) pair.falseEnv
+  { trueEnv = newTrue, falseEnv = newFalse }
+
+@label "narrow: true constraint"
+@description "The canonical true-branch SetExpr constraint for a comparison against a numeric literal (> ⇒ (lit,∞); >= ⇒ [lit,∞); < ⇒ (-∞,lit); <= ⇒ (-∞,lit]; ==/=== ⇒ {lit}). Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowTrueC : (op: String) -> (lit: Number) -> a
+narrowTrueC op lit =
+  if eq op ">" then SeInterval { interval = { lo = Just { value = lit, inclusive = false }, hi = Nothing } }
+  else if eq op ">=" then SeInterval { interval = { lo = Just { value = lit, inclusive = true }, hi = Nothing } }
+  else if eq op "<" then SeInterval { interval = { lo = Nothing, hi = Just { value = lit, inclusive = false } } }
+  else if eq op "<=" then SeInterval { interval = { lo = Nothing, hi = Just { value = lit, inclusive = true } } }
+  else SeEnum { values = appendItem lit [] }
+
+@label "narrow: false constraint"
+@description "The canonical false-branch SetExpr constraint for a comparison against a numeric literal (> ⇒ (-∞,lit]; >= ⇒ (-∞,lit); < ⇒ [lit,∞); <= ⇒ (lit,∞); ==/=== ⇒ all ∖ {lit}). Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowFalseC : (op: String) -> (lit: Number) -> a
+narrowFalseC op lit =
+  if eq op ">" then SeInterval { interval = { lo = Nothing, hi = Just { value = lit, inclusive = true } } }
+  else if eq op ">=" then SeInterval { interval = { lo = Nothing, hi = Just { value = lit, inclusive = false } } }
+  else if eq op "<" then SeInterval { interval = { lo = Just { value = lit, inclusive = true }, hi = Nothing } }
+  else if eq op "<=" then SeInterval { interval = { lo = Just { value = lit, inclusive = false }, hi = Nothing } }
+  else SeDiff { left = SeAll, right = SeEnum { values = appendItem lit [] } }
+
+@label "narrow: env set"
+@description "Upsert a name→set binding into a `$`-free env assoc list: drop any existing entry for the name, then append the new one (Map equality is order-independent, so append-after-remove ≡ in-place replace). Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+envSet : (name: String) -> (set: a) -> (env: b) -> c
+envSet name set env =
+  appendItem { name = name, set = set } (filter (\e -> not (eq e.name name)) env)
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- and — left-fold the pair through each conjunct (sequential accumulation, both
+-- branches). The narrowed binding from one conjunct is visible to the next (the
+-- legacy's mutate-the-same-Maps behaviour, now explicit threading).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "narrow: and fold"
+@description "Left-fold the env pair through each conjunct of an `and`: narrow each arg into both branches, threading the accumulated pair. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowAndFold : (args: a) -> (pair: b) -> c
+narrowAndFold args pair =
+  case head args of
+    Nothing -> pair
+    Just arg ->
+      let p2 = narrowInto arg pair
+      case tail args of
+        Nothing -> p2
+        Just rest -> narrowAndFold rest p2
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- or — the trueEnv passes through unchanged (≥1 of N true ⇒ can't narrow); the
+-- falseEnv left-folds each disjunct's FALSE-narrowing (in a false-branch, ALL
+-- disjuncts are false). Mirrors the legacy tempFalse-into-falseEnv merge: each
+-- step narrows the arg against the CURRENT falseEnv (as both temp branches) and
+-- keeps the arg's false-narrowing.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "narrow: or arm"
+@description "Narrow an `or`: the true-branch is unchanged (≥1 disjunct true ⇒ no precise narrowing); the false-branch folds each disjunct's false-narrowing (all disjuncts false). Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowOrArm : (args: a) -> (pair: b) -> c
+narrowOrArm args pair =
+  { trueEnv = pair.trueEnv, falseEnv = narrowOrFold args pair.falseEnv }
+
+@label "narrow: or fold"
+@description "Left-fold the falseEnv through each `or` disjunct: for each arg, narrow it against the current falseEnv (as both temp branches) and keep the arg's false-narrowing as the new falseEnv. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowOrFold : (args: a) -> (fe: b) -> c
+narrowOrFold args fe =
+  case head args of
+    Nothing -> fe
+    Just arg ->
+      let res = narrowInto arg { trueEnv = fe, falseEnv = fe }
+      case tail args of
+        Nothing -> res.falseEnv
+        Just rest -> narrowOrFold rest res.falseEnv
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- not / ! — narrow the operand with the pair SWAPPED, then swap the result back.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "narrow: not"
+@description "Narrow !/not: recurse into the first arg with the true/false envs swapped, then swap the result pair back. ≥1 arg required; else no-op. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+narrowNot : (args: a) -> (pair: b) -> c
+narrowNot args pair =
+  case head args of
+    Nothing -> pair
+    Just arg ->
+      let res = narrowInto arg { trueEnv = pair.falseEnv, falseEnv = pair.trueEnv }
+      { trueEnv = res.falseEnv, falseEnv = res.trueEnv }
+
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- inferExprTypeNarrow — inference WITH liquid-type narrowing through ifs. The
+-- 3-arg `if` special case: narrow the condition, recurse (narrowing-aware) on
+-- then/else in the narrowed envs, union the branch types. Everything else
+-- delegates to the now-Fenel forward `inferExprType`. ONE composed dispatch
+-- (D-3b-3c-3). The TS delegate returns the unchanged INPUT env (narrowing is
+-- branch-local — the top-level env is never mutated).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Infer expr type (narrowing)"
+@description "Forward inference WITH liquid-type narrowing through if-conditions: a 3-arg `if` narrows the condition (narrowFromCondition), recurses on the then-branch in the narrowed true-env and the else-branch in the narrowed false-env, and unions the two branch types; every other expression delegates to the forward inferExprType walk. Composes both Fenel bodies bare-name (one dispatch) and returns canonical SetExpr; the TS delegate pairs it with the unchanged input env. unified-static-analysis Phase 3b-3c / floor-kernel Phase 4."
+@tags "engine" "inference" "narrowing" "unified-static-analysis" "phase-3b-3c"
+inferExprTypeNarrow : (m: a) -> (env: b) -> (tbl: c) -> d
+inferExprTypeNarrow m env tbl =
+  if eq m.tag "Op" then inferNarrowOp m env tbl
+  else inferExprType m env tbl
+
+@label "narrow: infer op"
+@description "The narrowing-aware op arm: a 3-arg (or more) `if` narrows into branches; any other op (or shorter `if`) delegates to the forward inferExprType. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+inferNarrowOp : (m: a) -> (env: b) -> (tbl: c) -> d
+inferNarrowOp m env tbl =
+  if eq m.op "if" then
+    if gte (length m.args) 3 then inferIfNarrow m.args env tbl
+    else inferExprType m env tbl
+  else inferExprType m env tbl
+
+@label "narrow: infer if"
+@description "Narrow a 3-arg if: narrowFromCondition the condition (arg 0), recurse inferExprTypeNarrow on the then-branch (arg 1) in the true-env and the else-branch (arg 2) in the false-env, then union the two branch types. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+inferIfNarrow : (args: a) -> (env: b) -> (tbl: c) -> d
+inferIfNarrow args env tbl =
+  case nthArg args 0 of
+    Nothing -> SeAll
+    Just condM ->
+      let pair = narrowFromCondition condM env
+      let thenT = inferNarrowAt args 1 pair.trueEnv tbl
+      let elseT = inferNarrowAt args 2 pair.falseEnv tbl
+      normMarker (SeUnion { branches = appendItem elseT (appendItem thenT []) })
+
+@label "narrow: infer nth (narrowing)"
+@description "Index into the arg-marker list and recurse inferExprTypeNarrow on the element in the given env; out of range ⇒ $all. Internal helper."
+@tags "engine" "internal" "narrowing" "unified-static-analysis" "phase-3b-3c"
+@category "engine-internal"
+inferNarrowAt : (args: a) -> (i: Number) -> (env: b) -> (tbl: c) -> d
+inferNarrowAt args i env tbl =
+  case nthArg args i of
+    Nothing -> SeAll
+    Just a -> inferExprTypeNarrow a env tbl

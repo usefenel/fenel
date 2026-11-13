@@ -1,0 +1,132 @@
+module std where
+
+-- =========================================================================
+-- Rational arithmetic — the PURE source of truth (numeric-tower Phase 3).
+--
+-- These bodies are the conceptual definition of rational arithmetic over the
+-- pure ADT `Rational = Rational num: Int den: PositiveNat` (the ratio form;
+-- type-foundation.ts / fenel/std/foundation.fenel). They COMPOSE the Phase-2
+-- Int bodies (intAdd/intSub/intMul/intNegate/intLt/intEq + mkInt) and the
+-- Phase-1 Nat bodies (natAdd/natMul/natDiv/natMod/natLt/natEq): a Rational's
+-- `num` field IS an Int (carrying the whole sign) and its `den` field IS a Nat
+-- (the magnitude of a PositiveNat, always >= 1 — the type forces a positive
+-- denominator). They are the SEMANTICS that the flat `@native` `add`/`sub`/
+-- `mul`/`div`/`lt`/`eq` over the opaque `rational`/`number` repr are the runtime
+-- performance branch FOR. Rational's runtime branch now keeps exact integer
+-- decimal strings and uses BigInt inside its FFI leaf; Number/DirectOp floating
+-- operations remain a separate approximation. Native/pure parity is checked
+-- against the materialized ratio and exact cross multiplication.
+-- [[feedback_opaque_is_optimization]]
+--
+-- NAMED-RECORD SURFACE. Rational's pure is a single-case `$record` with two
+-- meaningful fields, so these bodies build + destructure via the NAMED surface
+-- (`Rational { num = q, den = d }` / `case a of Rational { num = q, den = d } ->
+-- …`) — the Int precedent. The construct gap is dissolved (representation-
+-- substrate Phases 1–2; numeric-tower Phases 1–2): registering `Rational` as a
+-- catalog entity (the `@label`/`@icon`/`@description` on its foundation.fenel
+-- decl) makes the registry `$opaque`-peel index `_constructors.Rational =
+-- ["num", "den"]`. ZERO new TS — the bodies are pure `.fenel`.
+--
+-- THE LOWEST-TERMS INVARIANT (the central canonical-form hazard). A rational
+-- has infinitely many representations (`1/2 = 2/4 = 3/6 = …`) and a sign that
+-- can sit on the numerator OR the denominator (`-1/2 = 1/-2`). If a
+-- non-canonical value escapes, byte/structural identity can fork even though
+-- mathematical equality agrees. THE
+-- RESOLUTION: a normalizing smart constructor `mkRational` that puts EVERY
+-- result in the unique canonical form — (1) lowest terms (divide num+den by
+-- gcd), (2) positive denominator (the sign lives entirely on `num`; the type
+-- already forces den >= 1), (3) `0 = 0/1`. EVERY op builds its result through
+-- `mkRational`, never a bare `Rational { … }` literal in result position. The
+-- canonical form is unique; ratEq independently cross-multiplies so valid
+-- unreduced input has the same mathematical equality. This is the same
+-- canonical storage role mkInt plays for negative-zero, one rung up.
+--
+-- These are NEW, standalone, Rational-typed fnIds (`std:mkRational`/`std:ratAdd`
+-- …). They have no `defineFunction` TS spec. The explicit rational-ffi
+-- performance map only selects exact represented operands; all-pure operands
+-- execute these bodies. The Numeric Rational instance references these same
+-- functions. Number natives and DirectOp lowering stay separate.
+-- `ratRecip`/`ratFloor`/`ratCeil`/`ratMod` are DEFERRED (the roadmap Phase-3 row
+-- omits them; ported only when a concrete consumer forces it).
+
+-- --- natGcd — the new Nat op gcd needs (Euclid over Nat) ---------------------
+-- Conceptually a Nat op, but homed HERE (the rational module) to keep the
+-- frozen Phase-1 `nat-arith.fenel` untouched — it is needed ONLY by mkRational.
+-- gcd is over Nat MAGNITUDES (the dens are positive, num signs fold into the
+-- result), so it needs natMod, NOT a signed intMod — the roadmap's tentative
+-- "may pull intMod forward" does NOT fire (record the correction). fnId
+-- `std:natGcd`.
+@label "Nat gcd"
+@description "Greatest common divisor over Nat via Euclid's algorithm on natMod: natGcd a Zero = a; natGcd a (Succ q) = natGcd b (natMod a b). The new Nat op the lowest-terms reduction needs (mkRational divides num+den magnitudes by it). gcd is over Nat magnitudes — no signed remainder needed, so natMod suffices (no intMod). Terminates by the Nat measure (the second arg strictly decreases — natMod a b < b) which is below the totality checker's structural/sub-1 rungs ⇒ checker returns Unknown, NOT @partial (the body IS total; the natDiv/natMod precedent)."
+@tags "numeric" "nat" "gcd"
+natGcd : (a: Nat) -> (b: Nat) -> Nat
+natGcd a b = case b of
+  Zero -> a
+  Succ q -> natGcd b (natMod a b)
+
+-- --- the normalizer + the ops -----------------------------------------------
+
+@label "Make Rational"
+@description "Normalize two Int parts: put the sign in the numerator, divide by their gcd, and use 0/1 for zero. This unchecked reference constructor retains its historical zero-denominator sentinel; public rationalFromParts refuses zero before calling it. Every arithmetic output is reduced with a positive denominator."
+@tags "numeric" "rational" "normalize"
+mkRational : (num: Int) -> (den: NonZeroInt) -> Rational
+mkRational num den = case num of
+  Int { magnitude = nm, negative = nn } -> case den of
+    Int { magnitude = dm, negative = dn } -> case dm of
+      Zero -> Rational { num = Int { magnitude = Zero, negative = False }, den = Succ Zero }
+      Succ q ->
+        let g = natGcd nm dm
+        Rational { num = mkInt (natDiv nm g) (xorSign nn dn), den = natDiv dm g }
+
+@label "Rational negate"
+@description "Arithmetic negation — negate the numerator (an Int) through mkRational; the denominator is unchanged. ratNeg (Rational num den) = mkRational (intNegate num) (mkInt den False). Total (the den Nat lifts to a positive Int via mkInt). Routing through mkRational preserves the canonical form (den already coprime ⇒ a re-reduce by gcd 1)."
+@tags "numeric" "rational" "unary"
+ratNeg : (a: Rational) -> Rational
+ratNeg a = case a of
+  Rational { num = aNum, den = aDen } -> mkRational (intNegate aNum) (mkInt aDen False)
+
+@label "Rational add"
+@description "a/b + c/d = (a·d + c·b)/(b·d). Numerator = intAdd (intMul aNum |bDen|) (intMul bNum |aDen|); denominator = natMul aDen bDen (lifted to a positive Int); through mkRational (which reduces to lowest terms — cross-multiplication is NOT already reduced). The dens (Nat) lift to positive Ints via mkInt _ False. Composes the Phase-2 Int ops + the Phase-1 Nat ops + mkRational."
+@tags "numeric" "rational"
+ratAdd : (a: Rational) -> (b: Rational) -> Rational
+ratAdd a b = case a of
+  Rational { num = aNum, den = aDen } -> case b of
+    Rational { num = bNum, den = bDen } -> mkRational (intAdd (intMul aNum (mkInt bDen False)) (intMul bNum (mkInt aDen False))) (mkInt (natMul aDen bDen) False)
+
+@label "Rational subtract"
+@description "ratSub a b = ratAdd a (ratNeg b). Total."
+@tags "numeric" "rational"
+ratSub : (a: Rational) -> (b: Rational) -> Rational
+ratSub a b = ratAdd a (ratNeg b)
+
+@label "Rational multiply"
+@description "(a/b)·(c/d) = (a·c)/(b·d). mkRational (intMul aNum bNum) (natMul aDen bDen lifted to a positive Int). Through mkRational so e.g. (2/3)·(3/4) = 6/12 reduces to 1/2. Composes intMul + natMul + mkRational."
+@tags "numeric" "rational"
+ratMul : (a: Rational) -> (b: Rational) -> Rational
+ratMul a b = case a of
+  Rational { num = aNum, den = aDen } -> case b of
+    Rational { num = bNum, den = bDen } -> mkRational (intMul aNum bNum) (mkInt (natMul aDen bDen) False)
+
+@label "Rational divide"
+@description "(a/b)÷(c/d) = (a·d)/(b·c). mkRational (intMul aNum |bDen|) (intMul |aDen| bNum). This is WHY mkRational takes a SIGNED Int denominator: b's numerator sign + zero-ness flow through the one mkRational guard. bNum = 0 ⇒ the denominator magnitude is Zero ⇒ mkRational hits its zero-den guard ⇒ the documented 0/1 sentinel (the rational div-by-zero boundary, the Nat zero-divisor precedent)."
+@tags "numeric" "rational"
+ratDiv : (a: Rational) -> (b: NonZeroRational) -> Rational
+ratDiv a b = case a of
+  Rational { num = aNum, den = aDen } -> case b of
+    Rational { num = bNum, den = bDen } -> mkRational (intMul aNum (mkInt bDen False)) (intMul (mkInt aDen False) bNum)
+
+@label "Rational equal"
+@description "Exact mathematical equality by cross multiplication. Positive denominators make 1/2 and 2/4 equal even before checked construction normalizes their representation."
+@tags "numeric" "rational" "comparison"
+ratEq : (a: Rational) -> (b: Rational) -> Boolean
+ratEq a b = case a of
+  Rational { num = aNum, den = aDen } -> case b of
+    Rational { num = bNum, den = bDen } -> intEq (intMul aNum (mkInt bDen False)) (intMul bNum (mkInt aDen False))
+
+@label "Rational less-than"
+@description "Cross-multiplied strict order: a/b < c/d iff a·d < c·b (both dens positive ⇒ the inequality direction is preserved). intLt (intMul aNum |bDen|) (intMul bNum |aDen|). The dens lift to positive Ints via mkInt _ False. Total (Rational order is decidable; the ℝ rung is where lt goes partial, D4)."
+@tags "numeric" "rational" "comparison"
+ratLt : (a: Rational) -> (b: Rational) -> Boolean
+ratLt a b = case a of
+  Rational { num = aNum, den = aDen } -> case b of
+    Rational { num = bNum, den = bDen } -> intLt (intMul aNum (mkInt bDen False)) (intMul bNum (mkInt aDen False))

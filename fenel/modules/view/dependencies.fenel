@@ -1,0 +1,530 @@
+module view where
+
+import std (map, concat, fold, elem, appendItem, some, eq, and, filter, find, head, length, unique, all, not, lookup, entries, flatMap, isString, isArray, assocRecord)
+import engine (humanizeCodeName)
+
+-- This is authored dependency data, not an evaluation trace or access grant.
+-- Acquisition supplies only the current reader's admitted visible roster;
+-- the canonical expression codec enumerates executable reference/call slots.
+@label "Dependency node"
+DependencyNode = DependencyNode id: String label: String
+
+-- Labels name the relation when the source says it: the field of the using
+-- data's own record that holds the reference. One edge joins its labels.
+@label "Dependency edge"
+DependencyEdge = DependencyEdge from: String to: String labels: List String
+
+@label "Dependencies"
+@description "A directed graph of authored references and calls within a stated visible scope. Missing or inaccessible data is not evidence that no other users exist."
+DependencyGraph = DependencyGraph focus: String nodes: List DependencyNode edges: List DependencyEdge scope: String
+
+dependencyGraphNode : String -> String -> DependencyNode
+dependencyGraphNode identity label = DependencyNode { id = identity, label = label }
+
+dependencyGraphRetainNode : List DependencyNode -> DependencyNode -> List DependencyNode
+dependencyGraphRetainNode nodes node =
+  if elem node.id (map (\existing -> existing.id) nodes) then nodes else appendItem node nodes
+
+dependencyGraphSameEdge : DependencyEdge -> DependencyEdge -> Bool
+dependencyGraphSameEdge left right = eq left.from right.from && eq left.to right.to
+
+dependencyGraphJoinLabels : List String -> List String -> List String
+dependencyGraphJoinLabels labels added = fold (\kept label -> if elem label kept then kept else appendItem label kept) labels added
+
+dependencyGraphRetainEdge : List DependencyEdge -> DependencyEdge -> List DependencyEdge
+dependencyGraphRetainEdge edges edge =
+  if some edges (dependencyGraphSameEdge edge)
+  then map (\existing -> if dependencyGraphSameEdge existing edge then DependencyEdge { from = existing.from, to = existing.to, labels = dependencyGraphJoinLabels existing.labels edge.labels } else existing) edges
+  else appendItem edge edges
+
+@label "Inspect dependencies"
+@description "Build ordinary directed graph data from the canonical authored slots and current visible incoming-reference roster. Identity deduplication preserves shared sources and cycles without evaluating any expression."
+dependencyGraph : String -> DependencyNode -> List DependencyNode -> List DependencyNode -> DependencyGraph
+dependencyGraph scope subject uses usedBy =
+  let nodes = fold dependencyGraphRetainNode [] (concat [subject] (concat uses usedBy))
+  let outgoing = map (\node -> DependencyEdge { from = node.id, to = subject.id, labels = [] }) uses
+  let incoming = map (\node -> DependencyEdge { from = subject.id, to = node.id, labels = [] }) usedBy
+  DependencyGraph { focus = subject.id, nodes = nodes, edges = fold dependencyGraphRetainEdge [] (concat outgoing incoming), scope = scope }
+
+-- The codec transports every executable occurrence without its literal data.
+-- A packet is fixed for one evaluation; its coordinates never grant a read.
+-- A named-field record construction retains its constructor tag: the head is
+-- known statically, and its fields' references and calls are separate slots.
+-- An application (`f x`, `x |> f`) whose every callable position is itself an
+-- executable occurrence adds no dependency of its own: its function head and
+-- its inputs are their own slots, so their references and calls are already
+-- drawn. A head the codec cannot report as an occurrence stays SourceUnknown.
+-- A code identity held as a value (`{$ref}`: a function bound by a local name
+-- or passed as an input) is a SourceCodeReference. It is drawn where it is
+-- named, like a call (its visible callable label, else its identity), so a
+-- function applied through a local name keeps its node.
+@label "Executable source slot"
+-- A reference under a field of the expression's own record names that field.
+SourceExecutableSlot = SourceReference identity: String | SourceFieldReference identity: String field: String | SourceCall identity: String | SourceConstructor identity: String | SourceCodeReference identity: String | SourceApplication | SourceLiteral | SourceParameter | SourceUnknown issue: String
+
+@label "Source expression metadata"
+SourceExpressionMetadata = SourceExpressionMetadata id: String label: String slots: List SourceExecutableSlot
+
+@label "Source occurrence metadata"
+SourceOccurrenceMetadata = SourceOccurrenceMetadata id: String label: String expressionId: String referenceId: Maybe String
+
+@label "Reader source metadata"
+ReaderSourceMetadata = ReaderSourceMetadata source: WorkspaceSource rootId: String generation: String expressions: List SourceExpressionMetadata occurrences: List SourceOccurrenceMetadata callableLabels: List DependencyNode
+
+@label "Dependency source"
+DependencySourceLocator = DependencySourceLocator source: WorkspaceSource rootId: String occurrenceId: String
+
+@native
+@label "Current source metadata"
+@description "Read only the ordinary source-metadata packet already captured for this evaluation's owning reader. Missing or retired owners supply Nothing. The leaf performs no source, account, storage or registry lookup."
+readerSourceMetadata : Maybe ReaderSourceMetadata
+
+dependencyMetadataRowsUnique : List a -> Bool
+dependencyMetadataRowsUnique rows =
+  if not (isArray rows) then false
+  else
+    let identities = map (\row -> row.id) rows
+    length identities == length (unique identities) && all rows (\row -> isString row.id && not (eq row.id "") && isString row.label)
+
+dependencyMetadataExpression : ReaderSourceMetadata -> String -> Result String SourceExpressionMetadata
+dependencyMetadataExpression metadata identity =
+  if not (isString identity) || eq identity "" || not (isArray metadata.expressions) then Err "An expression in this visible source is unavailable or malformed."
+  else
+    let matches = filter (\row -> eq row.id identity) metadata.expressions
+    if not (eq (length matches) 1) then Err "An expression in this visible source is missing or ambiguous."
+    else case head matches of
+      Nothing -> Err "An expression in this visible source is missing or ambiguous."
+      Just expression ->
+        if not (isString expression.label) || not (isArray expression.slots) then Err "An expression in this visible source has unavailable metadata."
+        else Ok expression
+
+dependencySourceSlotIssue : SourceExecutableSlot -> Maybe String
+dependencySourceSlotIssue slot = case slot of
+  SourceUnknown { issue = issue } -> Just (if isString issue && not (eq issue "") then issue else "An executable source slot could not be inspected.")
+  SourceReference { identity = identity } -> if not (isString identity) || eq identity "" then Just "A source reference has no readable identity." else Nothing
+  SourceFieldReference { identity = identity, field = field } -> if not (isString identity) || eq identity "" || not (isString field) || eq field "" then Just "A source reference has no readable identity or field." else Nothing
+  SourceCall { identity = identity } -> if not (isString identity) || eq identity "" then Just "A source call has no readable identity." else Nothing
+  SourceConstructor { identity = identity } -> if not (isString identity) || eq identity "" then Just "A source constructor has no readable identity." else Nothing
+  SourceCodeReference { identity = identity } -> if not (isString identity) || eq identity "" then Just "A source code reference has no readable identity." else Nothing
+  SourceApplication -> Nothing
+  SourceLiteral -> Nothing
+  SourceParameter -> Nothing
+  other -> Just "An executable source slot is unavailable or malformed."
+
+dependencySourceSlotsIssue : List SourceExecutableSlot -> Maybe String
+dependencySourceSlotsIssue slots =
+  if not (isArray slots) then Just "Executable source slots are unavailable."
+  else
+    let retainIssue = \issue slot ->
+          case issue of
+            Just message -> issue
+            Nothing -> dependencySourceSlotIssue slot
+    fold retainIssue Nothing slots
+
+dependencySourceReferences : String -> SourceExecutableSlot -> Bool
+dependencySourceReferences identity slot = case slot of
+  SourceReference { identity = reference } -> eq identity reference
+  SourceFieldReference { identity = reference, field = field } -> eq identity reference
+  SourceCall { identity = callable } -> false
+  SourceConstructor { identity = constructor } -> false
+  SourceCodeReference { identity = code } -> false
+  SourceApplication -> false
+  SourceLiteral -> false
+  SourceParameter -> false
+  SourceUnknown { issue = issue } -> false
+
+dependencySourceReferenceLabel : ReaderSourceMetadata -> String -> String
+dependencySourceReferenceLabel metadata identity =
+  case find (\row -> eq row.id identity) metadata.expressions of
+    Nothing -> "Saved data"
+    Just row -> if eq row.label "" then "Saved data" else row.label
+
+dependencySourceCallableLabel : ReaderSourceMetadata -> String -> String
+dependencySourceCallableLabel metadata identity =
+  case find (\row -> eq row.id identity) metadata.callableLabels of
+    Nothing -> identity
+    Just row -> if eq row.label "" then identity else row.label
+
+-- A constructor is drawn only under an exact visible callable identity. Its
+-- retained tag can be a source spelling, never a label invented here.
+dependencySourceConstructorNodes : ReaderSourceMetadata -> String -> List DependencyNode
+dependencySourceConstructorNodes metadata identity =
+  case find (\row -> eq row.id identity) metadata.callableLabels of
+    Nothing -> []
+    Just row -> [DependencyNode { id = identity, label = if eq row.label "" then identity else row.label }]
+
+dependencySourceSlotNodes : ReaderSourceMetadata -> SourceExecutableSlot -> List DependencyNode
+dependencySourceSlotNodes metadata slot = case slot of
+  SourceReference { identity = identity } -> [DependencyNode { id = identity, label = dependencySourceReferenceLabel metadata identity }]
+  SourceFieldReference { identity = identity, field = field } -> [DependencyNode { id = identity, label = dependencySourceReferenceLabel metadata identity }]
+  SourceCall { identity = identity } -> [DependencyNode { id = identity, label = dependencySourceCallableLabel metadata identity }]
+  SourceConstructor { identity = identity } -> dependencySourceConstructorNodes metadata identity
+  SourceCodeReference { identity = identity } -> [DependencyNode { id = identity, label = dependencySourceCallableLabel metadata identity }]
+  SourceApplication -> []
+  SourceLiteral -> []
+  SourceParameter -> []
+  SourceUnknown { issue = issue } -> []
+
+dependencyQueryIncomingStep : ReaderSourceMetadata -> SourceOccurrenceMetadata -> String -> Result String (List DependencyNode) -> SourceOccurrenceMetadata -> Result String (List DependencyNode)
+dependencyQueryIncomingStep metadata selected reference result occurrence = case result of
+  Err issue -> Err issue
+  Ok nodes ->
+    if eq occurrence.id selected.id then Ok nodes
+    else case dependencyMetadataExpression metadata occurrence.expressionId of
+      Err issue -> Err issue
+      Ok expression -> case dependencySourceSlotsIssue expression.slots of
+        Just issue -> Err issue
+        Nothing ->
+          if some expression.slots (dependencySourceReferences reference)
+          then Ok (appendItem (DependencyNode { id = occurrence.id, label = occurrence.label }) nodes)
+          else Ok nodes
+
+dependencyQueryIncoming : ReaderSourceMetadata -> SourceOccurrenceMetadata -> Result String (List DependencyNode)
+dependencyQueryIncoming metadata selected = case selected.referenceId of
+  Nothing -> Ok []
+  Just reference ->
+    if eq reference "" then Err "The selected source reference has no identity."
+    else fold (dependencyQueryIncomingStep metadata selected reference) (Ok []) metadata.occurrences
+
+dependencyQuerySelected : ReaderSourceMetadata -> SourceOccurrenceMetadata -> Result String DependencyGraph
+dependencyQuerySelected metadata selected = case dependencyMetadataExpression metadata selected.expressionId of
+  Err issue -> Err issue
+  Ok expression -> case dependencySourceSlotsIssue expression.slots of
+    Just issue -> Err issue
+    Nothing -> case dependencyQueryIncoming metadata selected of
+      Err issue -> Err issue
+      Ok incoming ->
+        let identity = case selected.referenceId of
+              Nothing -> selected.id
+              Just reference -> reference
+        let subject = DependencyNode { id = identity, label = selected.label }
+        let uses = flatMap (dependencySourceSlotNodes metadata) expression.slots
+        Ok (dependencyGraph "Authored references and calls in this data; incoming links from currently visible saved data." subject uses incoming)
+
+-- The one exact admitted occurrence a locator selects in one captured packet.
+dependencySelectedOccurrence : DependencySourceLocator -> ReaderSourceMetadata -> Result String SourceOccurrenceMetadata
+dependencySelectedOccurrence locator metadata =
+  let packetPresent = case metadata of
+        ReaderSourceMetadata { source = source } -> true
+        other -> false
+  let locatorPresent = case locator of
+        DependencySourceLocator { source = source } -> true
+        other -> false
+  let packetSourceValid = case metadata.source of
+        AllDataSource -> true
+        PublicSource -> true
+        ThisTabSource -> true
+        AccountSource { accountId = identity } -> isString identity && not (eq identity "")
+        other -> false
+  let locatorSourceValid = case locator.source of
+        AllDataSource -> true
+        PublicSource -> true
+        ThisTabSource -> true
+        AccountSource { accountId = identity } -> isString identity && not (eq identity "")
+        other -> false
+  if not packetPresent || not locatorPresent || not packetSourceValid || not locatorSourceValid then Err "This dependency source metadata is unavailable or malformed."
+  else if not (isString metadata.rootId) || eq metadata.rootId "" || not (isString metadata.generation) || eq metadata.generation "" || not (isString locator.rootId) || eq locator.rootId "" || not (isString locator.occurrenceId) || eq locator.occurrenceId "" then Err "This dependency source has no readable current identity."
+  else if not (workspaceSourceEqual locator.source metadata.source) || not (eq locator.rootId metadata.rootId) then Err "This dependency source is not available in the current reader."
+  else if not (dependencyMetadataRowsUnique metadata.occurrences) || not (dependencyMetadataRowsUnique metadata.expressions) then Err "This visible source contains missing or duplicate identities."
+  else if not (isArray metadata.callableLabels) then Err "Callable source labels are unavailable."
+  else if not (all metadata.callableLabels (\row -> isString row.id && not (eq row.id "") && isString row.label)) then Err "Callable source labels have unreadable identities."
+  else
+    let occurrenceCoordinates = \row -> do
+          let inspectReferenceId = \unit ->
+                case row.referenceId of
+                  Nothing -> true
+                  Just identity -> isString identity && not (eq identity "")
+                  other -> false
+          isString row.expressionId && not (eq row.expressionId "") && inspectReferenceId 0
+    if not (all metadata.occurrences occurrenceCoordinates) then Err "A visible occurrence has unavailable source coordinates."
+    else
+      let matches = filter (\row -> eq row.id locator.occurrenceId) metadata.occurrences
+      if not (eq (length matches) 1) then Err "The selected data is no longer available in this source."
+      else case head matches of
+        Nothing -> Err "The selected data is no longer available in this source."
+        Just selected -> Ok selected
+
+@label "Query dependency metadata"
+@description "Inspect one exact admitted occurrence in one captured source packet. Unknown executable slots, missing expressions and ambiguous identities refuse rather than claiming an empty dependency set. No expression is evaluated and no locator grants access."
+dependencyQueryFromMetadata : DependencySourceLocator -> ReaderSourceMetadata -> Result String DependencyGraph
+dependencyQueryFromMetadata locator metadata = case dependencySelectedOccurrence locator metadata of
+  Err issue -> Err issue
+  Ok selected -> dependencyQuerySelected metadata selected
+
+@label "Dependencies of source data"
+@description "Run an ordinary dependency query against this evaluation's current reader packet. Reevaluation can observe a new packet while retaining the same locator and expression. A missing packet is unavailable, never a cached answer or a cross-source lookup."
+dependencyQuery : DependencySourceLocator -> Result String DependencyGraph
+dependencyQuery locator =
+  let metadata = readerSourceMetadata()
+  case metadata of
+    Nothing -> Err "This data source is no longer available in the current reader."
+    Just packet -> dependencyQueryFromMetadata locator packet
+
+-- Linked data a few links away. One saved datum is one node however many
+-- occurrences show it, so links found from different data join; inline data
+-- keeps its occurrence identity. Calls and constructors are drawn where they
+-- are made and never followed. Any unreadable expression on the way refuses
+-- the whole graph, as the direct query does.
+--
+-- Invariant: every drawn datum is joined to the focus by a chain of links
+-- that all run the same way. The focus goes on both ways (what it uses, and
+-- the visible data that uses it). A datum reached as a PART of the focus
+-- goes on only towards its own parts; a datum reached as a USER of the focus
+-- goes on only towards its own users. So a card that uses the focus (Demo
+-- holds Fenel) never brings in the other things it holds: they are neither
+-- parts nor users of the focus. A datum reached both ways (a cycle) goes on
+-- both ways, once per way.
+@label "Linked walk step"
+@description "One datum the linked walk has reached, with the ways it goes on from there: towards the data it is made from, towards the visible data that uses it, or both for the focus."
+DependencyWalkStep = DependencyWalkStep identity: String towardParts: Bool towardUsers: Bool
+
+@label "Linked data walk"
+DependencyLinkedWalk = DependencyLinkedWalk nodes: List DependencyNode edges: List DependencyEdge seen: List DependencyWalkStep next: List DependencyWalkStep
+
+@label "Direct links of one datum"
+DependencyLinks = DependencyLinks nodes: List DependencyNode edges: List DependencyEdge linked: List String
+
+dependencyOccurrenceIdentity : SourceOccurrenceMetadata -> String
+dependencyOccurrenceIdentity occurrence = case occurrence.referenceId of
+  Just reference -> reference
+  Nothing -> occurrence.id
+
+dependencyIdentityExpression : ReaderSourceMetadata -> String -> String
+dependencyIdentityExpression metadata identity =
+  case find (\row -> eq row.id identity) metadata.occurrences of
+    Nothing -> identity
+    Just row -> case row.referenceId of
+      Nothing -> row.expressionId
+      Just reference -> identity
+
+dependencyIdentityLabel : ReaderSourceMetadata -> String -> String
+dependencyIdentityLabel metadata identity =
+  case find (\row -> eq (dependencyOccurrenceIdentity row) identity) metadata.occurrences of
+    Nothing -> dependencySourceReferenceLabel metadata identity
+    Just row -> if eq row.label "" then dependencySourceReferenceLabel metadata identity else row.label
+
+dependencySlotReference : SourceExecutableSlot -> List String
+dependencySlotReference slot = case slot of
+  SourceReference { identity = identity } -> [identity]
+  SourceFieldReference { identity = identity, field = field } -> [identity]
+  _ -> []
+
+dependencySlotLabels : SourceExecutableSlot -> List String
+dependencySlotLabels slot = case slot of
+  SourceFieldReference { identity = identity, field = field } -> [humanizeCodeName field]
+  _ -> []
+
+-- The edges one slot of the using data's expression draws into that data.
+dependencySlotEdges : ReaderSourceMetadata -> String -> SourceExecutableSlot -> List DependencyEdge
+dependencySlotEdges metadata identity slot =
+  map (\node -> DependencyEdge { from = node.id, to = identity, labels = dependencySlotLabels slot }) (dependencyLinkedSlotNodes metadata slot)
+
+-- The labelled edges from referenced data into one visible consumer.
+dependencyConsumerEdges : String -> String -> SourceExpressionMetadata -> List DependencyEdge
+dependencyConsumerEdges identity consumer expression =
+  map (\slot -> DependencyEdge { from = identity, to = consumer, labels = dependencySlotLabels slot }) (filter (dependencySourceReferences identity) expression.slots)
+
+dependencyLinkedSlotNodes : ReaderSourceMetadata -> SourceExecutableSlot -> List DependencyNode
+dependencyLinkedSlotNodes metadata slot = case slot of
+  SourceReference { identity = identity } -> [DependencyNode { id = identity, label = dependencyIdentityLabel metadata identity }]
+  SourceFieldReference { identity = identity, field = field } -> [DependencyNode { id = identity, label = dependencyIdentityLabel metadata identity }]
+  _ -> dependencySourceSlotNodes metadata slot
+
+dependencyIncomingIdentityStep : ReaderSourceMetadata -> String -> Result String DependencyLinks -> SourceOccurrenceMetadata -> Result String DependencyLinks
+dependencyIncomingIdentityStep metadata identity result occurrence = case result of
+  Err issue -> Err issue
+  Ok found ->
+    let consumer = dependencyOccurrenceIdentity occurrence
+    if eq consumer identity then Ok found
+    else case dependencyMetadataExpression metadata occurrence.expressionId of
+      Err issue -> Err issue
+      Ok expression -> case dependencySourceSlotsIssue expression.slots of
+        Just issue -> Err issue
+        Nothing ->
+          if some expression.slots (dependencySourceReferences identity) && not (elem consumer found.linked)
+          then Ok (DependencyLinks { nodes = appendItem (DependencyNode { id = consumer, label = dependencyIdentityLabel metadata consumer }) found.nodes, edges = concat found.edges (dependencyConsumerEdges identity consumer expression), linked = appendItem consumer found.linked })
+          else Ok found
+
+@label "Parts of one datum"
+@description "What one datum is made of, from its own readable expression: the data it references, which the walk follows on towards their own parts, and the calls and constructors it makes, drawn where they are made and never followed."
+dependencyPartLinks : ReaderSourceMetadata -> String -> SourceExpressionMetadata -> DependencyLinks
+dependencyPartLinks metadata holder expression =
+  DependencyLinks { nodes = flatMap (dependencyLinkedSlotNodes metadata) expression.slots, edges = flatMap (dependencySlotEdges metadata holder) expression.slots, linked = flatMap dependencySlotReference expression.slots }
+
+@label "Users of one datum"
+@description "The currently visible data whose readable expression references one datum, each with the labelled edges into it. Any unreadable visible expression refuses rather than hiding a user."
+dependencyUserLinks : ReaderSourceMetadata -> String -> Result String DependencyLinks
+dependencyUserLinks metadata used =
+  fold (dependencyIncomingIdentityStep metadata used) (Ok (DependencyLinks { nodes = [], edges = [], linked = [] })) metadata.occurrences
+
+@label "Already reached that way"
+@description "Whether a reached step already covers a candidate step: the same datum, already going on every way the candidate would."
+dependencyWalkCovers : DependencyWalkStep -> DependencyWalkStep -> Bool
+dependencyWalkCovers candidate reached =
+  eq reached.identity candidate.identity && (reached.towardParts || not candidate.towardParts) && (reached.towardUsers || not candidate.towardUsers)
+
+@label "Keep a new walk step"
+@description "Append a candidate step unless a step seen earlier, or one kept earlier in this round, already covers it. Order of first reach is kept."
+dependencyWalkRetainStep : List DependencyWalkStep -> List DependencyWalkStep -> DependencyWalkStep -> List DependencyWalkStep
+dependencyWalkRetainStep seenSteps kept candidate =
+  if some seenSteps (dependencyWalkCovers candidate) || some kept (dependencyWalkCovers candidate) then kept else appendItem candidate kept
+
+-- One reached datum goes on only the ways its step names (see the invariant
+-- above "Linked data walk"). Its own expression is read whichever way it goes,
+-- so an unreadable datum on the way still refuses the graph.
+@label "Expand one walk step"
+@description "Add the links of one reached datum in the ways its step names: its parts, which go on towards their parts, and its users, which go on towards their users. Steps already covered are not queued again."
+dependencyLinkedExpand : ReaderSourceMetadata -> Result String DependencyLinkedWalk -> DependencyWalkStep -> Result String DependencyLinkedWalk
+dependencyLinkedExpand metadata result step = case result of
+  Err issue -> Err issue
+  Ok walk -> case dependencyMetadataExpression metadata (dependencyIdentityExpression metadata step.identity) of
+    Err issue -> Err issue
+    Ok expression -> case dependencySourceSlotsIssue expression.slots of
+      Just issue -> Err issue
+      Nothing ->
+        let found = if step.towardUsers then dependencyUserLinks metadata step.identity else Ok (DependencyLinks { nodes = [], edges = [], linked = [] })
+        case found of
+          Err issue -> Err issue
+          Ok userLinks ->
+            let partLinks = if step.towardParts then dependencyPartLinks metadata step.identity expression else DependencyLinks { nodes = [], edges = [], linked = [] }
+            let partSteps = map (\reference -> DependencyWalkStep { identity = reference, towardParts = true, towardUsers = false }) (unique partLinks.linked)
+            let userSteps = map (\consumer -> DependencyWalkStep { identity = consumer, towardParts = false, towardUsers = true }) (unique userLinks.linked)
+            let fresh = fold (dependencyWalkRetainStep walk.seen) [] (concat partSteps userSteps)
+            Ok (DependencyLinkedWalk { nodes = fold dependencyGraphRetainNode walk.nodes (concat partLinks.nodes userLinks.nodes), edges = fold dependencyGraphRetainEdge walk.edges (concat partLinks.edges userLinks.edges), seen = concat walk.seen fresh, next = concat walk.next fresh })
+
+-- The remaining count is a Number: subtracting from a Nat need not stay a Nat.
+dependencyLinkedRounds : ReaderSourceMetadata -> Number -> List DependencyWalkStep -> DependencyLinkedWalk -> Result String DependencyLinkedWalk
+dependencyLinkedRounds metadata hops frontier walk =
+  if hops < 1 then Ok walk
+  else if eq (length frontier) 0 then Ok walk
+  else case fold (dependencyLinkedExpand metadata) (Ok (DependencyLinkedWalk { nodes = walk.nodes, edges = walk.edges, seen = walk.seen, next = [] })) frontier of
+    Err issue -> Err issue
+    Ok expanded -> dependencyLinkedRounds metadata (hops - 1) expanded.next expanded
+
+@label "Query linked dependency metadata"
+@description "Follow authored references from one exact admitted occurrence up to the given number of links, within one captured source packet: what it is made from and the parts of those, and the visible data that uses it and the users of those. Calls and constructors are shown where they are made. Unknown executable slots and missing or ambiguous identities refuse. No expression is evaluated and no locator grants access."
+dependencyQueryLinkedFromMetadata : DependencySourceLocator -> Nat -> ReaderSourceMetadata -> Result String DependencyGraph
+dependencyQueryLinkedFromMetadata locator hops metadata = case dependencySelectedOccurrence locator metadata of
+  Err issue -> Err issue
+  Ok selected ->
+    let identity = dependencyOccurrenceIdentity selected
+    let subject = DependencyNode { id = identity, label = selected.label }
+    let focusStep = DependencyWalkStep { identity = dependencyOccurrenceIdentity selected, towardParts = true, towardUsers = true }
+    let start = DependencyLinkedWalk { nodes = [subject], edges = [], seen = [focusStep], next = [] }
+    case dependencyLinkedRounds metadata hops [focusStep] start of
+      Err issue -> Err issue
+      Ok walk -> Ok (DependencyGraph { focus = identity, nodes = walk.nodes, edges = walk.edges, scope = "Data this data is made from and data that uses it, followed a few links through currently visible saved data: parts of its parts and users of its users. Calls are shown where they are made." })
+
+@label "Linked data around source data"
+@description "Run the linked dependency query against this evaluation's current reader packet, following up to the given number of links. A missing packet is unavailable, never a cached answer or a cross-source lookup."
+dependencyQueryLinked : DependencySourceLocator -> Nat -> Result String DependencyGraph
+dependencyQueryLinked locator hops =
+  let metadata = readerSourceMetadata()
+  case metadata of
+    Nothing -> Err "This data source is no longer available in the current reader."
+    Just packet -> dependencyQueryLinkedFromMetadata locator hops packet
+
+@label "Linked data around a retained reference"
+@description "Inspect the source binding named by an authored reference inside an admitted occurrence. The same current reader packet owns both coordinates. Missing bindings refuse; calls and structural containment never become references."
+dependencyQueryLinkedAtReference : DependencySourceLocator -> String -> Nat -> Result String DependencyGraph
+dependencyQueryLinkedAtReference locator reference hops =
+  case readerSourceMetadata () of
+    Nothing -> Err "This data source is no longer available in the current reader."
+    Just packet -> case dependencySelectedOccurrence locator packet of
+      Err issue -> Err issue
+      Ok parent ->
+        if not (isString reference) || eq reference "" then Err "This authored reference has no readable source identity."
+        else case dependencyAuthoredReferenceWalk packet [parent.expressionId] [] reference of
+          Err issue -> Err issue
+          Ok false -> Err "This data's authored source does not retain that reference."
+          Ok true ->
+            let namesReference = \row -> case row.referenceId of
+                  Nothing -> false
+                  Just identity -> eq identity reference
+            case find namesReference packet.occurrences of
+              Nothing -> Err "This referenced data has no admitted source occurrence in the current reader."
+              Just binding -> dependencyQueryLinkedFromMetadata (DependencySourceLocator { source = packet.source, rootId = packet.rootId, occurrenceId = binding.id }) hops packet
+
+-- Retained children may lie behind another saved reference. Follow only
+-- those canonical outgoing slots, never incoming consumers or calls. Each
+-- expression is inspected once; unknown or missing source remains refusal.
+dependencyAuthoredReferenceWalk : ReaderSourceMetadata -> List String -> List String -> String -> Result String Bool
+dependencyAuthoredReferenceWalk metadata pending seen reference =
+  case head pending of
+    Nothing -> Ok false
+    Just identity ->
+      let remaining = filter (\candidate -> not (eq candidate identity)) pending
+      if elem identity seen then dependencyAuthoredReferenceWalk metadata remaining seen reference
+      else case dependencyMetadataExpression metadata (dependencyIdentityExpression metadata identity) of
+        Err issue -> Err issue
+        Ok expression -> case dependencySourceSlotsIssue expression.slots of
+          Just issue -> Err issue
+          Nothing ->
+            if some expression.slots (dependencySourceReferences reference) then Ok true
+            else dependencyAuthoredReferenceWalk metadata (concat remaining (flatMap dependencySlotReference expression.slots)) (appendItem identity seen) reference
+
+dependencyMetadataText : a -> String -> String -> String
+dependencyMetadataText row key fallback = case lookup row key of
+  Nothing -> fallback
+  Just value -> if isString value && not (eq value "") then value else fallback
+
+dependencyMetadataOccurrence : r -> i -> SourceOccurrenceMetadata
+dependencyMetadataOccurrence root item =
+  let identity = browserDataOccurrenceReference root item
+  let reference = case lookup item "source" of
+        Nothing -> Nothing
+        Just source -> if eq source.kind "ref" then Just source.ref.id else Nothing
+  let expression = case reference of
+        Nothing -> identity
+        Just saved -> saved
+  SourceOccurrenceMetadata { id = item.id, label = dependencyMetadataText item "caption" "Data", expressionId = expression, referenceId = reference }
+
+dependencyMetadataExpressionLabel : r -> List v -> List SourceOccurrenceMetadata -> String -> String
+dependencyMetadataExpressionLabel root values occurrences identity =
+  case find (\row -> eq row.id identity) values of
+    Just row -> dependencyMetadataText row "name" "Saved data"
+    Nothing -> case find (\occurrence -> eq occurrence.expressionId identity) occurrences of
+      Just occurrence -> occurrence.label
+      Nothing ->
+        if eq identity root.referenceId then dependencyMetadataText root "name" "Data"
+        else case find (\row -> eq row.referenceId identity) root.lists of
+          Nothing -> "Saved data"
+          Just row -> dependencyMetadataText row "name" "Data"
+
+dependencyMetadataSavedExpression : v -> List ({ id: String, label: String, expression: e })
+dependencyMetadataSavedExpression row = case lookup row "query" of
+  Nothing -> []
+  Just query ->
+    if not (eq query.kind "expression") then []
+    else case lookup query "expr" of
+      Nothing -> []
+      Just expression -> [{ id = row.id, label = dependencyMetadataText row "name" "Saved data", expression = expression }]
+
+dependencyMetadataInlineExpression : r -> List ({ id: String, label: String, expression: e }) -> i -> List ({ id: String, label: String, expression: e })
+dependencyMetadataInlineExpression root rows item =
+  let occurrence = dependencyMetadataOccurrence root item
+  case occurrence.referenceId of
+    Just reference -> rows
+    Nothing ->
+      if some rows (\row -> eq row.id occurrence.expressionId) then rows
+      else appendItem { id = occurrence.expressionId, label = occurrence.label, expression = tabDataItemExpression item } rows
+
+@label "Capture admitted dependency roster"
+@description "Project one already admitted root and saved-value snapshot into raw source rows and the existing visible occurrence scope. Expressions retain their original carriers for the canonical codec boundary; literal payloads are never inspected, copied or evaluated here."
+dependencyMetadataRoster : r -> List v -> List ({ id: String, label: String }) -> { expressions: List ({ id: String, label: String, expression: e }), occurrences: List SourceOccurrenceMetadata, callableLabels: List DependencyNode }
+dependencyMetadataRoster root values callables =
+  let items = concat root.items (flatMap (\row -> row.view.items) root.lists)
+  let occurrences = map (dependencyMetadataOccurrence root) items
+  let saved = flatMap dependencyMetadataSavedExpression values
+  let rootRows = map (\entry -> { id = entry.key, label = dependencyMetadataExpressionLabel root values occurrences entry.key, expression = entry.value }) (entries root.expressions)
+  let retained = concat (filter (\row -> not (some saved (\replacement -> eq replacement.id row.id))) rootRows) saved
+  let expressions = fold (dependencyMetadataInlineExpression root) retained items
+  { expressions = expressions, occurrences = occurrences, callableLabels = map (\row -> DependencyNode { id = row.id, label = row.label }) callables }
+
+-- Source-owned bindings may occur inside an ordinary collection instead of
+-- as root cards. Their explicit admitted occurrences keep incoming-reference
+-- queries honest; structural containment alone never invents a binding.
+@tags "internal"
+dependencyMetadataRosterWithBindings : r -> List v -> List ({ id: String, label: String }) -> List i -> { expressions: List ({ id: String, label: String, expression: e }), occurrences: List SourceOccurrenceMetadata, callableLabels: List DependencyNode }
+dependencyMetadataRosterWithBindings root values callables bindings =
+  dependencyMetadataRoster (assocRecord root "items" (concat root.items bindings)) values callables

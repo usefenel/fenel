@@ -1,0 +1,363 @@
+module dashboard where
+
+-- =========================================================================
+-- Dashboard /saved-queries + /query-categories + /locus-views routes.
+--
+-- Phase 12a sub-step 7 of the ts-elimination workstream. Seventeen route
+-- bodies + supporting helpers wrapping ~21 state:* substrate primitives
+-- added in 12a-7.
+--
+-- Decisions resolved (per the brief):
+--   EE: dedicated state:searchSavedQueries primitive (ILIKE has no JSONB
+--       analog).
+--   FF: Fenel body composes single-active invariant via clearAllActive +
+--       update (non-atomic — matches legacy semantics).
+--   GG: Fenel body composes auto-promote-next via deleteLocusViewById +
+--       Maybe-check wasActive + promoteOldestLocusView (non-atomic).
+--   HH: raw drizzle inside IO handlers — no @fenel/db helpers exist for
+--       any of the 4 tables.
+--   II: Fenel body stitches category members via pure
+--       stitchCategoryMembers helper.
+--   JJ: single Fenel body with branch helpers for savedQueriesAggregated
+--       (savedQueriesByCategory / savedQueriesBySearch / savedQueriesDefault).
+--   KK: keep Zod in TS wrapper (D2 — per 12a-2 precedent).
+--
+-- Anonymous records throughout — Maybe + Result envelopes cover the
+-- discriminations (no new ADT entity).
+-- =========================================================================
+
+-- ---- Shared helpers -----------------------------------------------------
+
+-- sqvDefaultToLocal — null-coalesce. Local utility (each .fenel file's
+-- defaults are co-located with their callers — same pattern as io.fenel
+-- and typeclass-triggers-timeline.fenel).
+@label "Default to (local)"
+@description "Null-coalesce — local to the saved-queries-and-views module."
+@tags "dashboard" "helper" "pure" "phase-12a"
+sqvDefaultToLocal dflt x = ifElse (isNull x) dflt x
+
+-- queryIdsForCategory — given a list of all members and one category id,
+-- return the queryIds[] for that category. Pure list filter + project.
+@label "Query ids for category"
+@description "Given a member list, project the queryIds for one categoryId."
+@tags "dashboard" "query-category" "pure" "phase-12a"
+queryIdsForCategory : (members: List ({})) -> (catId: String) -> List (String)
+queryIdsForCategory members catId =
+  map (extractQueryId) (filter (memberMatchesCategory catId) members)
+
+@label "Member matches category"
+@description "Predicate for filtering members by categoryId."
+@tags "dashboard" "query-category" "pure" "phase-12a"
+memberMatchesCategory : (catId: String) -> (member: {}) -> Boolean
+memberMatchesCategory catId member = eq member.categoryId catId
+
+@label "Extract query id"
+@description "Projection helper — member row → its queryId."
+@tags "dashboard" "query-category" "pure" "phase-12a"
+extractQueryId : (member: {}) -> String
+extractQueryId member = member.queryId
+
+-- stitchCategoryRow — given a category row + the full members list,
+-- attach queryIds[] inline. Pure record merge.
+@label "Stitch category row"
+@description "Attach queryIds[] inline to a single category row. Pure record merge over the all-members list."
+@tags "dashboard" "query-category" "pure" "phase-12a"
+stitchCategoryRow : (members: List ({})) -> (cat: {}) -> {}
+stitchCategoryRow members cat = mergeRecords cat { queryIds = queryIdsForCategory members cat.id }
+
+-- stitchCategoryMembers — given all categories + all members, return the
+-- stitched list with queryIds[] inline on each. Decision II pattern.
+@label "Stitch category members"
+@description "Given all categories + all members, return the stitched list with queryIds[] inline on each (Decision II pattern)."
+@tags "dashboard" "query-category" "pure" "phase-12a"
+stitchCategoryMembers : (cats: List ({})) -> (members: List ({})) -> List ({})
+stitchCategoryMembers cats members =
+  map (stitchCategoryRow members) cats
+
+-- ---- Saved queries ------------------------------------------------------
+
+-- Branch helpers for savedQueriesAggregated. Each returns a list of saved
+-- query rows. The umbrella body case-of's the (Maybe<String>, Maybe<String>)
+-- shape and dispatches to one of the three.
+
+@label "Saved queries by category"
+@description "Branch: dispatch to state:listSavedQueriesByCategory."
+@tags "dashboard" "saved-query" "route" "phase-12a"
+savedQueriesByCategory : (categorySlug: String) -> List ({})
+savedQueriesByCategory categorySlug = listSavedQueriesByCategory categorySlug
+
+@label "Saved queries by search"
+@description "Branch: dispatch to state:searchSavedQueries."
+@tags "dashboard" "saved-query" "route" "phase-12a"
+savedQueriesBySearch : (q: String) -> List ({})
+savedQueriesBySearch q = searchSavedQueries q
+
+@label "Saved queries (default)"
+@description "Branch: dispatch to state:listSavedQueries (no filter)."
+@tags "dashboard" "saved-query" "route" "phase-12a"
+savedQueriesDefault : List ({})
+savedQueriesDefault = listSavedQueries()
+
+-- Pick the right query branch based on (category, q) Maybes.
+@label "Pick saved queries branch"
+@description "Case-of dispatch over (category, q) Maybes — Just category → savedQueriesByCategory; Just q → savedQueriesBySearch; else default."
+@tags "dashboard" "saved-query" "route" "phase-12a"
+pickSavedQueries : (category: Maybe (String)) -> (q: Maybe (String)) -> List ({})
+pickSavedQueries category q =
+  case category of
+    Just slug -> savedQueriesByCategory slug
+    _ ->
+      case q of
+        Just term -> savedQueriesBySearch term
+        _ -> savedQueriesDefault()
+
+-- GET /saved-queries — branched dispatch + always return {queries,
+-- categories} with each category carrying queryIds[]. Returns an anonymous
+-- record matching the wire shape.
+@label "List saved queries aggregated"
+@description "GET /saved-queries — branch dispatch + always returns {queries, categories} with each category carrying queryIds[]."
+@tags "dashboard" "saved-query" "route" "phase-12a"
+listSavedQueriesAggregated : (category: Maybe (String)) -> (q: Maybe (String)) -> {}
+listSavedQueriesAggregated category q =
+  let queries = pickSavedQueries category q
+  let cats = listQueryCategories()
+  let catIds = map (extractId) cats
+  let members = listQueryCategoryMembers catIds
+  { queries = queries, categories = stitchCategoryMembers cats members }
+
+@label "Extract id"
+@description "Projection helper — row → row.id."
+@tags "dashboard" "pure" "phase-12a"
+extractId : (row: {}) -> String
+extractId row = row.id
+
+-- GET /saved-queries/:id — Maybe pass-through.
+@label "Get saved query by id"
+@description "GET /saved-queries/:id — Maybe pass-through."
+@tags "dashboard" "saved-query" "route" "phase-12a"
+getSavedQueryById : (id: String) -> Maybe ({})
+getSavedQueryById id = getSavedQuery id
+
+-- POST /saved-queries — thin create wrapper.
+@label "Create saved query body"
+@description "POST /saved-queries — thin create wrapper."
+@tags "dashboard" "saved-query" "route" "phase-12a"
+createSavedQueryBody : (data: {}) -> {}
+createSavedQueryBody data = createSavedQuery data
+
+-- PUT /saved-queries/:id — Maybe-unwrapping patch.
+@label "Update saved query body"
+@description "PUT /saved-queries/:id — Maybe-unwrapping patch."
+@tags "dashboard" "saved-query" "route" "phase-12a"
+updateSavedQueryBody : (id: String) -> (slug: Maybe (String)) -> (name: Maybe (String)) -> (description: Maybe (String)) -> (query: Maybe ({})) -> (expectedQuery: Maybe a) -> Maybe ({})
+updateSavedQueryBody id slug name description query expectedQuery =
+  updateSavedQuery id { slug = slug, name = name, description = description, query = query, expectedQuery = expectedQuery }
+
+-- DELETE /saved-queries/:id — Boolean.
+@label "Delete saved query body"
+@description "DELETE /saved-queries/:id — Boolean."
+@tags "dashboard" "saved-query" "route" "phase-12a"
+deleteSavedQueryBody : (id: String) -> (expectedQuery: Maybe a) -> Boolean
+deleteSavedQueryBody id expectedQuery = deleteSavedQuery id expectedQuery
+
+-- ---- Locus views --------------------------------------------------------
+
+-- GET /locus-views — thin list pass-through.
+@label "List locus views all"
+@description "GET /locus-views — thin list pass-through."
+@tags "dashboard" "locus-view" "route" "phase-12a"
+listLocusViewsAll : List ({})
+listLocusViewsAll = listLocusViews()
+
+-- GET /locus-views/active — Maybe row.
+@label "Get active locus view body"
+@description "GET /locus-views/active — Maybe row."
+@tags "dashboard" "locus-view" "route" "phase-12a"
+getActiveLocusViewBody : Maybe ({})
+getActiveLocusViewBody = getActiveLocusView()
+
+-- shouldActivateNew — first-row-is-active gate. body.active=true OR the
+-- account has no existing rows. `or` is infix-only in Fenel (same as
+-- `and`); use ifElse to keep the keyword-free function-call form
+-- (12a-6 surprise #1 pattern).
+@label "Should activate new"
+@description "First-row-is-active gate. body.active=true OR no existing rows. Uses ifElse (or is infix-only — 12a-6 surprise #1)."
+@tags "dashboard" "locus-view" "pure" "phase-12a"
+shouldActivateNew : (active: Boolean) -> (count: Number) -> Boolean
+shouldActivateNew active count = ifElse active true (eq count 0)
+
+-- clearOthersIfActive — if the new row will be active, clear all others'
+-- active first. Returns Unit (Boolean discarded). The let-binding sequences
+-- the side-effect; the body's final return value is the created row.
+@label "Clear others if active"
+@description "Gated side-effect — clear all active locus_views iff willBeActive=true."
+@tags "dashboard" "locus-view" "phase-12a"
+clearOthersIfActive : (willBeActive: Boolean) -> Boolean
+clearOthersIfActive willBeActive =
+  ifElse willBeActive (clearAllActiveLocusViews()) false
+
+@label "Get root data"
+@description "Read the account's one Fenel root value through its storage effect."
+@tags "dashboard" "locus" "route"
+getLocusRootBody : {}
+getLocusRootBody = readLocusRoot()
+
+@label "Edit root data"
+@description "Apply a root edit to the revision the user actually edited."
+@tags "dashboard" "locus" "route"
+editLocusRootBody : (id: String) -> (expectedRevision: Number) -> (command: {}) -> Maybe ({})
+editLocusRootBody id expectedRevision command = editLocusRoot id expectedRevision command
+
+-- POST /locus-views — create + single-active invariant (Decision FF:
+-- Fenel body composes; non-atomic).
+@label "Create locus view body"
+@description "POST /locus-views — create + single-active invariant composition (Decision FF)."
+@tags "dashboard" "locus-view" "route" "phase-12a"
+createLocusViewBody : (name: String) -> (view: {}) -> (active: Boolean) -> {}
+createLocusViewBody name view active =
+  let count = countLocusViews()
+  let willBeActive = shouldActivateNew active count
+  let _clear = clearOthersIfActive willBeActive
+  createLocusView { name = name, view = view, active = willBeActive }
+
+-- PUT /locus-views/:id — Maybe-unwrapping patch (doesn't touch active).
+@label "Update locus view body"
+@description "PUT /locus-views/:id — Maybe-unwrapping patch (doesn't touch active)."
+@tags "dashboard" "locus-view" "route" "phase-12a"
+updateLocusViewBody : (id: String) -> (name: Maybe (String)) -> (view: Maybe ({})) -> Maybe ({})
+updateLocusViewBody id name view =
+  updateLocusView id { name = name, view = view }
+
+-- POST /locus-views/:id/activate — clear all others + set this active.
+-- Maybe<Row> return; Nothing → 404.
+@label "Activate locus view body"
+@description "POST /locus-views/:id/activate — clear-others + set-this-active."
+@tags "dashboard" "locus-view" "route" "phase-12a"
+activateLocusViewBody : (id: String) -> Maybe ({})
+activateLocusViewBody id =
+  let _clear = clearAllActiveLocusViews()
+  updateLocusView id { active = (Just true) }
+
+-- DELETE /locus-views/:id — delete + maybe auto-promote-next. Returns
+-- Boolean (true on hit, false on miss). The promote is sequenced after
+-- the delete via a let-binding.
+@label "Delete locus view with promote"
+@description "DELETE /locus-views/:id — delete + maybe auto-promote-next (Decision GG)."
+@tags "dashboard" "locus-view" "route" "phase-12a"
+deleteLocusViewWithPromote : (id: String) -> Boolean
+deleteLocusViewWithPromote id =
+  case deleteLocusViewById id of
+    Just deleted ->
+      let _promoted = promoteIfWasActive deleted.active
+      true
+    _ -> false
+
+-- promoteIfWasActive — gated promote. If the deleted row was active,
+-- promote the oldest remaining row. Otherwise no-op.
+@label "Promote if was active"
+@description "Gated promote — if the deleted row was active, promote oldest remaining; else no-op."
+@tags "dashboard" "locus-view" "phase-12a"
+promoteIfWasActive : (wasActive: Boolean) -> Boolean
+promoteIfWasActive wasActive =
+  ifElse wasActive (promoteOldestLocusView()) false
+
+-- ---- Query categories ---------------------------------------------------
+
+-- GET /query-categories — list + stitch.
+@label "List query categories aggregated"
+@description "GET /query-categories — list + stitch members."
+@tags "dashboard" "query-category" "route" "phase-12a"
+listQueryCategoriesAggregated : List ({})
+listQueryCategoriesAggregated =
+  let cats = listQueryCategories()
+  let catIds = map (extractId) cats
+  let members = listQueryCategoryMembers catIds
+  stitchCategoryMembers cats members
+
+-- POST /query-categories — create + optional bulk-members insert. Returns
+-- the created row with queryIds[] inline.
+@label "Create query category body"
+@description "POST /query-categories — create + optional bulk-members insert + return cat with queryIds[] inline."
+@tags "dashboard" "query-category" "route" "phase-12a"
+createQueryCategoryBody : (data: {}) -> (queryIds: Maybe (List (String))) -> {}
+createQueryCategoryBody data queryIds =
+  let cat = createQueryCategory data
+  let _members = insertMembersIfAny cat.id queryIds
+  mergeRecords cat { queryIds = sqvDefaultToLocal [] queryIds }
+
+-- insertMembersIfAny — gated bulk insert. Empty list = no-op.
+@label "Insert members if any"
+@description "Gated bulk insert — empty list = no-op."
+@tags "dashboard" "query-category" "phase-12a"
+insertMembersIfAny : (categoryId: String) -> (queryIds: Maybe (List (String))) -> Boolean
+insertMembersIfAny categoryId queryIds =
+  ifElse (eq (length (sqvDefaultToLocal [] queryIds)) 0) false (createQueryCategoryMembers categoryId queryIds)
+
+-- PUT /query-categories/:id — Maybe-unwrapping patch.
+@label "Update query category body"
+@description "PUT /query-categories/:id — Maybe-unwrapping patch."
+@tags "dashboard" "query-category" "route" "phase-12a"
+updateQueryCategoryBody : (id: String) -> (slug: Maybe (String)) -> (name: Maybe (String)) -> (description: Maybe (String)) -> (parentId: Maybe (String)) -> Maybe ({})
+updateQueryCategoryBody id slug name description parentId =
+  updateQueryCategory id { slug = slug, name = name, description = description, parentId = parentId }
+
+-- DELETE /query-categories/:id — Boolean.
+@label "Delete query category body"
+@description "DELETE /query-categories/:id — Boolean. CASCADE deletes members."
+@tags "dashboard" "query-category" "route" "phase-12a"
+deleteQueryCategoryBody : (id: String) -> Boolean
+deleteQueryCategoryBody id = deleteQueryCategory id
+
+-- POST /query-categories/:id/queries — 2 lookups + insert. Returns a
+-- Result-shaped record: { ok: Boolean, error: Maybe<String> } so the TS
+-- wrapper can discriminate 200 vs 404. Pattern matches 12a-3 / 12a-4's
+-- anonymous-record + Maybe pattern.
+@label "Add query to category body"
+@description "POST /query-categories/:id/queries — 2 lookups (cat + query) + insert; returns {ok, error}."
+@tags "dashboard" "query-category" "route" "phase-12a"
+addQueryToCategoryBody : (categoryId: String) -> (queryId: String) -> {}
+addQueryToCategoryBody categoryId queryId =
+  case getQueryCategoryById categoryId of
+    Just _cat ->
+      case getSavedQuery queryId of
+        Just _q ->
+          let _added = addQueryToCategory categoryId queryId
+          { ok = true, error = (Nothing) }
+        _ -> { ok = false, error = (Just "Query not found") }
+    _ -> { ok = false, error = (Just "Category not found") }
+
+-- DELETE /query-categories/:id/queries/:queryId — 1 lookup + delete.
+@label "Remove query from category body"
+@description "DELETE /query-categories/:id/queries/:queryId — 1 lookup + delete; returns {ok, error}."
+@tags "dashboard" "query-category" "route" "phase-12a"
+removeQueryFromCategoryBody : (categoryId: String) -> (queryId: String) -> {}
+removeQueryFromCategoryBody categoryId queryId =
+  case getQueryCategoryById categoryId of
+    Just _cat ->
+      let _removed = removeQueryFromCategory categoryId queryId
+      { ok = true, error = (Nothing) }
+    _ -> { ok = false, error = (Just "Category not found") }
+
+-- getQueryCategoryById — local helper that wraps the list+filter pattern
+-- (no dedicated state:getQueryCategory primitive; the dashboard's only
+-- direct-by-id need is the membership lookups). Filters the listed
+-- categories by id; returns Maybe<Row>.
+@label "Get query category by id"
+@description "Lookup helper — wraps listQueryCategories + filter (no dedicated state primitive; rarely-used direct lookup)."
+@tags "dashboard" "query-category" "phase-12a"
+getQueryCategoryById : (id: String) -> Maybe ({})
+getQueryCategoryById id =
+  let cats = listQueryCategories()
+  pickFirst (filter (rowIdEquals id) cats)
+
+@label "Row id equals"
+@description "Predicate — eq row.id id."
+@tags "dashboard" "pure" "phase-12a"
+rowIdEquals : (id: String) -> (row: {}) -> Boolean
+rowIdEquals id row = eq row.id id
+
+@label "Pick first"
+@description "List → Maybe head (Cons -> Just, _ -> Nothing)."
+@tags "dashboard" "pure" "phase-12a"
+pickFirst : (rows: List ({})) -> Maybe ({})
+pickFirst rows = head rows

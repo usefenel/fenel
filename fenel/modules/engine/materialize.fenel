@@ -1,0 +1,207 @@
+module engine where
+
+-- =========================================================================
+-- queries = solve ∘ materialize — the MATERIALIZE half + the four query
+-- entries. expr-substrate Phase 16 (brief:
+-- `workstreams/expr-substrate/briefs/phase-16-queries-materialize.md`).
+--
+-- P13 (`solveRel`/`solveFnRel`) shipped the relational solve over a THREADED
+-- facts env — the pure core NEVER fetches; the caller builds `{ relations,
+-- rules }`. P15 (`solveRelAll`/`solveFnRelAll` + `relSolveSet`) shipped the
+-- findall family (EVERY satisfying binding). What was missing is ONLY the
+-- bridge: entity-instance rows → relation extensions. This phase ships that
+-- bridge (the pure builders) + the four query entries (thin compositions over
+-- the SHIPPED solve+findall families). NOT new reasoning.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE relDef MARKER (caller-facing; the `$`-key barrier discipline — a Fenel
+-- body can't author `$`-keyed objects, so the input is a plain record, same as
+-- the facts env in rel-solve.fenel):
+--   relDef = { name        — the atom-head spelling the query lambda uses
+--                            (caller's choice, VERBATIM — the P13 rule)
+--            , fieldOrder   — the projection column names IN ORDER (THREADED by
+--                            the caller; deriving it from the `$`-keyed entity
+--                            schema is a TS-boundary / exposure-era job, NOT a
+--                            pure-body job)
+--            , instances }  — the flat merged-envelope rows
+--                            `{ id, accountId, ...data, createdAt, updatedAt }`
+--                            that `state:listInstancesByName` returns (storage
+--                            strips the top-level `$tag`; variant values NESTED
+--                            in fields keep theirs).
+--
+-- ENVELOPE FIELDS ARE ORDINARY COLUMNS (decision 2): `id` / `accountId` /
+-- `createdAt` / `updatedAt` sit flat in the row exactly like data fields —
+-- `fieldOrder` decides what projects. NO special-casing: an `id`-join
+-- (`ownerOf x y` where `y` is an instance id) is a first-class query shape.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE BUILDERS:
+--   • projectInstanceRow fieldOrder instance ⇒ Maybe row — `std:lookup` each
+--     name in order; ANY missing field ⇒ Nothing (the row is dropped upstream
+--     — a fact must be TOTAL; partial rows can't join honestly. The proven-rows
+--     spirit: we only assert facts we fully read).
+--   • rowsFromInstances fieldOrder instances ⇒ rows — fold, dropping Nothing.
+--   • relationFromInstances name fieldOrder instances ⇒ { name, arity, rows }.
+--   • relDefToRelation / relationsFromDefs / factsFromDefs ⇒ the facts env.
+--
+-- SCALAR CELLS MATCH; VARIANT CELLS RIDE BUT DON'T MATCH (decision 4 — the
+-- shallow-eq honesty fence). std `eq` is reference-shallow on records (the P13
+-- rowEq rationale; Step-0 probe re-confirmed: `eq {tag=Just,_0=5} {tag=Just,
+-- _0=5}` ⇒ false), so a variant-valued cell (`{$tag:"Just",_0:5}` nested in a
+-- field) projects into rows VERBATIM via std:lookup but a constant/residual
+-- match against it is `false` — the row simply never matches, sound-by-under-
+-- approximation (proven-rows). Deep structural matching is a documented
+-- widening (a cross-surface deep-eq discipline decision), NOT this phase.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE FOUR QUERY ENTRIES — thin compositions, findall-first (decision 3):
+--   queryRel       expr relDefs rules                  = solveRelAll over the env
+--   queryRelOne    expr relDefs rules                  = solveRel (first-witness)
+--   queryFnRel     input ctorDefs nullValue relDefs rules = solveFnRelAll (reify)
+--   queryFnRelOne  input ctorDefs nullValue relDefs rules = solveFnRel (reify)
+-- All semantics INHERITED: `Just []` = safe-but-empty, `Nothing` = fence/unsafe
+-- (the P15 split), proven-rows residuals, stage-1 fences. solve/solveFn/solveRel
+-- /solveFnRel/solveRelAll/solveFnRelAll/relSolveSet/enumerateSet/inhabit
+-- ALL stay byte-untouched.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE LIVE CALLER (documented, NOT wired here — decision 6). A production
+-- `state:queryRel` (requires HasStateIO, body calling `engine:factsFromDefs`)
+-- DANGLES today: engine ∉ SYSTEM_MODULES, so the cross-module refs don't
+-- resolve in the production registry. The live wiring is therefore the
+-- caller-side one-liner:
+--   listInstancesByName "Customer"   -- the ONE storage leaf (state.ts:876)
+--     |> \rows -> { name = "customer", fieldOrder = ["id", "boughtBook", "joinedDay"], instances = rows }
+--     |> \relDef -> dispatchedQueryRel queryExpr [relDef] []
+-- demonstrated in materialize.test.ts with HANDLER-SHAPED fixture rows. The
+-- production query surface rides the engine→SYSTEM_MODULES exposure decision
+-- (the parked P5-era item) + the state-module orchestration fn that lands with
+-- it — NOT this phase.
+--
+-- NO ENTITY DECLS / NO Enumerable/Queryable typeclass (decision 7): relDefs +
+-- facts + rows are plain records (the audit-green invariant) ⇒ codename-lock
+-- +0, law +0, entity oracle untouched, audit exit-0.
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- projectInstanceRow — `std:lookup` each fieldOrder name in order; ANY missing
+-- field ⇒ Nothing (the row must be TOTAL).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Project instance row"
+@description "Project one flat merged-envelope instance row onto a fieldOrder column list ⇒ Maybe row (a positional scalar list in column order). `std:lookup` each name in order; ANY missing field ⇒ Nothing — the row is dropped upstream (a fact must be TOTAL; partial rows can't join honestly — the proven-rows spirit: only facts we fully read are asserted). Envelope fields (id / accountId / createdAt / updatedAt) project exactly like data fields — fieldOrder decides what projects. A variant-valued cell rides verbatim under Just (decision 4 — it projects but never matches a constant, by std eq's reference-shallowness). expr-substrate Phase 16."
+@tags "engine" "query" "materialize" "expr-substrate" "phase-16"
+projectInstanceRow : (fieldOrder: List String) -> (instance: a) -> Maybe a
+projectInstanceRow fieldOrder instance =
+  projectFields fieldOrder instance []
+
+@label "Project fields"
+@description "The fold behind projectInstanceRow: walk a fieldOrder name list, `std:lookup` each on the instance, appending its value to the row; the first missing key short-circuits to Nothing (the total-row requirement). Empty / exhausted names ⇒ Just acc. Internal helper."
+@tags "engine" "internal" "query" "materialize" "expr-substrate" "phase-16"
+@category "engine-internal"
+projectFields : (names: a) -> (instance: a) -> (acc: a) -> Maybe a
+projectFields names instance acc =
+  case head names of
+    Nothing -> Just acc
+    Just n ->
+      case lookup instance n of
+        Nothing -> Nothing
+        Just v ->
+          let rest = case tail names of
+                       Nothing -> []
+                       Just r -> r
+          projectFields rest instance (appendItem v acc)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- rowsFromInstances — fold the instances, dropping Nothing (partial) rows.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Rows from instances"
+@description "Materialize a relation's EXTENSION from a flat merged-envelope instance list: projectInstanceRow each, KEEPING only the total (Just) rows — a partial instance (missing a fieldOrder column) is silently dropped (the proven-rows / total-fact policy). The positional rows feed straight into the P13 facts env. Internal helper."
+@tags "engine" "internal" "query" "materialize" "expr-substrate" "phase-16"
+@category "engine-internal"
+rowsFromInstances : (fieldOrder: a) -> (instances: a) -> (acc: a) -> a
+rowsFromInstances fieldOrder instances acc =
+  case head instances of
+    Nothing -> acc
+    Just inst ->
+      let acc2 = case projectInstanceRow fieldOrder inst of
+                   Just row -> appendItem row acc
+                   Nothing -> acc
+      case tail instances of
+        Nothing -> acc2
+        Just rest -> rowsFromInstances fieldOrder rest acc2
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- relationFromInstances / relDefToRelation / relationsFromDefs / factsFromDefs
+-- — assemble the P13 facts env from relDef markers + rules.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Relation from instances"
+@description "Build a P13 relation entry `{ name, arity, rows }` from a name, a fieldOrder, and a flat instance list. `name` = the atom-head spelling the query lambda uses (caller's choice, verbatim); `arity` = length fieldOrder; `rows` = the materialized total-row extension (rowsFromInstances). expr-substrate Phase 16."
+@tags "engine" "query" "materialize" "expr-substrate" "phase-16"
+relationFromInstances : (name: String) -> (fieldOrder: a) -> (instances: a) -> a
+relationFromInstances name fieldOrder instances =
+  { name = name, arity = length fieldOrder, rows = rowsFromInstances fieldOrder instances [] }
+
+@label "Rel def to relation"
+@description "Materialize one relDef marker `{ name, fieldOrder, instances }` into a P13 relation entry `{ name, arity, rows }` (relationFromInstances over its three fields). Internal helper."
+@tags "engine" "internal" "query" "materialize" "expr-substrate" "phase-16"
+@category "engine-internal"
+relDefToRelation : (relDef: a) -> a
+relDefToRelation relDef =
+  relationFromInstances relDef.name relDef.fieldOrder relDef.instances
+
+@label "Relations from defs"
+@description "Map a relDef-marker list onto the P13 relations list (relDefToRelation each), threading the accumulator. Internal helper."
+@tags "engine" "internal" "query" "materialize" "expr-substrate" "phase-16"
+@category "engine-internal"
+relationsFromDefs : (relDefs: a) -> (acc: a) -> a
+relationsFromDefs relDefs acc =
+  case head relDefs of
+    Nothing -> acc
+    Just rd ->
+      let acc2 = appendItem (relDefToRelation rd) acc
+      case tail relDefs of
+        Nothing -> acc2
+        Just rest -> relationsFromDefs rest acc2
+
+@label "Facts from defs"
+@description "Assemble the P13 facts env `{ relations, rules }` from a relDef-marker list + a pre-reified rules list: materialize every relDef into a relation extension (relationsFromDefs), pass the rules through verbatim (each `{ name, params, body }`, body PRE-REIFIED to Expr by the caller). The bridge between the entity-instance world and the relational solver. expr-substrate Phase 16."
+@tags "engine" "query" "materialize" "datalog" "expr-substrate" "phase-16"
+factsFromDefs : (relDefs: a) -> (rules: a) -> a
+factsFromDefs relDefs rules =
+  { relations = relationsFromDefs relDefs [], rules = rules }
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The four query entries — thin compositions over the SHIPPED solve+findall
+-- families (decision 3). findall-first.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Query relational"
+@description "queries = solve ∘ materialize (the findall entry): materialize relDef markers + rules into the P13 facts env (factsFromDefs), then enumerate ALL satisfying bindings of a multi-binder predicate `Expr` (solveRelAll over collectFreeVars order) ⇒ Maybe (List bindings). THE engine-side query primitive: a user query ('bought book B ∧ joined < 3 days') = a predicate over materialized entity-instance relations. `Just []` = query SAFE but no satisfying rows; `Nothing` = unsafe / out-of-fragment (the inherited P15 split). The production exposure (a `state:queryRel` orchestration fn calling the live `listInstancesByName → relDef`) rides the engine→SYSTEM_MODULES decision (decision 6). expr-substrate Phase 16."
+@tags "engine" "query" "materialize" "solve" "relational" "datalog" "prover" "expr-substrate" "phase-16"
+queryRel : (expr: Expr) -> (relDefs: a) -> (rules: a) -> Maybe a
+queryRel expr relDefs rules =
+  solveRelAll expr (factsFromDefs relDefs rules)
+
+@label "Query relational one"
+@description "The first-witness sibling of queryRel: materialize relDef markers + rules into the facts env, then solveRel (the first satisfying binding) ⇒ Maybe (List binding). `Nothing` = unsafe / out-of-fragment / no satisfying row (solveRel folds safe-but-empty back to Nothing via witTuples-on-empty — the P13 first-witness behaviour). expr-substrate Phase 16."
+@tags "engine" "query" "materialize" "solve" "relational" "datalog" "prover" "expr-substrate" "phase-16"
+queryRelOne : (expr: Expr) -> (relDefs: a) -> (rules: a) -> Maybe a
+queryRelOne expr relDefs rules =
+  solveRel expr (factsFromDefs relDefs rules)
+
+@label "Query fn relational"
+@description "The reify-composed findall query entry: materialize relDef markers + rules into the facts env, then solveFnRelAll (reify the marshalled Fn value to its Expr body + captures, the lambda's PARAMS as the ordered unknowns) ⇒ EVERY satisfying binding. The lambda form of queryRel — `\\x y -> and (boughtBook x \"book-b\") (joinedDay y) ...`. reify's Err (bodyless / native) ⇒ Nothing; safe-but-empty ⇒ Just []; unsafe ⇒ Nothing. expr-substrate Phase 16."
+@tags "engine" "query" "materialize" "solve" "relational" "reify" "datalog" "prover" "expr-substrate" "phase-16"
+queryFnRel : (input: { body: a, params: List String, env: a }) -> (ctorDefs: a) -> (nullValue: a) -> (relDefs: a) -> (rules: a) -> Maybe a
+queryFnRel input ctorDefs nullValue relDefs rules =
+  solveFnRelAll input ctorDefs nullValue (factsFromDefs relDefs rules)
+
+@label "Query fn relational one"
+@description "The reify-composed first-witness query entry: materialize relDef markers + rules into the facts env, then solveFnRel (reify, the params as the ordered unknowns, the FIRST satisfying binding) ⇒ Maybe (List binding). The lambda form of queryRelOne. reify's Err ⇒ Nothing; no satisfying row ⇒ Nothing. expr-substrate Phase 16."
+@tags "engine" "query" "materialize" "solve" "relational" "reify" "datalog" "prover" "expr-substrate" "phase-16"
+queryFnRelOne : (input: { body: a, params: List String, env: a }) -> (ctorDefs: a) -> (nullValue: a) -> (relDefs: a) -> (rules: a) -> Maybe a
+queryFnRelOne input ctorDefs nullValue relDefs rules =
+  solveFnRel input ctorDefs nullValue (factsFromDefs relDefs rules)

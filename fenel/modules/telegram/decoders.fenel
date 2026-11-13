@@ -1,0 +1,470 @@
+-- =========================================================================
+-- Telegram entity decoders — typed JsonValue → domain ADT (User / Chat /
+-- ChatRef / ChatType / MessageEntity / MessageEntityType / Message /
+-- CallbackQuery / Update).
+--
+-- Phase 11c sub-step 2c of the ts-elimination workstream. Closes the C2
+-- anti-pattern flagged in the retroactive audit: the inbound Telegram
+-- webhook handler was flattening typed Update payloads into a flat
+-- {botId, chatId, userId, text, messageDate, callbackData, _eventType}
+-- record TS-side; that primitive extraction now lives here as a chain of
+-- Fenel decoder bodies that pattern-match on the typed Update.
+--
+-- Composition: every record decoder folds bindResult over a series of
+-- decodeRecordField / decodeRecordRequiredField / decodeRecordListField
+-- calls; the innermost continuation builds the typed value via the
+-- named-constructor form (User { … } / Chat { … } / etc.). Short-circuit
+-- on the first Err propagates the failure with full provenance.
+--
+-- decodeMessage is self-recursive on `replyToMessage: Maybe<Message>`;
+-- Telegram's nesting is bounded in practice (reply-to-a-reply ≈ 1-2
+-- levels) so a vanilla recursive call suffices — no depth-limit
+-- mitigation needed.
+--
+-- decodeUpdate dispatches on which non-updateId key is present in the
+-- JsonObject pairs (camelCase, post-fromTelegramWire) — the umbrella
+-- variant selector. Frequency-ordered: MessageUpdate first (the bulk of
+-- live traffic), then EditedMessageUpdate, then CallbackQueryUpdate,
+-- then the long tail of business / channel / inline / payment / poll /
+-- chat-member / boost variants. Unknown keys fall through to
+-- UnknownUpdate kind so future Telegram-feature additions don't silently
+-- Err at the boundary.
+--
+-- module-substrate Phase 3o.1 (2026-05-31) — this file + `conversation.fenel`
+-- carry `module telegram where`, so they UNION into the `telegram` module
+-- (`loadFenelModuleUnion` groups by header — OQ3); the union is the merge-point
+-- the Phase-3p `mixed-ingress` dissolve joins `webhook-wrapper.fenel` into. The
+-- 9 decoders + `flatPayloadForTriggers` were hand-wrapped `defineFunction` specs
+-- in `engine/src/modules/telegram.ts`; their identity now rides @facet directives
+-- here, their bodies UNCHANGED. The two `flat*Inner` helpers stay directive-free
+-- → Codeable-only (the Phase-3j loader default — the auth precedent). No stored
+-- @category (the `telegram` category derives at read time from the `telegram:`
+-- id prefix, Phase 3j). The decoder param/return types round-trip byte-identically
+-- through the `.fenel` sig (JsonValue → Result String NamedType — verified vs the
+-- retired specs), so this is a true parity migration.
+-- =========================================================================
+
+module telegram where
+
+-- ---------------------------------------------------------------------------
+-- decodeChatType — nullary 4-case enum from JsonString.
+-- Telegram wire: "private" | "group" | "supergroup" | "channel".
+-- ---------------------------------------------------------------------------
+
+@label "Decode ChatType"
+@description "Decode a JsonValue into the typed ChatType ADT (Private | Group | Supergroup | Channel). Telegram wire emits lower-case strings; this matches camelCase or snake_case forms."
+@tags "telegram" "decode" "decodable" "pure"
+decodeChatType : JsonValue -> Result String ChatType
+decodeChatType jv =
+  bindResult (decodeJsonString jv) (\s ->
+    if s == "private" then Ok (Private)
+    else if s == "group" then Ok (Group)
+    else if s == "supergroup" then Ok (Supergroup)
+    else if s == "channel" then Ok (Channel)
+    else Err (concat "decodeChatType: unknown chat type " s))
+
+-- ---------------------------------------------------------------------------
+-- decodeChatRef — sum dispatched on JsonValue variant. JsonNumber → ById;
+-- JsonString → ByUsername. Telegram's chat.id is almost always a number;
+-- the @username string form appears in a handful of API surfaces (not
+-- normally in webhook updates).
+-- ---------------------------------------------------------------------------
+
+@label "Decode ChatRef"
+@description "Decode a JsonValue into the typed ChatRef sum (ById Int | ByUsername String). Dispatches on JsonValue variant — JsonNumber → ById, JsonString → ByUsername."
+@tags "telegram" "decode" "decodable" "pure"
+decodeChatRef : JsonValue -> Result String ChatRef
+decodeChatRef jv =
+  case jv of
+    JsonNumber { value = n } -> Ok (ById n)
+    JsonString { value = u } -> Ok (ByUsername u)
+    _ -> Err "decodeChatRef: expected JsonNumber or JsonString"
+
+-- ---------------------------------------------------------------------------
+-- decodeMessageEntityType — nullary 19-case enum from JsonString.
+-- Telegram wire: lower-case snake-case strings ("text_link", etc.). Pre-
+-- pass via fromTelegramWire flips snake-case → camelCase, so we match on
+-- the camel-cased forms here (textLink, etc.).
+-- ---------------------------------------------------------------------------
+
+@label "Decode MessageEntityType"
+@description "Decode a JsonValue into the typed MessageEntityType nullary 19-case enum. Accepts both camelCase and snake_case wire forms."
+@tags "telegram" "decode" "decodable" "pure"
+decodeMessageEntityType : JsonValue -> Result String MessageEntityType
+decodeMessageEntityType jv =
+  bindResult (decodeJsonString jv) (\s ->
+    if s == "mention" then Ok (Mention)
+    else if s == "hashtag" then Ok (Hashtag)
+    else if s == "cashtag" then Ok (Cashtag)
+    else if s == "bot_command" then Ok (BotCommand)
+    else if s == "botCommand" then Ok (BotCommand)
+    else if s == "url" then Ok (UrlEntity)
+    else if s == "email" then Ok (EmailEntity)
+    else if s == "phone_number" then Ok (PhoneNumber)
+    else if s == "phoneNumber" then Ok (PhoneNumber)
+    else if s == "bold" then Ok (Bold)
+    else if s == "italic" then Ok (Italic)
+    else if s == "underline" then Ok (Underline)
+    else if s == "strikethrough" then Ok (Strikethrough)
+    else if s == "spoiler" then Ok (Spoiler)
+    else if s == "code" then Ok (Code)
+    else if s == "pre" then Ok (Pre)
+    else if s == "text_link" then Ok (TextLink)
+    else if s == "textLink" then Ok (TextLink)
+    else if s == "text_mention" then Ok (TextMention)
+    else if s == "textMention" then Ok (TextMention)
+    else if s == "custom_emoji" then Ok (CustomEmoji)
+    else if s == "customEmoji" then Ok (CustomEmoji)
+    else if s == "blockquote" then Ok (Blockquote)
+    else if s == "expandable_blockquote" then Ok (ExpandableBlockquote)
+    else if s == "expandableBlockquote" then Ok (ExpandableBlockquote)
+    else Err (concat "decodeMessageEntityType: unknown entity type " s))
+
+-- ---------------------------------------------------------------------------
+-- decodeUser — User record. 3 required fields (id, isBot, firstName) +
+-- 6 Maybe-typed optional fields.
+-- ---------------------------------------------------------------------------
+
+@label "Decode User"
+@description "Decode a JsonValue into the typed User record. 3 required fields (id / isBot / firstName) + 6 Maybe-typed optional fields."
+@tags "telegram" "decode" "decodable" "pure"
+decodeUser : JsonValue -> Result String User
+decodeUser jv = (bindResult (decodeRecordRequiredField jv "id" decodeJsonInt) (\id ->
+  bindResult (decodeRecordRequiredField jv "isBot" decodeJsonBool) (\isBot ->
+  bindResult (decodeRecordRequiredField jv "firstName" decodeJsonString) (\firstName ->
+  bindResult (decodeRecordField jv "lastName" decodeJsonString) (\lastName ->
+  bindResult (decodeRecordField jv "username" decodeJsonString) (\username ->
+  bindResult (decodeRecordField jv "languageCode" decodeJsonString) (\languageCode ->
+  bindResult (decodeRecordField jv "isPremium" decodeJsonBool) (\isPremium ->
+  bindResult (decodeRecordField jv "canJoinGroups" decodeJsonBool) (\canJoinGroups ->
+  bindResult (decodeRecordField jv "canManageBots" decodeJsonBool) (\canManageBots ->
+    Ok (User {
+      id = id,
+      isBot = isBot,
+      firstName = firstName,
+      lastName = lastName,
+      username = username,
+      languageCode = languageCode,
+      isPremium = isPremium,
+      canJoinGroups = canJoinGroups,
+      canManageBots = canManageBots
+    })))))))))))
+
+-- ---------------------------------------------------------------------------
+-- decodeChat — Chat record. id (ChatRef) + type (ChatType) required;
+-- 5 Maybe-typed optional fields.
+-- ---------------------------------------------------------------------------
+
+@label "Decode Chat"
+@description "Decode a JsonValue into the typed Chat record. id (ChatRef) + type (ChatType) required; 5 Maybe-typed optional fields."
+@tags "telegram" "decode" "decodable" "pure"
+decodeChat : JsonValue -> Result String Chat
+decodeChat jv = (bindResult (decodeRecordRequiredField jv "id" decodeChatRef) (\id ->
+  bindResult (decodeRecordRequiredField jv "type" decodeChatType) (\ty ->
+  bindResult (decodeRecordField jv "title" decodeJsonString) (\title ->
+  bindResult (decodeRecordField jv "username" decodeJsonString) (\username ->
+  bindResult (decodeRecordField jv "firstName" decodeJsonString) (\firstName ->
+  bindResult (decodeRecordField jv "lastName" decodeJsonString) (\lastName ->
+  bindResult (decodeRecordField jv "isForum" decodeJsonBool) (\isForum ->
+    Ok (Chat {
+      id = id,
+      type = ty,
+      title = title,
+      username = username,
+      firstName = firstName,
+      lastName = lastName,
+      isForum = isForum
+    })))))))))
+
+-- ---------------------------------------------------------------------------
+-- decodeMessageEntity — MessageEntity record. type / offset / length
+-- required; 4 Maybe-typed optional fields (incl. nested Maybe<User>).
+-- ---------------------------------------------------------------------------
+
+@label "Decode MessageEntity"
+@description "Decode a JsonValue into the typed MessageEntity record. type / offset / length required; 4 Maybe-typed optional fields incl. nested Maybe<User>."
+@tags "telegram" "decode" "decodable" "pure"
+decodeMessageEntity : JsonValue -> Result String MessageEntity
+decodeMessageEntity jv = (bindResult (decodeRecordRequiredField jv "type" decodeMessageEntityType) (\ty ->
+  bindResult (decodeRecordRequiredField jv "offset" decodeJsonInt) (\offset ->
+  bindResult (decodeRecordRequiredField jv "length" decodeJsonInt) (\len ->
+  bindResult (decodeRecordField jv "url" decodeJsonString) (\url ->
+  bindResult (decodeRecordField jv "user" decodeUser) (\user ->
+  bindResult (decodeRecordField jv "language" decodeJsonString) (\language ->
+  bindResult (decodeRecordField jv "customEmojiId" decodeJsonString) (\customEmojiId ->
+    Ok (MessageEntity {
+      type = ty,
+      offset = offset,
+      length = len,
+      url = url,
+      user = user,
+      language = language,
+      customEmojiId = customEmojiId
+    })))))))))
+
+-- ---------------------------------------------------------------------------
+-- decodeMessage — Message record. Self-recursive via replyToMessage. The
+-- nested entities (User, Chat, MessageEntity) decode through their own
+-- helpers. LinkPreviewOptions is intentionally decoded as Nothing for
+-- 11c-2c — not yet wired through dispatchCollectorEvent or any other
+-- downstream consumer; trigger this as a follow-up if a downstream body
+-- needs it.
+-- ---------------------------------------------------------------------------
+
+@label "Decode Message"
+@description "Decode a JsonValue into the typed Message record. Self-recursive via replyToMessage: Maybe<Message>. linkPreviewOptions is decoded as Nothing pending a downstream consumer in 11c-3+."
+@tags "telegram" "decode" "decodable" "pure"
+decodeMessage : JsonValue -> Result String Message
+decodeMessage jv = (bindResult (decodeRecordRequiredField jv "messageId" decodeJsonInt) (\id ->
+  bindResult (decodeRecordField jv "from" decodeUser) (\from ->
+  bindResult (decodeRecordField jv "senderChat" decodeChat) (\senderChat ->
+  bindResult (decodeRecordRequiredField jv "chat" decodeChat) (\chat ->
+  bindResult (decodeRecordRequiredField jv "date" decodeJsonInt) (\date ->
+  bindResult (decodeRecordField jv "messageThreadId" decodeJsonInt) (\messageThreadId ->
+  bindResult (decodeRecordField jv "text" decodeJsonString) (\text ->
+  bindResult (decodeRecordListField jv "entities" decodeMessageEntity) (\entities ->
+  bindResult (decodeRecordField jv "caption" decodeJsonString) (\caption ->
+  bindResult (decodeRecordListField jv "captionEntities" decodeMessageEntity) (\captionEntities ->
+  bindResult (decodeRecordField jv "hasProtectedContent" decodeJsonBool) (\hasProtectedContent ->
+  bindResult (decodeRecordField jv "isTopicMessage" decodeJsonBool) (\isTopicMessage ->
+  bindResult (decodeRecordField jv "editDate" decodeJsonInt) (\editDate ->
+  bindResult (decodeRecordField jv "replyToMessage" decodeMessage) (\replyToMessage ->
+    Ok (Message {
+      id = id,
+      from = from,
+      senderChat = senderChat,
+      chat = chat,
+      date = date,
+      messageThreadId = messageThreadId,
+      text = text,
+      entities = entities,
+      caption = caption,
+      captionEntities = captionEntities,
+      hasProtectedContent = hasProtectedContent,
+      isTopicMessage = isTopicMessage,
+      editDate = editDate,
+      replyToMessage = replyToMessage,
+      linkPreviewOptions = Nothing
+    }))))))))))))))))
+
+-- ---------------------------------------------------------------------------
+-- decodeCallbackQuery — CallbackQuery record. 4 required fields (id, from,
+-- chatInstance + message-as-Maybe), 3 Maybe-typed.
+-- ---------------------------------------------------------------------------
+
+@label "Decode CallbackQuery"
+@description "Decode a JsonValue into the typed CallbackQuery record. id / from / chatInstance required; 3 Maybe-typed optional + Maybe<Message>."
+@tags "telegram" "decode" "decodable" "pure"
+decodeCallbackQuery : JsonValue -> Result String CallbackQuery
+decodeCallbackQuery jv = (bindResult (decodeRecordRequiredField jv "id" decodeJsonString) (\id ->
+  bindResult (decodeRecordRequiredField jv "from" decodeUser) (\from ->
+  bindResult (decodeRecordRequiredField jv "chatInstance" decodeJsonString) (\chatInstance ->
+  bindResult (decodeRecordField jv "message" decodeMessage) (\message ->
+  bindResult (decodeRecordField jv "inlineMessageId" decodeJsonString) (\inlineMessageId ->
+  bindResult (decodeRecordField jv "data" decodeJsonString) (\data ->
+  bindResult (decodeRecordField jv "gameShortName" decodeJsonString) (\gameShortName ->
+    Ok (CallbackQuery {
+      id = id,
+      from = from,
+      chatInstance = chatInstance,
+      message = message,
+      inlineMessageId = inlineMessageId,
+      data = data,
+      gameShortName = gameShortName
+    })))))))))
+
+-- ---------------------------------------------------------------------------
+-- decodeUpdate — top-level dispatch on which non-updateId key is present
+-- in the JsonObject pairs. Frequency-ordered (Message / EditedMessage /
+-- CallbackQuery cover ~95% of live webhook traffic). Long-tail variants
+-- (business / channel / boost / inline / payment / poll / chat-member /
+-- pre-checkout) follow. Unknown keys produce UnknownUpdate { kind } so
+-- new Telegram-feature additions don't silently drop.
+-- ---------------------------------------------------------------------------
+
+@label "Decode Update"
+@description "Decode a JsonValue into the typed Update ADT (~25 variants). Dispatches on which non-updateId key is present in the JsonObject pairs. Frequency-ordered: MessageUpdate / EditedMessageUpdate / CallbackQueryUpdate cover ~95% of live traffic; long-tail variants (business / channel / boost / inline / payment / poll / chat-member / pre-checkout) follow. Unknown keys produce UnknownUpdate { kind = \"unknown\" } so future Telegram-feature additions don't silently drop."
+@tags "telegram" "decode" "decodable" "pure"
+decodeUpdate : JsonValue -> Result String Update
+decodeUpdate jv =
+  case jv of
+    JsonObject { pairs } ->
+      bindResult (decodeRecordRequiredField jv "updateId" decodeJsonInt) (\updateId ->
+        if hasPair pairs "message" then
+          bindResult (decodeRecordRequiredField jv "message" decodeMessage) (\message ->
+            Ok (MessageUpdate { updateId = updateId, message = message }))
+        else if hasPair pairs "editedMessage" then
+          bindResult (decodeRecordRequiredField jv "editedMessage" decodeMessage) (\message ->
+            Ok (EditedMessageUpdate { updateId = updateId, message = message }))
+        else if hasPair pairs "callbackQuery" then
+          bindResult (decodeRecordRequiredField jv "callbackQuery" decodeCallbackQuery) (\callbackQuery ->
+            Ok (CallbackQueryUpdate { updateId = updateId, callbackQuery = callbackQuery }))
+        else if hasPair pairs "channelPost" then
+          bindResult (decodeRecordRequiredField jv "channelPost" decodeMessage) (\message ->
+            Ok (ChannelPostUpdate { updateId = updateId, message = message }))
+        else if hasPair pairs "editedChannelPost" then
+          bindResult (decodeRecordRequiredField jv "editedChannelPost" decodeMessage) (\message ->
+            Ok (EditedChannelPostUpdate { updateId = updateId, message = message }))
+        else if hasPair pairs "businessConnection" then
+          Ok (BusinessConnectionUpdate { updateId = updateId, connectionId = "" })
+        else if hasPair pairs "businessMessage" then
+          bindResult (decodeRecordRequiredField jv "businessMessage" decodeMessage) (\message ->
+            Ok (BusinessMessageUpdate { updateId = updateId, message = message }))
+        else if hasPair pairs "editedBusinessMessage" then
+          bindResult (decodeRecordRequiredField jv "editedBusinessMessage" decodeMessage) (\message ->
+            Ok (EditedBusinessMessageUpdate { updateId = updateId, message = message }))
+        else if hasPair pairs "deletedBusinessMessages" then
+          Ok (DeletedBusinessMessagesUpdate { updateId = updateId, chatId = ById 0, messageIds = [] })
+        else if hasPair pairs "messageReaction" then
+          Ok (MessageReactionUpdate { updateId = updateId, chatId = ById 0, messageId = 0 })
+        else if hasPair pairs "messageReactionCount" then
+          Ok (MessageReactionCountUpdate { updateId = updateId, chatId = ById 0, messageId = 0 })
+        else if hasPair pairs "inlineQuery" then
+          Ok (InlineQueryUpdate { updateId = updateId, queryId = "", fromUserId = 0, query = "" })
+        else if hasPair pairs "chosenInlineResult" then
+          Ok (ChosenInlineResultUpdate { updateId = updateId, resultId = "", fromUserId = 0, query = "" })
+        else if hasPair pairs "shippingQuery" then
+          Ok (ShippingQueryUpdate { updateId = updateId, queryId = "", fromUserId = 0 })
+        else if hasPair pairs "preCheckoutQuery" then
+          Ok (PreCheckoutQueryUpdate { updateId = updateId, queryId = "", fromUserId = 0 })
+        else if hasPair pairs "purchasedPaidMedia" then
+          Ok (PurchasedPaidMediaUpdate { updateId = updateId, fromUserId = 0, payload = "" })
+        else if hasPair pairs "poll" then
+          Ok (PollUpdate { updateId = updateId, pollId = "" })
+        else if hasPair pairs "pollAnswer" then
+          Ok (PollAnswerUpdate { updateId = updateId, pollId = "", fromUserId = Nothing })
+        else if hasPair pairs "myChatMember" then
+          Ok (MyChatMemberUpdate { updateId = updateId, chatId = ById 0 })
+        else if hasPair pairs "chatMember" then
+          Ok (ChatMemberStatusUpdate { updateId = updateId, chatId = ById 0 })
+        else if hasPair pairs "chatJoinRequest" then
+          Ok (ChatJoinRequestUpdate { updateId = updateId, chatId = ById 0, fromUserId = 0 })
+        else if hasPair pairs "chatBoost" then
+          Ok (ChatBoostUpdate { updateId = updateId, chatId = ById 0 })
+        else if hasPair pairs "removedChatBoost" then
+          Ok (RemovedChatBoostUpdate { updateId = updateId, chatId = ById 0 })
+        else
+          Ok (UnknownUpdate { updateId = updateId, kind = "unknown" }))
+    _ -> Err "decodeUpdate: expected JsonObject"
+
+-- ---------------------------------------------------------------------------
+-- flatPayloadForTriggers — minimal helper that preserves the legacy
+-- user-trigger payload contract for dispatchEventTriggers
+-- (Decision EE — 11c-3 conservative lean).
+--
+-- The pre-3 updateToFlatPayload shim served both dispatchCollectorEvent
+-- AND dispatchEventTriggers; stepConversation now consumes the typed
+-- Update directly, but user-defined triggers in production may bind on
+-- the flat payload's fields (payload.text / payload.callbackData /
+-- payload._eventType). This single helper produces the same field set
+-- the 2c shim did so the trigger contract stays unchanged.
+--
+-- Returns { eventType: String, payload: Record }. eventType maps:
+--   MessageUpdate         → "telegram.message"
+--   EditedMessageUpdate   → "telegram.editedMessage"
+--   ChannelPostUpdate     → "telegram.channelPost"
+--   EditedChannelPostUpdate → "telegram.editedChannelPost"
+--   BusinessMessageUpdate → "telegram.businessMessage"
+--   EditedBusinessMessageUpdate → "telegram.editedBusinessMessage"
+--   CallbackQueryUpdate   → "telegram.callbackQuery"
+--   anything else         → "telegram.other"
+--
+-- Field extraction matches the pre-3 TS-flattening shape:
+--   chatId       — ChatRef.ById n → n; ByUsername _ → 0
+--   userId       — Maybe<User>.value.id or cq.from.id; 0 if absent
+--   text         — Maybe<String> text or ""; "" for callback queries
+--   callbackData — cq.data or ""; "" for messages
+--   messageDate  — Just (date * 1000) for messages; Nothing for callbacks
+--   _eventType   — same as eventType (preserved for back-compat)
+-- ---------------------------------------------------------------------------
+
+@label "Flatten Update → user-trigger payload"
+@description "Phase 11c sub-step 3 minimal helper — flattens a typed Update into the legacy user-trigger payload shape ({ eventType, payload: { botId, chatId, userId, text, callbackData, messageDate, _eventType } }) so dispatchEventTriggers in handleTelegramUpdate's body keeps the pre-3 contract (user-defined triggers may bind on payload.text / payload.callbackData / payload._eventType). Decision EE — preserves the field set verbatim (including _eventType) to avoid breaking any user trigger code in production. Replaces the pre-3 three-helper updateToFlatPayload shim (which split the message vs callbackQuery flatten across two helpers); this lives as a single helper since the only consumer is dispatchEventTriggers."
+@tags "telegram" "decode" "trigger" "pure"
+flatPayloadForTriggers : String -> Update -> {}
+flatPayloadForTriggers botId update =
+  case update of
+    MessageUpdate { message = message } ->
+      flatMessagePayloadInner botId "telegram.message" message
+    EditedMessageUpdate { message = message } ->
+      flatMessagePayloadInner botId "telegram.editedMessage" message
+    ChannelPostUpdate { message = message } ->
+      flatMessagePayloadInner botId "telegram.channelPost" message
+    EditedChannelPostUpdate { message = message } ->
+      flatMessagePayloadInner botId "telegram.editedChannelPost" message
+    BusinessMessageUpdate { message = message } ->
+      flatMessagePayloadInner botId "telegram.businessMessage" message
+    EditedBusinessMessageUpdate { message = message } ->
+      flatMessagePayloadInner botId "telegram.editedBusinessMessage" message
+    CallbackQueryUpdate { callbackQuery = cq } ->
+      flatCallbackQueryPayloadInner botId cq
+    _ ->
+      {
+        eventType = "telegram.other",
+        payload = {
+          botId = botId,
+          chatId = 0,
+          userId = 0,
+          text = "",
+          callbackData = "",
+          messageDate = Nothing,
+          _eventType = "telegram.other"
+        }
+      }
+
+-- Inner helper — flatten a Message-bearing update for the user-trigger
+-- payload. Mirrors the pre-3 flatMessagePayload shape; renamed with
+-- "Inner" suffix since the outer flatPayloadForTriggers is the one
+-- registered as a function (Inner helpers are referenced by codeName
+-- from the outer body's case arms).
+
+flatMessagePayloadInner : String -> String -> Message -> {}
+flatMessagePayloadInner botId eventType message =
+  let chatId = case message.chat.id of
+        ById { id = n } -> n
+        ByUsername { username = _u } -> 0
+  let userId = case message.from of
+        Nothing -> 0
+        Just u -> u.id
+  let text = case message.text of
+        Nothing -> ""
+        Just t -> t
+  let messageDate = Just (message.date * 1000)
+  {
+    eventType = eventType,
+    payload = {
+      botId = botId,
+      chatId = chatId,
+      userId = userId,
+      text = text,
+      callbackData = "",
+      messageDate = messageDate,
+      _eventType = eventType
+    }
+  }
+
+-- Inner helper — flatten a CallbackQuery-bearing update.
+
+flatCallbackQueryPayloadInner : String -> CallbackQuery -> {}
+flatCallbackQueryPayloadInner botId cq =
+  let chatId = case cq.message of
+        Nothing -> 0
+        Just m ->
+          case m.chat.id of
+            ById { id = n } -> n
+            ByUsername { username = _u } -> 0
+  let callbackData = case cq.data of
+        Nothing -> ""
+        Just d -> d
+  {
+    eventType = "telegram.callbackQuery",
+    payload = {
+      botId = botId,
+      chatId = chatId,
+      userId = cq.from.id,
+      text = "",
+      callbackData = callbackData,
+      messageDate = Nothing,
+      _eventType = "telegram.callbackQuery"
+    }
+  }

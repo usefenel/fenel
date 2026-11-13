@@ -1,0 +1,699 @@
+module engine where
+
+-- ---------------------------------------------------------------------------
+-- JSON Schema -> Fenel authoring plan
+--
+-- The host supplies one `$`-free, own-property marker tree. JSON object
+-- properties are ordered rows (`{ wireName, schema, reuse }`), so names such
+-- as `__proto__` and `constructor` never become host lookup policy. Every
+-- schema decision below is Fenel-owned. The TypeScript boundary only encodes
+-- the marker, serialises this plan to `$`-key FenelType, and applies explicit
+-- entropy plus the Phase-2b authoring validator.
+-- ---------------------------------------------------------------------------
+
+@category "engine-internal"
+jsrReady : (plan: a) -> b
+jsrReady plan =
+  { ok = true
+  , plan = plan
+  , code = ""
+  , wireName = ""
+  , keyToken = ""
+  , message = ""
+  }
+
+@category "engine-internal"
+jsrInvalid : (code: String) -> (wireName: String) -> (keyToken: String) -> (message: String) -> a
+jsrInvalid code wireName keyToken message =
+  { ok = false
+  , plan = []
+  , code = code
+  , wireName = wireName
+  , keyToken = keyToken
+  , message = message
+  }
+
+@category "engine-internal"
+jsrUse : (base: String) -> (constraint: Maybe a) -> b
+jsrUse base constraint = { kind = "use", base = base, constraint = constraint }
+
+@category "engine-internal"
+jsrStringMaybe : (slot: a) -> Maybe String
+jsrStringMaybe slot =
+  if and slot.present (isString slot.value) then Just slot.value else Nothing
+
+@category "engine-internal"
+jsrPrimaryType : (slot: a) -> String
+jsrPrimaryType slot =
+  if not slot.present then ""
+  else if isString slot.value then slot.value
+  else if isArray slot.value then case head slot.value of
+    Just value -> if isString value then value else ""
+    Nothing -> ""
+  else ""
+
+@category "engine-internal"
+jsrRec1 : (key: String) -> (value: a) -> b
+jsrRec1 key value = fromEntries [{ key = key, value = value }]
+
+@category "engine-internal"
+jsrJsonEntry : (entry: a) -> b
+jsrJsonEntry entry = { key = entry.key, value = jsrJsonValue entry.value }
+
+@category "engine-internal"
+jsrLiteralFirstError : (first: Maybe String) -> (later: Maybe String) -> Maybe String
+jsrLiteralFirstError first later = case first of
+  Just kind -> Just kind
+  Nothing -> later
+
+@category "engine-internal"
+jsrJsonLiteralKind : (kind: String) -> Bool
+jsrJsonLiteralKind kind =
+  or (eq kind "null") (or (eq kind "boolean") (or (eq kind "number") (eq kind "string")))
+
+@category "engine-internal"
+jsrJsonCompoundLiteralError : (marker: a) -> Maybe String
+jsrJsonCompoundLiteralError marker =
+  if eq marker.kind "array" then fold (\acc item -> jsrLiteralFirstError acc (jsrJsonLiteralError item)) Nothing marker.items
+  else if eq marker.kind "object" then fold (\acc entry -> jsrLiteralFirstError acc (jsrJsonLiteralError entry.value)) Nothing marker.entries
+  else if and (eq marker.kind "unsupported") (isString marker.value) then Just marker.value
+  else Just "unsupported"
+
+@category "engine-internal"
+jsrJsonLiteralError : (marker: a) -> Maybe String
+jsrJsonLiteralError marker =
+  if jsrJsonLiteralKind marker.kind then Nothing else jsrJsonCompoundLiteralError marker
+
+@category "engine-internal"
+jsrSchemaComposedLiteralError : (schema: a) -> (first: Maybe String) -> Maybe String
+jsrSchemaComposedLiteralError schema first =
+  let anyError = fold (\acc child -> jsrLiteralFirstError acc (jsrSchemaLiteralError child)) first schema.anyOfSchemas
+  let allError = fold (\acc child -> jsrLiteralFirstError acc (jsrSchemaLiteralError child)) anyError schema.allOfSchemas
+  let oneError = fold (\acc child -> jsrLiteralFirstError acc (jsrSchemaLiteralError child)) allError schema.oneOfSchemas
+  let notError = if schema.notSchema.present then jsrSchemaLiteralError schema.notSchema.value else Nothing
+  jsrLiteralFirstError oneError notError
+
+@category "engine-internal"
+jsrSchemaLiteralError : (schema: a) -> Maybe String
+jsrSchemaLiteralError schema =
+  let enumError = if schema.enumValues.present then jsrJsonLiteralError schema.enumValues.value else Nothing
+  let constError = if schema.constValue.present then jsrJsonLiteralError schema.constValue.value else Nothing
+  let localError = jsrLiteralFirstError enumError constError
+  let propertyError = fold (\acc row -> jsrLiteralFirstError acc (jsrSchemaLiteralError row.schema)) localError schema.propertyRows
+  let itemsError = if schema.itemsSchema.present then jsrSchemaLiteralError schema.itemsSchema.value else Nothing
+  let withItems = jsrLiteralFirstError propertyError itemsError
+  jsrSchemaComposedLiteralError schema withItems
+
+@category "engine-internal"
+jsrJsonValue : (marker: a) -> b
+jsrJsonValue marker =
+  if eq marker.kind "null" then nullValue
+  else if eq marker.kind "boolean" then marker.value
+  else if eq marker.kind "number" then marker.value
+  else if eq marker.kind "string" then marker.value
+  else if eq marker.kind "array" then map jsrJsonValue marker.items
+  else if eq marker.kind "object" then fromEntries (map jsrJsonEntry marker.entries)
+  else marker
+
+@category "engine-internal"
+jsrSetsMaybe : (sets: List a) -> Maybe a
+jsrSetsMaybe sets = case head sets of
+  Nothing -> Nothing
+  Just first -> case tail sets of
+    Nothing -> Just first
+    Just rest ->
+      if eq (length rest) 0
+      then Just first
+      else Just (SeIntersect { branches = sets })
+
+@category "engine-internal"
+jsrAppendMaybeSet : (candidate: Maybe a) -> (sets: List a) -> List a
+jsrAppendMaybeSet candidate sets = case candidate of
+  Nothing -> sets
+  Just value -> appendItem value sets
+
+@category "engine-internal"
+jsrMaybeSetList : (candidate: Maybe a) -> List a
+jsrMaybeSetList candidate = case candidate of
+  Nothing -> []
+  Just value -> [value]
+
+@category "engine-internal"
+jsrFormatSet : (format: String) -> Maybe a
+jsrFormatSet format =
+  if eq format "email" then Just (SeRef { handle = "format:email" })
+  else if eq format "phone" then Just (SeRef { handle = "format:phone" })
+  else if eq format "uri" then Just (SeRef { handle = "format:url" })
+  else jsrFormatSetRest format
+
+@category "engine-internal"
+jsrFormatSetRest : (format: String) -> Maybe a
+jsrFormatSetRest format =
+  if eq format "uri-reference" then Just (SeRef { handle = "format:url" })
+  else if eq format "uuid" then Just (SeRef { handle = "format:uuid" })
+  else if eq format "hostname" then Just (SeRef { handle = "format:handle" })
+  else Nothing
+
+@category "engine-internal"
+jsrEnumConstraintParts : (schema: a) -> (sets: List a) -> List a
+jsrEnumConstraintParts schema sets =
+  let enumValue = jsrJsonValue schema.enumValues.value
+  let next = if and schema.enumValues.present (isArray enumValue) then appendItem (SeEnum { values = enumValue }) sets else sets
+  if schema.constValue.present
+  then appendItem (SeEnum { values = [jsrJsonValue schema.constValue.value] }) next
+  else next
+
+@category "engine-internal"
+jsrPatternConstraintParts : (schema: a) -> (sets: List a) -> List a
+jsrPatternConstraintParts schema sets =
+  if and schema.patternValue.present (isString schema.patternValue.value)
+  then if eq schema.patternValue.value "" then sets else appendItem (regexSet schema.patternValue.value) sets
+  else sets
+
+@category "engine-internal"
+jsrFormatConstraintParts : (schema: a) -> (sets: List a) -> List a
+jsrFormatConstraintParts schema sets =
+  let next = if and schema.formatValue.present (isString schema.formatValue.value) then jsrAppendMaybeSet (jsrFormatSet schema.formatValue.value) sets else sets
+  if eq (jsrPrimaryType schema.typeValue) "integer"
+  then appendItem (SeRef { handle = "ℤ" }) next
+  else next
+
+@category "engine-internal"
+jsrSimpleConstraintParts : (schema: a) -> (sets: List a) -> List a
+jsrSimpleConstraintParts schema sets =
+  let enumSets = jsrEnumConstraintParts schema sets
+  let patternSets = jsrPatternConstraintParts schema enumSets
+  jsrFormatConstraintParts schema patternSets
+
+@category "engine-internal"
+jsrLowerBound : (schema: a) -> Maybe a
+jsrLowerBound schema =
+  if and schema.minimumValue.present (isNumber schema.minimumValue.value)
+  then Just { value = schema.minimumValue.value, inclusive = true }
+  else if and schema.exclusiveMinimumValue.present (isNumber schema.exclusiveMinimumValue.value)
+    then Just { value = schema.exclusiveMinimumValue.value, inclusive = false }
+    else Nothing
+
+@category "engine-internal"
+jsrUpperBound : (schema: a) -> Maybe a
+jsrUpperBound schema =
+  if and schema.maximumValue.present (isNumber schema.maximumValue.value)
+  then Just { value = schema.maximumValue.value, inclusive = true }
+  else if and schema.exclusiveMaximumValue.present (isNumber schema.exclusiveMaximumValue.value)
+    then Just { value = schema.exclusiveMaximumValue.value, inclusive = false }
+    else Nothing
+
+@category "engine-internal"
+jsrIntervalSet : (schema: a) -> Maybe a
+jsrIntervalSet schema =
+  let lo = jsrLowerBound schema
+  let hi = jsrUpperBound schema
+  case lo of
+    Just _ -> Just (SeInterval { interval = { lo = lo, hi = hi } })
+    Nothing -> case hi of
+      Just _ -> Just (SeInterval { interval = { lo = lo, hi = hi } })
+      Nothing -> Nothing
+
+@category "engine-internal"
+jsrPositiveMultipleOfSet : (schema: a) -> Maybe b
+jsrPositiveMultipleOfSet schema =
+  let pred = jsrRec1 "call" ["isMultipleOf", jsrRec1 "var" "value", schema.multipleOfValue.value, 1]
+  Just (SeWhere { pred = pred })
+
+@category "engine-internal"
+jsrMultipleOfSet : (schema: a) -> Maybe a
+jsrMultipleOfSet schema =
+  if and schema.multipleOfValue.present (isNumber schema.multipleOfValue.value)
+  then if gt schema.multipleOfValue.value 0 then jsrPositiveMultipleOfSet schema else Nothing
+  else Nothing
+
+@category "engine-internal"
+jsrConstraintListGo : (schemas: List a) -> (sets: List b) -> List b
+jsrConstraintListGo schemas sets = case head schemas of
+  Nothing -> sets
+  Just schema ->
+    let next = jsrAppendMaybeSet (jsrConstraintMaybe schema) sets
+    case tail schemas of
+      Nothing -> next
+      Just rest -> jsrConstraintListGo rest next
+
+@category "engine-internal"
+jsrUnionSet : (schemas: List a) -> Maybe b
+jsrUnionSet schemas =
+  let sets = jsrConstraintListGo schemas []
+  case head sets of
+    Nothing -> Nothing
+    Just first -> case tail sets of
+      Nothing -> Just first
+      Just rest ->
+        if eq (length rest) 0
+        then Just first
+        else Just (SeUnion { branches = sets })
+
+@category "engine-internal"
+jsrNotSet : (schemaSlot: a) -> Maybe b
+jsrNotSet schemaSlot =
+  if not schemaSlot.present then Nothing
+  else case jsrConstraintMaybe schemaSlot.value of
+    Nothing -> Nothing
+    Just inner -> Just (SeComplement { inner = inner })
+
+@category "engine-internal"
+jsrConstraintMaybe : (schema: a) -> Maybe b
+jsrConstraintMaybe schema =
+  let simple = jsrSimpleConstraintParts schema []
+  let bounded = jsrAppendMaybeSet (jsrIntervalSet schema) simple
+  let stepped = jsrAppendMaybeSet (jsrMultipleOfSet schema) bounded
+  let negated = jsrAppendMaybeSet (jsrNotSet schema.notSchema) stepped
+  let anySets = jsrAppendMaybeSet (jsrUnionSet schema.anyOfSchemas) negated
+  let oneSets = jsrAppendMaybeSet (jsrUnionSet schema.oneOfSchemas) anySets
+  let allSets = jsrConstraintListGo schema.allOfSchemas oneSets
+  jsrSetsMaybe allSets
+
+@label "JSON Schema reverse SetExpr plan"
+@description "Fold enum/const/pattern/format/integer/interval/multipleOf/not/anyOf/oneOf/allOf JSON Schema constraints into canonical Se* constructors. The input is the own-property marker; regex parsing uses the existing std regexSet leaf."
+@tags "engine" "json-schema" "reverse" "set-expr" "phase-3"
+jsonSchemaReverseSet : (schema: a) -> Maybe b
+jsonSchemaReverseSet schema = case jsrSchemaLiteralError schema of
+  Just _ -> Nothing
+  Nothing -> jsrConstraintMaybe schema
+
+@category "engine-internal"
+jsrListLengthCheck : (op: String) -> (slot: a) -> Maybe b
+jsrListLengthCheck op slot =
+  let lengthExpr = jsrRec1 "length" (jsrRec1 "var" "value")
+  if and slot.present (isNumber slot.value)
+  then Just (jsrRec1 op [lengthExpr, slot.value])
+  else Nothing
+
+@category "engine-internal"
+jsrAppendMaybeValue : (candidate: Maybe a) -> (values: List a) -> List a
+jsrAppendMaybeValue candidate values = case candidate of
+  Nothing -> values
+  Just value -> appendItem value values
+
+@category "engine-internal"
+jsrListWhereSet : (schema: a) -> Maybe b
+jsrListWhereSet schema =
+  let minChecks = jsrAppendMaybeValue (jsrListLengthCheck ">=" schema.minItemsValue) []
+  let checks = jsrAppendMaybeValue (jsrListLengthCheck "<=" schema.maxItemsValue) minChecks
+  case head checks of
+    Nothing -> Nothing
+    Just first -> case tail checks of
+      Nothing -> Just (SeWhere { pred = first })
+      Just rest ->
+        if eq (length rest) 0
+        then Just (SeWhere { pred = first })
+        else Just (SeWhere { pred = jsrRec1 "and" checks })
+
+@category "engine-internal"
+jsrListConstraint : (schema: a) -> Maybe b
+jsrListConstraint schema =
+  let lengthSets = jsrAppendMaybeSet (jsrListWhereSet schema) []
+  let sets =
+        if and schema.uniqueItemsValue.present (eq schema.uniqueItemsValue.value true)
+        then appendItem (SeRef { handle = "list:distinct" }) lengthSets
+        else lengthSets
+  jsrSetsMaybe sets
+
+@category "engine-internal"
+jsrNamedReuseKey : (reuse: a) -> Maybe FieldKey
+jsrNamedReuseKey reuse =
+  let handle = if and (eq reuse.kind "NamedField") (isString reuse.referenceValue) then reuse.referenceValue else ""
+  Just (NamedField { ref = jsrRec1 "$ref" handle })
+
+@category "engine-internal"
+jsrReuseKey : (reuse: a) -> Maybe FieldKey
+jsrReuseKey reuse =
+  if not reuse.present then Nothing
+  else if eq reuse.kind "PositionalField" then Just (PositionalField { index = reuse.indexValue })
+  else jsrNamedReuseKey reuse
+
+@category "engine-internal"
+jsrIdentityRows : (rows: List a) -> (acc: List b) -> List b
+jsrIdentityRows rows acc = case head rows of
+  Nothing -> acc
+  Just row ->
+    let next = appendItem { wireName = row.wireName, reuse = jsrReuseKey row.reuse } acc
+    case tail rows of
+      Nothing -> next
+      Just rest -> jsrIdentityRows rest next
+
+@category "engine-internal"
+jsrFieldPlan : (row: a) -> (intent: b) -> (requiredNames: List String) -> (typePlan: c) -> d
+jsrFieldPlan row intent requiredNames typePlan =
+  { identity = intent
+  , wireName = row.wireName
+  , required = elem row.wireName requiredNames
+  , typePlan = typePlan
+  , title = jsrStringMaybe row.schema.titleValue
+  , description = jsrStringMaybe row.schema.descriptionValue
+  }
+
+@category "engine-internal"
+jsrFieldPlansContinue : (rows: List a) -> (intents: List b) -> (requiredNames: List String) -> (acc: List c) -> d
+jsrFieldPlansContinue rows intents requiredNames acc = case tail rows of
+  Nothing -> jsrReady acc
+  Just restRows -> case tail intents of
+    Nothing -> jsrInvalid "invalid-reused-field" "" "" "JSON Schema identity planner ended before the property rows"
+    Just restIntents -> jsrFieldPlansGo restRows restIntents requiredNames acc
+
+@category "engine-internal"
+jsrFieldPlanResult : (row: a) -> (intent: b) -> (requiredNames: List String) -> c
+jsrFieldPlanResult row intent requiredNames =
+  let child = jsrTypePlan row.schema
+  if not child.ok then child
+  else jsrReady (jsrFieldPlan row intent requiredNames child.plan)
+
+@category "engine-internal"
+jsrFieldPlansGo : (rows: List a) -> (intents: List b) -> (requiredNames: List String) -> (acc: List c) -> d
+jsrFieldPlansGo rows intents requiredNames acc = case head rows of
+  Nothing -> jsrReady acc
+  Just row -> case head intents of
+    Nothing -> jsrInvalid "invalid-reused-field" row.wireName "" "JSON Schema identity planner omitted a property intent"
+    Just intent ->
+      let field = jsrFieldPlanResult row intent requiredNames
+      if not field.ok then field
+      else jsrFieldPlansContinue rows intents requiredNames (appendItem field.plan acc)
+
+@category "engine-internal"
+jsrFieldPlans : (rows: List a) -> (requiredNames: List String) -> b
+jsrFieldPlans rows requiredNames = case jsonSchemaIdentityIntents (jsrIdentityRows rows []) of
+  JsipInvalid { code = code, wireName = wireName, keyToken = keyToken, message = message } ->
+    jsrInvalid code wireName keyToken message
+  JsipReady { intents = intents } -> jsrFieldPlansGo rows intents requiredNames []
+
+@category "engine-internal"
+jsrWithoutProperty : (rows: List a) -> (wireName: String) -> (acc: List a) -> List a
+jsrWithoutProperty rows wireName acc = case head rows of
+  Nothing -> acc
+  Just row ->
+    let next = if eq row.wireName wireName then acc else appendItem row acc
+    case tail rows of
+      Nothing -> next
+      Just rest -> jsrWithoutProperty rest wireName next
+
+@category "engine-internal"
+jsrFindProperty : (rows: List a) -> (wireName: String) -> Maybe a
+jsrFindProperty rows wireName = case head rows of
+  Nothing -> Nothing
+  Just row ->
+    if eq row.wireName wireName then Just row
+    else case tail rows of
+      Nothing -> Nothing
+      Just rest -> jsrFindProperty rest wireName
+
+@category "engine-internal"
+jsrVariantTag : (schema: a) -> (discriminator: String) -> Maybe String
+jsrVariantTag schema discriminator = case jsrFindProperty schema.propertyRows discriminator of
+  Nothing -> Nothing
+  Just row ->
+    let value = jsrJsonValue row.schema.constValue.value
+    if and row.schema.constValue.present (isString value)
+    then if eq value "" then Nothing else Just value
+    else Nothing
+
+@category "engine-internal"
+jsrVariantCase : (schema: a) -> (discriminator: String) -> (acc: List b) -> c
+jsrVariantCase schema discriminator acc = case jsrVariantTag schema discriminator of
+  Nothing -> jsrReady acc
+  Just caseName ->
+    let rows = jsrWithoutProperty schema.propertyRows discriminator []
+    let fields = jsrFieldPlans rows schema.requiredNames
+    if not fields.ok then fields
+    else jsrReady (appendItem { name = caseName, fields = fields.plan } acc)
+
+@category "engine-internal"
+jsrVariantCasesGo : (schemas: List a) -> (discriminator: String) -> (acc: List b) -> c
+jsrVariantCasesGo schemas discriminator acc = case head schemas of
+  Nothing -> jsrReady acc
+  Just schema ->
+    let next = jsrVariantCase schema discriminator acc
+    if not next.ok then next
+    else case tail schemas of
+      Nothing -> next
+      Just rest -> jsrVariantCasesGo rest discriminator next.plan
+
+@category "engine-internal"
+jsrVariantPlan : (schema: a) -> (discriminator: String) -> b
+jsrVariantPlan schema discriminator =
+  let cases = jsrVariantCasesGo schema.oneOfSchemas discriminator []
+  if not cases.ok then cases
+  else jsrReady { kind = "variant", discriminator = discriminator, cases = cases.plan }
+
+@category "engine-internal"
+jsrInferredBase : (schema: a) -> Maybe String
+jsrInferredBase schema =
+  let enumValue = jsrJsonValue schema.enumValues.value
+  if and schema.enumValues.present (isArray enumValue) then case head enumValue of
+    Just value -> if isNumber value then Just "number" else Just "string"
+    Nothing -> Just "string"
+  else if schema.patternValue.present then Just "string"
+  else if schema.formatValue.present then Just "string"
+  else case jsrIntervalSet schema of
+    Just _ -> Just "number"
+    Nothing -> Nothing
+
+@category "engine-internal"
+jsrResolvedBase : (schema: a) -> Maybe String
+jsrResolvedBase schema =
+  let direct = jsrPrimaryType schema.typeValue
+  if eq direct "integer" then Just "number"
+  else if not (eq direct "") then Just direct
+  else jsrInferredBase schema
+
+@category "engine-internal"
+jsrCollectBases : (schemas: List a) -> (acc: List String) -> List String
+jsrCollectBases schemas acc = case head schemas of
+  Nothing -> acc
+  Just schema ->
+    let next = case jsrResolvedBase schema of
+          Nothing -> acc
+          Just base -> appendItem base acc
+    case tail schemas of
+      Nothing -> next
+      Just rest -> jsrCollectBases rest next
+
+@category "engine-internal"
+jsrAllBase : (bases: List String) -> (expected: String) -> Bool
+jsrAllBase bases expected = case head bases of
+  Nothing -> true
+  Just base ->
+    if not (eq base expected) then false
+    else case tail bases of
+      Nothing -> true
+      Just rest -> jsrAllBase rest expected
+
+@category "engine-internal"
+jsrUnionBase : (schema: a) -> Maybe String
+jsrUnionBase schema =
+  let source = if gt (length schema.oneOfSchemas) 0 then schema.oneOfSchemas else schema.anyOfSchemas
+  let bases = jsrCollectBases source []
+  case head bases of
+    Nothing -> Nothing
+    Just first ->
+      if and (or (eq first "string") (eq first "number")) (jsrAllBase bases first)
+      then Just first
+      else Nothing
+
+@category "engine-internal"
+jsrMaybeUnionUse : (schema: a) -> Maybe b
+jsrMaybeUnionUse schema =
+  if schema.typeValue.present then Nothing
+  else case jsrUnionBase schema of
+    Nothing -> Nothing
+    Just base -> case jsrConstraintMaybe schema of
+      Nothing -> Nothing
+      Just set ->
+        let named = if eq base "number" then "Number" else "String"
+        Just (jsrUse named (Just set))
+
+@category "engine-internal"
+jsrDatePlan : (schema: a) -> (format: String) -> b
+jsrDatePlan schema format =
+  let baseSet = jsrConstraintMaybe schema
+  let sets = if eq format "date" then jsrAppendMaybeSet (Just (regexSet "^\\d{4}-\\d{2}-\\d{2}$")) (jsrMaybeSetList baseSet) else jsrMaybeSetList baseSet
+  jsrReady (jsrUse "Date" (jsrSetsMaybe sets))
+
+@category "engine-internal"
+jsrStringPlan : (schema: a) -> b
+jsrStringPlan schema = case jsrStringMaybe schema.formatValue of
+  Just format ->
+    if or (eq format "date") (eq format "date-time")
+    then jsrDatePlan schema format
+    else jsrReady (jsrUse "String" (jsrConstraintMaybe schema))
+  Nothing -> jsrReady (jsrUse "String" (jsrConstraintMaybe schema))
+
+@category "engine-internal"
+jsrArrayPlan : (schema: a) -> b
+jsrArrayPlan schema =
+  let item =
+        if schema.itemsSchema.present
+        then jsrTypePlan schema.itemsSchema.value
+        else jsrReady (jsrUse "String" Nothing)
+  if not item.ok then item
+  else jsrReady { kind = "list", item = item.plan, constraint = jsrListConstraint schema }
+
+@category "engine-internal"
+jsrRecordPlan : (schema: a) -> b
+jsrRecordPlan schema =
+  let fields = jsrFieldPlans schema.propertyRows schema.requiredNames
+  if not fields.ok then fields
+  else jsrReady { kind = "record", fields = fields.plan }
+
+@category "engine-internal"
+jsrTypePlanByNameRest : (schema: a) -> (typeName: String) -> b
+jsrTypePlanByNameRest schema typeName =
+  if eq typeName "boolean" then jsrReady (jsrUse "Boolean" Nothing)
+  else if eq typeName "array" then jsrArrayPlan schema
+  else if eq typeName "object" then jsrRecordPlan schema
+  else jsrReady (jsrUse "String" (jsrConstraintMaybe schema))
+
+@category "engine-internal"
+jsrTypePlanByName : (schema: a) -> (typeName: String) -> b
+jsrTypePlanByName schema typeName =
+  if eq typeName "string" then jsrStringPlan schema
+  else if or (eq typeName "number") (eq typeName "integer") then jsrReady (jsrUse "Number" (jsrConstraintMaybe schema))
+  else jsrTypePlanByNameRest schema typeName
+
+@category "engine-internal"
+jsrTypePlanNoVariant : (schema: a) -> b
+jsrTypePlanNoVariant schema =
+  if schema.referenceValue.present then jsrReady (jsrUse "String" Nothing)
+  else case jsrMaybeUnionUse schema of
+    Just plan -> jsrReady plan
+    Nothing -> jsrTypePlanByName schema (jsrPrimaryType schema.typeValue)
+
+@category "engine-internal"
+jsrDiscriminatorValue : (schema: a) -> Maybe String
+jsrDiscriminatorValue schema =
+  if and (isString schema.discriminatorName.value) (not (eq schema.discriminatorName.value "")) then Just schema.discriminatorName.value else Nothing
+
+@category "engine-internal"
+jsrDiscriminator : (schema: a) -> Maybe String
+jsrDiscriminator schema =
+  if and schema.discriminatorName.present (gt (length schema.oneOfSchemas) 0)
+  then jsrDiscriminatorValue schema
+  else Nothing
+
+@category "engine-internal"
+jsrTypePlan : (schema: a) -> b
+jsrTypePlan schema = case jsrDiscriminator schema of
+  Just discriminator -> jsrVariantPlan schema discriminator
+  Nothing -> jsrTypePlanNoVariant schema
+
+-- Reuse callbacks are a host capability, so the pure planner first returns
+-- the exact authoring paths at which facts are needed. The host invokes the
+-- callback, attaches those facts by opaque marker `location`, then calls the
+-- plan entry above. This preserves the public `case:<tag>` path contract while
+-- keeping discriminator/case selection here in Fenel.
+
+@category "engine-internal"
+jsrReuseImmediate : (rows: List a) -> (path: List String) -> (acc: List b) -> List b
+jsrReuseImmediate rows path acc = case head rows of
+  Nothing -> acc
+  Just row ->
+    let fieldPath = appendItem row.wireName path
+    let next = appendItem { location = row.location, path = fieldPath, wireName = row.wireName } acc
+    case tail rows of
+      Nothing -> next
+      Just rest -> jsrReuseImmediate rest path next
+
+@category "engine-internal"
+jsrReuseChildren : (rows: List a) -> (path: List String) -> (acc: List b) -> List b
+jsrReuseChildren rows path acc = case head rows of
+  Nothing -> acc
+  Just row ->
+    let childPath = appendItem row.wireName path
+    let next = jsrReuseType row.schema childPath acc
+    case tail rows of
+      Nothing -> next
+      Just rest -> jsrReuseChildren rest path next
+
+@category "engine-internal"
+jsrReuseFields : (rows: List a) -> (path: List String) -> (acc: List b) -> List b
+jsrReuseFields rows path acc =
+  let immediate = jsrReuseImmediate rows path acc
+  jsrReuseChildren rows path immediate
+
+@category "engine-internal"
+jsrReuseVariantCases : (schemas: List a) -> (discriminator: String) -> (path: List String) -> (acc: List b) -> List b
+jsrReuseVariantCases schemas discriminator path acc = case head schemas of
+  Nothing -> acc
+  Just schema ->
+    let tag = jsrVariantTag schema discriminator
+    let next = case tag of
+          Nothing -> acc
+          Just caseName ->
+            let casePath = appendItem (concat "case:" caseName) path
+            let rows = jsrWithoutProperty schema.propertyRows discriminator []
+            jsrReuseFields rows casePath acc
+    case tail schemas of
+      Nothing -> next
+      Just rest -> jsrReuseVariantCases rest discriminator path next
+
+@category "engine-internal"
+jsrReuseArrayType : (schema: a) -> (path: List String) -> (acc: List b) -> List b
+jsrReuseArrayType schema path acc =
+  if schema.itemsSchema.present then jsrReuseType schema.itemsSchema.value (appendItem "item" path) acc else acc
+
+@category "engine-internal"
+jsrReuseTypeByName : (schema: a) -> (typeName: String) -> (path: List String) -> (acc: List b) -> List b
+jsrReuseTypeByName schema typeName path acc =
+  if eq typeName "object" then jsrReuseFields schema.propertyRows path acc
+  else if eq typeName "array" then jsrReuseArrayType schema path acc
+  else acc
+
+@category "engine-internal"
+jsrReuseNoVariant : (schema: a) -> (path: List String) -> (acc: List b) -> List b
+jsrReuseNoVariant schema path acc =
+  if schema.referenceValue.present then acc
+  else case jsrMaybeUnionUse schema of
+    Just _ -> acc
+    Nothing -> jsrReuseTypeByName schema (jsrPrimaryType schema.typeValue) path acc
+
+@category "engine-internal"
+jsrReuseType : (schema: a) -> (path: List String) -> (acc: List b) -> List b
+jsrReuseType schema path acc = case jsrDiscriminator schema of
+  Just discriminator -> jsrReuseVariantCases schema.oneOfSchemas discriminator path acc
+  Nothing -> jsrReuseNoVariant schema path acc
+
+@label "JSON Schema reverse reuse requests"
+@description "Return callback requests at the semantic authoring paths selected by the reverse planner. Discriminated cases retain the public case:<tag> path; no host-side case selection is needed."
+@tags "engine" "json-schema" "reverse" "field-identity" "reuse" "phase-3"
+jsonSchemaReverseReuseRequests : (schema: a) -> List b
+jsonSchemaReverseReuseRequests schema = case jsrSchemaLiteralError schema of
+  Just _ -> []
+  Nothing -> jsrReuseType schema [] []
+
+@label "JSON Schema reverse form reuse requests"
+@description "Reuse-callback requests for jsonSchemaToFormFields, including its property-bearing schema compatibility surface and recursively selected child types."
+@tags "engine" "json-schema" "reverse" "form" "field-identity" "reuse" "phase-3"
+jsonSchemaReverseFormReuseRequests : (schema: a) -> List b
+jsonSchemaReverseFormReuseRequests schema = case jsrSchemaLiteralError schema of
+  Just _ -> []
+  Nothing ->
+    let typeName = jsrPrimaryType schema.typeValue
+    if or (eq typeName "object") (gt (length schema.propertyRows) 0)
+    then jsrReuseFields schema.propertyRows [] []
+    else []
+
+@label "JSON Schema reverse authoring plan"
+@description "Plan recursive JSON Schema scalar/list/record/discriminated-variant imports over a single own-property marker. Fenel owns constraint folding, required membership, Mint/Reuse sibling validation, and every structural choice; the host only serialises and applies the plan."
+@tags "engine" "json-schema" "reverse" "field-identity" "authoring" "phase-3"
+jsonSchemaReversePlan : (schema: a) -> b
+jsonSchemaReversePlan schema = case jsrSchemaLiteralError schema of
+  Just kind -> jsrInvalid "invalid-json-literal" "" kind (concat "JSON Schema reverse: unsupported JSON literal type " kind)
+  Nothing -> jsrTypePlan schema
+
+@label "JSON Schema reverse form-field plan"
+@description "Return top-level property authoring plans for the public jsonSchemaToFormFields surface. Property presence and object classification are decided in Fenel; identity intents are entropy-free."
+@tags "engine" "json-schema" "reverse" "form" "field-identity" "phase-3"
+jsonSchemaReverseFormFields : (schema: a) -> b
+jsonSchemaReverseFormFields schema = case jsrSchemaLiteralError schema of
+  Just kind -> jsrInvalid "invalid-json-literal" "" kind (concat "JSON Schema reverse: unsupported JSON literal type " kind)
+  Nothing ->
+    let typeName = jsrPrimaryType schema.typeValue
+    if or (eq typeName "object") (gt (length schema.propertyRows) 0)
+    then jsrFieldPlans schema.propertyRows schema.requiredNames
+    else jsrReady []

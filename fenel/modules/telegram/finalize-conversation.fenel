@@ -1,0 +1,97 @@
+-- finalizeConversation — terminal step of a form-fill conversation.
+--
+-- Tries to materialize the collected values as an instance of the
+-- registered type (when `hooks.instanceTypeName` is Just). The outcome
+-- determines the rest:
+--
+--   - CreateFailed → STAY in `confirming` status. Send the validation
+--     error to the user with a hint to /back or cancel. Do NOT emit
+--     the completion event (downstream triggers shouldn't fire on a
+--     submission that didn't actually save).
+--
+--   - Created OR NoInstance → success path. Mark the conversation
+--     completed, fire the optional completion hook to derive the
+--     thank-you message, send it, emit `telegram.form.completed`.
+--
+-- This ordering means the user can retry from the confirmation step
+-- after a validation failure (type /back to edit fields, then Confirm
+-- again) without losing their previous answers. The conversation only
+-- closes when the data actually makes it to a typed instance.
+--
+-- module-substrate Phase 3o (2026-05-31) — migrated to `module telegram where`.
+-- The defineFunction spec + FINALIZE_CONVERSATION_BODY extraction RETIRED;
+-- identity rides @facet directives. The `InstanceOutcome` decl below rides the
+-- union as an entity (it was previously surfaced via orchestrationEntities).
+-- Def name === codeName (no @codeName). `requires` INFERRED. Body UNCHANGED.
+
+module telegram where
+
+InstanceOutcome = NoInstance | Created instanceId: String | CreateFailed error: String
+
+@label "Finalize Telegram Form Conversation"
+@description "Terminal step of a form-fill conversation. Marks the row completed, optionally materializes the collected values as a registered-type instance (when hooks.instanceTypeName is Just), fires the completion hook (when hooks.completionFn is Just), sends the user-facing thank-you message (with a `(note: could not save…)` suffix on persistence failure), and emits a `telegram.form.completed` event so user-defined triggers can fan out per-form."
+@tags "telegram" "collector" "io" "form" "lifecycle"
+@icon "check-circle"
+@emoji "✅"
+@ioAction "telegram_form.finalize"
+finalizeConversation : (conv: {}) -> (bot: {}) -> (chatId: Int) -> (userId: Int) -> Unit
+finalizeConversation conv bot chatId userId =
+  -- Draft mode persists the conversation as a `Draft<typeName>` entity
+  -- (validateInstanceData accepts Draft<*> permissively — the field-
+  -- level Either<String, T_field> shape is correct by construction
+  -- from the form-fill loop). Strict mode persists as `typeName`
+  -- directly, with the validator enforcing the full T shape.
+  let outcome = case conv.hooks.instanceTypeName of
+    Nothing -> NoInstance
+    Just typeName ->
+      let storageTypeName = if conv.hooks.asDraft
+        then `Draft<${typeName}>`
+        else typeName
+      let r = tryCreateInstanceByName storageTypeName conv.partialValue
+      if r.ok
+      then Created { instanceId = r.value }
+      else CreateFailed { error = r.error }
+
+  let labelStr = case conv.hooks.instanceTypeName of
+    Nothing -> "instance"
+    Just n -> if conv.hooks.asDraft then `Draft<${n}>` else n
+
+  case outcome of
+    CreateFailed { error = err } ->
+      -- Stay in `confirming`. The user can /back to fix or type
+      -- "cancel" to abandon. Re-confirming with the same data would
+      -- re-hit the same error — the message guides them away from that.
+      sendMessageText bot.token chatId `I couldn't save your answers as ${labelStr}:\n\n${err}\n\nType /back to go back and fix an answer, or "cancel" to start over.`
+    _ ->
+      -- Success path — either the instance was created, or there was
+      -- nothing to materialize. Either way the form-fill is done.
+      markConversationCompleted conv.id
+
+      let completionMsgMaybe = case conv.hooks.completionFn of
+        Nothing -> Nothing
+        Just fn ->
+          callHookFunctionString fn { botId = bot.id, chatId = chatId, userId = userId, values = conv.partialValue }
+
+      let baseMsg = case completionMsgMaybe of
+        Nothing -> "Got it — submitted!"
+        Just msg -> msg
+
+      let instanceIdField = case outcome of
+        Created { instanceId = id } -> Just id
+        _ -> Nothing
+
+      let basePayload = TelegramFormCompletedPayload {
+        botId = bot.id,
+        chatId = chatId,
+        userId = userId,
+        formId = conv.formId,
+        values = conv.partialValue,
+        instanceId = instanceIdField,
+        instanceError = Nothing
+      }
+      -- Right-bias: caller-supplied completionPayload extends basePayload.
+      let payload = mergeRecords basePayload conv.completionPayload
+
+      sendMessageText bot.token chatId baseMsg
+      appendEvent "telegram.form.completed" payload Nothing Nothing Nothing
+      dispatchEventTriggers "telegram.form.completed" payload

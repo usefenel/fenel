@@ -1,0 +1,220 @@
+module engine where
+
+-- derive-functor — the generic, schema-directed `fmap` (the kinds-arc capstone,
+-- unified-static-analysis Phase 6b).
+--
+-- Any `* -> *` type WITHOUT an authored `Functor` instance gets `fmap` for FREE:
+-- a single always-on structural `Functor` instance keyed by
+-- `{$pattern:"engine:isUnaryConstructor"}` resolves through the SHIPPED
+-- `matchStructural` substrate (6a made real parametric constructors dispatch by
+-- KIND), and its `fmap` is `engine:deriveFmap` — a thin category-B
+-- reflection+marshal bridge (engine-bodies-dispatch.ts) that resolves the
+-- dispatched value's owning type, marshals its schema across the `$`-key barrier
+-- via `marshalTraversalType`, and delegates the DECISION to THIS body. The
+-- authored `Maybe`/`List`/`Result` instances keep nominal precedence
+-- (`resolveStructural` is the last fall-through), so this only fires for
+-- previously-uninstanced unary constructors (e.g. a user `Box a` / `Tree a`).
+--
+-- This is the `$tag`-correct, multi-param-SOUND Fenel successor to the stale
+-- `__case`-era TS `structuralMap` (engine/src/structural.ts) it RETIRES: it
+-- classifies fields by the FUNCTOR-PARAM IDENTITY (`TtVar paramName`), recurses
+-- on self-recursive fields (`TtNamed typeName`), and LEAVES every other field —
+-- where `structuralMap` mapped EVERY non-recursive field (wrong for `Result`'s
+-- `e`, `Pair2 e a`'s `e`, …). The schema is the dispatched type AS A RUNTIME
+-- VALUE (runtime reflection over types) — the `types = UI = app` payoff.
+--
+-- TOTALITY (D-6b-4): the recursion descends ONLY into self-recursive sub-values
+-- (`fieldVal` is a structural sub-term of `value`), strictly smaller each step;
+-- an unknown tag / non-record value / unrecognised field-type ⇒ LEAVE (never
+-- crash). The fold is its own dog-food for the totality checker this workstream
+-- builds.
+--
+-- NESTED FOREIGN FUNCTOR (D-6b-5, CLOSED in 6c): a field where the param sits
+-- DIRECTLY under a DIFFERENT constructor (`Maybe a` / `List a` inside another
+-- functor; marshalled `TtApp` whose args carry `TtVar paramName`, NOT a bare
+-- `TtVar` and NOT self-recursive) is now MAPPED by RE-DISPATCHING `Functor.fmap
+-- g fieldVal` — the nested functor resolves its OWN instance (nominal for
+-- `List`/`Maybe`, derived for a user functor). Re-entrancy is safe: the nested
+-- type differs from the outer (a same-type field is the self-recursive case),
+-- so `resolveStructural`'s `(class,type)` fence is never tripped on the same key.
+-- FENCE (D-6c-2): COMPOUND nesting two functors deep (`List (Box a)` ⇒ the
+-- inner `TtApp` arg is itself a `TtApp`, not a bare `TtVar paramName`) needs
+-- `fmap (fmap g)` composition — still LEFT, documented, never silently partial.
+-- An APPLIED self-reference (`Tree a` ⇒ `TtApp`) is recognised as the
+-- self-recursive `TtNamed` case where the encoding gives it (the `structuralView`
+-- precedent).
+--
+-- `$map`-FIELD DESCENT (D-6c-3 CLOSED, array-substrate Phase 1a). A `TtMap` field
+-- whose VALUES carry the functor param directly (`Map String a`, marshalled
+-- `TtMap { values = TtVar paramName }`) is now MAPPED by calling `mapFmap g` on
+-- the field value — the `Functor (Map k)` operation (algebra-methods.fenel),
+-- which maps the map's values keys-fixed. A direct call, NOT a `Functor.fmap`
+-- re-dispatch: a bare map field value carries no `$tag`, so it has no reflectable
+-- type identity to dispatch on (the Phase-1a Step-0 fact — runtime dispatch keys
+-- on `typeConstructorOf`), but the `mapFmap` body operates on the bare-object
+-- entries directly. COMPOUND map values (`Map String (Box a)` ⇒ values is a
+-- `TtApp`, not a bare `TtVar paramName`) stay LEFT (the D-6c-2 compound fence,
+-- same as a compound `TtApp` arg).
+--
+-- The marshalled `TraversalType` ADT is declared in type-traversal.fenel
+-- (TtVariant / TtRecord / TtOpaque / TtMu / TtVar / TtNamed / TtField /
+-- TtVariantCase / …); this body pattern-matches it the way type-traversal.fenel
+-- + type-subsumes.fenel do. All helpers are prefixed `deriveFmap…` to avoid
+-- registry collisions. std fns (`mapGet`/`assocRecord`/`eq`/`head`/`tail`) are
+-- called by bare codeName (the engine-body idiom); the continuation `g` is a
+-- closure-valued PARAM applied via `$` (low-precedence application — bare `g x`
+-- would parse as a call-by-NAME fnId, the algebra-methods.fenel convention).
+
+-- deriveFmapFold — the entry. `g` the function, `value` the runtime functor
+-- value, `schemaView` the dispatched type's schema marshalled to TraversalType,
+-- `paramName` the functor type-param name (the type's LAST declared param, by the
+-- `f<a>` convention), `typeName` the owning type-constructor name (for
+-- self-recursion detection). Peels the schema wrappers to the variant/record,
+-- finds the matching case, rebuilds it. The 5th `typeName` arg is the build-time
+-- amendment to the brief's 4-arg sketch — self-recursion is `TtNamed typeName`,
+-- so the body needs the name (the bridge supplies it).
+@label "Derive fmap (generic fold)"
+@description "Phase 6b — the generic schema-directed `fmap`: any `* -> *` type without an authored Functor instance gets fmap free. Maps the functor-param leaves (TtVar paramName), recurses self-recursive fields (TtNamed typeName), leaves the rest (multi-param sound, the structuralMap repair). The decision half of the derived Functor instance; the engine:deriveFmap bridge supplies (g, value, schemaView, paramName, typeName). Total: descends only into strictly-smaller self-recursive sub-values."
+@tags "engine" "functor" "derive" "kinds" "phase-6b"
+deriveFmapFold : (g: a) -> (value: b) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> b
+deriveFmapFold g value schemaView paramName typeName =
+  case schemaView of
+    TtOpaque { pure = p } -> deriveFmapFold g value p paramName typeName
+    TtRefined { base = bse } -> deriveFmapFold g value bse paramName typeName
+    TtMu { body = bdy } -> deriveFmapFold g value bdy paramName typeName
+    TtRecord { fields = fs } ->
+      deriveFmapRebuild g value fs schemaView paramName typeName
+    TtVariant { cases = cs } ->
+      case mapGet value "$tag" of
+        Nothing -> value
+        Just tag ->
+          case deriveFmapFindCase cs tag of
+            Nothing -> value
+            Just c -> deriveFmapRebuild g value c.fields schemaView paramName typeName
+    _ -> value
+
+-- deriveFmapFindCase — locate the variant case whose name matches the value's
+-- `$tag`. Internal helper; head/tail recursion (the array-repr List idiom).
+@label "derive-functor: findCase"
+@description "Phase 6b — locate the TtVariantCase matching the value's $tag. Helper; tagged engine-internal."
+@tags "engine" "internal" "functor" "phase-6b"
+@category "engine-internal"
+deriveFmapFindCase : (cases: List a) -> (tag: String) -> Maybe a
+deriveFmapFindCase cases tag =
+  case head cases of
+    Nothing -> Nothing
+    Just c ->
+      if eq c.name tag
+        then Just c
+        else case tail cases of
+          Nothing -> Nothing
+          Just rest -> deriveFmapFindCase rest tag
+
+-- deriveFmapRebuild — thread the accumulator FROM `value` so `$tag` + every
+-- untouched field are preserved automatically (assocRecord = `{...rec, [k]:v}`);
+-- per declared field, set the (re)mapped value. Internal helper.
+@label "derive-functor: rebuild"
+@description "Phase 6b — rebuild a case's value: thread acc from value (preserves $tag + untouched fields), set each declared field to its mapped value. Helper; tagged engine-internal."
+@tags "engine" "internal" "functor" "phase-6b"
+@category "engine-internal"
+deriveFmapRebuild : (g: a) -> (value: b) -> (fields: List c) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> b
+deriveFmapRebuild g value fields schemaView paramName typeName =
+  deriveFmapRebuildGo g value value fields schemaView paramName typeName
+
+-- deriveFmapRebuildGo — the accumulator-threaded fold behind rebuild.
+@label "derive-functor: rebuildGo"
+@description "Phase 6b — accumulator-threaded fold: walk the declared fields, assoc each mapped value onto the accumulator. Helper; tagged engine-internal."
+@tags "engine" "internal" "functor" "phase-6b"
+@category "engine-internal"
+deriveFmapRebuildGo : (g: a) -> (acc: b) -> (value: b) -> (fields: List c) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> b
+deriveFmapRebuildGo g acc value fields schemaView paramName typeName =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let acc2 = deriveFmapStepField g acc value f schemaView paramName typeName
+      case tail fields of
+        Nothing -> acc2
+        Just rest -> deriveFmapRebuildGo g acc2 value rest schemaView paramName typeName
+
+-- deriveFmapStepField — one field step. A field absent from the value (a partial
+-- record) is LEFT untouched (no assoc); else assoc the classified+mapped value.
+-- Split out to avoid a `case`-in-`let` (the analyze.fenel/totality.fenel idiom).
+@label "derive-functor: stepField"
+@description "Phase 6b — one field: read the value's field (absent ⇒ leave acc untouched), classify+map, assoc onto acc. Helper; tagged engine-internal."
+@tags "engine" "internal" "functor" "phase-6b"
+@category "engine-internal"
+deriveFmapStepField : (g: a) -> (acc: b) -> (value: b) -> (f: c) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> b
+deriveFmapStepField g acc value f schemaView paramName typeName =
+  case mapGet value f.name of
+    Nothing -> acc
+    Just fieldVal ->
+      assocRecord acc f.name (deriveFmapMapField g fieldVal f.type schemaView paramName typeName)
+
+-- deriveFmapMapField — CLASSIFY one field by its marshalled TraversalType:
+--   element       — `TtVar paramName`   ⇒ apply the continuation `g`.
+--   self-recursive — `TtNamed typeName` ⇒ recurse `deriveFmapFold` (same schema).
+--   map-field      — `TtMap` whose values carry the param ⇒ `mapFmap g` over the
+--                    map's values (D-6c-3, closed Phase 1a — a direct call, the
+--                    bare map field has no `$tag` to re-dispatch on).
+--   otherwise (a different type-var `e`, a fixed `Int`, an unrelated named type,
+--             a compound-nested `TtApp`/`TtMap`) ⇒ LEAVE unchanged.
+-- D-6b-1: classification is by FUNCTOR-PARAM IDENTITY, not "non-recursive" — the
+-- multi-param soundness repair over the legacy `structuralMap`. The `TtApp` case
+-- (6c) closes D-6b-5: a one-level nested foreign functor re-dispatches `fmap`.
+@label "derive-functor: mapField"
+@description "Phase 6b/6c/1a — classify a field by its TraversalType: TtVar paramName ⇒ apply g (the functor param); TtNamed typeName ⇒ recurse (self-recursive); TtApp carrying the param ⇒ re-dispatch Functor.fmap on the nested functor value (D-6b-5, one level, 6c); TtMap whose values carry the param ⇒ mapFmap g over the map values (D-6c-3, closed Phase 1a); else leave (other vars / fixed types / compound nesting). Helper; tagged engine-internal."
+@tags "engine" "internal" "functor" "phase-6b"
+@category "engine-internal"
+deriveFmapMapField : (g: a) -> (fieldVal: d) -> (ft: TraversalType) -> (schemaView: TraversalType) -> (paramName: String) -> (typeName: String) -> d
+deriveFmapMapField g fieldVal ft schemaView paramName typeName =
+  case ft of
+    TtVar { name = vn } ->
+      if eq vn paramName
+        then (g $ fieldVal)
+        else fieldVal
+    TtNamed { name = nn } ->
+      if eq nn typeName
+        then deriveFmapFold g fieldVal schemaView paramName typeName
+        else fieldVal
+    TtApp { args = as } ->
+      if deriveFmapAppHasParam as paramName
+        then fmap g fieldVal
+        else fieldVal
+    TtMap { values = vs } ->
+      if deriveFmapArgIsParam vs paramName
+        then mapFmap g fieldVal
+        else fieldVal
+    _ -> fieldVal
+
+-- deriveFmapAppHasParam — does this applied-type's arg list carry the functor
+-- param DIRECTLY as one of its args (`Con .. a ..`)? Only a bare `TtVar
+-- paramName` counts — a nested `TtApp` arg (compound nesting, `List (Box a)`)
+-- does NOT, so it falls to the LEAVE branch (D-6c-2 fence). Internal helper;
+-- head/tail recursion. (Sibling of derive-foldable.fenel's deriveFoldrAppHasParam
+-- — kept per-file to keep the two derivation modules independent.)
+@label "derive-functor: appHasParam"
+@description "Phase 6c — does an applied-type's arg list carry the functor param directly (one-level nesting)? A nested TtApp arg (compound nesting) does NOT count — D-6c-2 fence. Helper; tagged engine-internal."
+@tags "engine" "internal" "functor" "phase-6c"
+@category "engine-internal"
+deriveFmapAppHasParam : (args: List a) -> (paramName: String) -> Bool
+deriveFmapAppHasParam args paramName =
+  case head args of
+    Nothing -> false
+    Just a ->
+      if deriveFmapArgIsParam a paramName
+        then true
+        else case tail args of
+          Nothing -> false
+          Just rest -> deriveFmapAppHasParam rest paramName
+
+-- deriveFmapArgIsParam — is this single TraversalType arg the functor param
+-- (`TtVar paramName`)? Internal helper.
+@label "derive-functor: argIsParam"
+@description "Phase 6c — is a single TraversalType arg the functor param (TtVar paramName)? Helper; tagged engine-internal."
+@tags "engine" "internal" "functor" "phase-6c"
+@category "engine-internal"
+deriveFmapArgIsParam : (a: TraversalType) -> (paramName: String) -> Bool
+deriveFmapArgIsParam a paramName =
+  case a of
+    TtVar { name = vn } -> eq vn paramName
+    _ -> false

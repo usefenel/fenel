@@ -1,0 +1,2047 @@
+module engine where
+
+-- validate — type-driven value validator.
+--
+-- Phase 8a port. Mirrors the TS oracle at
+-- implementations/typescript/engine/src/validate.ts (now a thin shim
+-- over the dispatched wrappers for the ported entries).
+--
+-- Sub-step 1 lands the atomic-leaf validators: validateBoolean /
+-- validateNumber / validateString. The TS wrapper pre-computes:
+--
+--   * For Number / String set-membership: `contains(set, value)` →
+--     MaybeBool (collapsed to Bool at the marshaller boundary;
+--     Just true = pass, otherwise fail with a pre-computed
+--     formatSetError(set) message).
+--   * For String multi-select: each item's contains() pre-computed in
+--     parallel arrays (multiItems / multiOkFlags).
+--   * For SetExpr-as-value detection: isSetExpr(value) pre-computed,
+--     plus the structural-SetExpr validation result.
+--   * For String: String(value) coercion pre-computed (the body sees
+--     a String input, not raw `unknown`).
+--
+-- The body operates on per-shape Schema ADTs (ValBoolSchema /
+-- ValNumSchema / ValStrSchema) and emits a FieldResult { errors, value }
+-- record directly — no marshalling needed on the output side beyond
+-- the wrapper passing through.
+--
+-- All internal helpers are prefixed `validate…` / `vlt…` to avoid
+-- collisions with like-named helpers already registered by other
+-- engine bodies.
+
+-- ---------------------------------------------------------------------------
+-- FieldError + FieldResult
+-- ---------------------------------------------------------------------------
+
+-- One validation error. `path` is the field's dotted path
+-- ("user.address.zip"). `message` is a human-readable string
+-- (LocaleString-compatible at the TS surface — the body emits plain
+-- strings; the wrapper passes through).
+FieldError = FieldError path: String message: String
+
+-- The validators' canonical output: a list of accumulated errors plus
+-- the (possibly coerced) value. The TS shim splits this back to
+-- `{ errors, value }` at the wrapper.
+FieldResult = FieldResult errors: a value: a
+
+-- ---------------------------------------------------------------------------
+-- Per-shape input ADTs (sub-step 1)
+--
+-- Each leaf validator takes a narrow ADT carrying pre-computed values
+-- from the TS marshaller. This keeps the body free of `unknown`
+-- introspection — every primitive arm only does structural work.
+-- ---------------------------------------------------------------------------
+
+-- The Boolean validator dispatches on a 4-way pre-classification.
+-- `VbsTrue` / `VbsFalse` — input value was a JS boolean (passes
+--    through); the wrapper carries the raw value.
+-- `VbsCoerceTrue` / `VbsCoerceFalse` — input was "true" / 1 / "false"
+--    / 0 (coerced to the matching boolean).
+-- `VbsInvalid` — input value didn't match any known boolean coercion;
+--    the body emits the "Must be a boolean" error.
+ValBoolSchema =
+  VbsTrue
+  | VbsFalse
+  | VbsCoerceTrue
+  | VbsCoerceFalse
+  | VbsInvalid
+
+-- Number validator schema.
+--
+-- `isSetExprValue` — set if the input is a SetExpr (well-formed
+--   `$enum` / `$interval` / etc.); the body returns the
+--   pre-computed `setExprValidationResult` instead of the number path.
+-- `setExprValidationResult` — when isSetExprValue is true, the
+--   FieldResult from validateSetExprValue(); ignored otherwise.
+-- `isNaN` — set if Number(value) returned NaN; emit "Must be a number".
+-- `numValue` — the coerced number (when !isNaN).
+-- `hasSet` — set if a SetExpr constraint applies; the wrapper
+--   pre-computed `contains(set, num)` as a Bool below.
+-- `setOk` — pre-computed contains() result (when hasSet is true).
+-- `setErrMsg` — pre-computed formatSetError(set) (when hasSet is true).
+ValNumSchema = ValNumSchema
+  isSetExprValue: a
+  setExprValidationResult: a
+  isNaN: a
+  numValue: a
+  hasSet: a
+  setOk: a
+  setErrMsg: String
+
+-- String validator schema.
+--
+-- `isSetExprValue` — SetExpr-as-value branch (see ValNumSchema).
+-- `setExprValidationResult` — when isSetExprValue is true.
+-- `hasSet` — single-string set constraint flag.
+-- `setOk` — pre-computed contains() result.
+-- `setErrMsg` — pre-computed formatSetError().
+-- `strValue` — String(value) coercion.
+--
+-- Phase 5c of field-meta-collapse retired the multi-select arm
+-- (isMultiple / multipleNotArray / multiItems / multiOkFlags) +
+-- the `validateStringMultiCollect` helper. `$list T` routes
+-- through the universal list validator now.
+ValStrSchema = ValStrSchema
+  isSetExprValue: a
+  setExprValidationResult: a
+  hasSet: a
+  setOk: a
+  setErrMsg: String
+  strValue: String
+
+-- ---------------------------------------------------------------------------
+-- validateBoolean — `value` is the raw input; the TS wrapper does the
+-- typeof-check + coercion table and emits the 5-way ValBoolSchema. The
+-- body returns the matched FieldResult.
+--
+-- TS oracle (validate.ts:validateBoolean):
+--   if typeof value === "boolean"     → { errors: [], value }
+--   if "true" / 1                      → { errors: [], value: true }
+--   if "false" / 0                     → { errors: [], value: false }
+--   otherwise                          → { errors: [{path, "Must be a boolean"}], value }
+-- ---------------------------------------------------------------------------
+
+@label "validate: validateBoolean"
+@description "Phase 8a sub-step 1 — pure dispatch on ValBoolSchema (VbsTrue / VbsFalse / VbsCoerceTrue / VbsCoerceFalse / VbsInvalid) emitting a FieldResult. The TS wrapper does the typeof/coercion check + classifies to a schema. Boundary adapter; dispatched via `dispatchedValidateBoolean` in engine-bodies-dispatch.ts. Mirrors implementations/typescript/engine/src/validate.ts:validateBoolean."
+@tags "engine" "validate" "boolean" "boundary" "phase-8a"
+validateBoolean : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateBoolean schema rawValue path = case schema of
+  VbsTrue -> FieldResult { errors = [], value = rawValue }
+  VbsFalse -> FieldResult { errors = [], value = rawValue }
+  VbsCoerceTrue -> FieldResult { errors = [], value = true }
+  VbsCoerceFalse -> FieldResult { errors = [], value = false }
+  VbsInvalid ->
+    let err = FieldError { path = path, message = "Must be a boolean" }
+    FieldResult { errors = appendItem err [], value = rawValue }
+
+-- ---------------------------------------------------------------------------
+-- validateNumber — Number / Int / Nat. Number-step / multipleOf
+-- constraints encode as a $where SetExpr wrapping the type (the wrapper
+-- pre-computes contains() for the membership check).
+--
+-- TS oracle (validate.ts:validateNumber):
+--   if isSetExpr(value)             → validateSetExprValue (passthrough)
+--   const num = Number(value); if isNaN → error "Must be a number"
+--   if set && !isJustTrue(contains(set, num)) → error formatSetError(set)
+--   else                            → { errors, value: num }
+-- ---------------------------------------------------------------------------
+
+@label "validate: validateNumber"
+@description "Phase 8a sub-step 1 — Number / Int / Nat validator. The TS wrapper pre-computes Number(value)/isNaN, contains(set, num) (when a set constraint applies), formatSetError(set), and the SetExpr-as-value branch (pre-computed FieldResult from validateSetExprValue). The body dispatches on a ValNumSchema record. Boundary adapter; dispatched via `dispatchedValidateNumber`."
+@tags "engine" "validate" "number" "boundary" "phase-8a"
+validateNumber : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateNumber schema rawValue path =
+  if schema.isSetExprValue
+  then schema.setExprValidationResult
+  else if schema.isNaN
+    then
+      let err = FieldError { path = path, message = "Must be a number" }
+      FieldResult { errors = appendItem err [], value = rawValue }
+    else if schema.hasSet
+      then if schema.setOk
+        then FieldResult { errors = [], value = schema.numValue }
+        else
+          let err = FieldError { path = path, message = schema.setErrMsg }
+          FieldResult { errors = appendItem err [], value = schema.numValue }
+      else FieldResult { errors = [], value = schema.numValue }
+
+-- ---------------------------------------------------------------------------
+-- validateString — single-string validator with optional set membership.
+--
+-- TS oracle (validate.ts:validateString):
+--   if isSetExpr(value)             → validateSetExprValue (passthrough)
+--   const str = String(value)
+--   if set && !contains(set, str)   → error formatSetError(set)
+--   else                            → { errors, value: str }
+--
+-- Phase 5c of field-meta-collapse retired the multi-select arm —
+-- multi-value String fields now express as `$list T` and route
+-- through the universal list validator.
+-- ---------------------------------------------------------------------------
+
+@label "validate: validateString"
+@description "Phase 8a sub-step 1 — String validator with multi-select + single-value branches. The TS wrapper pre-computes String(value), Array.isArray(value), contains() per item (multi-select), contains() over String(value) (single), formatSetError(set), and the SetExpr-as-value branch. The body dispatches on a ValStrSchema record. Boundary adapter; dispatched via `dispatchedValidateString`."
+@tags "engine" "validate" "string" "boundary" "phase-8a"
+validateString : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateString schema rawValue path =
+  if schema.isSetExprValue
+  then schema.setExprValidationResult
+  else
+    if schema.hasSet
+      then if schema.setOk
+        then FieldResult { errors = [], value = schema.strValue }
+        else
+          let err = FieldError { path = path, message = schema.setErrMsg }
+          FieldResult { errors = appendItem err [], value = schema.strValue }
+      else FieldResult { errors = [], value = schema.strValue }
+
+-- ---------------------------------------------------------------------------
+-- Sub-step 2 — remaining per-shape validators + structural validators.
+--
+-- The structural validators (validateList / validateRecord /
+-- validateUnion) receive PRE-VALIDATED items / fields from the TS
+-- wrapper rather than recursing through `validateFieldByType` directly
+-- — sub-step 2's body operates on a list of FieldResult records, the
+-- body just accumulates errors + assembles the output value. Sub-step 3
+-- will port `validateFieldByType` itself; the wrapper's pre-validation
+-- pass moves into the dispatcher's body at that point.
+-- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- ValSetExprShape — pre-classified SetExpr-value variant for
+-- validateSetExprValue. The TS wrapper inspects the SetExpr's
+-- canonical key ($enum / $interval / etc.) and emits one of these
+-- shape markers; the body emits the FieldResult.
+--
+-- * `SesEnumValid` — `$enum: Array<…>` (array check passed).
+-- * `SesEnumNonArray` — `$enum` key present but value isn't an array.
+-- * `SesIntervalValid` — `$interval` is an object.
+-- * `SesIntervalNonObject` — `$interval` is not an object.
+-- * `SesUnionValid` — `$union` is an array.
+-- * `SesUnionNonArray` — `$union` is not an array.
+-- * `SesIntersectValid` — `$intersect` is an array.
+-- * `SesIntersectNonArray` — `$intersect` is not an array.
+-- * `SesDiffValid` — `$diff` is a 2-element array.
+-- * `SesDiffMalformed` — `$diff` is not a 2-element array.
+-- * `SesKnownNoCheck` — `$complement` / `$all` / `$none` / `$named` /
+--   `$pattern` / `$where` — structurally valid; no further check.
+-- * `SesUnrecognized` — a single-key object whose key isn't a known
+--   SetExpr variant.
+-- ---------------------------------------------------------------------------
+
+ValSetExprShape =
+  SesEnumValid
+  | SesEnumNonArray
+  | SesIntervalValid
+  | SesIntervalNonObject
+  | SesUnionValid
+  | SesUnionNonArray
+  | SesIntersectValid
+  | SesIntersectNonArray
+  | SesDiffValid
+  | SesDiffMalformed
+  | SesKnownNoCheck
+  | SesUnrecognized
+
+-- validateSetExprValue — structural validation of a SetExpr-as-value.
+-- The wrapper pre-classifies into a ValSetExprShape; the body emits
+-- the FieldResult.
+@label "validate: validateSetExprValue"
+@description "Phase 8a sub-step 2 — structural validation of a SetExpr-as-value. The wrapper pre-classifies the SetExpr's variant into a ValSetExprShape (SesEnumValid / SesEnumNonArray / SesIntervalValid / SesIntervalNonObject / SesUnionValid / SesUnionNonArray / SesIntersectValid / SesIntersectNonArray / SesDiffValid / SesDiffMalformed / SesKnownNoCheck / SesUnrecognized); the body emits the FieldResult with the matching error message. Boundary adapter; dispatched via `dispatchedValidateSetExprValue`."
+@tags "engine" "validate" "setexpr" "boundary" "phase-8a"
+validateSetExprValue : (shape: a) -> (value: a) -> (path: String) -> a
+validateSetExprValue shape value path = case shape of
+  SesEnumValid -> FieldResult { errors = [], value = value }
+  SesEnumNonArray ->
+    let err = FieldError { path = path, message = "SetExpr $enum must be an array" }
+    FieldResult { errors = appendItem err [], value = value }
+  SesIntervalValid -> FieldResult { errors = [], value = value }
+  SesIntervalNonObject ->
+    let err = FieldError { path = path, message = "SetExpr $interval must be an object" }
+    FieldResult { errors = appendItem err [], value = value }
+  SesUnionValid -> FieldResult { errors = [], value = value }
+  SesUnionNonArray ->
+    let err = FieldError { path = path, message = "SetExpr $union must be an array" }
+    FieldResult { errors = appendItem err [], value = value }
+  SesIntersectValid -> FieldResult { errors = [], value = value }
+  SesIntersectNonArray ->
+    let err = FieldError { path = path, message = "SetExpr $intersect must be an array" }
+    FieldResult { errors = appendItem err [], value = value }
+  SesDiffValid -> FieldResult { errors = [], value = value }
+  SesDiffMalformed ->
+    let err = FieldError { path = path, message = "SetExpr $diff must be a [SetExpr, SetExpr] pair" }
+    FieldResult { errors = appendItem err [], value = value }
+  SesKnownNoCheck -> FieldResult { errors = [], value = value }
+  SesUnrecognized ->
+    let err = FieldError { path = path, message = "Unrecognized SetExpr variant" }
+    FieldResult { errors = appendItem err [], value = value }
+
+-- ---------------------------------------------------------------------------
+-- validateRef — UUID-shaped string check. The wrapper pre-computes
+-- String(value) + matches the canonical UUID regex; the body emits
+-- the FieldResult.
+--
+-- ValRefSchema — { isValid: Bool, strValue: String }
+-- ---------------------------------------------------------------------------
+
+ValRefSchema = ValRefSchema isValid: a strValue: String
+
+@label "validate: validateRef"
+@description "Phase 8a sub-step 2 — UUID-shaped string ref validator. The wrapper pre-computes String(value) + matches the canonical UUID regex; the body emits the FieldResult. Boundary adapter; dispatched via `dispatchedValidateRef`."
+@tags "engine" "validate" "ref" "boundary" "phase-8a"
+validateRef : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateRef schema rawValue path =
+  if schema.isValid
+  then FieldResult { errors = [], value = schema.strValue }
+  else
+    let err = FieldError { path = path, message = "Must be a valid entity reference" }
+    FieldResult { errors = appendItem err [], value = rawValue }
+
+-- ---------------------------------------------------------------------------
+-- validateFile — File descriptor structural shape.
+--
+-- The wrapper pre-computes the shape classification:
+-- `notObject` — value isn't an object (single error, early return).
+-- `missingUrl` — url field is missing/empty/non-string.
+-- `missingMimeType` — mimeType field is missing/empty/non-string.
+-- ---------------------------------------------------------------------------
+
+ValFileSchema = ValFileSchema
+  notObject: a
+  missingUrl: a
+  missingMimeType: a
+
+@label "validate: validateFile"
+@description "Phase 8a sub-step 2 — File descriptor structural shape check (notObject / missingUrl / missingMimeType flags pre-computed by the wrapper); body accumulates per-flag errors. Boundary adapter; dispatched via `dispatchedValidateFile`."
+@tags "engine" "validate" "file" "boundary" "phase-8a"
+validateFile : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateFile schema rawValue path =
+  if schema.notObject
+  then
+    let err = FieldError { path = path, message = "Expected a file descriptor object" }
+    FieldResult { errors = appendItem err [], value = rawValue }
+  else
+    let errs0 = []
+    let errs1 = if schema.missingUrl
+      then appendItem (FieldError { path = path, message = "File missing url" }) errs0
+      else errs0
+    let errs2 = if schema.missingMimeType
+      then appendItem (FieldError { path = path, message = "File missing mimeType" }) errs1
+      else errs1
+    FieldResult { errors = errs2, value = rawValue }
+
+-- ---------------------------------------------------------------------------
+-- validateDate — Date string + set membership.
+--
+-- The wrapper pre-computes:
+-- `isSetExprValue` — SetExpr-as-value branch (see ValNumSchema).
+-- `setExprValidationResult` — the pre-computed FieldResult.
+-- `isInvalidDate` — Date(value) returned NaN.
+-- `strValue` — String(value) coercion.
+-- `hasSet` / `setOk` / `setErrMsg` — set membership pre-computation.
+-- ---------------------------------------------------------------------------
+
+ValDateSchema = ValDateSchema
+  isSetExprValue: a
+  setExprValidationResult: a
+  isInvalidDate: a
+  strValue: String
+  hasSet: a
+  setOk: a
+  setErrMsg: String
+
+@label "validate: validateDate"
+@description "Phase 8a sub-step 2 — Date string + set membership. The wrapper pre-computes new Date(str)/isNaN, contains(set, str), the SetExpr-as-value branch. Boundary adapter; dispatched via `dispatchedValidateDate`."
+@tags "engine" "validate" "date" "boundary" "phase-8a"
+validateDate : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateDate schema rawValue path =
+  if schema.isSetExprValue
+  then schema.setExprValidationResult
+  else if schema.isInvalidDate
+    then
+      let err = FieldError { path = path, message = "Invalid date" }
+      FieldResult { errors = appendItem err [], value = rawValue }
+    else if schema.hasSet
+      then if schema.setOk
+        then FieldResult { errors = [], value = schema.strValue }
+        else
+          let err = FieldError { path = path, message = schema.setErrMsg }
+          FieldResult { errors = appendItem err [], value = schema.strValue }
+      else FieldResult { errors = [], value = schema.strValue }
+
+-- ---------------------------------------------------------------------------
+-- validateMarkup — Markup ADT structural check + subset membership.
+--
+-- ValMarkupSchema:
+-- `notObject` — value isn't an object.
+-- `badCase` — __case isn't "Element" or "Text".
+-- `subsetName` — optional subset name (Maybe String) for the error
+--   message when the membership check fails. (Wrapper pre-computes
+--   isJustTrue(contains({$named: subsetName}, value)).)
+-- `subsetMatch` — when subsetName is Just, true means OK.
+-- ---------------------------------------------------------------------------
+
+ValMarkupSchema = ValMarkupSchema
+  notObject: a
+  badCase: a
+  subsetName: a
+  subsetMatch: a
+
+@label "validate: validateMarkup"
+@description "Phase 8a sub-step 2 — Markup ADT structural check + subset membership. The wrapper pre-computes notObject / badCase / subsetName / subsetMatch flags; body emits FieldResult. Boundary adapter; dispatched via `dispatchedValidateMarkup`."
+@tags "engine" "validate" "markup" "boundary" "phase-8a"
+validateMarkup : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateMarkup schema rawValue path =
+  if schema.notObject
+  then
+    let err = FieldError { path = path, message = "Must be a Markup value" }
+    FieldResult { errors = appendItem err [], value = rawValue }
+  else if schema.badCase
+    then
+      let err = FieldError { path = path, message = "Markup must be tagged Element or Text" }
+      FieldResult { errors = appendItem err [], value = rawValue }
+    else case schema.subsetName of
+      Nothing -> FieldResult { errors = [], value = rawValue }
+      Just subName ->
+        if schema.subsetMatch
+        then FieldResult { errors = [], value = rawValue }
+        else
+          let msg = concat "Markup violates subset: " subName
+          let err = FieldError { path = path, message = msg }
+          FieldResult { errors = appendItem err [], value = rawValue }
+
+-- ---------------------------------------------------------------------------
+-- validateLocaleString — plain string OR locale-map.
+--
+-- The wrapper pre-classifies into ValLocaleStringShape:
+-- `VlsPlainStringOk` — plain string + (no set OR set passed).
+-- `VlsPlainStringFail` — plain string + set failed; carries setErrMsg.
+-- `VlsMap { localeEntries }` — locale map; each entry pre-validated.
+-- `VlsInvalid` — value is neither string nor map.
+-- ---------------------------------------------------------------------------
+
+ValLocaleStringShape =
+  VlsPlainStringOk
+  | VlsPlainStringFail msg: String
+  | VlsMap entries: a
+  | VlsInvalid
+
+-- VlsMapEntry — one (locale, text, classification) row. The wrapper
+-- pre-classifies each row:
+--   `unknownLocale` — locale code didn't match the validLocale registry.
+--   `nonStringText` — text isn't a string (cannot run set check).
+--   `setFail` — text is a string but failed set membership.
+--   `setErrMsg` — the per-row set-error message.
+-- The body emits one error per failed flag (in original encounter order).
+VlsMapEntry = VlsMapEntry
+  locale: String
+  unknownLocale: a
+  nonStringText: a
+  setFail: a
+  setErrMsg: String
+
+@label "validate: validateLocaleString"
+@description "Phase 8a sub-step 2 — plain string OR locale map { [locale]: text }. The wrapper pre-classifies into a ValLocaleStringShape ADT (VlsPlainStringOk / VlsPlainStringFail / VlsMap / VlsInvalid) with each map row pre-validated (unknown locale, non-string text, set fail). Boundary adapter; dispatched via `dispatchedValidateLocaleString`."
+@tags "engine" "validate" "locale-string" "boundary" "phase-8a"
+validateLocaleString : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateLocaleString schema rawValue path = case schema of
+  VlsPlainStringOk -> FieldResult { errors = [], value = rawValue }
+  VlsPlainStringFail { msg = m } ->
+    let err = FieldError { path = path, message = m }
+    FieldResult { errors = appendItem err [], value = rawValue }
+  VlsMap { entries = es } ->
+    let errs = validateLocaleStringWalkEntries es path []
+    FieldResult { errors = errs, value = rawValue }
+  VlsInvalid ->
+    let err = FieldError { path = path, message = "Must be a string or locale map" }
+    FieldResult { errors = appendItem err [], value = rawValue }
+
+-- validateLocaleStringWalkEntries — append one error per failed entry.
+@label "validate: validateLocaleStringWalkEntries"
+@description "Phase 8a sub-step 2 — append one error per failed VlsMapEntry (unknownLocale / nonStringText / setFail). Internal helper."
+@tags "engine" "internal" "validate" "locale-string" "phase-8a"
+@category "engine-internal"
+validateLocaleStringWalkEntries : (entries: a) -> (path: String) -> (acc: List a) -> List a
+validateLocaleStringWalkEntries entries path acc = case head entries of
+  Nothing -> acc
+  Just e ->
+    let entryPath = concat path (concat "." e.locale)
+    let acc1 = if e.unknownLocale
+      then
+        let msg = concat "Unknown locale code: " e.locale
+        appendItem (FieldError { path = entryPath, message = msg }) acc
+      else acc
+    let acc2 = if e.nonStringText
+      then appendItem (FieldError { path = entryPath, message = "Translation must be a string" }) acc1
+      else acc1
+    let acc3 = if e.setFail
+      then appendItem (FieldError { path = entryPath, message = e.setErrMsg }) acc2
+      else acc2
+    case tail entries of
+      Nothing -> acc3
+      Just rest -> validateLocaleStringWalkEntries rest path acc3
+
+-- ---------------------------------------------------------------------------
+-- validateList — array of inner items. The wrapper pre-validates each
+-- item by calling validateFieldByType TS-side (sub-step 3 will port
+-- that itself) and packs the per-item FieldResult into the input ADT.
+--
+-- ValListSchema:
+-- `notArray` — value isn't an array (single early error).
+-- `itemResults` — list of FieldResult records (one per item, in order).
+-- ---------------------------------------------------------------------------
+
+ValListSchema = ValListSchema
+  notArray: a
+  itemResults: a
+
+@label "validate: validateList"
+@description "Phase 8a sub-step 2 — array of inner items. The wrapper pre-computes notArray + recursively validates each item by calling validateFieldByType TS-side (sub-step 3 will port that); the body just accumulates errors + values. Boundary adapter; dispatched via `dispatchedValidateList`."
+@tags "engine" "validate" "list" "boundary" "phase-8a"
+validateList : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateList schema rawValue path =
+  if schema.notArray
+  then
+    let err = FieldError { path = path, message = "Must be a list" }
+    FieldResult { errors = appendItem err [], value = rawValue }
+  else
+    let acc = validateListWalk schema.itemResults [] []
+    FieldResult { errors = acc.errors, value = acc.values }
+
+-- ListAccum — accumulator threading errors + values through the walk.
+ListAccum = ListAccum errors: a values: a
+
+@label "validate: validateListWalk"
+@description "Phase 8a sub-step 2 — recursive walk threading {errors, values} through the pre-validated item FieldResults. Internal helper."
+@tags "engine" "internal" "validate" "list" "phase-8a"
+@category "engine-internal"
+validateListWalk : (results: a) -> (errAcc: List a) -> (valAcc: List a) -> a
+validateListWalk results errAcc valAcc = case head results of
+  Nothing -> ListAccum { errors = errAcc, values = valAcc }
+  Just r ->
+    let errAcc1 = validateListMergeErrors r.errors errAcc
+    let valAcc1 = appendItem r.value valAcc
+    case tail results of
+      Nothing -> ListAccum { errors = errAcc1, values = valAcc1 }
+      Just rest -> validateListWalk rest errAcc1 valAcc1
+
+-- validateListMergeErrors — append each error from `src` into `dst`,
+-- preserving order. Equivalent to `[...dst, ...src]` in TS.
+@label "validate: validateListMergeErrors"
+@description "Phase 8a sub-step 2 — append each error from `src` into `dst` preserving encounter order. Equivalent to `[...dst, ...src]`. Internal helper; reused by validateRecord + validateUnion."
+@tags "engine" "internal" "validate" "phase-8a"
+@category "engine-internal"
+validateListMergeErrors : (src: List a) -> (dst: List a) -> List a
+validateListMergeErrors src dst = case head src of
+  Nothing -> dst
+  Just e ->
+    let dst1 = appendItem e dst
+    case tail src of
+      Nothing -> dst1
+      Just rest -> validateListMergeErrors rest dst1
+
+-- ---------------------------------------------------------------------------
+-- validateRecord — recurse over each declared field with strict-mode
+-- checks. The wrapper pre-validates each field by calling
+-- validateFieldByType TS-side; the body accumulates errors + assembles
+-- the output record from per-field {name, result, omitted, required}
+-- entries.
+--
+-- ValRecordSchema:
+-- `notObject` — value isn't an object (early error).
+-- `emptySchema` — `$record: { fields: [] }` opaque-record passthrough.
+-- `addedErrors` — pre-computed errors for the rejectAdded check.
+-- `fieldEntries` — list of ValRecordFieldEntry rows.
+-- ---------------------------------------------------------------------------
+
+ValRecordSchema = ValRecordSchema
+  notObject: a
+  emptySchema: a
+  addedErrors: a
+  fieldEntries: a
+
+-- Per-field entry. The wrapper picks one of three classifications:
+-- * `VrfRequiredMissing` — Maybe-typed field; value missing; skip.
+-- * `VrfOmittedMaybe` — Maybe-typed field; value missing; passthrough.
+-- * `VrfRequiredAbsent` — non-Maybe field; value missing; emit required.
+-- * `VrfValidated` — value present; carries the pre-computed FieldResult.
+ValRecordFieldEntry =
+  VrfOmittedMaybe name: String
+  | VrfRequiredAbsent name: String label: String fieldPath: String
+  | VrfValidated name: String result: a
+
+@label "validate: validateRecord"
+@description "Phase 8a sub-step 2 — recurse over declared fields with strict-mode checks. The wrapper pre-computes notObject / emptySchema / addedErrors (rejectAdded keys) + pre-validates each FieldDef by calling validateFieldByType TS-side; the body accumulates errors + assembles the output record. Boundary adapter; dispatched via `dispatchedValidateRecord`."
+@tags "engine" "validate" "record" "boundary" "phase-8a"
+validateRecord : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateRecord schema rawValue path =
+  if schema.notObject
+  then
+    let err = FieldError { path = path, message = "Must be an object" }
+    FieldResult { errors = appendItem err [], value = rawValue }
+  else if schema.emptySchema
+    then FieldResult { errors = [], value = rawValue }
+    else
+      let acc = validateRecordWalk schema.fieldEntries schema.addedErrors emptyMap
+      FieldResult { errors = acc.errors, value = acc.fields }
+
+-- RecAccum — accumulator: errors list + fields record. `fields` is
+-- accumulated as a record via `mapSet` (std native). `emptyMap` is the
+-- free var resolving to `null` — `mapSet null "key" v` returns `{key: v}`.
+RecAccum = RecAccum errors: a fields: a
+
+@label "validate: validateRecordWalk"
+@description "Phase 8a sub-step 2 — recursive walk threading errors + fields through the per-field ValRecordFieldEntry rows. Internal helper."
+@tags "engine" "internal" "validate" "record" "phase-8a"
+@category "engine-internal"
+validateRecordWalk : (entries: a) -> (errAcc: List a) -> (fieldAcc: a) -> a
+validateRecordWalk entries errAcc fieldAcc = case head entries of
+  Nothing -> RecAccum { errors = errAcc, fields = fieldAcc }
+  Just e ->
+    let next = validateRecordStep e errAcc fieldAcc
+    case tail entries of
+      Nothing -> next
+      Just rest -> validateRecordWalk rest next.errors next.fields
+
+@label "validate: validateRecordStep"
+@description "Phase 8a sub-step 2 — one step of the validateRecordWalk: VrfOmittedMaybe / VrfRequiredAbsent / VrfValidated dispatch. Internal helper."
+@tags "engine" "internal" "validate" "record" "phase-8a"
+@category "engine-internal"
+validateRecordStep : (entry: a) -> (errAcc: List a) -> (fieldAcc: a) -> a
+validateRecordStep entry errAcc fieldAcc = case entry of
+  VrfOmittedMaybe { name = n } -> RecAccum { errors = errAcc, fields = fieldAcc }
+  VrfRequiredAbsent { name = n, label = l, fieldPath = fp } ->
+    let msg = concat l " is required"
+    let err = FieldError { path = fp, message = msg }
+    RecAccum { errors = appendItem err errAcc, fields = fieldAcc }
+  VrfValidated { name = n, result = r } ->
+    let errs1 = validateListMergeErrors r.errors errAcc
+    let fields1 = mapSet fieldAcc n r.value
+    RecAccum { errors = errs1, fields = fields1 }
+
+-- ---------------------------------------------------------------------------
+-- validateUnion — variant-tagged record. The wrapper pre-computes the
+-- variant key + the variant-key lookup (known vs unknown) and pre-
+-- validates each field of the matched variant.
+--
+-- ValUnionSchema:
+-- `notObject` — value isn't an object.
+-- `variantKey` — extracted discriminator key (String).
+-- `variantKeyEmpty` — variantKey was empty / discriminator missing.
+-- `unknownVariant` — variantKey not in variants table.
+-- `validKeyList` — comma-joined string of valid variant names (for the
+--   error message).
+-- `discriminator` — the discriminator field name (for error path).
+-- `fieldEntries` — per-field results for the matched variant (same
+--   shape as validateRecord's).
+-- ---------------------------------------------------------------------------
+
+ValUnionSchema = ValUnionSchema
+  notObject: a
+  variantKey: String
+  variantKeyEmpty: a
+  unknownVariant: a
+  validKeyList: String
+  discriminator: String
+  fieldEntries: a
+
+@label "validate: validateUnion"
+@description "Phase 8a sub-step 2 — variant-tagged record. The wrapper extracts the discriminator key + classifies (empty / unknown / matched), pre-validates each field of the matched variant. Boundary adapter; dispatched via `dispatchedValidateUnion`."
+@tags "engine" "validate" "union" "boundary" "phase-8a"
+validateUnion : (schema: a) -> (rawValue: a) -> (path: String) -> a
+validateUnion schema rawValue path =
+  if schema.notObject
+  then
+    let err = FieldError { path = path, message = "Must be an object" }
+    FieldResult { errors = appendItem err [], value = rawValue }
+  else if validateUnionBadKey schema
+    then
+      let discPath = concat path (concat "." schema.discriminator)
+      let msg = concat "Must be one of: " schema.validKeyList
+      let err = FieldError { path = discPath, message = msg }
+      FieldResult { errors = appendItem err [], value = rawValue }
+    else
+      let initFields = mapSet emptyMap schema.discriminator schema.variantKey
+      let acc = validateRecordWalk schema.fieldEntries [] initFields
+      FieldResult { errors = acc.errors, value = acc.fields }
+
+-- validateUnionBadKey — true if the variantKey is empty OR not in the
+-- variant table.
+@label "validate: validateUnionBadKey"
+@description "Phase 8a sub-step 2 — true if the union's variantKey is empty OR not in the variant table. Internal helper."
+@tags "engine" "internal" "validate" "union" "phase-8a"
+@category "engine-internal"
+validateUnionBadKey : (schema: a) -> Bool
+validateUnionBadKey schema = if schema.variantKeyEmpty
+  then true
+  else schema.unknownVariant
+
+-- ===========================================================================
+-- field-identity Phase 3 / ux-parity Phase 16 — identity-total runtime
+--
+-- TraversalType is the one mechanical `$`-barrier mirror. ValidationType is an
+-- INTERNAL semantic plan elaborated here: the host exposes only opaque field,
+-- registry, parser, and codec facts. Constructor policy, exact canonical
+-- recognition, resolution priority/cycles, and recursion are Fenel-owned.
+-- ===========================================================================
+
+ValidationType =
+  VtNamed name: String representationName: String resolved: a raw: a
+  | VtRefined base: a set: a raw: a
+  | VtOpaque name: String representationName: String pure: a raw: a
+  | VtMaybe value: a raw: a
+  | VtList elem: a raw: a
+  | VtRecord fields: a raw: a
+  | VtVariant cases: a discriminator: String raw: a
+  | VtMap keys: a values: a finite: Bool card: Number enumKeys: Bool raw: a
+  | VtUnion branches: List ValidationType raw: a
+  | VtTagged value: ValidationType valueName: String phantomTypeName: String phantomValue: a phantomName: a raw: a
+  | VtArrow params: a returns: a raw: a
+  | VtType raw: a
+  | VtEl raw: a
+  | VtVar name: String raw: a
+  | VtCycle name: String raw: a
+  | VtInvalid message: String raw: a
+  | VtOther kind: String raw: a
+
+@category "engine-internal"
+validationPrimitiveName : (name: String) -> Bool
+validationPrimitiveName name =
+  elem name ["String", "Number", "Int", "Nat", "Boolean", "Bytes", "Date", "File", "Markup"]
+
+@category "engine-internal"
+validationFirstFact : (first: Maybe a) -> (second: Maybe a) -> Maybe a
+validationFirstFact first second = case first of
+  Just value -> Just value
+  Nothing -> second
+
+@category "engine-internal"
+validationModeBase : (mode: String) -> String
+validationModeBase mode = if elem mode ["schema", "source-schema"] then "schema" else "runtime"
+
+@category "engine-internal"
+validationModeSource : (mode: String) -> Bool
+validationModeSource mode = elem mode ["source-schema", "source-runtime"]
+
+@category "engine-internal"
+validationCapturedDeclarationValid : (fact: Maybe a) -> Bool
+validationCapturedDeclarationValid fact = case fact of
+  Nothing -> false
+  Just observed -> observed.sameDeclaration && observed.ownerIdentity != "" && observed.ownerIdentity == observed.resolvedOwnerIdentity
+
+@category "engine-internal"
+validationNamedSourceObservation : (facts: a) -> (key: String) -> Maybe a
+validationNamedSourceObservation facts key = case mapGet facts key of Just observed -> observed; Nothing -> Nothing
+
+@category "engine-internal"
+validationNamedSourceFact : (facts: a) -> Maybe a
+validationNamedSourceFact facts = case facts.definition of
+  Just definition -> Nothing
+  Nothing -> case facts.registryHandle of
+    Just candidate -> validationNamedSourceObservation facts "registryHandleSource"
+    Nothing -> case facts.registryEntityName of
+      Just candidate -> validationNamedSourceObservation facts "registryEntityNameSource"
+      Nothing -> case facts.contextType of
+        Just candidate -> validationNamedSourceObservation facts "contextTypeSource"
+        Nothing -> Nothing
+
+@category "engine-internal"
+validationNamedCandidateMode : (facts: a) -> (mode: String) -> String
+validationNamedCandidateMode facts mode =
+  let base = validationModeBase mode
+  if validationCapturedDeclarationValid (validationNamedSourceFact facts) then concat "source-" base else base
+
+@category "engine-internal"
+validationTraversalSemanticError : (type: TraversalType) -> (mode: String) -> Maybe String
+validationTraversalSemanticError type mode =
+  if validationModeSource mode then traversalSemanticSlotsErrorWithSourceHandles type else typeToSetSemanticError type
+
+@category "engine-internal"
+validationNamedFactForMode : (facts: a) -> (mode: String) -> Maybe b
+validationNamedFactForMode facts mode =
+  let registry = validationFirstFact facts.registryHandle facts.registryEntityName
+  let catalog = validationFirstFact facts.catalogEntity facts.catalogName
+  let captured = validationFirstFact registry facts.contextType
+  let runtimeFallback = validationFirstFact captured (validationFirstFact facts.functionType (if facts.contextOwnsTypes then Nothing else catalog))
+  if eq (validationModeBase mode) "schema"
+  then validationFirstFact facts.definition captured
+  else validationFirstFact facts.definition runtimeFallback
+
+@category "engine-internal"
+validationTraversalName : (t: TraversalType) -> String
+validationTraversalName t = case t of
+  TtNamed { name = name } -> name
+  TtOpaque { name = name } -> name
+  _ -> ""
+
+@category "engine-internal"
+validationPhantomTypeName : (t: TraversalType) -> String
+validationPhantomTypeName t = case t of
+  TtRefined { base = base } -> validationPhantomTypeName base
+  _ -> validationTraversalName t
+
+@category "engine-internal"
+validationRepresentationName : (t: TraversalType) -> String
+validationRepresentationName t = canonicalRepresentationName t
+
+@category "engine-internal"
+validationNamedRepresentationName : (facts: a) -> (candidate: Maybe TraversalType) -> String
+validationNamedRepresentationName facts candidate = case candidate of
+  Just type -> if validationCapturedBooleanDeclaration facts type then "Boolean" else validationRepresentationName type
+  Nothing -> case (if facts.contextOwnsTypes then Nothing else validationFirstFact facts.catalogEntity facts.catalogName) of
+    Just type -> validationRepresentationName type
+    Nothing -> ""
+
+@category "engine-internal"
+validationCapturedBooleanDeclaration : (facts: a) -> (type: TraversalType) -> Bool
+validationCapturedBooleanDeclaration facts type =
+  if not (validationCapturedDeclarationValid (validationNamedSourceFact facts)) then false
+  else case type of
+    TtOpaque { name = name, pure = pure } ->
+      if not (eq name "Boolean") then false
+      else case mapGet type "readerCanonicalOwner" of
+        Just (Just owner) ->
+          if eq owner.readerOwnerIdentity "" || owner.readerOwnerIdentity != owner.expectedSystemIdentity then false
+          else case pure of
+            TtVariant { cases = cases } ->
+              length cases == 2 && some cases (\variantCase -> variantCase.name == "True" && length variantCase.fields == 0) && some cases (\variantCase -> variantCase.name == "False" && length variantCase.fields == 0)
+            _ -> false
+        _ -> false
+    _ -> false
+
+@category "engine-internal"
+validationPhantomFirst : (phantom: TraversalType) -> Maybe a
+validationPhantomFirst phantom = case phantom of
+  TtRefined { set = rawSet } -> case validationCanonicalSet rawSet Nothing of
+    SeEnum { values = values } -> head values
+    _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+validationPhantomName : (value: Maybe a) -> Maybe String
+validationPhantomName value = case value of
+  Just first -> if isString first then Just first else Nothing
+  Nothing -> Nothing
+
+@category "engine-internal"
+validationListHeadFieldVariant : (cases: List a) -> Maybe b
+validationListHeadFieldVariant cases =
+  if not (eq (length cases) 2)
+  then Nothing
+  else case setAlgebraFindCaseByName cases "Nil" of
+    Nothing -> Nothing
+    Just nilCase ->
+      if gt (length nilCase.fields) 0
+      then Nothing
+      else case setAlgebraFindCaseByName cases "Cons" of
+        Nothing -> Nothing
+        Just consCase ->
+          if not (eq (length consCase.fields) 2)
+          then Nothing
+          else case setAlgebraFindFieldByKey consCase.fields (canonicalListHeadFieldKey ()) of
+            Nothing -> Nothing
+            Just headField -> Just headField
+
+@category "engine-internal"
+validationListInnerVariant : (cases: List a) -> Maybe b
+validationListInnerVariant cases = case validationListHeadFieldVariant cases of
+  Nothing -> Nothing
+  Just headField -> Just headField.type
+
+@category "engine-internal"
+validationListInnerMuBody : (body: TraversalType) -> Maybe a
+validationListInnerMuBody body = case body of
+  TtVariant { cases = cases } -> validationListInnerVariant cases
+  _ -> Nothing
+
+@category "engine-internal"
+validationListInnerOpaquePure : (pure: TraversalType) -> Maybe a
+validationListInnerOpaquePure pure = case pure of
+  TtVariant { cases = cases } -> validationListInnerVariant cases
+  TtMu { body = body } -> validationListInnerMuBody body
+  _ -> Nothing
+
+@category "engine-internal"
+validationListInner : (t: TraversalType) -> Maybe a
+validationListInner t = case t of
+  TtOpaque { pure = pure } -> validationListInnerOpaquePure pure
+  TtMu { body = body } -> validationListInnerMuBody body
+  _ -> Nothing
+
+-- Keep the recognized List's actual head occurrence: its token carries the
+-- declaration scope that would be lost by projecting only headField.type.
+@category "engine-internal"
+validationListHeadField : (t: TraversalType) -> Maybe a
+validationListHeadField t = case t of
+  TtOpaque { pure = pure } -> case pure of
+    TtVariant { cases = cases } -> validationListHeadFieldVariant cases
+    TtMu { body = body } -> case body of
+      TtVariant { cases = cases } -> validationListHeadFieldVariant cases
+      _ -> Nothing
+    _ -> Nothing
+  TtMu { body = body } -> case body of
+    TtVariant { cases = cases } -> validationListHeadFieldVariant cases
+    _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+validationFiniteMapCard : (keys: a) -> Maybe Number
+validationFiniteMapCard keys = case keys of
+  SeInterval { interval = interval } -> case interval.lo of
+    Nothing -> Nothing
+    Just lo -> case interval.hi of
+      Nothing -> Nothing
+      Just hi ->
+        if and (eq lo.value 0)
+          (and lo.inclusive (and (isNumber hi.value) (not hi.inclusive)))
+        then Just hi.value
+        else Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+validationEnumMapKeys : (keys: a) -> Bool
+validationEnumMapKeys keys = case keys of
+  SeEnum {} -> true
+  _ -> false
+
+@category "engine-internal"
+validationElaborateFields : (fields: List a) -> (mode: String) -> (seen: List String) -> (ordinal: Number) -> (acc: List b) -> List b
+validationElaborateFields fields mode seen ordinal acc = validationElaborateScopedFields fields mode seen ordinal acc []
+
+@category "engine-internal"
+validationElaborateFieldOccurrence : (field: a) -> (fact: a) -> (mode: String) -> (seen: List String) -> (bindings: List ({ name: String, type: TraversalType })) -> ValidationType
+validationElaborateFieldOccurrence field fact mode seen bindings =
+  if not (validationModeSource mode) then validationElaborateScopedType field.type mode seen bindings
+  else case fact.scopedOccurrence of
+    Nothing -> validationElaborateScopedType field.type mode seen bindings
+    Just scoped ->
+      let unavailable = VtInvalid { message = "The field type could not be resolved in its captured declaration", raw = fact.rawType }
+      if not (validationCapturedDeclarationValid scoped.declarationSource) then unavailable
+      else if not (validationCapturedDeclarationValid scoped.targetSource) then unavailable
+      else case scoped.projection of
+        Nothing -> unavailable
+        Just type -> case validationTraversalSemanticError type mode of
+          Just message -> VtInvalid { message = message, raw = fact.rawType }
+          Nothing -> validationElaborateScopedType type mode seen bindings
+
+@category "engine-internal"
+validationElaborateScopedFields : (fields: List a) -> (mode: String) -> (seen: List String) -> (ordinal: Number) -> (acc: List b) -> (bindings: List ({ name: String, type: TraversalType })) -> List b
+validationElaborateScopedFields fields mode seen ordinal acc bindings = case head fields of
+  Nothing -> acc
+  Just field ->
+    let fact = validationFieldFact field.token
+    let planned =
+          { key = field.semanticKey
+          , wireName = fact.wireName
+          , ordinal = ordinal
+          , occurrenceType = validationElaborateFieldOccurrence field fact mode seen bindings
+          , rawField = fact.rawField
+          , rawType = fact.rawType
+          , label = fact.label
+          , widgetName = fact.widgetName
+          , identityError = fact.identityError
+          , sourceDeclaration = validationModeSource mode
+          }
+    let next = appendItem planned acc
+    case tail fields of
+      Nothing -> next
+      Just rest -> validationElaborateScopedFields rest mode seen (add ordinal 1) next bindings
+
+@category "engine-internal"
+validationElaborateCases : (cases: List a) -> (mode: String) -> (seen: List String) -> (acc: List b) -> List b
+validationElaborateCases cases mode seen acc = validationElaborateScopedCases cases mode seen acc []
+
+@category "engine-internal"
+validationElaborateScopedCases : (cases: List a) -> (mode: String) -> (seen: List String) -> (acc: List b) -> (bindings: List ({ name: String, type: TraversalType })) -> List b
+validationElaborateScopedCases cases mode seen acc bindings = case head cases of
+  Nothing -> acc
+  Just variantCase ->
+    let planned =
+          { name = variantCase.name
+          , fields = validationElaborateScopedFields variantCase.fields mode seen 0 [] bindings
+          }
+    let next = appendItem planned acc
+    case tail cases of
+      Nothing -> next
+      Just rest -> validationElaborateScopedCases rest mode seen next bindings
+
+@category "engine-internal"
+validationElaborateNamed : (name: String) -> (raw: a) -> (mode: String) -> (seen: List String) -> ValidationType
+validationElaborateNamed name raw mode seen =
+  if eq name "Boolean"
+  then
+    let facts = validationNamedFacts name
+    let candidate = validationNamedFactForMode facts mode
+    VtNamed { name = name, representationName = validationNamedRepresentationName facts candidate, resolved = Nothing, raw = raw }
+  else if validationPrimitiveName name
+  then VtNamed { name = name, representationName = "", resolved = Nothing, raw = raw }
+  else if elem name seen
+    then VtCycle { name = name, raw = raw }
+    else
+      let facts = validationNamedFacts name
+      case validationNamedFactForMode facts mode of
+        Nothing -> VtNamed { name = name, representationName = validationNamedRepresentationName facts Nothing, resolved = Nothing, raw = raw }
+        Just candidate ->
+          let nextSeen = appendItem name seen
+          let candidateMode = validationNamedCandidateMode facts mode
+          let plannedCandidate = case validationTraversalSemanticError candidate candidateMode of
+                Just message -> VtInvalid { message = message, raw = raw }
+                Nothing -> validationElaborateType candidate candidateMode nextSeen
+          VtNamed
+            { name = name
+            , representationName = validationNamedRepresentationName facts (Just candidate)
+            , resolved = Just plannedCandidate
+            , raw = raw
+            }
+
+@category "engine-internal"
+validationElaborateType : (t: TraversalType) -> (mode: String) -> (seen: List String) -> ValidationType
+validationElaborateType t mode seen = validationElaborateScopedType t mode seen []
+
+@category "engine-internal"
+validationElaborateScopedType : (t: TraversalType) -> (mode: String) -> (seen: List String) -> (bindings: List ({ name: String, type: TraversalType })) -> ValidationType
+validationElaborateScopedType t mode seen bindings = case t of
+  TtRefined { base = base, set = rawSet, raw = raw } ->
+    VtRefined
+      { base = validationElaborateScopedType base mode seen bindings
+      , set = validationCanonicalSet rawSet (Just raw)
+      , raw = raw
+      }
+  TtNamed { name = name, raw = raw } -> validationElaborateNamed name raw mode seen
+  TtRecord { fields = fields, raw = raw } ->
+    VtRecord { fields = validationElaborateScopedFields fields mode seen 0 [] bindings, raw = raw }
+  TtVariant { cases = cases, discriminator = discriminator, raw = raw } ->
+    case typeTraversalMaybeInner cases of
+      Just inner -> VtMaybe { value = validationElaborateScopedType inner mode seen bindings, raw = raw }
+      Nothing ->
+        let wireDiscriminator = case discriminator of
+              Just value -> value
+              Nothing -> "$tag"
+        VtVariant
+          { cases = validationElaborateScopedCases cases mode seen [] bindings
+          , discriminator = wireDiscriminator
+          , raw = raw
+          }
+  TtMap { keys = rawKeys, values = values, raw = raw } ->
+    let keys = validationCanonicalSet rawKeys Nothing
+    let card = validationFiniteMapCard keys
+    VtMap
+      { keys = keys
+      , values = validationElaborateScopedType values mode seen bindings
+      , finite = case card of Just value -> true; Nothing -> false
+      , card = case card of Just value -> value; Nothing -> 0
+      , enumKeys = validationEnumMapKeys keys
+      , raw = raw
+      }
+  TtTagged { value = value, phantom = phantom, raw = raw } ->
+    let phantomValue = validationPhantomFirst phantom
+    VtTagged
+      { value = validationElaborateScopedType value mode seen bindings
+      , valueName = validationTraversalName value
+      , phantomTypeName = validationPhantomTypeName phantom
+      , phantomValue = phantomValue
+      , phantomName = validationPhantomName phantomValue
+      , raw = raw
+      }
+  TtArrow { params = params, returns = returns, raw = raw } ->
+    VtArrow
+      { params = validationElaborateScopedFields params mode seen 0 [] bindings
+      , returns = validationElaborateScopedType returns mode seen bindings
+      , raw = raw
+      }
+  TtTypeUniverse { raw = raw } -> VtType { raw = raw }
+  TtEl { raw = raw } -> VtEl { raw = raw }
+  TtVar { name = name, raw = raw } -> case callSiteMembershipScopeLookup name bindings of
+    Nothing -> VtVar { name = name, raw = raw }
+    Just bound -> validationElaborateType bound (validationModeBase mode) []
+  TtOpaque { name = name, pure = pure, raw = raw } ->
+    let innerBindings = filter (\binding -> not (eq binding.name name)) bindings
+    case validationListHeadField t of
+      Just headField ->
+        let fact = validationFieldFact headField.token
+        VtList { elem = validationElaborateFieldOccurrence headField fact mode seen innerBindings, raw = raw }
+      Nothing -> VtOpaque { name = name, representationName = validationRepresentationName t, pure = validationElaborateScopedType pure mode seen innerBindings, raw = raw }
+  TtMu { var = name, raw = raw } ->
+    let innerBindings = filter (\binding -> not (eq binding.name name)) bindings
+    case validationListHeadField t of
+      Just headField ->
+        let fact = validationFieldFact headField.token
+        VtList { elem = validationElaborateFieldOccurrence headField fact mode seen innerBindings, raw = raw }
+      Nothing -> VtOther { kind = "mu", raw = raw }
+  TtUnit { raw = raw } -> VtOther { kind = "unit", raw = raw }
+  TtVoid { raw = raw } -> VtOther { kind = "void", raw = raw }
+  TtTuple { raw = raw } -> VtOther { kind = "tuple", raw = raw }
+  TtApp { raw = raw } -> VtEl { raw = raw }
+  TtUnion { branches = branches, raw = raw } -> VtUnion { branches = map (\branch -> validationElaborateScopedType branch mode seen bindings) branches, raw = raw }
+  TtIntersect { raw = raw } -> VtOther { kind = "intersect", raw = raw }
+  -- The universal type needs no new core former: Anything = complement Void.
+  -- Recognize only this exact algebraic identity. General complements still
+  -- use the existing membership fallback; a plan failure is not negation.
+  TtComplement { inner = inner, raw = raw } -> case inner of
+    TtVoid {} -> VtOther { kind = "anything", raw = raw }
+    _ -> VtOther { kind = "complement", raw = raw }
+  TtUnknown { raw = raw } -> VtOther { kind = "unknown", raw = raw }
+
+ValidationAccessPlan =
+  VapInvalid path: String message: String
+  | VapReady fields: a knownKeys: a requiredKeys: a knownWireNames: a requiredWireNames: a
+
+ValidationPlanAccum = ValidationPlanAccum fields: a knownKeys: a requiredKeys: a knownWireNames: a requiredWireNames: a
+
+@category "engine-internal"
+validationIdentityFactError : (fields: List a) -> Maybe String
+validationIdentityFactError fields = case head fields of
+  Nothing -> Nothing
+  Just f ->
+    if not (eq f.identityError "")
+    then Just f.identityError
+    else case tail fields of
+      Nothing -> Nothing
+      Just rest -> validationIdentityFactError rest
+
+@category "engine-internal"
+validationPathJoin : (parent: String) -> (child: String) -> String
+validationPathJoin parent child =
+  if eq parent "" then child else concat parent (concat "." child)
+
+@category "engine-internal"
+validationSemanticJoin : (parent: String) -> (segment: String) -> String
+validationSemanticJoin parent segment =
+  if eq parent "" then segment else concat parent (concat "/" segment)
+
+@category "engine-internal"
+validationTypeOptional : (t: ValidationType) -> Bool
+validationTypeOptional t = case t of
+  VtMaybe {} -> true
+  VtRefined { base = b } -> validationTypeOptional b
+  VtOpaque { pure = p } -> validationTypeOptional p
+  VtTagged { value = value } -> validationTypeOptional value
+  VtUnion { branches = branches } -> std.some branches validationTypeOptional
+  _ -> false
+
+-- Expression widgets carry source text rather than a value of the occurrence
+-- type.  The host only projects the current widget name; this Fenel policy
+-- decides which explicit widgets bypass occurrence validation.
+@category "engine-internal"
+validationWidgetSkipsOccurrence : (widgetName: String) -> Bool
+validationWidgetSkipsOccurrence widgetName =
+  or (eq widgetName "markup-expression") (eq widgetName "string-expression")
+
+@category "engine-internal"
+validationPlanRows : (fields: List a) -> (semanticParent: String) -> (readableParent: String) -> (acc: ValidationPlanAccum) -> ValidationPlanAccum
+validationPlanRows fields semanticParent readableParent acc = case head fields of
+  Nothing -> acc
+  Just f ->
+    let token = fieldKeyToken f.key
+    let required = not (validationTypeOptional f.occurrenceType)
+    let semanticPath = validationSemanticJoin semanticParent token
+    let diagnosticPath = validationPathJoin readableParent f.wireName
+    let row =
+          { key = f.key
+          , wireName = f.wireName
+          , ordinal = f.ordinal
+          , occurrenceType = f.occurrenceType
+          , rawField = f.rawField
+          , rawType = f.rawType
+          , label = f.label
+          , widgetName = f.widgetName
+          , skipValidation = validationWidgetSkipsOccurrence f.widgetName
+          , required = required
+          , semanticParentPath = semanticParent
+          , semanticPath = semanticPath
+          , readableParentPath = readableParent
+          , diagnosticPath = diagnosticPath
+          }
+    let next = ValidationPlanAccum
+          { fields = appendItem row acc.fields
+          , knownKeys = appendItem token acc.knownKeys
+          , requiredKeys = if required then appendItem token acc.requiredKeys else acc.requiredKeys
+          , knownWireNames = appendItem f.wireName acc.knownWireNames
+          , requiredWireNames = if required then appendItem f.wireName acc.requiredWireNames else acc.requiredWireNames
+          }
+    case tail fields of
+      Nothing -> next
+      Just rest -> validationPlanRows rest semanticParent readableParent next
+
+@label "Validation access plan"
+@description "field-identity Phase 3 — build the one identity-total field access plan used by validation and JSON Schema. Rejects missing/malformed/duplicate keys, duplicate current-wire projections, and positional ordinal/projection mismatches before producing semantic/readable paths and known/required key sets."
+@tags "engine" "validate" "field-identity" "plan" "phase-3"
+validationAccessPlan : (fields: List a) -> (semanticParent: String) -> (readableParent: String) -> ValidationAccessPlan
+validationAccessPlan fields semanticParent readableParent =
+  case validationIdentityFactError fields of
+    Just message -> VapInvalid { path = if eq readableParent "" then "$" else readableParent
+      , message = message
+      }
+    Nothing -> case (if std.all fields (\field -> case mapGet field "sourceDeclaration" of Just source -> source; Nothing -> false)
+      then fieldSemanticSlotsErrorWithSourceHandles fields else fieldSemanticSlotsError fields) of
+      Just message -> VapInvalid { path = if eq readableParent "" then "$" else readableParent
+        , message = message
+        }
+      Nothing ->
+        let initial = ValidationPlanAccum
+              { fields = []
+              , knownKeys = []
+              , requiredKeys = []
+              , knownWireNames = []
+              , requiredWireNames = []
+              }
+        let plan = validationPlanRows fields semanticParent readableParent initial
+        VapReady
+          { fields = plan.fields
+          , knownKeys = plan.knownKeys
+          , requiredKeys = plan.requiredKeys
+          , knownWireNames = plan.knownWireNames
+          , requiredWireNames = plan.requiredWireNames
+          }
+
+@label "Validation access plan from traversal"
+@description "Field-identity Phase 3 repair — audit a shared TraversalType and elaborate its root record entirely in Fenel before building the identity-total access plan."
+@tags "engine" "validate" "field-identity" "traversal" "phase-3"
+validationAccessPlanFromTraversal : (root: TraversalType) -> (semanticParent: String) -> (readableParent: String) -> ValidationAccessPlan
+validationAccessPlanFromTraversal root semanticParent readableParent =
+  case traversalSemanticSlotsError root of
+    Just message -> VapInvalid { path = if eq readableParent "" then "$" else readableParent
+      , message = message
+      }
+    Nothing -> case validationElaborateType root "runtime" [] of
+      VtRecord { fields = fields } -> validationAccessPlan fields semanticParent readableParent
+      _ -> VapInvalid { path = if eq readableParent "" then "$" else readableParent
+        , message = "validation access plan requires a record type"
+        }
+
+@category "engine-internal"
+validationPlanRowsError : (rows: List a) -> Maybe a
+validationPlanRowsError rows = case head rows of
+  Nothing -> Nothing
+  Just row ->
+    case validationTypePlanError row.occurrenceType row.semanticPath row.diagnosticPath of
+      Just error -> Just error
+      Nothing -> case tail rows of
+        Nothing -> Nothing
+        Just rest -> validationPlanRowsError rest
+
+@category "engine-internal"
+validationCasesPlanError : (cases: List a) -> (semanticParent: String) -> (readableParent: String) -> Maybe a
+validationCasesPlanError cases semanticParent readableParent = case head cases of
+  Nothing -> Nothing
+  Just c ->
+    let caseParent = validationSemanticJoin semanticParent (concat "case:" c.name)
+    case validationAccessPlan c.fields caseParent readableParent of
+      VapInvalid { path = p, message = m } -> Just (FieldError { path = p, message = m })
+      VapReady { fields = rows } ->
+        case validationPlanRowsError rows of
+          Just error -> Just error
+          Nothing -> case tail cases of
+            Nothing -> Nothing
+            Just rest -> validationCasesPlanError rest semanticParent readableParent
+
+@category "engine-internal"
+validationTypePlanError : (t: ValidationType) -> (semanticParent: String) -> (readableParent: String) -> Maybe a
+validationTypePlanError t semanticParent readableParent = case t of
+  VtRefined { base = b } -> validationTypePlanError b semanticParent readableParent
+  VtOpaque { representationName = representationName, pure = p } ->
+    if eq representationName "" then validationTypePlanError p semanticParent readableParent else Nothing
+  VtTagged { value = value, valueName = valueName } ->
+    if or (eq valueName "Id") (eq valueName "GeoPath") then Nothing
+    else validationTypePlanError value semanticParent readableParent
+  VtUnion { branches = branches } -> validationUnionPlanError branches semanticParent readableParent
+  VtMaybe { value = v } -> validationTypePlanError v semanticParent readableParent
+  VtList { elem = e } -> validationTypePlanError e (validationSemanticJoin semanticParent "list-item") readableParent
+  VtRecord { fields = fs } ->
+    case validationAccessPlan fs semanticParent readableParent of
+      VapInvalid { path = p, message = m } -> Just (FieldError { path = p, message = m })
+      VapReady { fields = rows } -> validationPlanRowsError rows
+  VtVariant { cases = cs } -> validationCasesPlanError cs semanticParent readableParent
+  VtMap { values = v } -> validationTypePlanError v (validationSemanticJoin semanticParent "map-value") readableParent
+  VtArrow { params = ps, returns = r } ->
+    case validationAccessPlan ps (validationSemanticJoin semanticParent "arrow-params") readableParent of
+      VapInvalid { path = p, message = m } -> Just (FieldError { path = p, message = m })
+      VapReady { fields = rows } ->
+        case validationPlanRowsError rows of
+          Just error -> Just error
+          Nothing -> validationTypePlanError r (validationSemanticJoin semanticParent "arrow-return") readableParent
+  VtNamed { resolved = Just r } -> validationTypePlanError r semanticParent readableParent
+  VtInvalid { message = message } -> Just (FieldError { path = if eq readableParent "" then "$" else readableParent
+    , message = message
+    })
+  _ -> Nothing
+
+@category "engine-internal"
+validationUnionPlanError : (branches: List ValidationType) -> (semanticParent: String) -> (readableParent: String) -> Maybe a
+validationUnionPlanError branches semanticParent readableParent = case head branches of
+  Nothing -> Nothing
+  Just branch -> case validationTypePlanError branch semanticParent readableParent of
+    Just error -> Just error
+    Nothing -> validationUnionPlanError (tailOr branches) semanticParent readableParent
+
+@category "engine-internal"
+validationRequireMembership : (options: a) -> Bool
+validationRequireMembership options = case mapGet options "membership" of
+  Just required -> required
+  Nothing -> false
+
+@category "engine-internal"
+validationExplicitMaybe : (value: a) -> Bool
+validationExplicitMaybe value =
+  if not (validationIsRecord value) then false
+  else case mapGet value "$tag" of
+    Just tag -> if eq tag "Nothing" then true
+      else if eq tag "Just" then case mapGet value "_0" of Just _ -> true; Nothing -> false
+      else false
+    Nothing -> false
+
+@category "engine-internal"
+validationUndecided : (value: a) -> (path: String) -> FieldResult
+validationUndecided value path = validationErrorResult path "The engine could not decide membership for this type and value" value
+
+@category "engine-internal"
+validationUnionOptions : (options: a) -> a
+validationUnionOptions options = mapSet (mapSet (mapSet options "coerce" false) "primitiveTypes" true) "membership" true
+
+@category "engine-internal"
+validationValidateUnion : (branches: List ValidationType) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> FieldResult
+validationValidateUnion branches value semanticParent path formData options = case head branches of
+  Nothing -> validationUndecided value path
+  Just branch ->
+    let checked = validationValidateType branch value semanticParent path formData (validationUnionOptions options) false
+    if eq (length checked.errors) 0 then validationOk value
+    else validationValidateUnion (tailOr branches) value semanticParent path formData options
+
+@category "engine-internal"
+validationErrorResult : (path: String) -> (message: String) -> (value: a) -> FieldResult
+validationErrorResult path message value =
+  FieldResult
+    { errors = [FieldError { path = path, message = message }]
+    , value = value
+    }
+
+@category "engine-internal"
+validationOk : (value: a) -> FieldResult
+validationOk value = FieldResult { errors = [], value = value }
+
+@category "engine-internal"
+validationIsRecord : (value: a) -> Bool
+validationIsRecord value =
+  and (not (isNull value)) (and (not (isArray value)) (and (not (isString value)) (and (not (isNumber value)) (not (isBoolean value)))))
+
+@category "engine-internal"
+validationIsEmpty : (value: a) -> Bool
+validationIsEmpty value = if isNull value then true else if isString value then eq value "" else false
+
+@category "engine-internal"
+validationIsSetExprValue : (value: a) -> Bool
+validationIsSetExprValue value = validationSetExprRecognized value
+
+@category "engine-internal"
+validationSetExprValueResult : (value: a) -> (path: String) -> FieldResult
+validationSetExprValueResult value path =
+  validateSetExprValue SesKnownNoCheck value path
+
+@category "engine-internal"
+validationMembershipAccepted : (result: Maybe Bool) -> Bool
+validationMembershipAccepted result = case result of
+  Just true -> true
+  Just false -> false
+  Nothing -> false
+
+@category "engine-internal"
+-- field-identity Phase 4 (review F7) — membership checks carry the CURRENT
+-- sibling scope: `formData` threads to the validationSetContains native so a
+-- nested `$where` refinement reads its own record's merged data, not the
+-- dispatch-time ROOT object the native closes over (the pre-fix drop rejected
+-- valid nested data whenever a sibling read had no top-level twin). Callers
+-- without a record scope (locale leaves) pass Nothing — the native then keeps
+-- its root fallback.
+validationSetCheck : (set: a) -> (value: b) -> (path: String) -> (formData: b) -> (observationPath: Maybe String) -> FieldResult
+validationSetCheck set value path formData observationPath =
+  case validationSetContains set value formData observationPath (Just path) of
+    Just true -> validationOk value
+    Just false -> validationErrorResult path (validationSetError set) value
+    Nothing -> validationErrorResult path "The engine could not decide membership for this type and value" value
+
+@category "engine-internal"
+-- Only scalar-leaf membership may be observed for contextual authoring
+-- refusals. A container's independently checked refinement does not repair
+-- its abstaining whole-value representation/slot judgment.
+validationLiteralMembershipLeaf : (type: ValidationType) -> Bool
+validationLiteralMembershipLeaf type = case type of
+  VtNamed { name = name, resolved = resolved } ->
+    if elem name ["String", "Number", "Int", "Nat", "Rational", "ℚ", "Boolean", "Date"]
+    then true
+    else case resolved of
+      Just inner -> validationLiteralMembershipLeaf inner
+      Nothing -> false
+  VtRefined { base = base } -> validationLiteralMembershipLeaf base
+  VtOpaque { pure = pure } -> validationLiteralMembershipLeaf pure
+  VtTagged { value = value } -> validationLiteralMembershipLeaf value
+  _ -> false
+
+@category "engine-internal"
+validationValidateRefined : (base: ValidationType) -> (set: a) -> (value: b) -> (semanticParent: String) -> (path: String) -> (formData: b) -> (options: b) -> (coerceAllowed: Bool) -> FieldResult
+validationValidateRefined base set value semanticParent path formData options coerceAllowed =
+  let inner = validationValidateType base value semanticParent path formData options coerceAllowed
+  if gt (length inner.errors) 0
+  then inner
+  else validationSetCheck set (if validationAdmissionRequested options then value else inner.value) path formData (if validationLiteralMembershipLeaf base then Just path else Nothing)
+
+@category "engine-internal"
+validationValidateString : (value: a) -> (path: String) -> FieldResult
+validationValidateString value path =
+  if validationIsSetExprValue value
+  then validationSetExprValueResult value path
+  else validationOk (validationStringCoerce value)
+
+@category "engine-internal"
+validationValidateNumber : (value: a) -> (path: String) -> FieldResult
+validationValidateNumber value path =
+  if validationIsSetExprValue value
+  then validationSetExprValueResult value path
+  else if validationNumberIsNaN value
+    then validationErrorResult path "Must be a number" value
+    else validationOk (toNumber value)
+
+@category "engine-internal"
+validationValidateInteger : (name: String) -> (value: a) -> (path: String) -> (formData: a) -> FieldResult
+validationValidateInteger name value path formData =
+  if validationIsSetExprValue value then validationSetExprValueResult value path
+  else if isString value then
+    let parsed = if or (eq name "Nat") (eq name "ℕ") then parseExactNat (ParseExactStr value) else parseExactInt (ParseExactStr value)
+    case parsed of
+      POk { value = integer } -> validationSetCheck (typeNamedToSet name) integer path formData (Just path)
+      PFail { error = message } -> validationErrorResult path message value
+  else validationSetCheck (typeNamedToSet name) value path formData (Just path)
+
+@category "engine-internal"
+validationValidateBoolean : (value: a) -> (path: String) -> FieldResult
+validationValidateBoolean value path =
+  if isBoolean value then validationOk value
+  else if and (isString value) (eq value "true") then validationOk true
+  else if and (isNumber value) (eq value 1) then validationOk true
+  else if and (isString value) (eq value "false") then validationOk false
+  else if and (isNumber value) (eq value 0) then validationOk false
+  else validationErrorResult path "Must be a boolean" value
+
+@category "engine-internal"
+validationValidateDate : (value: a) -> (path: String) -> FieldResult
+validationValidateDate value path =
+  if validationIsSetExprValue value
+  then validationSetExprValueResult value path
+  else
+    let strValue = validationStringCoerce value
+    if validationDateValid strValue
+    then validationOk strValue
+    else validationErrorResult path "Must be a valid date" value
+
+@category "engine-internal"
+validationNonEmptyStringField : (value: a) -> (key: String) -> Bool
+validationNonEmptyStringField value key = case mapGet value key of
+  Just v -> and (isString v) (not (eq v ""))
+  Nothing -> false
+
+@category "engine-internal"
+validationValidateFile : (value: a) -> (path: String) -> FieldResult
+validationValidateFile value path =
+  if not (validationIsRecord value)
+  then validationErrorResult path "Must be a file" value
+  else if not (validationNonEmptyStringField value "url")
+    then validationErrorResult path "File URL is required" value
+    else if not (validationNonEmptyStringField value "mimeType")
+      then validationErrorResult path "File MIME type is required" value
+      else validationOk value
+
+@category "engine-internal"
+validationMarkupTag : (value: a) -> String
+validationMarkupTag value = case mapGet value "$tag" of
+  Just tag -> if isString tag then tag else ""
+  Nothing -> case mapGet value "__case" of
+    Just tag -> if isString tag then tag else ""
+    Nothing -> ""
+
+@category "engine-internal"
+validationValidateMarkup : (value: a) -> (path: String) -> FieldResult
+validationValidateMarkup value path =
+  if not (validationIsRecord value)
+  then validationErrorResult path "Markup must be an object" value
+  else
+    let tag = validationMarkupTag value
+    if or (eq tag "Element") (eq tag "Text")
+    then validationOk value
+    else validationErrorResult path "Markup must be tagged Element or Text" value
+
+@category "engine-internal"
+validationValidateRef : (value: a) -> (path: String) -> FieldResult
+validationValidateRef value path =
+  let strValue = validationStringCoerce value
+  if validationUuidValid strValue
+  then validationOk strValue
+  else validationErrorResult path "Must be a valid reference ID" value
+
+@category "engine-internal"
+validationValidateNamed : (name: String) -> (resolved: Maybe ValidationType) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> (coerceAllowed: Bool) -> FieldResult
+validationValidateNamed name resolved value semanticParent path formData options coerceAllowed =
+  if or (eq name "Rational") (eq name "ℚ")
+  then case resolved of
+    Just inner -> validationValidateType inner value semanticParent path formData options coerceAllowed
+    Nothing -> if validationRequireMembership options then validationUndecided value path else validationSetCheck (typeNamedToSet name) value path formData (Just path)
+  else if and options.primitiveTypes (elem name ["String", "Number", "Int", "Nat", "Boolean"])
+  then validationSetCheck (typeNamedToSet name) value path formData (if elem name ["String", "Number", "Int", "Nat", "Boolean", "Date"] then Just path else Nothing)
+  else if and options.primitiveTypes (and (eq name "Date") (not (isString value)))
+    then validationErrorResult path "Must be a date string" value
+    else validationValidateNamedCompat name resolved value semanticParent path formData options coerceAllowed
+
+-- Existing form coercion remains the default. Strict primitive input selects
+-- the shared membership semantics above and follows aliases recursively here.
+@category "engine-internal"
+validationValidateNamedCompat : (name: String) -> (resolved: Maybe ValidationType) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> (coerceAllowed: Bool) -> FieldResult
+validationValidateNamedCompat name resolved value semanticParent path formData options coerceAllowed =
+  if eq name "String" then validationValidateString value path
+  else if eq name "Number" then validationValidateNumber value path
+  else if or (eq name "Int") (eq name "Nat") then validationValidateInteger name value path formData
+  else if eq name "Boolean" then validationValidateBoolean value path
+  else if eq name "Bytes" then if validationBytesValid value then validationOk value else validationErrorResult path "Must be Bytes" value
+  else if eq name "Date" then validationValidateDate value path
+  else if eq name "File" then validationValidateFile value path
+  else if eq name "Markup" then validationValidateMarkup value path
+  else case resolved of
+    Just t -> validationValidateType t value semanticParent path formData options coerceAllowed
+    Nothing -> validationErrorResult path "Unknown field type" value
+
+@category "engine-internal"
+validationValidateMaybe : (inner: ValidationType) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> (coerceAllowed: Bool) -> FieldResult
+validationValidateMaybe inner value semanticParent path formData options coerceAllowed =
+  if validationIsEmpty value then validationOk null
+  else if validationIsRecord value
+    then case mapGet value "$tag" of
+      Just tag ->
+        if eq tag "Nothing" then validationOk value
+        else if eq tag "Just"
+          then
+            let innerValue = case mapGet value "_0" of
+                  Just x -> x
+                  Nothing -> case mapGet value "value" of Just x -> x; Nothing -> null
+            let result = validationValidateType inner innerValue semanticParent (validationPathJoin path "_0") formData (validationChildOptions options) coerceAllowed
+            FieldResult { errors = result.errors, value = value }
+          else validationValidateType inner value semanticParent path formData options coerceAllowed
+      Nothing -> validationValidateType inner value semanticParent path formData options coerceAllowed
+    else validationValidateType inner value semanticParent path formData options coerceAllowed
+
+-- type-substrate P1(a.18) precedent (TODO.md "THE RECURSION-DEPTH QUESTION IS
+-- SYSTEMIC") — this walk was a linear SELF-RECURSION over the value list, one
+-- Fenel level per element, so validating a list of ~600 records overflowed the
+-- host stack: a 64 x 64 `Image` (4096 `Color` pixels) raised `RangeError:
+-- Maximum call stack size exceeded` inside `validateValue`, which the clipboard
+-- adapter could only read as "not a member of its own type".  It is now the step
+-- of a `fold`, whose perf branch is a JS loop: each callback returns before the
+-- next runs, so the walk costs O(1) host stack instead of O(items).  The
+-- loop-invariant arguments are CAPTURED (no new declaration is minted); only the
+-- three accumulators that the recursive call advanced ride in the state record.
+-- Equivalent by construction: the old `Nothing` base arm and the old last-item
+-- arm return the same `FieldResult` the line after the fold now returns, and the
+-- walk never short-circuited on an error.
+@category "engine-internal"
+validationListWalk : (items: List a) -> (inner: ValidationType) -> (index: Number) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> (errors: List a) -> (values: List a) -> FieldResult
+validationListWalk items inner index semanticParent path formData options errors values =
+  let final =
+    fold
+      (\state item -> do
+        let itemPath = validationPathJoin path (toString state.index)
+        let itemSemantic = validationSemanticJoin semanticParent (concat "item:" (toString state.index))
+        let result = validationValidateType inner item itemSemantic itemPath formData options false
+        {
+          index = add state.index 1,
+          errors = validateListMergeErrors result.errors state.errors,
+          values = appendItem result.value state.values
+        }
+      end)
+      { index = index, errors = errors, values = values }
+      items
+  FieldResult { errors = final.errors, value = final.values }
+
+@category "engine-internal"
+validationValidateListRuntime : (inner: ValidationType) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> FieldResult
+validationValidateListRuntime inner value semanticParent path formData options =
+  if not (isArray value)
+  then validationErrorResult path "Must be a list" value
+  else validationListWalk value inner 0 semanticParent path formData (validationChildOptions options) [] []
+
+@category "engine-internal"
+validationPlanHasWireName : (rows: List a) -> (wireName: String) -> Bool
+validationPlanHasWireName rows wireName = case head rows of
+  Nothing -> false
+  Just row -> if eq row.wireName wireName then true else case tail rows of
+    Nothing -> false
+    Just rest -> validationPlanHasWireName rest wireName
+
+@category "engine-internal"
+validationAddedErrors : (inputEntries: List a) -> (rows: List a) -> (extraWireName: String) -> (path: String) -> (acc: List a) -> List a
+validationAddedErrors inputEntries rows extraWireName path acc = case head inputEntries of
+  Nothing -> acc
+  Just entry ->
+    let known = if and (not (eq extraWireName "")) (eq entry.key extraWireName)
+          then true
+          else validationPlanHasWireName rows entry.key
+    let next = if known
+          then acc
+          else appendItem (FieldError { path = validationPathJoin path entry.key, message = "Unknown field" }) acc
+    case tail inputEntries of
+      Nothing -> next
+      Just rest -> validationAddedErrors rest rows extraWireName path next
+
+@category "engine-internal"
+validationCoerceValue : (row: a) -> (value: a) -> (options: a) -> a
+validationCoerceValue row value options =
+  if not options.coerce then value
+  else if validationIsEmpty value then value
+  else
+    case validationParseInput row.rawType value options.coerceContext of
+      Just parsed -> parsed
+      Nothing -> value
+
+-- Strict/coerce policy belongs to the outermost field walk (the validateForm
+-- contract): child values validate structurally, without re-applying
+-- rejectAdded/rejectOmitted/coerce at depth. The opt-in primitive membership
+-- policy still applies at every depth. Rebuilding the record also resets
+-- the same-level `unfolded` cycle ledger — a child value starts its own
+-- unfolding budget.
+@category "engine-internal"
+validationChildOptions : (options: a) -> a
+validationChildOptions options =
+  { coerce = false
+  , coerceContext = options.coerceContext
+  , rejectAdded = false
+  , rejectOmitted = false
+  , primitiveTypes = options.primitiveTypes
+  , membership = validationRequireMembership options
+  , admission = validationAdmissionRequested options
+  }
+
+@category "engine-internal"
+validationUnfoldedNames : (options: a) -> List String
+validationUnfoldedNames options = case mapGet options "unfolded" of
+  Just names -> names
+  Nothing -> []
+
+@category "engine-internal"
+validationRecordRows : (rows: List a) -> (obj: a) -> (mergedData: a) -> (options: a) -> (errors: List a) -> (fields: a) -> FieldResult
+validationRecordRows rows obj mergedData options errors fields = case head rows of
+  Nothing -> FieldResult { errors = errors, value = fields }
+  Just row ->
+    let present = validationRecordValueField obj row.wireName
+    let step = case present of
+          Nothing ->
+            let observed = if validationAdmissionRequested options then validationObserveAdmission false true false else true
+            if not observed
+            then RecAccum { errors = appendItem (FieldError { path = row.diagnosticPath, message = "The engine could not decide membership for this type and value" }) errors, fields = fields }
+            else if options.rejectOmitted
+            then RecAccum { errors = appendItem (FieldError { path = row.diagnosticPath, message = "Field must be present" }) errors
+              , fields = fields
+              }
+            else if row.required
+              then RecAccum { errors = appendItem (FieldError { path = row.diagnosticPath, message = concat row.label " is required" }) errors
+                , fields = fields
+                }
+              else RecAccum { errors = errors, fields = fields }
+          Just rawValue ->
+            if validationIsEmpty rawValue && not (options.primitiveTypes && isString rawValue) && not (validationAdmissionRequested options)
+            then if row.required
+              then RecAccum { errors = appendItem (FieldError { path = row.diagnosticPath, message = concat row.label " is required" }) errors
+                , fields = fields
+                }
+              else RecAccum { errors = errors, fields = fields }
+            else
+              let value = validationCoerceValue row rawValue options
+              let result = if row.skipValidation && not (validationAdmissionRequested options)
+                    then validationOk value
+                    else validationValidateType row.occurrenceType value row.semanticPath row.diagnosticPath mergedData (validationChildOptions options) true
+              RecAccum
+                { errors = validateListMergeErrors result.errors errors
+                , fields = mapSet fields row.wireName result.value
+                }
+    case tail rows of
+      Nothing -> FieldResult { errors = step.errors, value = step.fields }
+      Just rest -> validationRecordRows rest obj mergedData options step.errors step.fields
+
+@category "engine-internal"
+validationValidatePlannedRecord : (plan: ValidationAccessPlan) -> (value: a) -> (path: String) -> (formData: a) -> (options: a) -> (extraWireName: String) -> (initialFields: a) -> FieldResult
+validationValidatePlannedRecord plan value path formData options extraWireName initialFields = case plan of
+  VapInvalid { path = p, message = m } -> validationErrorResult p m value
+  VapReady { fields = rows } ->
+    -- Sibling scope is data too. Snapshot both records before combining them:
+    -- mergeRecords/entries on the original host object would invoke getters.
+    case representationValueSnapshot value of
+      SnapshotRecord ownFields -> case representationValueSnapshot formData of
+        SnapshotRecord siblingFields ->
+          let ownData = fromEntries (map (\field -> { key = field.name, value = field.value }) ownFields)
+          let siblingData = fromEntries (map (\field -> { key = field.name, value = field.value }) siblingFields)
+          let added = if options.rejectAdded
+                then validationAddedErrors (entries ownData) rows extraWireName path []
+                else []
+          let mergedData = mergeRecords siblingData ownData
+          validationRecordRows rows ownData mergedData options added initialFields
+        _ -> validationErrorResult path "Could not read sibling record data" value
+      _ -> validationErrorResult path "Could not read record data" value
+
+@category "engine-internal"
+validationValidateRecordRuntime : (fields: List a) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> FieldResult
+validationValidateRecordRuntime fields value semanticParent path formData options =
+  if not (validationIsRecord value)
+  then validationErrorResult path "Must be an object" value
+  else if eq (length fields) 0
+    -- An undeclared-shape record ({$record: []}) passes its payload through
+    -- unchanged rather than rebuilding an empty object over declared rows —
+    -- but the strict added-field policy still applies (review F8: the zero-
+    -- field early return bypassed rejectAdded at the TOP level; every value
+    -- entry of a zero-field record is an added field). Child depths arrive
+    -- with rejectAdded already neutered by validationChildOptions, so the
+    -- nested passthrough behavior is unchanged.
+    then
+      let added = if options.rejectAdded
+            then validationAddedErrors (entries value) [] "" path []
+            else []
+      if gt (length added) 0
+      then FieldResult { errors = added, value = value }
+      else validationOk value
+    else
+      let plan = validationAccessPlan fields semanticParent path
+      validationValidatePlannedRecord plan value path formData options "" {}
+
+@category "engine-internal"
+validationFindCase : (cases: List a) -> (name: String) -> Maybe a
+validationFindCase cases name = case head cases of
+  Nothing -> Nothing
+  Just c -> if eq c.name name then Just c else case tail cases of
+    Nothing -> Nothing
+    Just rest -> validationFindCase rest name
+
+@category "engine-internal"
+validationCaseNames : (cases: List a) -> (acc: List String) -> List String
+validationCaseNames cases acc = case head cases of
+  Nothing -> acc
+  Just c ->
+    let next = appendItem c.name acc
+    case tail cases of Nothing -> next; Just rest -> validationCaseNames rest next
+
+@category "engine-internal"
+validationValidateVariant : (cases: List a) -> (discriminator: String) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> FieldResult
+validationValidateVariant cases discriminator value semanticParent path formData options =
+  if not (validationIsRecord value)
+  then validationErrorResult path "Must be an object" value
+  else
+    -- Select the case through the same descriptor-only policy as its field
+    -- plan. Reading the original discriminator first would invoke an accessor
+    -- before that plan can refuse it; hidden own data tags remain available.
+    let snapshot = representationValueSnapshot value
+    case snapshot of
+      SnapshotRecord fields ->
+        let variantKey = case representationSnapshotField snapshot discriminator of Just v -> validationStringCoerce v; Nothing -> ""
+        case validationFindCase cases variantKey of
+          Nothing ->
+            let valid = join (validationCaseNames cases []) ", "
+            validationErrorResult (validationPathJoin path discriminator) (concat "Must be one of: " valid) value
+          Just c ->
+            let caseParent = validationSemanticJoin semanticParent (concat "case:" c.name)
+            let plan = validationAccessPlan c.fields caseParent path
+            let initial = mapSet {} discriminator variantKey
+            validationValidatePlannedRecord plan value path formData options discriminator initial
+      _ -> validationErrorResult path "Could not read record data" value
+
+@category "engine-internal"
+validationTypeTopSet : (t: ValidationType) -> Maybe a
+validationTypeTopSet t = case t of
+  VtRefined { set = set } -> Just set
+  _ -> Nothing
+
+@category "engine-internal"
+validationLocaleEntries : (inputEntries: List a) -> (set: Maybe a) -> (path: String) -> (errors: List a) -> List a
+validationLocaleEntries inputEntries set path errors = case head inputEntries of
+  Nothing -> errors
+  Just entry ->
+    let entryPath = validationPathJoin path entry.key
+    let errors1 = if validationLocaleValid entry.key
+          then errors
+          else appendItem (FieldError { path = entryPath, message = concat "Unknown locale code: " entry.key }) errors
+    let errors2 = if isString entry.value
+          then errors1
+          else appendItem (FieldError { path = entryPath, message = "Translation must be a string" }) errors1
+    let errors3 = if isString entry.value
+          then case set of
+            Nothing -> errors2
+            Just s -> if validationMembershipAccepted (validationSetContains s entry.value Nothing)
+              then errors2
+              else appendItem (FieldError { path = entryPath, message = validationSetError s }) errors2
+          else errors2
+    case tail inputEntries of
+      Nothing -> errors3
+      Just rest -> validationLocaleEntries rest set path errors3
+
+@category "engine-internal"
+validationValidateLocaleStringRuntime : (valuesType: ValidationType) -> (value: a) -> (path: String) -> FieldResult
+validationValidateLocaleStringRuntime valuesType value path =
+  let set = validationTypeTopSet valuesType
+  if isString value
+  then case set of
+    Nothing -> validationOk value
+    Just s -> validationSetCheck s value path Nothing Nothing
+  else if validationIsRecord value
+    then FieldResult { errors = validationLocaleEntries (entries value) set path [], value = value }
+    else validationErrorResult path "Must be a string or locale map" value
+
+@category "engine-internal"
+validationValidateMap : (t: ValidationType) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> FieldResult
+validationValidateMap t value semanticParent path formData options = case t of
+  VtMap { values = valuesType, finite = finite, card = card, enumKeys = enumKeys, raw = raw } ->
+    if finite
+    then if validationMembershipAccepted (validationMapMembership raw value formData)
+      then validationOk value
+      else validationErrorResult path (concat "Must be an array of length " (concat (toString card) " with conforming elements")) value
+    else if enumKeys
+      then validationOk value
+      else validationValidateLocaleStringRuntime valuesType value path
+  _ -> validationErrorResult path "Unknown field type" value
+
+@category "engine-internal"
+validationCallableRecord : (value: a) -> Bool
+validationCallableRecord value =
+  if not (validationIsRecord value) then false
+  else case mapGet value "__fenelFn" of
+    Just x -> true
+    Nothing -> case mapGet value "__fenelPartial" of Just x -> true; Nothing -> false
+
+-- modules-as-values — a function REFERENCE value (`{$ref: handle}`, the Ref
+-- substrate) names a function exactly as its handle string does, so it takes
+-- the by-name path with that handle: the same registry fact, the same arity
+-- check, the same refute-only signature column, and a handle the registry does
+-- not know is admitted like an unknown name (tcb-ledger row
+-- `t.sub.signature-collapse`). A string keeps its own path. Any other value
+-- asks the host fact `validationFunctionRefHandle` for its handle: an OWN DATA
+-- `$ref` holding a non-empty string, read at the `$`-key boundary because a
+-- `.fenel` body cannot name `$ref` and `mapGet` would run an accessor. An
+-- accessor, an inherited `$ref` and a Proxy's `get` trap never make a
+-- reference, so every value without such a handle takes the callable-record
+-- check exactly as before. The result carries the value itself, the name or
+-- the reference.
+@category "engine-internal"
+validationValidateArrow : (params: List a) -> (raw: a) -> (value: a) -> (path: String) -> FieldResult
+validationValidateArrow params raw value path =
+  let name = if isString value
+        then value
+        else case validationFunctionRefHandle value of
+          Just handle -> handle
+          Nothing -> ""
+  if eq name ""
+  then if isString value then validationOk value
+    else if validationCallableRecord value
+      then validationOk value
+      else validationErrorResult path "Expected a callable value (function name, lambda, or partial application)" value
+  else case validationFunctionFact name raw of
+    Nothing -> validationOk value
+    Just fact ->
+      if not (eq fact.paramCount (length params))
+      then validationErrorResult path (concat "Function \"" (concat name (concat "\" has " (concat (toString fact.paramCount) (concat " param(s) but expected " (toString (length params))))))) value
+      else if fact.signatureSubtype
+        then validationOk value
+        else validationErrorResult path (concat "Function \"" (concat name "\" signature is not a subtype of the expected arrow")) value
+
+@category "engine-internal"
+ValidationAdmissionObservation = ValidationAdmissionNode supported: Bool refutation: Bool | ValidationAdmissionExact verdict: Maybe Bool | ValidationAdmissionMember verdict: Maybe Bool
+
+@native
+validationObserveAdmission : (supported: Bool) -> (refutation: Bool) -> (refused: Bool) -> Bool
+
+@native
+validationAdmissionNamedFact : (name: String) -> (value: a) -> (allowOwnedMembership: Bool) -> (metadataOnly: Bool) -> { verdict: Maybe Bool, ownerMatches: Bool, declarationAvailable: Bool }
+
+@native
+validationCanonicalSet : (set: a) -> (declaration: Maybe b) -> SetExpr
+
+@category "engine-internal"
+validationAdmissionNamedVariant : (resolved: Maybe ValidationType) -> Bool
+validationAdmissionNamedVariant resolved = case resolved of Just (VtVariant {}) -> true; _ -> false
+
+@category "engine-internal"
+validationAdmissionRequested : (options: a) -> Bool
+validationAdmissionRequested options = case mapGet options "admission" of Just enabled -> enabled; Nothing -> false
+
+@category "engine-internal"
+validationAdmissionNodeSupported : (t: ValidationType) -> Bool
+validationAdmissionNodeSupported t = case t of
+  VtMap {} -> false
+  VtArrow {} -> false
+  VtVar {} -> false
+  -- This is a deferred eager-plan node, not a successful membership fact.
+  -- The existing value-driven branch validates its body; strict recursion
+  -- without value progress still returns undecided at the unfolding guard.
+  VtCycle {} -> true
+  VtInvalid {} -> false
+  VtType {} -> false
+  VtOther { kind = kind } -> eq kind "anything"
+  VtTagged {} -> false
+  VtVariant { cases = cases } -> eq (length (unique (map (\item -> item.name) cases))) (length cases)
+  VtNamed { name = name } -> not (elem name ["Markup", "File", "LocaleString", "Bytes", "Date"])
+  _ -> true
+
+@category "engine-internal"
+validationAdmissionNamedTerminalSupported : (name: String) -> (resolved: Maybe ValidationType) -> Maybe Bool
+validationAdmissionNamedTerminalSupported name resolved =
+  let descendant = case resolved of
+        Just (VtNamed { name = innerName, resolved = inner }) -> validationAdmissionNamedTerminalSupported innerName inner
+        Just (VtOpaque {}) -> Just true
+        _ -> Just false
+  case descendant of
+    Just false -> Just false
+    _ ->
+      let facts = validationNamedFacts name
+      case facts.definition of
+        Just _ -> Just false
+        Nothing -> if validationCapturedDeclarationValid (validationNamedSourceFact facts) then descendant else Nothing
+
+@category "engine-internal"
+validationAdmissionShapeRefused : (t: ValidationType) -> (value: a) -> Bool
+validationAdmissionShapeRefused t value = case t of
+  VtList {} -> not (isArray value)
+  VtRecord {} -> not (validationIsRecord value)
+  _ -> false
+
+@category "engine-internal"
+validationValidateType : (t: ValidationType) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> (coerceAllowed: Bool) -> FieldResult
+validationValidateType t value semanticParent path formData options coerceAllowed =
+  let observed = if validationAdmissionRequested options then validationObserveAdmission (and options.primitiveTypes (and (validationRequireMembership options) (validationAdmissionNodeSupported t))) (case t of VtUnion {} -> false; _ -> true) (validationAdmissionShapeRefused t value) else true
+  if observed then case t of
+    VtNamed { name = name, resolved = resolved } ->
+      let scalarRequested = (isString value || isNumber value || isBoolean value) && (validationAdmissionRequested options || (options.primitiveTypes && not options.coerce))
+      let scalarPlan = if scalarRequested then validationAdmissionNamedTerminalSupported name resolved else Just false
+      case scalarPlan of
+        Nothing ->
+          let fact = validationAdmissionNamedFact name value false true
+          case fact.verdict of
+            Nothing -> validationUndecided value path
+            Just _ -> validationUndecided value path
+        Just eligibleScalar ->
+          if eligibleScalar || (validationAdmissionRequested options && validationAdmissionNamedVariant resolved) then
+            let fact = validationAdmissionNamedFact name value eligibleScalar false
+            case fact.verdict of
+              Just true -> if eligibleScalar then validationOk value else validationValidateTypeCore t value semanticParent path formData options coerceAllowed
+              Just false -> validationErrorResult path "Value does not inhabit its declared type" value
+              Nothing ->
+                if not fact.declarationAvailable then validationUndecided value path
+                else if validationAdmissionNamedVariant resolved && not fact.ownerMatches then validationUndecided value path
+                else validationValidateTypeCore t value semanticParent path formData options coerceAllowed
+          else validationValidateTypeCore t value semanticParent path formData options coerceAllowed
+    _ -> validationValidateTypeCore t value semanticParent path formData options coerceAllowed
+  else validationUndecided value path
+
+@category "engine-internal"
+validationValidateTypeCore : (t: ValidationType) -> (value: a) -> (semanticParent: String) -> (path: String) -> (formData: a) -> (options: a) -> (coerceAllowed: Bool) -> FieldResult
+validationValidateTypeCore t value semanticParent path formData options coerceAllowed = case t of
+  VtRefined { base = b, set = set } -> validationValidateRefined b set value semanticParent path formData options coerceAllowed
+  VtOpaque { representationName = representationName, pure = p } ->
+    if not (eq representationName "")
+    then if not options.primitiveTypes && elem representationName ["Nat", "Int"]
+      then validationValidateInteger representationName value path formData
+      else validationSetCheck (typeNamedToSet representationName) value path formData (Just path)
+    else validationValidateType p value semanticParent path formData options coerceAllowed
+  VtMaybe { value = inner } ->
+    if validationRequireMembership options && not (validationExplicitMaybe value) then validationUndecided value path
+    else validationValidateMaybe inner value semanticParent path formData options coerceAllowed
+  VtList { elem = inner } -> validationValidateListRuntime inner value semanticParent path formData options
+  VtRecord { fields = fields } -> validationValidateRecordRuntime fields value semanticParent path formData options
+  VtVariant { cases = cases, discriminator = discriminator } -> validationValidateVariant cases discriminator value semanticParent path formData options
+  VtMap {} -> validationValidateMap t value semanticParent path formData options
+  VtUnion { branches = branches } -> validationValidateUnion branches value semanticParent path formData options
+  VtNamed { name = name, representationName = representationName, resolved = resolved } ->
+    if eq representationName "Boolean"
+    then case membershipBooleanVerdict value of
+      Just _ -> validationOk value
+      Nothing -> validationErrorResult path "Must be a boolean" value
+    else validationValidateNamed name resolved value semanticParent path formData options coerceAllowed
+  VtTagged { value = inner, valueName = valueName } ->
+    if or (eq valueName "Id") (eq valueName "GeoPath") then validationValidateRef value path
+    else validationValidateType inner value semanticParent path formData options coerceAllowed
+  VtArrow { params = params, raw = raw } -> if validationRequireMembership options then validationUndecided value path else validationValidateArrow params raw value path
+  VtType {} -> if validationRequireMembership options then validationUndecided value path else if validationFenelTypeValid value then validationOk value else validationErrorResult path "expected a type value" value
+  VtEl { raw = raw } -> case validationResolveEl raw formData of
+    Nothing -> if validationRequireMembership options then validationUndecided value path else validationOk value
+    Just resolved -> case typeToSetSemanticError resolved of
+      Just message -> validationErrorResult (if eq path "" then "$" else path) message value
+      Nothing -> validationValidateType (validationElaborateType resolved "runtime" []) value semanticParent path formData options coerceAllowed
+  VtVar {} -> if validationRequireMembership options then validationUndecided value path else validationOk value
+  VtCycle { name = name } ->
+    -- Value-driven unfolding: the eager plan cut this knot to stay finite, so
+    -- re-elaborate the named type fresh here. `options.unfolded` accumulates
+    -- through same-level wrappers and resets at every child-value edge
+    -- (validationChildOptions), so data recursion validates at every value
+    -- depth while a degenerate wrapper cycle (no value descent) accepts after
+    -- one unfolding instead of looping.
+    let unfolded = validationUnfoldedNames options
+    if elem name unfolded
+    then if validationRequireMembership options then validationUndecided value path else validationOk value
+    else
+      let facts = validationNamedFacts name
+      case validationNamedFactForMode facts "runtime" of
+        Nothing -> validationErrorResult (if eq path "" then "$" else path) "Unknown field type" value
+        Just candidate ->
+          let candidateMode = validationNamedCandidateMode facts "runtime"
+          case validationTraversalSemanticError candidate candidateMode of
+            Just message -> validationErrorResult (if eq path "" then "$" else path) message value
+            Nothing ->
+              let unfoldOptions = mapSet options "unfolded" (appendItem name unfolded)
+              validationValidateType (validationElaborateType candidate candidateMode []) value semanticParent path formData unfoldOptions coerceAllowed
+  VtInvalid { message = message } -> validationErrorResult (if eq path "" then "$" else path) message value
+  VtOther { kind = kind } ->
+    if eq kind "anything" then validationOk value
+    else validationErrorResult path "Unknown field type" value
+  other -> validationErrorResult (if eq path "" then "$" else path) "validation internal: unrecognized validation plan" value
+
+@label "Validation runtime"
+@description "field-identity Phase 3 / absorbed ux-parity Phase 16 — canonical Fenel-owned validation entry. Audits the complete identity-bearing type plan before value decisions, then owns type-branch selection, recursion, strict/optional policy, path/error accumulation, and record/list/variant result assembly. Host seams are limited to `$`-barrier marshalling, parser/codec leaves, registry facts, and set/dependent re-entry."
+@tags "engine" "validate" "runtime" "field-identity" "phase-3" "ux-parity" "phase-16"
+validationRuntime : (t: TraversalType) -> (value: a) -> (input: a) -> FieldResult
+validationRuntime t value input =
+  case typeToSetSemanticError t of
+    Just message -> validationErrorResult (if eq input.path "" then "$" else input.path) message value
+    Nothing ->
+      let planned = validationElaborateType t "runtime" []
+      case validationTypePlanError planned input.semanticParent input.path of
+        Just error -> FieldResult { errors = [error], value = value }
+        Nothing -> validationValidateType planned value input.semanticParent input.path input.formData input.options false
+
+-- Structural admission after an actual representation crossing validates the
+-- captured declaration's pure outer layer. It must not reuse native owner
+-- Membership for that layer: a native carrier is not the declared pure record
+-- or variant. The existing elaborator/validator owns all value recursion.
+@label "Captured pure declaration validation"
+@description "Validate only the pure structural view of the same authenticated named opaque declaration currently captured by the reader. Definitions, ambient catalog fallback, aliases and unresolved observations refuse. SourceHandle-aware identity checks are admitted only through existing declaration provenance. One outer mu exposes its body with a private lexical binding back to the original named owner; general mu validation remains fenced."
+@tags "engine" "validate" "representation" "field-identity"
+@category "engine-internal"
+validationPureDeclarationRuntime : (owner: TraversalType) -> (value: Any) -> (input: Any) -> FieldResult
+validationPureDeclarationRuntime owner value input = case owner of
+  TtNamed { name = name, origin = origin } ->
+    if not (eq origin "ref") then validationUndecided value input.path
+    else
+      let facts = validationNamedFacts name
+      if not (validationCapturedDeclarationValid (validationNamedSourceFact facts)) then validationUndecided value input.path
+      else case validationNamedFactForMode facts "runtime" of
+        Nothing -> validationUndecided value input.path
+        Just declaration -> case declaration of
+          TtOpaque { pure = pure } ->
+            let mode = validationNamedCandidateMode facts "runtime"
+            case validationTraversalSemanticError declaration mode of
+              Just message -> validationErrorResult (if eq input.path "" then "$" else input.path) message value
+              Nothing ->
+                let planned = validationElaboratePureOuter owner pure mode
+                case validationTypePlanError planned input.semanticParent input.path of
+                  Just error -> FieldResult { errors = [error], value = value }
+                  Nothing ->
+                    let membershipOptions = mapSet input.options "membership" true
+                    let primitiveOptions = mapSet membershipOptions "primitiveTypes" true
+                    let strictOptions = mapSet primitiveOptions "coerce" false
+                    validationValidateType planned value input.semanticParent input.path input.formData strictOptions false
+          _ -> validationUndecided value input.path
+  _ -> validationUndecided value input.path
+
+@category "engine-internal"
+validationElaboratePureOuter : (owner: TraversalType) -> (pure: TraversalType) -> (mode: String) -> ValidationType
+validationElaboratePureOuter owner pure mode = case pure of
+  TtMu { var = binder, body = body } ->
+    validationElaborateScopedType body mode [] [{ name = binder, type = owner }]
+  _ -> validationElaborateType pure mode []

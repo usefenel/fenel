@@ -1,0 +1,878 @@
+module engine where
+
+-- =========================================================================
+-- enumerate / sample / optimize — the findall family + seeded sampling +
+-- argmin/argmax, ALL as readers over the canonical `Se*` SetExpr.
+-- expr-substrate Phase 15 (brief:
+-- `workstreams/expr-substrate/briefs/phase-15-enumeration-sample-optimize.md`);
+-- representation collapsed onto `Se*` in decide-substrate Phase 1 Stage B
+-- (the WitSet marker vocabulary is RETIRED — `enumerateSet` now reads the
+-- registered `$tag` SetExpr `comprehend` emits, the DecidableMembership
+-- `enumerate` method dispatches here, and the relational tuple-set is a
+-- `SeEnum` of binding-record rows — the P-1 form; WsTuples is gone).
+--
+-- P5 shipped first-witness extraction (now `inhabit`, inhabit.fenel). This
+-- family exposes the SET: `enumerateSet` (the Prolog `findall`) reads the
+-- complete finite extension of a SetExpr, then `sample` = enumerate ∘ seeded
+-- choice and `optimize` = argmin/argmax OF the witness set. NOT new
+-- reasoning modes — SIBLING READERS over the same canonical representation.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- `enumerateSet : SetExpr -> Maybe (List a)` — the load-bearing distinction
+-- `Just [] ≠ Nothing`: `Just xs` = the set's COMPLETE finite extension (exact,
+-- deduped); `Nothing` = NOT finitely enumerable / out-of-fragment.
+-- `inhabit` conflates empty-set and can't-decide into Nothing; enumeration
+-- MUST NOT. Per-shape table:
+--   SeEnum      ⇒ Just (dedupe values)        (STRUCTURAL dedupe since
+--                decide-substrate Phase 3 Step D — deepEqValue; scalars
+--                byte-identical to the old shallow eq, object rows/records
+--                now dedupe as one set element; relational rows still arrive
+--                pre-deduped from projectTupleSet, so no change on that path)
+--   SeNone      ⇒ Just []                     (THE empty-vs-undecidable split)
+--   SeAll       ⇒ Nothing  · SeWhere ⇒ Nothing · SeComplement ⇒ Nothing
+--   SeInterval  ⇒ Nothing  — the type-erased fence persists: a bare SetExpr
+--                carries NO base type, so Int-stepping is unjustifiable (the
+--                P5 "NO integer-stepping invented here" rule). Typed
+--                enumeration lives in `enumerableSet` (the Enumerable path).
+--   SeUnion     ⇒ ALL branches enumerate ⇒ Just (dedupe concat); ANY branch
+--                Nothing ⇒ Nothing (a union with a non-enumerable is non-enum).
+--   SeIntersect ⇒ enumerable EXACTLY when ALL branches are SeEnum ⇒ filter the
+--                first branch by membership in every other (EXACT intersection).
+--                Mixed / interval branches ⇒ Nothing — NO proven-members
+--                under-approximation here: enumeration claims "this IS the set",
+--                so exactness over progress (the P13 proven-rows honesty was for
+--                FILTERING, where under-approx is sound; here it would be a lie).
+--   SeRef / SeDiff / SePattern ⇒ Nothing (honest fences — a Diff enum-minus-
+--                decidable widening is a later phase, not carried from Ws).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- THE FINDALL FAMILY — fences mirror the first-witness siblings (decision 3):
+--   solveAll       — single-free-var (collectFreeVars); 0/≥2 ⇒ Nothing (solve's
+--                    fence); then enumerateSet ∘ comprehend.
+--   solveFnAll     — reify + substituteCaptures + solveAll (the solveFn compo).
+--   solveRelAll    — enumerateSet ∘ relSolveSet over collectFreeVars order —
+--                    THE P13 payoff: ALL grandparent pairs, not just the first.
+--   solveFnRelAll  — param-order, reify-composed.
+-- `Just []` = query safe but no satisfying rows; `Nothing` = fence/unsafe/
+-- non-enumerable. solve/solveFn/solveRel/solveFnRel stay BYTE-UNTOUCHED.
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- SAMPLE = enumerate ∘ SEEDED choice — PURE only (decision 4). `sampleSet
+-- seed w` = enumerateSet, then pick index `mod stepped n` after one LCG step.
+-- PRNG = MINSTD (Park–Miller), double-precision-safe:
+--   lcgNext seed = mod (mul 48271 seed) 2147483647
+-- 48271·(2³¹−2) ≈ 1.04e14 < 2⁵³ — NO float overflow (a 1103515245-class
+-- multiplier WOULD silently lose precision in JS doubles — the classic trap,
+-- fenced BY CONSTRUCTION). Seed normalisation guards the 0 fixed-point AND
+-- negative inputs (std `mod` keeps the dividend's sign — Step-0 probe — so a
+-- DOUBLE-mod re-normalises a negative seed back into [1, m−1]). Same seed ⇒
+-- same pick (pinned). Empty enumeration ⇒ Nothing; non-enumerable (intervals
+-- — i.e. continuous) ⇒ Nothing, honest. Unseeded / IO sampling is OUT (no new
+-- IO leaves; the Random-effect handler variant is the deferred half).
+--
+-- ─────────────────────────────────────────────────────────────────────────
+-- OPTIMIZE = argmin/argmax OF the set — no objective function (decision 5; an
+-- objective-DRIVEN `minimize f over S` needs evaluate-over-Expr = P8). Two
+-- tiers:
+--   Tier 1 — enumerable (enumerateSet ⇒ Just xs, non-empty, SCALAR extension)
+--            ⇒ std `minimum`/`maximum` natives (Step-0 probe: they order BOTH
+--            numbers AND strings correctly, whereas `lt`/`gt` are numeric-only
+--            and return false on strings — so a hand-rolled lt/gt fold would be
+--            WRONG for mixed scalars; the natives are the correct tier-1
+--            comparator). `Just []` ⇒ Nothing (no extremum of ∅). A NON-SCALAR
+--            extension (relational binding-rows, records) ⇒ Nothing — records
+--            and binding lists have no canonical order (the guard that
+--            replaced the old WsTuples short-circuit, Stage B; it also fences
+--            boolean enums, which the old tier-1 would have mis-ordered).
+--   Tier 2 — non-enumerable: SeInterval directly, and SeIntersect folded
+--            through the SHARED `seIntervalFold` (inhabit.fenel, cross-file)
+--            ⇒ endpoint analysis: min = lo when INCLUSIVE, exclusive/unbounded
+--            ⇒ Nothing (no attained infimum — the ℝ honesty fence); max
+--            symmetric on hi. Everything else (SeAll / SeWhere / SeComplement /
+--            union-of-intervals) ⇒ Nothing.
+--
+-- NO ENTITY DECLS: functions only (codename-lock engine +0, law +0, entity
+-- oracle untouched).
+-- =========================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- enumerateSet — canonical SetExpr → Maybe (List a). The sibling reader.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Enumerate set"
+@description "Read the COMPLETE finite extension of a canonical `Se*` SetExpr ⇒ Maybe (List a). `Just xs` = the exact, deduped finite set; `Nothing` = not finitely enumerable / out-of-fragment. The load-bearing distinction `Just [] ≠ Nothing`: SeNone ⇒ Just [] (the empty set), whereas SeAll / SeWhere / SeComplement / SeInterval ⇒ Nothing (undecidable or — for intervals — the type-erased fence: a bare SetExpr carries no base type, so integer-stepping is unjustifiable; the typed de-fence is `enumerableSet`). SeEnum ⇒ Just (deduped values); SeUnion ⇒ Just (deduped concat) when ALL branches enumerate else Nothing; SeIntersect ⇒ the exact intersection when ALL branches are SeEnum (filter the first by membership in every other) else Nothing. The relational tuple-set rides SeEnum (binding-record rows — the P-1 form; Stage B retired WsTuples). A SIBLING READER of inhabit (which extracts only the first witness). expr-substrate Phase 15; Se* since decide-substrate Phase 1 Stage B."
+@tags "engine" "solve" "enumerate" "prover" "expr-substrate" "phase-15" "decide-substrate" "phase-1"
+-- decide-substrate Phase 3 (the theory-family completion tail) — THE THIN
+-- DISPATCHER over the DecidableMembership family: `enumerateSet` routes by the
+-- shape `$tag` (seTag) to each theory's OWN per-shape enumerate face
+-- (seEnumEnum / seEnumNone / seEnumUnion / seEnumIntersect / seEnumOpaque —
+-- below), the per-shape arms EXTRACTED from the old fat `case`. The
+-- DecidableMembership `enumerate` method dispatches to the SAME faces (the
+-- instances name the `engine:` fnIds — the family-location note in inhabit.fenel).
+-- The six non-enumerable shapes (SeAll / SeInterval / SeWhere / SeComplement /
+-- SeRef / SeDiff / SePattern) share the ONE honest `seEnumOpaque` face (Nothing).
+-- signature-substrate Phase 4 slice 3a — the `SeRigid` arm below routes to
+-- `seEnumOpaque` (Nothing = NON-ENUMERABLE), never to `seEnumNone`'s `Just []`.
+-- That split is load-bearing: `Just []` claims a COMPLETE empty extension
+-- (= decidably empty), which at a rigid is exactly the vacuity trap. The arm is
+-- explicit rather than inherited from the trailing `else` so the exhaustiveness
+-- meta-test can read it. (No interleaved comment inside the chain: the Fenel
+-- grammar does not accept one between `then <expr>` and `else`.)
+enumerateSet : (w: SetExpr) -> Maybe a
+enumerateSet w =
+  let t = seTag w
+  if eq t "SeEnum" then seEnumEnum w
+  else if eq t "SeNone" then seEnumNone w
+  else if eq t "SeUnion" then seEnumUnion w
+  else if eq t "SeIntersect" then seEnumIntersect w
+  else if eq t "SeRigid" then seEnumOpaque w
+  else seEnumOpaque w
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The per-shape enumerate faces — the DecidableMembership instances' `enumerate`
+-- method targets (decide-substrate Phase 3). Each takes the WHOLE SetExpr and
+-- re-matches its own shape (Nothing on mismatch — a standalone per-shape
+-- procedure). The load-bearing `Just [] ≠ Nothing` split lives in the None face.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "enumerate: seEnumEnum"
+@description "decide-substrate Phase 3 — the SeEnum theory's enumerate face: Just the deduped (shallow std eq, first-seen order) finite extension. The DecidableMembership SetEnum instance's `enumerate` method target; enumerateSet dispatches here. Per-shape face."
+@tags "engine" "internal" "solve" "enumerate" "decide-substrate" "phase-3"
+@category "engine-internal"
+seEnumEnum : (w: SetExpr) -> Maybe a
+seEnumEnum w =
+  case w of
+    SeEnum { values = vs } -> dedupeValuesTri vs []
+    _ -> Nothing
+
+@label "enumerate: seEnumNone"
+@description "decide-substrate Phase 3 — the SeNone theory's enumerate face: Just [] for SeNone (the empty set's complete finite extension — THE load-bearing `Just [] ≠ Nothing` split: SeNone is decidably-empty, not non-enumerable), Nothing for a set of any other shape (a `Just []` there would claim a complete empty extension it does not have; modules-as-values Phase 2c). The DecidableMembership SetNone instance's `enumerate` method target. Per-shape face."
+@tags "engine" "internal" "solve" "enumerate" "decide-substrate" "phase-3"
+@category "engine-internal"
+seEnumNone : (w: SetExpr) -> Maybe a
+seEnumNone w = if eq (seTag w) "SeNone" then Just [] else Nothing
+
+@label "enumerate: seEnumUnion"
+@description "decide-substrate Phase 3 — the SeUnion theory's enumerate face: Just the deduped concatenation of every branch's extension when ALL enumerate, else Nothing (enumUnion). The DecidableMembership SetUnion instance's `enumerate` method target. Per-shape face."
+@tags "engine" "internal" "solve" "enumerate" "decide-substrate" "phase-3"
+@category "engine-internal"
+seEnumUnion : (w: SetExpr) -> Maybe a
+seEnumUnion w =
+  case w of
+    SeUnion { branches = bs } -> enumUnion bs
+    _ -> Nothing
+
+@label "enumerate: seEnumIntersect"
+@description "decide-substrate Phase 3 — the SeIntersect theory's enumerate face: Just the exact intersection when EVERY branch is a SeEnum (enumIntersect), else Nothing (exactness over progress). The DecidableMembership SetIntersect instance's `enumerate` method target. Per-shape face."
+@tags "engine" "internal" "solve" "enumerate" "decide-substrate" "phase-3"
+@category "engine-internal"
+seEnumIntersect : (w: SetExpr) -> Maybe a
+seEnumIntersect w =
+  case w of
+    SeIntersect { branches = bs } -> enumIntersect bs
+    _ -> Nothing
+
+@label "enumerate: seEnumOpaque"
+@description "decide-substrate Phase 3 — the SHARED non-enumerable face: the theories that are NOT finitely enumerable from a bare SetExpr (SetAll — infinite; SetInterval — the type-erased fence, a bare interval carries no base type so integer-stepping is unjustifiable, the typed de-fence is enumerableSet; SetWhere / SetComplement / SetRef / SetDiff / SetPattern — out-of-fragment) all dispatch their `enumerate` here ⇒ Nothing. One honest face (the brief's fewer-honest-faces rule). Per-shape face."
+@tags "engine" "internal" "solve" "enumerate" "decide-substrate" "phase-3"
+@category "engine-internal"
+seEnumOpaque : (w: SetExpr) -> Maybe a
+seEnumOpaque w = Nothing
+
+-- dedupeValues — STRUCTURAL dedupe (first-seen order). decide-substrate Phase 3
+-- Step D: the element-eq is deepEqValue, so structurally-equal object elements
+-- (binding-rows, records, variants) dedupe as ONE set element — a set does not
+-- contain the same value twice, and in a pure language equality is structural.
+-- Scalars are byte-identical (deepEqValue bottoms out in std eq).
+@label "enumerate: dedupeValues"
+@description "Phase 15 / decide-substrate Phase 3 Step D — deduplicate a value list by STRUCTURAL equality (deepEqValue — scalars byte-identical to the old shallow std `eq`; records/variants/rows now dedupe structurally, correct set semantics), preserving first-seen order. Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "expr-substrate" "phase-15" "deep-eq" "decide-substrate" "phase-3"
+@category "engine-internal"
+dedupeValues : (values: a) -> (acc: a) -> a
+dedupeValues values acc =
+  case head values of
+    Nothing -> acc
+    Just v ->
+      let acc2 = if valueMember v acc then acc else appendItem v acc
+      case tail values of
+        Nothing -> acc2
+        Just rest -> dedupeValues rest acc2
+
+-- valueMember — STRUCTURAL membership of a value in a list (Step D).
+@label "enumerate: valueMember"
+@description "Phase 15 / decide-substrate Phase 3 Step D — true when a value is STRUCTURALLY equal (deepEqValue; scalars byte-identical to shallow std `eq`) to some element of a list. Internal helper for dedupe + the exact enum-intersection filter — object-element enums now intersect correctly."
+@tags "engine" "internal" "solve" "enumerate" "expr-substrate" "phase-15" "deep-eq" "decide-substrate" "phase-3"
+@category "engine-internal"
+valueMember : (v: a) -> (xs: a) -> Bool
+valueMember v xs =
+  case head xs of
+    Nothing -> false
+    Just x ->
+      if deepEqValue v x then true
+      else
+        case tail xs of
+          Nothing -> false
+          Just rest -> valueMember v rest
+
+-- Exact enumeration must retain unknown singleton identity rather than
+-- silently discard or double-count an uninspected exact representation.
+@category "engine-internal"
+dedupeValuesTri : (values: List a) -> (acc: List a) -> Maybe (List a)
+dedupeValuesTri values acc = case head values of
+  Nothing -> Just acc
+  Just value -> case deepEqValueTri value value of
+    Just true -> case valueMemberTri value acc false of
+      Nothing -> Nothing
+      Just member -> dedupeValuesTri (fromMaybe [] (tail values)) (if member then acc else appendItem value acc)
+    _ -> Nothing
+
+@category "engine-internal"
+valueMemberTri : (value: a) -> (values: List a) -> (sawNothing: Bool) -> Maybe Bool
+valueMemberTri value values sawNothing = case head values of
+  Nothing -> if sawNothing then Nothing else Just false
+  Just other -> case deepEqValueTri value other of
+    Just true -> Just true
+    verdict -> valueMemberTri value (fromMaybe [] (tail values)) (sawNothing || eq verdict Nothing)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Union — ALL branches enumerate ⇒ Just (dedupe concat); ANY Nothing ⇒ Nothing.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "enumerate: enumUnion"
+@description "Phase 15 — enumerate a SeUnion: when EVERY branch enumerates, Just the deduped concatenation of all their extensions; when ANY branch is non-enumerable (Nothing), the whole union is non-enumerable ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "expr-substrate" "phase-15"
+@category "engine-internal"
+enumUnion : (branches: a) -> Maybe a
+enumUnion branches =
+  let r = enumUnionFold branches { ok = true, vals = [] }
+  if r.ok then dedupeValuesTri r.vals [] else Nothing
+
+@label "enumerate: enumUnionFold"
+@description "Phase 15 — accumulator-threaded fold over SeUnion branches: enumerate each, concat its extension onto the running vals; the first non-enumerable branch sets ok=false (short-circuited). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "expr-substrate" "phase-15"
+@category "engine-internal"
+enumUnionFold : (branches: a) -> (acc: a) -> a
+enumUnionFold branches acc =
+  if acc.ok
+  then
+    case head branches of
+      Nothing -> acc
+      Just b ->
+        let acc2 = case enumerateSet b of
+                     Nothing -> { ok = false, vals = acc.vals }
+                     Just bs -> { ok = true, vals = concat acc.vals bs }
+        case tail branches of
+          Nothing -> acc2
+          Just rest -> enumUnionFold rest acc2
+  else acc
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Intersect — enumerable EXACTLY when ALL branches are SeEnum (exactness over
+-- progress — NO proven-members under-approximation here, unlike P13 filtering).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "enumerate: enumIntersect"
+@description "Phase 15 — enumerate a SeIntersect: enumerable EXACTLY when EVERY branch is a SeEnum (allEnum) ⇒ Just the deduped EXACT intersection (the first branch's values filtered to those present in every other branch). A mixed / interval / non-enum branch ⇒ Nothing — exactness over progress (enumeration claims \"this IS the set\", so an under-approximation would be a lie; the P13 proven-rows honesty was for filtering, where under-approx is sound). Empty branches ⇒ Nothing (can't enumerate the universe). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "expr-substrate" "phase-15"
+@category "engine-internal"
+enumIntersect : (branches: a) -> Maybe a
+enumIntersect branches =
+  case head branches of
+    Nothing -> Nothing
+    Just first ->
+      case first of
+        SeEnum { values = vs } ->
+          if allEnum branches
+          then
+            let rest = case tail branches of
+                         Nothing -> []
+                         Just r -> r
+            case filterInAllTri vs rest [] of
+              Nothing -> Nothing
+              Just values -> dedupeValuesTri values []
+          else Nothing
+        _ -> Nothing
+
+@label "enumerate: allEnum"
+@description "Phase 15 — true when EVERY branch of an intersection is a SeEnum (the exact-intersection precondition). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "expr-substrate" "phase-15"
+@category "engine-internal"
+allEnum : (branches: a) -> Bool
+allEnum branches =
+  case head branches of
+    Nothing -> true
+    Just b ->
+      case b of
+        SeEnum {} ->
+          case tail branches of
+            Nothing -> true
+            Just rest -> allEnum rest
+        _ -> false
+
+@label "enumerate: filterInAll"
+@description "Phase 15 — keep the values from the first SeEnum branch that are members (valueMember) of EVERY other SeEnum branch's value list — the exact set intersection. Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "expr-substrate" "phase-15"
+@category "engine-internal"
+filterInAll : (values: a) -> (restBranches: a) -> (acc: a) -> a
+filterInAll values restBranches acc =
+  case head values of
+    Nothing -> acc
+    Just v ->
+      let acc2 = if inAllBranches v restBranches then appendItem v acc else acc
+      case tail values of
+        Nothing -> acc2
+        Just rest -> filterInAll rest restBranches acc2
+
+@label "enumerate: inAllBranches"
+@description "Phase 15 — true when a value is a member of every remaining SeEnum branch's value list (vacuously true for no branches). Internal helper for filterInAll."
+@tags "engine" "internal" "solve" "enumerate" "expr-substrate" "phase-15"
+@category "engine-internal"
+inAllBranches : (v: a) -> (restBranches: a) -> Bool
+inAllBranches v restBranches =
+  case head restBranches of
+    Nothing -> true
+    Just b ->
+      case b of
+        SeEnum { values = vs } ->
+          if valueMember v vs
+          then
+            case tail restBranches of
+              Nothing -> true
+              Just rest -> inAllBranches v rest
+          else false
+        _ -> false
+
+@category "engine-internal"
+filterInAllTri : (values: List a) -> (restBranches: List SetExpr) -> (acc: List a) -> Maybe (List a)
+filterInAllTri values restBranches acc = case head values of
+  Nothing -> Just acc
+  Just value -> case inAllBranchesTri value restBranches false of
+    Nothing -> Nothing
+    Just member -> filterInAllTri (fromMaybe [] (tail values)) restBranches (if member then appendItem value acc else acc)
+
+@category "engine-internal"
+inAllBranchesTri : (value: a) -> (restBranches: List SetExpr) -> (sawNothing: Bool) -> Maybe Bool
+inAllBranchesTri value restBranches sawNothing = case head restBranches of
+  Nothing -> if sawNothing then Nothing else Just true
+  Just branch -> case branch of
+    SeEnum { values = values } -> case valueMemberTri value values false of
+      Just false -> Just false
+      verdict -> inAllBranchesTri value (fromMaybe [] (tail restBranches)) (sawNothing || eq verdict Nothing)
+    _ -> Nothing
+
+-- (enumTuples / tuplesToBindings are GONE — decide-substrate Phase 1 Stage B:
+-- relSolveSet emits a `SeEnum` of PRE-ZIPPED binding-record rows (the P-1
+-- form; rowsToBindings in rel-solve.fenel), so the tuple-set rides the plain
+-- SeEnum arm — witness = first row, enumeration = all rows.)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The findall family — fences mirror the first-witness siblings (decision 3).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Solve all"
+@description "The findall sibling of `solve`: enumerate ALL witnesses of a single-free-var predicate `Expr` ⇒ Maybe (List a) — LITERALLY `enumerateSet ∘ comprehend`. Discovers the free var via collectFreeVars; 0 or ≥2 free vars ⇒ Nothing (solve's documented fence). `solveAll (x == 5 or x == 7)` ⇒ Just [5, 7]. `Just []` = decidable-but-empty (e.g. SeNone); `Nothing` = the free-var fence or a non-enumerable set (interval / out-of-fragment). solve stays byte-untouched. expr-substrate Phase 15; Se* since decide-substrate Phase 1 Stage B."
+@tags "engine" "solve" "enumerate" "prover" "expr-substrate" "phase-15" "decide-substrate" "phase-1"
+solveAll : (expr: Expr) -> Maybe a
+solveAll expr =
+  let free = collectFreeVars expr [] []
+  if eq (length free) 1
+  then
+    case head free of
+      Nothing -> Nothing
+      Just varName -> enumerateSet (comprehend varName expr)
+  else Nothing
+
+@label "Solve fn all"
+@description "The findall composition `solveFnAll f = solveAll (reify f)`: reify the marshalled Fn value to its `Expr` body + captures, substitute the captures, then enumerate all witnesses. reify's Err (bodyless / native / non-reifiable) ⇒ Nothing. The list-valued sibling of solveFn. expr-substrate Phase 15."
+@tags "engine" "solve" "enumerate" "reify" "prover" "expr-substrate" "phase-15"
+solveFnAll : (input: a) -> (ctorDefs: a) -> (nullValue: a) -> Maybe a
+solveFnAll input ctorDefs nullValue =
+  case reify input ctorDefs nullValue of
+    Err e -> Nothing
+    Ok r -> solveAll (substituteCaptures r.body r.captures)
+
+@label "Solve relational all"
+@description "The findall sibling of `solveRel`: enumerate ALL satisfying bindings of a multi-binder predicate `Expr` against a threaded fact base ⇒ Maybe (List bindings). THE P13 payoff — `solveRelAll (and (parentOf x y) (parentOf y \"eleonora\"))` returns EVERY grandparent pair, not just the first. Discovers the unknowns via collectFreeVars (first-appearance order), runs relSolveSet (which emits the SeEnum-of-binding-rows tuple set), then enumerates it. `Just []` = query SAFE but no satisfying rows; `Nothing` = unsafe / out-of-fragment (the new semantic split — relSolveSet's fences ⇒ Nothing, safe-but-empty ⇒ Just []). expr-substrate Phase 15. Since 2026-11-06 the core is relSolveSetComplete: when any joined row's residual is undecided the answer is Nothing, never a shortened list or a false Just []."
+@tags "engine" "solve" "enumerate" "relational" "datalog" "prover" "expr-substrate" "phase-15"
+solveRelAll : (expr: Expr) -> (facts: a) -> Maybe a
+solveRelAll expr facts =
+  let vars = collectFreeVars expr [] []
+  maybeEnumerate (relSolveSetComplete vars expr facts)
+
+@label "Solve fn relational all"
+@description "The findall relational composition `solveFnRelAll f facts = solveRelAll (reify f) facts` (with the lambda's PARAMS as the ordered unknowns): reify, substitute the captures, run relSolveSet over the param order against the threaded fact base, then enumerate the tuple set ⇒ EVERY satisfying binding. reify's Err ⇒ Nothing; safe-but-empty ⇒ Just []; unsafe ⇒ Nothing. expr-substrate Phase 15. Since 2026-11-06 the core is relSolveSetComplete: when any joined row's residual is undecided the answer is Nothing, never a shortened list or a false Just []."
+@tags "engine" "solve" "enumerate" "relational" "reify" "datalog" "prover" "expr-substrate" "phase-15"
+solveFnRelAll : (input: a) -> (ctorDefs: a) -> (nullValue: a) -> (facts: a) -> Maybe a
+solveFnRelAll input ctorDefs nullValue facts =
+  case reify input ctorDefs nullValue of
+    Err e -> Nothing
+    Ok r -> maybeEnumerate (relSolveSetComplete input.params (substituteCaptures r.body r.captures) facts)
+
+@label "enumerate: maybeEnumerate"
+@description "Phase 15 — bind a `Maybe SetExpr` (relSolveSet's result) through enumerateSet: Nothing ⇒ Nothing (the fence preserved); Just w ⇒ enumerateSet w. The Maybe-bind shared by solveRelAll + solveFnRelAll. Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "expr-substrate" "phase-15"
+@category "engine-internal"
+maybeEnumerate : (mw: a) -> Maybe a
+maybeEnumerate mw =
+  case mw of
+    Nothing -> Nothing
+    Just w -> enumerateSet w
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- sample — enumerate ∘ SEEDED choice. PURE only; MINSTD PRNG.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Sample set"
+@description "Pick ONE element of a SetExpr's finite extension by a deterministic seeded choice ⇒ Maybe a. Enumerates the set (enumerateSet), normalises the seed into [1, m−1] (lcgSeed — guarding the 0 fixed-point AND negative inputs, since std `mod` keeps the dividend's sign), takes one MINSTD step (lcgNext), and selects index `mod stepped n`. SAME seed ⇒ SAME pick (deterministic, pinned). Empty enumeration (SeNone) ⇒ Nothing; a non-enumerable set (interval — i.e. continuous — / out-of-fragment) ⇒ Nothing (honest). PURE only — unseeded / IO sampling is the deferred Random-effect handler variant (no new IO leaves here). expr-substrate Phase 15."
+@tags "engine" "solve" "sample" "prover" "expr-substrate" "phase-15"
+sampleSet : (seed: a) -> (w: a) -> Maybe a
+sampleSet seed w =
+  case enumerateSet w of
+    Nothing -> Nothing
+    Just xs ->
+      let n = length xs
+      if eq n 0 then Nothing
+      else nthOf xs (mod (lcgNext (lcgSeed seed)) n)
+
+@label "enumerate: lcgNext"
+@description "Phase 15 — one MINSTD (Park–Miller) step: `mod (mul 48271 seed) 2147483647`. Double-precision-SAFE: 48271·(2³¹−2) ≈ 1.04e14 < 2⁵³, so NO float overflow (a 1103515245-class multiplier would silently lose precision in JS doubles — the classic trap, fenced by construction). Internal helper."
+@tags "engine" "internal" "solve" "sample" "expr-substrate" "phase-15"
+@category "engine-internal"
+lcgNext : (seed: a) -> a
+lcgNext seed = mod (mul 48271 seed) 2147483647
+
+@label "enumerate: lcgSeed"
+@description "Phase 15 — normalise an arbitrary seed into [1, 2147483646], guarding the 0 fixed-point. Double-mod because std `mod` keeps the dividend's sign (Step-0 probe), so a negative seed re-normalises back into range: `add (mod (add (mod s m') m') m') 1` with m' = 2147483646. Internal helper."
+@tags "engine" "internal" "solve" "sample" "expr-substrate" "phase-15"
+@category "engine-internal"
+lcgSeed : (s: a) -> a
+lcgSeed s = add (mod (add (mod s 2147483646) 2147483646) 2147483646) 1
+
+@label "enumerate: nthOf"
+@description "Phase 15 — the nth element (0-based) of a list ⇒ Maybe a; an out-of-range index ⇒ Nothing. Internal helper for sampleSet."
+@tags "engine" "internal" "solve" "sample" "expr-substrate" "phase-15"
+@category "engine-internal"
+nthOf : (xs: a) -> (i: a) -> Maybe a
+nthOf xs i =
+  case head xs of
+    Nothing -> Nothing
+    Just x ->
+      if eq i 0 then Just x
+      else
+        case tail xs of
+          Nothing -> Nothing
+          Just rest -> nthOf rest (sub i 1)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- optimize — argmin/argmax OF the set (no objective function). Two tiers.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Min of set"
+@description "The minimum (argmin) of a SetExpr ⇒ Maybe a. Tier 1 — enumerable (enumerateSet ⇒ Just non-empty) with a SCALAR extension (number/string head) ⇒ the std `minimum` native (orders BOTH numbers AND strings correctly — unlike `lt`/`gt`, which are numeric-only); a NON-scalar extension (relational binding-rows, records, booleans) ⇒ Nothing — no canonical order (the guard that replaced the WsTuples short-circuit, decide-substrate Phase 1 Stage B). Tier 2 — non-enumerable: SeInterval ⇒ the lo bound when INCLUSIVE, else Nothing (no attained infimum — the ℝ honesty fence); SeIntersect ⇒ fold the interval branches (the shared seIntervalFold) then the lo endpoint. SeAll / SeWhere / SeComplement / union-of-intervals ⇒ Nothing; the empty set ⇒ Nothing. Objective-driven optimization (`minimize f over S`) needs evaluate-over-Expr — that is Phase 8, fenced out. expr-substrate Phase 15."
+@tags "engine" "solve" "optimize" "prover" "expr-substrate" "phase-15"
+minOfSet : (w: a) -> Maybe a
+minOfSet w =
+  case enumerateSet w of
+    Just xs -> if scalarExtension xs then minimum xs else Nothing
+    Nothing -> minNonEnum w
+
+@label "Max of set"
+@description "The maximum (argmax) of a SetExpr ⇒ Maybe a. Tier 1 — enumerable (enumerateSet ⇒ Just non-empty) with a SCALAR extension ⇒ the std `maximum` native (orders BOTH numbers AND strings correctly); a NON-scalar extension (binding-rows, records, booleans) ⇒ Nothing — no canonical order (the Stage-B guard). Tier 2 — non-enumerable: SeInterval ⇒ the hi bound when INCLUSIVE, else Nothing (no attained supremum — the ℝ honesty fence); SeIntersect ⇒ fold the interval branches (seIntervalFold) then the hi endpoint. SeAll / SeWhere / SeComplement / union-of-intervals ⇒ Nothing; the empty set ⇒ Nothing. Objective-driven optimization is Phase 8, fenced out. expr-substrate Phase 15."
+@tags "engine" "solve" "optimize" "prover" "expr-substrate" "phase-15"
+maxOfSet : (w: a) -> Maybe a
+maxOfSet w =
+  case enumerateSet w of
+    Just xs -> if scalarExtension xs then maximum xs else Nothing
+    Nothing -> maxNonEnum w
+
+-- scalarExtension — non-empty + number/string head (orderable tier-1 input).
+@label "enumerate: scalarExtension"
+@description "Stage B — true when an enumerated extension is non-empty AND its head is an orderable scalar (number or string) — the tier-1 min/max precondition. Empty ⇒ false (no extremum of ∅); a binding-row / record / boolean head ⇒ false (no canonical order — the honest fence that replaced the WsTuples short-circuit). Internal helper."
+@tags "engine" "internal" "solve" "optimize" "decide-substrate" "phase-1"
+@category "engine-internal"
+scalarExtension : (xs: a) -> Bool
+scalarExtension xs =
+  case head xs of
+    Nothing -> false
+    Just h -> if isNumber h then true else isString h
+
+@label "enumerate: minNonEnum"
+@description "Phase 15 — tier-2 min for a non-enumerable SetExpr: SeInterval ⇒ minOfInterval over its lo; SeIntersect ⇒ minOfIntersect (fold the interval branches, then the lo endpoint); anything else (SeAll / SeWhere / SeComplement / union-of-intervals) ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "expr-substrate" "phase-15"
+@category "engine-internal"
+minNonEnum : (w: a) -> Maybe a
+minNonEnum w =
+  case w of
+    SeInterval { interval = iv } -> minOfInterval iv.lo
+    SeIntersect { branches = bs } -> minOfIntersect bs
+    _ -> Nothing
+
+@label "enumerate: maxNonEnum"
+@description "Phase 15 — tier-2 max for a non-enumerable SetExpr: SeInterval ⇒ maxOfInterval over its hi; SeIntersect ⇒ maxOfIntersect (fold the interval branches, then the hi endpoint); anything else ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "expr-substrate" "phase-15"
+@category "engine-internal"
+maxNonEnum : (w: a) -> Maybe a
+maxNonEnum w =
+  case w of
+    SeInterval { interval = iv } -> maxOfInterval iv.hi
+    SeIntersect { branches = bs } -> maxOfIntersect bs
+    _ -> Nothing
+
+@label "enumerate: minOfInterval"
+@description "Phase 15 — the attained minimum of an interval's lo bound: Just lo.value when INCLUSIVE; exclusive or unbounded ⇒ Nothing (no attained infimum — the ℝ honesty fence). Internal helper."
+@tags "engine" "internal" "solve" "optimize" "expr-substrate" "phase-15"
+@category "engine-internal"
+minOfInterval : (lo: a) -> Maybe a
+minOfInterval lo =
+  case lo of
+    Just b -> if b.inclusive then Just b.value else Nothing
+    Nothing -> Nothing
+
+@label "enumerate: maxOfInterval"
+@description "Phase 15 — the attained maximum of an interval's hi bound: Just hi.value when INCLUSIVE; exclusive or unbounded ⇒ Nothing (no attained supremum — the ℝ honesty fence). Internal helper."
+@tags "engine" "internal" "solve" "optimize" "expr-substrate" "phase-15"
+@category "engine-internal"
+maxOfInterval : (hi: a) -> Maybe a
+maxOfInterval hi =
+  case hi of
+    Just b -> if b.inclusive then Just b.value else Nothing
+    Nothing -> Nothing
+
+@label "enumerate: minOfIntersect"
+@description "Phase 15 — tier-2 min of a SeIntersect: fold the interval branches into one combined interval via the SHARED seIntervalFold (inhabit.fenel, cross-file — tighter lo / tighter hi), then the lo endpoint (minOfInterval). A non-interval branch sets ok=false ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "expr-substrate" "phase-15"
+@category "engine-internal"
+minOfIntersect : (branches: a) -> Maybe a
+minOfIntersect branches =
+  let acc = seIntervalFold branches { lo = Nothing, hi = Nothing, ok = true }
+  if acc.ok then minOfInterval acc.lo else Nothing
+
+@label "enumerate: maxOfIntersect"
+@description "Phase 15 — tier-2 max of a SeIntersect: fold the interval branches into one combined interval via the SHARED seIntervalFold (inhabit.fenel, cross-file), then the hi endpoint (maxOfInterval). A non-interval branch ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "expr-substrate" "phase-15"
+@category "engine-internal"
+maxOfIntersect : (branches: a) -> Maybe a
+maxOfIntersect branches =
+  let acc = seIntervalFold branches { lo = Nothing, hi = Nothing, ok = true }
+  if acc.ok then maxOfInterval acc.hi else Nothing
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- enumerableSet — complete enumeration with an explicit base type.
+-- Bounded Char intervals step exactly over codepoints. Nat/Int interval
+-- enumeration abstains: their mathematical Enumerable steppers do not list
+-- every admitted scalar, exact digit and pure constructor carrier. Witness
+-- search can still use scalar endpoints without claiming completeness.
+-- Intersections share seIntervalFold; unions require every branch to enumerate.
+-- Finite enum shapes delegate to the existing type-erased reader.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Enumerable set"
+@description "Read the COMPLETE finite extension of a SetExpr given the free variable's base type. Bounded Char intervals step over codepoints; finite enums and their supported composites use enumerateSet. Nat/Int intervals return Nothing: scalar integer stepping omits admitted exact digit carriers and pure constructors, so it cannot certify a complete extension. Unbounded or unsupported intervals also abstain. Intersections share seIntervalFold; unions require every branch to enumerate."
+@tags "engine" "solve" "enumerate" "prover" "enumerable" "solver-extension" "phase-1"
+enumerableSet : (base: a) -> (w: SetExpr) -> Maybe a
+enumerableSet base w =
+  case w of
+    SeInterval { interval = iv } -> enumBaseInterval base iv.lo iv.hi
+    SeIntersect { branches = bs } -> enumBaseIntersect base bs
+    SeUnion { branches = bs } -> enumBaseUnion base bs
+    _ -> enumerateSet w
+
+@label "enumerable: enumBaseInterval"
+@description "Route an interval by the supplied base name. Nat/Int use enumIntInterval's completeness fence; Char uses codepoint stepping; other bases return Nothing. The base comes from the type context."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+enumBaseInterval : (base: a) -> (lo: a) -> (hi: a) -> Maybe a
+enumBaseInterval base lo hi =
+  if isIntEnumerable base then enumIntInterval base lo hi
+  else if isCharEnumerable base then enumCharInterval lo hi
+  else Nothing
+
+@label "enumerable: isIntEnumerable"
+@description "Recognize the supplied Int/Nat base name for numeric-tower endpoint operations. Their Enumerable instances provide mathematical stepping, which does not enumerate every admitted interval carrier. Rational/Real are not discrete integer bases."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-1"
+@category "engine-internal"
+isIntEnumerable : (base: a) -> Bool
+isIntEnumerable base = or (eq base "Int") (eq base "Nat")
+
+@label "enumerable: isCharEnumerable"
+@description "solver-extension Phase 2 — true when a base type NAME is `Char` — the gate for codepoint-stepping a Char-typed SeInterval (Char is the first NON-numeric Enumerable base: a discrete order over the Unicode codespace). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+isCharEnumerable : (base: a) -> Bool
+isCharEnumerable base = eq base "Char"
+
+@label "enumerable: enumIntInterval"
+@description "Abstain from complete Nat/Int interval enumeration. A scalar range omits exact digit records and pure constructor inhabitants, even at a singleton bound. Their ordinary Enumerable steppers remain available; interval witness search may use scalar endpoints as inexact candidates."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-1"
+@category "engine-internal"
+enumIntInterval : (base: a) -> (lo: a) -> (hi: a) -> Maybe a
+enumIntInterval base lo hi = Nothing
+
+@label "enumerable: loBoundInt"
+@description "solver-extension Phase 1 — the INCLUSIVE integer lower endpoint of an interval bound { value, inclusive }: inclusive ⇒ numberToInt value; exclusive (x > value) ⇒ value + 1 over ℤ (intAdd (numberToInt value) (numberToInt 1)). The step unit is built via numberToInt 1 (the bridge path — the numeric-tower §0.2 stack hazard). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-1"
+@category "engine-internal"
+loBoundInt : (lb: a) -> Int
+loBoundInt lb = if lb.inclusive then numberToInt lb.value else intAdd (numberToInt lb.value) (numberToInt 1)
+
+@label "enumerable: hiBoundInt"
+@description "solver-extension Phase 1 — the INCLUSIVE integer upper endpoint of an interval bound { value, inclusive }: inclusive ⇒ numberToInt value; exclusive (x < value) ⇒ value − 1 over ℤ (intSub (numberToInt value) (numberToInt 1)). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-1"
+@category "engine-internal"
+hiBoundInt : (hb: a) -> Int
+hiBoundInt hb = if hb.inclusive then numberToInt hb.value else intSub (numberToInt hb.value) (numberToInt 1)
+
+@label "enumerable: intListToNumberArray"
+@description "solver-extension Phase 1 — fold a pure cons-spine `List Int` (the Enumerable Int stepper's output) into the native array of Numbers the SetExpr readers expect: Nil ⇒ []; Cons h t ⇒ concat [intToNumber h] (recurse). Mirrors listToArray exactly (the array-repr witness convention, the appendItem note). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-1"
+@category "engine-internal"
+intListToNumberArray : (xs: a) -> a
+intListToNumberArray xs = case xs of
+  Nil -> []
+  Cons h t -> concat [intToNumber h] (intListToNumberArray t)
+
+@label "enumerable: enumCharInterval"
+@description "solver-extension Phase 2 — enumerate a `SeInterval` over the Char base: BOTH bounds must be present (an unbounded side ⇒ infinite codespace ⇒ Nothing); the inclusive Char endpoints are recovered (loBoundChar / hiBoundChar — an exclusive bound steps in by one codepoint), and `charEnumFromTo lo hi` builds the pure `List Char` cons-spine (the Enumerable Char stepper, called DIRECTLY — a bare 1-char-string Char bound has no distinguishing runtime tag for reflective Enumerable dispatch, so the de-fence uses the concrete stepper; the instance exists for typed callers), folded to the native witness array via charListToArray. A range wider than 4096 code points abstains (Nothing) rather than building a list that size (GP-12 review 2026-11-07). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+enumCharInterval : (lo: a) -> (hi: a) -> Maybe a
+enumCharInterval lo hi =
+  case lo of
+    Nothing -> Nothing
+    Just lb ->
+      case hi of
+        Nothing -> Nothing
+        Just hb ->
+          let loChar = loBoundChar lb
+          let hiChar = hiBoundChar hb
+          if gt (sub (charCode hiChar) (charCode loChar)) 4096 then Nothing
+          else Just (charListToArray (charEnumFromTo loChar hiChar))
+
+@label "enumerable: loBoundChar"
+@description "solver-extension Phase 2 — the INCLUSIVE Char lower endpoint of an interval bound { value, inclusive }: inclusive ⇒ value (the Char); exclusive (c > value) ⇒ the NEXT codepoint (charFromCode (add (charCode value) 1)). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+loBoundChar : (lb: a) -> Char
+loBoundChar lb = if lb.inclusive then lb.value else charFromCode (add (charCode lb.value) 1)
+
+@label "enumerable: hiBoundChar"
+@description "solver-extension Phase 2 — the INCLUSIVE Char upper endpoint of an interval bound { value, inclusive }: inclusive ⇒ value (the Char); exclusive (c < value) ⇒ the PREVIOUS codepoint (charFromCode (sub (charCode value) 1)). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+hiBoundChar : (hb: a) -> Char
+hiBoundChar hb = if hb.inclusive then hb.value else charFromCode (sub (charCode hb.value) 1)
+
+@label "enumerable: charListToArray"
+@description "solver-extension Phase 2 — fold a pure cons-spine `List Char` (the Enumerable Char stepper's output) into the native witness array: Nil ⇒ []; Cons h t ⇒ concat [h] (recurse). The Char analogue of intListToNumberArray, but identity on each element (a Char IS already its own witness value — no numeric conversion). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+charListToArray : (xs: a) -> a
+charListToArray xs = case xs of
+  Nil -> []
+  Cons h t -> concat [h] (charListToArray t)
+
+@label "enumerable: enumBaseIntersect"
+@description "Fold an intersection of interval branches through seIntervalFold, then use enumBaseInterval and its shared completeness fences. A non-interval branch or unsupported base returns Nothing."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+enumBaseIntersect : (base: a) -> (branches: a) -> Maybe a
+enumBaseIntersect base branches =
+  let acc = seIntervalFold branches { lo = Nothing, hi = Nothing, ok = true }
+  if acc.ok then enumBaseInterval base acc.lo acc.hi else Nothing
+
+@label "enumerable: enumBaseUnion"
+@description "Enumerate every union branch through enumerableSet, concatenate complete extensions and deduplicate. Any unavailable branch makes the union unavailable, including a Nat/Int interval branch."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-3"
+@category "engine-internal"
+enumBaseUnion : (base: a) -> (branches: a) -> Maybe a
+enumBaseUnion base branches =
+  let r = enumBaseUnionFold base branches { ok = true, vals = [] }
+  if r.ok then dedupeValuesTri r.vals [] else Nothing
+
+@label "enumerable: enumBaseUnionFold"
+@description "solver-extension Phase 3 — accumulator-threaded fold over SeUnion branches for the base-aware union enumeration: enumerate each branch via `enumerableSet base`, concat its extension onto the running vals; the first non-enumerable branch sets ok=false (short-circuited). The base-aware sibling of enumUnionFold (which recurses the type-erased enumerateSet). Internal helper."
+@tags "engine" "internal" "solve" "enumerate" "enumerable" "solver-extension" "phase-3"
+@category "engine-internal"
+enumBaseUnionFold : (base: a) -> (branches: a) -> (acc: a) -> a
+enumBaseUnionFold base branches acc =
+  if acc.ok
+  then
+    case head branches of
+      Nothing -> acc
+      Just b ->
+        let acc2 = case enumerableSet base b of
+                     Nothing -> { ok = false, vals = acc.vals }
+                     Just bs -> { ok = true, vals = concat acc.vals bs }
+        case tail branches of
+          Nothing -> acc2
+          Just rest -> enumBaseUnionFold base rest acc2
+  else acc
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- The typed findall + sample consumers — the payoff. `enumerableSolveAll` is
+-- the typed sibling of `solveAll` (threads the base type into enumerableSet);
+-- `enumerableSampleSet` the typed sibling of `sampleSet`. solveAll / sampleSet
+-- stay BYTE-UNTOUCHED.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Enumerable solve all"
+@description "Enumerate all witnesses of a single-free-variable Expr through comprehend and enumerableSet with the supplied base type. Finite equality alternatives and supported Char interval predicates enumerate; unavailable complete extensions return Nothing. Zero or multiple free variables also abstain."
+@tags "engine" "solve" "enumerate" "prover" "enumerable" "solver-extension" "phase-1"
+enumerableSolveAll : (base: a) -> (expr: Expr) -> Maybe a
+enumerableSolveAll base expr =
+  let free = collectFreeVars expr [] []
+  if eq (length free) 1
+  then
+    case head free of
+      Nothing -> Nothing
+      Just varName -> enumerableSet base (comprehend varName expr)
+  else Nothing
+
+@label "Enumerable sample set"
+@description "Pick one member from enumerableSet's COMPLETE finite extension using deterministic MINSTD seeded choice. Normalize the seed, take one LCG step and select its index. Empty or unavailable enumeration returns Nothing, including Nat/Int intervals; finite enums and supported Char intervals remain sampleable."
+@tags "engine" "solve" "sample" "prover" "enumerable" "solver-extension" "phase-1"
+enumerableSampleSet : (base: a) -> (seed: a) -> (w: a) -> Maybe a
+enumerableSampleSet base seed w =
+  case enumerableSet base w of
+    Nothing -> Nothing
+    Just xs ->
+      let n = length xs
+      if eq n 0 then Nothing
+      else nthOf xs (mod (lcgNext (lcgSeed seed)) n)
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Endpoint-attained optimize over typed intervals (solver-extension Phase 2).
+-- `minOfSet`/`maxOfSet` (Phase 15) attain only an INCLUSIVE interval endpoint
+-- (exclusive ⇒ Nothing — the ℝ honesty fence: a real interval has no attained
+-- infimum at an open bound). For a DISCRETE base (Int/Nat/Char), an EXCLUSIVE
+-- bound DOES have an attained extremum — the next/previous step (`x > 2` over ℤ
+-- attains min 3; `c < 'e'` over Char attains max 'd'). These TYPED siblings lift
+-- that fence for discrete bases via the SAME loBound/hiBound step-in the de-fence
+-- uses; the ℝ / non-discrete / unbounded case delegates to the existing
+-- minOfSet/maxOfSet (UNCHANGED — byte-identical). `enumerableMinOfSet \"Int\" (x
+-- > 2 and x < 6)` ⇒ Just 3; `enumerableMaxOfSet` ⇒ Just 5; the ℝ case ⇒ Nothing.
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Enumerable min of set"
+@description "The TYPED argmin sibling of `minOfSet` (solver-extension Phase 2): the minimum of a SetExpr GIVEN the base type ⇒ Maybe a. For a DISCRETE-base (Int/Nat/Char) SeInterval (or SeIntersect of intervals), an EXCLUSIVE lower bound ATTAINS — it steps in by one (`x > 2` over ℤ ⇒ Just 3; `c > 'a'` over Char ⇒ Just 'b') — lifting the ℝ-honesty fence that minOfSet keeps for exclusive bounds (no attained infimum). An unbounded-below interval ⇒ Nothing. Every other case (SeEnum, ℝ/non-discrete interval, …) delegates to the byte-UNCHANGED minOfSet. solver-extension Phase 2."
+@tags "engine" "solve" "optimize" "prover" "enumerable" "solver-extension" "phase-2"
+enumerableMinOfSet : (base: a) -> (w: SetExpr) -> Maybe a
+enumerableMinOfSet base w =
+  case w of
+    SeInterval { interval = iv } -> baseMinOfInterval base iv.lo
+    SeIntersect { branches = bs } -> baseMinOfIntersect base bs
+    SeUnion {} -> baseMinOfUnion base w
+    _ -> minOfSet w
+
+@label "Enumerable max of set"
+@description "The TYPED argmax sibling of `maxOfSet` (solver-extension Phase 2): the maximum of a SetExpr GIVEN the base type ⇒ Maybe a. For a DISCRETE-base (Int/Nat/Char) SeInterval (or SeIntersect), an EXCLUSIVE upper bound ATTAINS — it steps in by one (`x < 6` over ℤ ⇒ Just 5; `c < 'e'` over Char ⇒ Just 'd') — lifting the ℝ-honesty fence maxOfSet keeps for exclusive bounds. An unbounded-above interval ⇒ Nothing. Every other case delegates to the byte-UNCHANGED maxOfSet. solver-extension Phase 2."
+@tags "engine" "solve" "optimize" "prover" "enumerable" "solver-extension" "phase-2"
+enumerableMaxOfSet : (base: a) -> (w: SetExpr) -> Maybe a
+enumerableMaxOfSet base w =
+  case w of
+    SeInterval { interval = iv } -> baseMaxOfInterval base iv.hi
+    SeIntersect { branches = bs } -> baseMaxOfIntersect base bs
+    SeUnion {} -> baseMaxOfUnion base w
+    _ -> maxOfSet w
+
+@label "enumerable: baseMinOfInterval"
+@description "solver-extension Phase 2 — the attained minimum of an interval's lo bound GIVEN the base: a discrete base (Int/Nat) ⇒ Just (intToNumber (loBoundInt lb)) — the inclusive endpoint, OR the step-in for an exclusive bound; Char ⇒ Just (loBoundChar lb); a non-discrete (ℝ) base delegates to minOfInterval (inclusive-only — the honesty fence); an unbounded lo (Nothing) ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+baseMinOfInterval : (base: a) -> (lo: a) -> Maybe a
+baseMinOfInterval base lo =
+  case lo of
+    Nothing -> Nothing
+    Just lb ->
+      if isIntEnumerable base then Just (intToNumber (loBoundInt lb))
+      else if isCharEnumerable base then Just (loBoundChar lb)
+      else minOfInterval lo
+
+@label "enumerable: baseMaxOfInterval"
+@description "solver-extension Phase 2 — the attained maximum of an interval's hi bound GIVEN the base: a discrete base (Int/Nat) ⇒ Just (intToNumber (hiBoundInt hb)) — inclusive endpoint OR step-in for an exclusive bound; Char ⇒ Just (hiBoundChar hb); a non-discrete (ℝ) base delegates to maxOfInterval (inclusive-only); an unbounded hi ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+baseMaxOfInterval : (base: a) -> (hi: a) -> Maybe a
+baseMaxOfInterval base hi =
+  case hi of
+    Nothing -> Nothing
+    Just hb ->
+      if isIntEnumerable base then Just (intToNumber (hiBoundInt hb))
+      else if isCharEnumerable base then Just (hiBoundChar hb)
+      else maxOfInterval hi
+
+@label "enumerable: baseMinOfIntersect"
+@description "solver-extension Phase 2 — the attained min of a SeIntersect of interval branches GIVEN the base: fold via the SHARED seIntervalFold (tighter lo/hi), then baseMinOfInterval on the combined lo (so `x > 2 and x < 6` ⇒ Just 3). A non-interval branch ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+baseMinOfIntersect : (base: a) -> (branches: a) -> Maybe a
+baseMinOfIntersect base branches =
+  let acc = seIntervalFold branches { lo = Nothing, hi = Nothing, ok = true }
+  if acc.ok then baseMinOfInterval base acc.lo else Nothing
+
+@label "enumerable: baseMaxOfIntersect"
+@description "solver-extension Phase 2 — the attained max of a SeIntersect of interval branches GIVEN the base: fold via the SHARED seIntervalFold, then baseMaxOfInterval on the combined hi (so `x > 2 and x < 6` ⇒ Just 5). A non-interval branch ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "enumerable" "solver-extension" "phase-2"
+@category "engine-internal"
+baseMaxOfIntersect : (base: a) -> (branches: a) -> Maybe a
+baseMaxOfIntersect base branches =
+  let acc = seIntervalFold branches { lo = Nothing, hi = Nothing, ok = true }
+  if acc.ok then baseMaxOfInterval base acc.hi else Nothing
+
+@label "enumerable: baseMinOfUnion"
+@description "solver-extension Phase 3 — the attained min of a discrete `SeUnion`: enumerate the whole union via `enumerableSet base` (which steps each interval branch), then the std `minimum` native (tier-1 — orders numbers AND chars/strings). A non-enumerable union (an unbounded branch / non-discrete base) ⇒ Nothing; the empty union ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "enumerable" "solver-extension" "phase-3"
+@category "engine-internal"
+baseMinOfUnion : (base: a) -> (w: a) -> Maybe a
+baseMinOfUnion base w =
+  case enumerableSet base w of
+    Nothing -> Nothing
+    Just xs -> if eq (length xs) 0 then Nothing else minimum xs
+
+@label "enumerable: baseMaxOfUnion"
+@description "solver-extension Phase 3 — the attained max of a discrete `SeUnion`: enumerate via `enumerableSet base`, then the std `maximum` native (tier-1). A non-enumerable union ⇒ Nothing; the empty union ⇒ Nothing. Internal helper."
+@tags "engine" "internal" "solve" "optimize" "enumerable" "solver-extension" "phase-3"
+@category "engine-internal"
+baseMaxOfUnion : (base: a) -> (w: a) -> Maybe a
+baseMaxOfUnion base w =
+  case enumerableSet base w of
+    Nothing -> Nothing
+    Just xs -> if eq (length xs) 0 then Nothing else maximum xs
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- inhabitSet / enumerableInhabit — REFINED-TYPE INHABITANT ENUMERATION
+-- (solver-extension Phase 6). LIST the complete values of a supported refined
+-- type, including finite enums and bounded Char intervals.
+--
+-- `⟦$refined base S⟧ = ⟦base⟧ ∩ S`, so the inhabitants = `enumerableSet base S`
+-- (the shared typed enumerator and its completeness fences). The `FenelType → {base, set}`
+-- marshal is the dispatch wrapper's job (the `$`-key barrier: a `.fenel` body
+-- cannot read `$refined` — it rides the LEDGERED `$`-key marshal boundary; the
+-- set arrives as the canonical `Se*` via `setExprToTag` since Stage B). These
+-- bodies consume the marshalled marker (a plain record, not a `$tag` ADT):
+--   { tag = "InhRefined", base = <String>, set = <Se* SetExpr> }
+--   { tag = "InhNone" }                     — anything else ⇒ Nothing
+-- The honesty fences (non-enumerable base ⇒ ℝ; unbounded; undecidable set ⇒
+-- SeWhere) are ALL carried by `enumerableSet` — the marshal adds none; we never
+-- invent inhabitants (the P5 rule — the base + bounds come from the TYPE).
+-- The first-witness propose-backed type inhabitation is `inhabit ∘ typeToSetExpr`
+-- (Stage E refits typeToSetExpr's output to Se*).
+-- ─────────────────────────────────────────────────────────────────────────
+
+@label "Inhabit set"
+@description "solver-extension Phase 6 — the `FenelType → Maybe {base, set}` marshal-result unwrapper for refined-type inhabitant enumeration. Consumes the dispatch-marshalled type marker (a plain record; the `$`-key read happens in the dispatch wrapper): `{ tag = InhRefined, base, set }` (a `$refined {base, set}` type) ⇒ Just { base, set } (the base type NAME + the set as the canonical `Se*` SetExpr — Stage B). anything else ⇒ Nothing. The exact-inhabitant law: ⟦$refined base S⟧ = ⟦base⟧ ∩ S, so the inhabitants = enumerableSet base S (enumerableInhabit). solver-extension Phase 6."
+@tags "engine" "solve" "inhabit" "enumerate" "prover" "enumerable" "solver-extension" "phase-6"
+inhabitSet : (typeMarker: a) -> Maybe a
+inhabitSet typeMarker =
+  if eq typeMarker.tag "InhRefined"
+  then Just { base = typeMarker.base, set = typeMarker.set }
+  else Nothing
+
+@label "Enumerable inhabit"
+@description "Enumerate a refined type's COMPLETE finite extension through inhabitSet and enumerableSet. Finite enum refinements and supported bounded Char intervals enumerate; Nat/Int interval refinements abstain because scalar stepping omits admitted exact and pure carriers. Non-refined, unbounded and unsupported shapes return Nothing."
+@tags "engine" "solve" "inhabit" "enumerate" "prover" "enumerable" "solver-extension" "phase-6"
+enumerableInhabit : (typeMarker: a) -> Maybe a
+enumerableInhabit typeMarker =
+  case inhabitSet typeMarker of
+    Nothing -> Nothing
+    Just r -> enumerableSet r.base r.set

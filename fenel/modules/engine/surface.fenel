@@ -1,0 +1,1704 @@
+module engine where
+
+using std (Image)
+
+-- surface — Fenel-native planning for specialized TypeView/Layout/ListDisplay
+-- surfaces. TypeScript supplies IO leaves and boundary marshals:
+-- named-type resolution, TypeView rows, component names, and raw TypeScript
+-- values. These bodies own the pure decisions over that data.
+
+SurfaceType =
+  SfNamed name: String raw: a
+  | SfRecord fields: a raw: a
+  | SfVariant raw: a
+  | SfTuple raw: a
+  | SfMap raw: a
+  | SfList elem: a raw: a
+  | SfMaybe value: a raw: a
+  | SfRefined base: a raw: a
+  | SfOpaque pure: a name: a raw: a
+  | SfOther raw: a
+
+SurfaceField = SurfaceField name: String label: String type: a raw: a
+
+@category "engine-internal"
+surfaceRawType : (t: SurfaceType) -> a
+surfaceRawType t = case t of
+  SfNamed { raw = r } -> r
+  SfRecord { raw = r } -> r
+  SfVariant { raw = r } -> r
+  SfTuple { raw = r } -> r
+  SfMap { raw = r } -> r
+  SfList { raw = r } -> r
+  SfMaybe { raw = r } -> r
+  SfRefined { raw = r } -> r
+  SfOpaque { raw = r } -> r
+  SfOther { raw = r } -> r
+
+@category "engine-internal"
+surfaceStructuralBase : (t: SurfaceType) -> SurfaceType
+surfaceStructuralBase t = case t of
+  SfRefined { base = b } -> surfaceStructuralBase b
+  SfOpaque { pure = p } -> surfaceStructuralBase p
+  SfNamed {} -> t
+  SfRecord {} -> t
+  SfVariant {} -> t
+  SfTuple {} -> t
+  SfMap {} -> t
+  SfList {} -> t
+  SfMaybe {} -> t
+  SfOther {} -> t
+
+@category "engine-internal"
+surfaceSyntheticField : (name: String) -> (label: String) -> (t: SurfaceType) -> SurfaceField
+surfaceSyntheticField name label t =
+  SurfaceField {
+    name = name,
+    label = label,
+    type = t,
+    raw = { name = name, label = Nothing, type = surfaceRawType t, meta = {}, ui = Nothing }
+  }
+
+@category "engine-internal"
+surfaceFieldsForType : (t: SurfaceType) -> a
+surfaceFieldsForType t =
+  let base = surfaceStructuralBase t
+  case base of
+    SfMaybe { value = v } -> surfaceFieldsForType v
+    SfList { elem = e } ->
+      let item = surfaceStructuralBase e
+      case item of
+        SfRecord { fields = fs } -> { fields = fs, source = "list-item-field" }
+        SfNamed {} -> { fields = [surfaceSyntheticField "item" "item" e], source = "synthetic" }
+        SfVariant {} -> { fields = [surfaceSyntheticField "item" "item" e], source = "synthetic" }
+        SfTuple {} -> { fields = [surfaceSyntheticField "item" "item" e], source = "synthetic" }
+        SfMap {} -> { fields = [surfaceSyntheticField "item" "item" e], source = "synthetic" }
+        SfList {} -> { fields = [surfaceSyntheticField "item" "item" e], source = "synthetic" }
+        SfMaybe {} -> { fields = [surfaceSyntheticField "item" "item" e], source = "synthetic" }
+        SfRefined {} -> { fields = [surfaceSyntheticField "item" "item" e], source = "synthetic" }
+        SfOpaque {} -> { fields = [surfaceSyntheticField "item" "item" e], source = "synthetic" }
+        SfOther {} -> { fields = [surfaceSyntheticField "item" "item" e], source = "synthetic" }
+    SfRecord { fields = fs } -> { fields = fs, source = "record-field" }
+    SfNamed {} -> { fields = [surfaceSyntheticField "value" "value" t], source = "synthetic" }
+    SfVariant {} -> { fields = [surfaceSyntheticField "value" "value" t], source = "synthetic" }
+    SfTuple {} -> { fields = [surfaceSyntheticField "value" "value" t], source = "synthetic" }
+    SfMap {} -> { fields = [surfaceSyntheticField "value" "value" t], source = "synthetic" }
+    SfOther {} -> { fields = [surfaceSyntheticField "value" "value" t], source = "synthetic" }
+
+@category "engine-internal"
+surfacePath : (prefix: String) -> (name: String) -> String
+surfacePath prefix name =
+  if eq prefix "" then name else concat prefix (concat "." name)
+
+@category "engine-internal"
+surfaceCandidateSource : (inherited: String) -> (source: String) -> String
+surfaceCandidateSource inherited source =
+  if eq inherited "" then source else inherited
+
+@category "engine-internal"
+surfaceCandidateForField : (f: SurfaceField) -> (path: String) -> (depth: Number) -> (source: String) -> a
+surfaceCandidateForField f path depth source =
+  { path = path
+  , label = f.label
+  , type = surfaceRawType f.type
+  , field = f.raw
+  , depth = depth
+  , source = source
+  , typeShape = f.type
+  }
+
+@category "engine-internal"
+surfaceCandidatePathMember : (path: String) -> (candidates: List a) -> Bool
+surfaceCandidatePathMember path candidates = case head candidates of
+  Nothing -> false
+  Just c ->
+    if eq c.path path
+    then true
+    else case tail candidates of
+      Nothing -> false
+      Just rest -> surfaceCandidatePathMember path rest
+
+@category "engine-internal"
+surfaceAppendCandidate : (candidate: a) -> (acc: List a) -> List a
+surfaceAppendCandidate candidate acc =
+  if surfaceCandidatePathMember candidate.path acc
+  then acc
+  else appendItem candidate acc
+
+@category "engine-internal"
+surfaceVisitFields : (fields: List SurfaceField) -> (prefix: String) -> (depth: Number) -> (inheritedSource: String) -> (source: String) -> (maxDepth: Number) -> (acc: List a) -> List a
+surfaceVisitFields fields prefix depth inheritedSource source maxDepth acc =
+  case head fields of
+    Nothing -> acc
+    Just f ->
+      let path = surfacePath prefix f.name
+      let candidateSource = surfaceCandidateSource inheritedSource source
+      let acc1 = surfaceAppendCandidate (surfaceCandidateForField f path depth candidateSource) acc
+      let acc2 =
+            if gte depth maxDepth
+            then acc1
+            else
+              let base = surfaceStructuralBase f.type
+              case base of
+                SfRecord {} -> surfaceVisit base path (add depth 1) source maxDepth acc1
+                SfNamed {} -> acc1
+                SfVariant {} -> acc1
+                SfTuple {} -> acc1
+                SfMap {} -> acc1
+                SfList {} -> acc1
+                SfMaybe {} -> acc1
+                SfRefined {} -> acc1
+                SfOpaque {} -> acc1
+                SfOther {} -> acc1
+      case tail fields of
+        Nothing -> acc2
+        Just rest -> surfaceVisitFields rest prefix depth inheritedSource source maxDepth acc2
+
+@category "engine-internal"
+surfaceVisit : (t: SurfaceType) -> (prefix: String) -> (depth: Number) -> (inheritedSource: String) -> (maxDepth: Number) -> (acc: List a) -> List a
+surfaceVisit t prefix depth inheritedSource maxDepth acc =
+  let info = surfaceFieldsForType t
+  surfaceVisitFields info.fields prefix depth inheritedSource info.source maxDepth acc
+
+@label "surface: fieldCandidates"
+@description "Fenel-native specialized-surface field candidate discovery. Walks a marshalled SurfaceType, peeling Maybe/refined/opaque/list/record shapes, returning typed field paths plus source/depth metadata. TS supplies resolver IO and raw FieldDef payloads only."
+@tags "engine" "surface" "authoring" "ux-parity" "phase-10"
+surfaceFieldCandidates : (t: SurfaceType) -> (maxDepth: Number) -> List a
+surfaceFieldCandidates t maxDepth =
+  surfaceVisit t "" 0 "" maxDepth []
+
+@category "engine-internal"
+surfaceTopLevelCandidates : (t: SurfaceType) -> List a
+surfaceTopLevelCandidates t =
+  surfaceTopLevelCandidatesGo (surfaceFieldCandidates t 1) []
+
+@category "engine-internal"
+surfaceTopLevelCandidatesGo : (candidates: List a) -> (acc: List a) -> List a
+surfaceTopLevelCandidatesGo candidates acc = case head candidates of
+  Nothing -> acc
+  Just c ->
+    let acc2 = if eq c.depth 0 then appendItem c acc else acc
+    case tail candidates of
+      Nothing -> acc2
+      Just rest -> surfaceTopLevelCandidatesGo rest acc2
+
+@category "engine-internal"
+surfaceSlotSpan : (t: SurfaceType) -> Number
+surfaceSlotSpan t =
+  let base = surfaceStructuralBase t
+  case base of
+    SfRecord {} -> 12
+    SfVariant {} -> 12
+    SfMap {} -> 12
+    SfList {} -> 12
+    SfNamed { name = n } ->
+      if eq n "Boolean" then 4
+      else if eq n "String" then 6
+      else if eq n "Number" then 6
+      else if eq n "Date" then 6
+      else 12
+    SfTuple {} -> 12
+    SfMaybe {} -> 12
+    SfRefined {} -> 12
+    SfOpaque {} -> 12
+    SfOther {} -> 12
+
+@category "engine-internal"
+surfaceSlotForCandidate : (c: a) -> (forceFull: Bool) -> a
+surfaceSlotForCandidate c forceFull =
+  { field = c.path, span = if forceFull then 12 else surfaceSlotSpan c.typeShape }
+
+@category "engine-internal"
+surfaceLayoutRow : (slots: List a) -> a
+surfaceLayoutRow slots =
+  mapSet {} "slots" slots
+
+@category "engine-internal"
+surfaceLayoutSection : (rows: List a) -> a
+surfaceLayoutSection rows =
+  mapSet {} "rows" rows
+
+@category "engine-internal"
+surfaceLayout : (sections: List a) -> a
+surfaceLayout sections =
+  mapSet {} "sections" sections
+
+@category "engine-internal"
+surfaceLayoutRows : (candidates: List a) -> (acc: List a) -> List a
+surfaceLayoutRows candidates acc = case head candidates of
+  Nothing -> acc
+  Just first ->
+    case tail candidates of
+      Nothing ->
+        appendItem (surfaceLayoutRow [(surfaceSlotForCandidate first true)]) acc
+      Just rest ->
+        case head rest of
+          Nothing ->
+            appendItem (surfaceLayoutRow [(surfaceSlotForCandidate first true)]) acc
+          Just second ->
+            let row = surfaceLayoutRow [(surfaceSlotForCandidate first false), (surfaceSlotForCandidate second false)]
+            case tail rest of
+              Nothing -> appendItem row acc
+              Just more -> surfaceLayoutRows more (appendItem row acc)
+
+@label "surface: defaultLayoutForType"
+@description "Fenel-native default detail/edit layout planner. Groups top-level field candidates into two-slot rows and sizes structural fields full-width while scalar fields get compact spans."
+@tags "engine" "surface" "layout" "authoring" "ux-parity" "phase-10"
+surfaceDefaultLayoutForType : (t: SurfaceType) -> a
+surfaceDefaultLayoutForType t =
+  let candidates = surfaceTopLevelCandidates t
+  if eq (length candidates) 0
+  then surfaceLayout []
+  else surfaceLayout [(surfaceLayoutSection (surfaceLayoutRows candidates []))]
+
+@category "engine-internal"
+surfaceListColumns : (candidates: List a) -> (remaining: Number) -> (acc: List a) -> List a
+surfaceListColumns candidates remaining acc =
+  if lte remaining 0
+  then acc
+  else case head candidates of
+    Nothing -> acc
+    Just c ->
+      let acc2 = appendItem { field = c.path, label = c.label } acc
+      case tail candidates of
+        Nothing -> acc2
+        Just rest -> surfaceListColumns rest (sub remaining 1) acc2
+
+@label "surface: defaultListDisplayForType"
+@description "Fenel-native default list-display planner. Uses up to six top-level field candidates as table columns, falling back to stack when no columns exist."
+@tags "engine" "surface" "list-display" "authoring" "ux-parity" "phase-10"
+surfaceDefaultListDisplayForType : (t: SurfaceType) -> a
+surfaceDefaultListDisplayForType t =
+  let columns = surfaceListColumns (surfaceTopLevelCandidates t) 6 []
+  if gt (length columns) 0
+  then { style = "table", columns = columns }
+  else { style = "stack", columns = [] }
+
+@category "engine-internal"
+surfaceConditionVariables : (candidates: List a) -> (acc: List a) -> List a
+surfaceConditionVariables candidates acc = case head candidates of
+  Nothing -> acc
+  Just c ->
+    let acc2 = appendItem { name = c.path, label = c.label, source = c.source } acc
+    case tail candidates of
+      Nothing -> acc2
+      Just rest -> surfaceConditionVariables rest acc2
+
+@label "surface: conditionScopeForType"
+@description "Fenel-native condition scope planner for TypeView/Layout predicates. Exposes candidate field paths plus the surface-provided _mode and _channel variables."
+@tags "engine" "surface" "conditions" "authoring" "ux-parity" "phase-10"
+surfaceConditionScopeForType : (t: SurfaceType) -> (mode: String) -> (channel: String) -> a
+surfaceConditionScopeForType t mode channel =
+  let vars = surfaceConditionVariables (surfaceFieldCandidates t 1) []
+  { mode = mode
+  , channel = channel
+  , variables = appendItem { name = "_channel", label = "Channel", source = "surface" } (appendItem { name = "_mode", label = "Mode", source = "surface" } vars)
+  }
+
+@label "surface: conditionContext"
+@description "Fenel-native runtime condition context merge for layout predicates. Adds _mode and _channel to the caller-supplied value record."
+@tags "engine" "surface" "conditions" "runtime" "ux-parity" "phase-10"
+surfaceConditionContext : (values: {}) -> (mode: String) -> (channel: String) -> {}
+surfaceConditionContext values mode channel =
+  mergeRecords values { _mode = mode, _channel = channel }
+
+@category "engine-internal"
+surfaceMaybeStringValue : (value: Maybe a) -> String
+surfaceMaybeStringValue value = case value of
+  Nothing -> ""
+  Just v -> v
+
+@category "engine-internal"
+surfaceMaybeDisplayText : (display: Maybe a) -> (slot: String) -> String
+surfaceMaybeDisplayText display slot = case display of
+  Nothing -> ""
+  Just d -> case mapGet d slot of
+    Nothing -> ""
+    Just mv -> surfaceMaybeStringValue mv
+
+@category "engine-internal"
+surfaceMaybeDisplayRecord : (display: Maybe a) -> (slot: String) -> Maybe a
+surfaceMaybeDisplayRecord display slot = case display of
+  Nothing -> Nothing
+  Just d -> case mapGet d slot of
+    Nothing -> Nothing
+    Just mv -> mv
+
+@category "engine-internal"
+surfaceMapStringLookup : (mapValue: Maybe a) -> (key: String) -> Maybe String
+surfaceMapStringLookup mapValue key = case mapValue of
+  Nothing -> Nothing
+  Just m -> case mapGet m key of
+    Nothing -> Nothing
+    Just v -> Just v
+
+@category "engine-internal"
+surfaceReadDisplayKind : (format: String) -> String
+surfaceReadDisplayKind format =
+  if eq format "badge" then "badge"
+  else if eq format "chip" then "chip"
+  else if eq format "link" then "link"
+  else if eq format "date-short" then "date-short"
+  else if eq format "relative-time" then "relative-time"
+  else "text"
+
+@category "engine-internal"
+surfaceReadHostFormat : (format: String) -> Maybe String
+surfaceReadHostFormat format =
+  if eq format "date-short" then Just "date-short"
+  else if eq format "relative-time" then Just "relative-time"
+  else Nothing
+
+@category "engine-internal"
+surfaceReadTransform : (text: String) -> (transform: String) -> String
+surfaceReadTransform text transform =
+  if eq transform "capitalize" then capitalize text
+  else if eq transform "uppercase" then upper text
+  else if eq transform "truncate" then
+    if gt (length text) 50 then concat (slice text 0 47) "..." else text
+  else text
+
+@category "engine-internal"
+surfaceReadAffixes : (text: String) -> (prefix: String) -> (suffix: String) -> String
+surfaceReadAffixes text prefix suffix =
+  concat prefix (concat text suffix)
+
+@category "engine-internal"
+surfaceReadBaseText : (value: a) -> (display: Maybe a) -> String
+surfaceReadBaseText value display =
+  if value.missing
+  then
+    let emptyText = surfaceMaybeDisplayText display "emptyText"
+    if eq emptyText "" then "-" else emptyText
+  else
+    let labelMap = surfaceMaybeDisplayRecord display "labelMap"
+    case surfaceMapStringLookup labelMap value.key of
+      Just label -> label
+      Nothing -> value.text
+
+@label "surface: read value plan"
+@description "Fenel-owned read-display projection. Applies empty text, label/color maps, deterministic text transforms, prefix/suffix stitching, display kind classification, and host-format tags. TS supplies scalar value marshalling and browser-only date/relative-time rendering remains a leaf."
+@tags "engine" "surface" "render-plan" "display" "ux-parity" "phase-13"
+surfaceReadValuePlan : (value: a) -> (display: Maybe a) -> (fallbackKind: String) -> a
+surfaceReadValuePlan value display fallbackKind =
+  let format0 = surfaceMaybeDisplayText display "format"
+  let format = if eq format0 "" then "text" else format0
+  let transform = surfaceMaybeDisplayText display "transform"
+  let prefix = if value.missing then "" else surfaceMaybeDisplayText display "prefix"
+  let suffix = if value.missing then "" else surfaceMaybeDisplayText display "suffix"
+  let rawText = surfaceReadBaseText value display
+  let transformed = surfaceReadTransform rawText transform
+  let text = if value.missing then transformed else surfaceReadAffixes transformed prefix suffix
+  let colorMap = surfaceMaybeDisplayRecord display "colorMap"
+  let color = surfaceMapStringLookup colorMap value.key
+  let hostFormat = surfaceReadHostFormat format
+  { kind = surfaceReadDisplayKind format
+  , text = text
+  , color = color
+  , href = if and (not value.missing) (eq format "link") then Just value.text else Nothing
+  , hostFormat = hostFormat
+  , empty = value.missing
+  , raw = value.raw
+  , fallbackKind = fallbackKind
+  }
+
+@category "engine-internal"
+surfaceMissingValue : a
+surfaceMissingValue =
+  { tag = "missing", text = "", key = "", raw = null, missing = true, children = {} }
+
+@category "engine-internal"
+surfaceLookupValueParts : (value: a) -> (parts: List String) -> a
+surfaceLookupValueParts value parts = case head parts of
+  Nothing -> value
+  Just part -> case mapGet value.children part of
+    Nothing -> surfaceMissingValue ()
+    Just child -> case tail parts of
+      Nothing -> child
+      Just rest -> surfaceLookupValueParts child rest
+
+@category "engine-internal"
+surfaceLookupValue : (values: a) -> (path: String) -> a
+surfaceLookupValue values path =
+  case mapGet values path of
+    Just v -> v
+    Nothing -> surfaceLookupValueParts { children = values } (split path ".")
+
+@category "engine-internal"
+surfaceLookupError : (errors: a) -> (path: String) -> Maybe String
+surfaceLookupError errors path = case mapGet errors path of
+  Nothing -> Nothing
+  Just e -> Just e
+
+@category "engine-internal"
+surfaceFindRenderField : (fields: List a) -> (name: String) -> Maybe a
+surfaceFindRenderField fields name = case head fields of
+  Nothing -> Nothing
+  Just f ->
+    if eq f.name name
+    then Just f
+    else case tail fields of
+      Nothing -> Nothing
+      Just rest -> surfaceFindRenderField rest name
+
+@category "engine-internal"
+surfaceComponentNameForTemplate : (template: Maybe a) -> (mode: String) -> Maybe String
+surfaceComponentNameForTemplate template mode = case template of
+  Nothing -> Nothing
+  Just t ->
+    let name =
+          if eq mode "edit"
+          then (if eq t.editComponent "" then t.component else t.editComponent)
+          else (if eq t.readComponent "" then t.component else t.readComponent)
+    if eq name "" then Nothing else Just name
+
+@category "engine-internal"
+surfaceReadDisplayForTemplate : (template: Maybe a) -> Maybe a
+surfaceReadDisplayForTemplate template = case template of
+  Nothing -> Nothing
+  Just t -> if t.hasReadDisplay then Just t.readDisplay else Nothing
+
+@category "engine-internal"
+surfaceTemplateRaw : (template: Maybe a) -> Maybe a
+surfaceTemplateRaw template = case template of
+  Nothing -> Nothing
+  Just t -> Just t.raw
+
+@category "engine-internal"
+surfaceSlotFallbackKind : (mode: String) -> (template: Maybe a) -> String
+surfaceSlotFallbackKind mode template =
+  if eq mode "edit" then "field-renderer"
+  else case template of
+    Nothing -> "scalar"
+    Just t -> "read-display"
+
+@category "engine-internal"
+surfacePlanLayoutSlot : (slot: a) -> (fields: List a) -> (values: a) -> (errors: a) -> (mode: String) -> Maybe a
+surfacePlanLayoutSlot slot fields values errors mode =
+  if not slot.visible
+  then Nothing
+  else
+    let template = slot.template
+    let componentName = surfaceComponentNameForTemplate template mode
+    case surfaceFindRenderField fields slot.field of
+      Nothing -> Just {
+        fieldName = slot.field,
+        label = slot.field,
+        span = slot.span,
+        field = Nothing,
+        value = Nothing,
+        error = Nothing,
+        templateName = slot.templateName,
+        template = surfaceTemplateRaw template,
+        componentName = componentName,
+        display = Nothing,
+        fallbackKind = "missing-field"
+      }
+      Just f ->
+        let value = surfaceLookupValue values slot.field
+        let display = if eq mode "read" then Just (surfaceReadValuePlan value (surfaceReadDisplayForTemplate template) (surfaceSlotFallbackKind mode template)) else Nothing
+        Just {
+          fieldName = slot.field,
+          label = f.label,
+          span = slot.span,
+          field = Just f.raw,
+          value = Just value.raw,
+          error = surfaceLookupError errors slot.field,
+          templateName = slot.templateName,
+          template = surfaceTemplateRaw template,
+          componentName = componentName,
+          display = display,
+          fallbackKind = surfaceSlotFallbackKind mode template
+        }
+
+@category "engine-internal"
+surfacePlanLayoutSlots : (slots: List a) -> (fields: List a) -> (values: a) -> (errors: a) -> (mode: String) -> (acc: List a) -> List a
+surfacePlanLayoutSlots slots fields values errors mode acc = case head slots of
+  Nothing -> acc
+  Just slot ->
+    let acc2 = case surfacePlanLayoutSlot slot fields values errors mode of
+      Nothing -> acc
+      Just planned -> appendItem planned acc
+    case tail slots of
+      Nothing -> acc2
+      Just rest -> surfacePlanLayoutSlots rest fields values errors mode acc2
+
+@category "engine-internal"
+surfacePlanLayoutRow : (row: a) -> (fields: List a) -> (values: a) -> (errors: a) -> (mode: String) -> Maybe a
+surfacePlanLayoutRow row fields values errors mode =
+  if not row.visible
+  then Nothing
+  else
+    let slots = surfacePlanLayoutSlots row.slots fields values errors mode []
+    if eq (length slots) 0
+    then Nothing
+    else Just { gap = row.gap, slots = slots }
+
+@category "engine-internal"
+surfacePlanLayoutRows : (rows: List a) -> (fields: List a) -> (values: a) -> (errors: a) -> (mode: String) -> (acc: List a) -> List a
+surfacePlanLayoutRows rows fields values errors mode acc = case head rows of
+  Nothing -> acc
+  Just row ->
+    let acc2 = case surfacePlanLayoutRow row fields values errors mode of
+      Nothing -> acc
+      Just planned -> appendItem planned acc
+    case tail rows of
+      Nothing -> acc2
+      Just rest -> surfacePlanLayoutRows rest fields values errors mode acc2
+
+@category "engine-internal"
+surfacePlanLayoutSection : (section: a) -> (fields: List a) -> (values: a) -> (errors: a) -> (mode: String) -> Maybe a
+surfacePlanLayoutSection section fields values errors mode =
+  if not section.visible
+  then Nothing
+  else
+    let rows = surfacePlanLayoutRows section.rows fields values errors mode []
+    if eq (length rows) 0
+    then Nothing
+    else Just {
+      title = section.title,
+      description = section.description,
+      collapsible = section.collapsible,
+      defaultCollapsed = section.defaultCollapsed,
+      rows = rows
+    }
+
+@category "engine-internal"
+surfacePlanLayoutSections : (sections: List a) -> (fields: List a) -> (values: a) -> (errors: a) -> (mode: String) -> (acc: List a) -> List a
+surfacePlanLayoutSections sections fields values errors mode acc = case head sections of
+  Nothing -> acc
+  Just section ->
+    let acc2 = case surfacePlanLayoutSection section fields values errors mode of
+      Nothing -> acc
+      Just planned -> appendItem planned acc
+    case tail sections of
+      Nothing -> acc2
+      Just rest -> surfacePlanLayoutSections rest fields values errors mode acc2
+
+@label "surface: layout render plan"
+@description "Fenel-owned layout render-plan interpretation. Consumes layout/field/value wires whose predicates and templates have already been marshalled at the boundary, then returns the visible section/row/slot plan with field/template/component/display fallback tags."
+@tags "engine" "surface" "layout" "render-plan" "ux-parity" "phase-13"
+surfaceLayoutRenderPlan : (layout: a) -> (fields: List a) -> (values: a) -> (errors: a) -> (mode: String) -> a
+surfaceLayoutRenderPlan layout fields values errors mode =
+  { sections = surfacePlanLayoutSections layout.sections fields values errors mode [] }
+
+@category "engine-internal"
+surfacePlanListColumn : (column: a) -> (fields: List a) -> a
+surfacePlanListColumn column fields =
+  let template = column.template
+  let field = surfaceFindRenderField fields column.field
+  let componentName = surfaceComponentNameForTemplate template "read"
+  { fieldName = column.field
+  , label = column.label
+  , span = column.span
+  , editable = column.editable
+  , field = case field of
+      Nothing -> Nothing
+      Just f -> Just f.raw
+  , templateName = column.templateName
+  , template = surfaceTemplateRaw template
+  , componentName = componentName
+  , readDisplay = surfaceReadDisplayForTemplate template
+  , fallbackKind = case field of
+      Nothing -> "missing-field"
+      Just f -> case template of
+        Nothing -> "scalar"
+        Just t -> "read-display"
+  }
+
+@category "engine-internal"
+surfacePlanListColumns : (columns: List a) -> (fields: List a) -> (acc: List a) -> List a
+surfacePlanListColumns columns fields acc = case head columns of
+  Nothing -> acc
+  Just column ->
+    let acc2 = appendItem (surfacePlanListColumn column fields) acc
+    case tail columns of
+      Nothing -> acc2
+      Just rest -> surfacePlanListColumns rest fields acc2
+
+@label "surface: list display render plan"
+@description "Fenel-owned list-display render-plan interpretation for the table/list vertical slice. Solid keeps DataTable, routing, and inline-edit handlers; Fenel decides column inclusion, template/component names, and scalar-vs-read-display fallback tags."
+@tags "engine" "surface" "list-display" "render-plan" "ux-parity" "phase-13"
+surfaceListDisplayRenderPlan : (display: a) -> (fields: List a) -> a
+surfaceListDisplayRenderPlan display fields =
+  { style = display.style
+  , addLabel = display.addLabel
+  , emptyText = display.emptyText
+  , itemTemplate = display.itemTemplate
+  , columns = surfacePlanListColumns display.columns fields []
+  }
+
+@category "engine-internal"
+surfaceMergeMaybe : (parent: Maybe a) -> (child: Maybe a) -> Maybe a
+surfaceMergeMaybe parent child = case child of
+  Just c -> Just c
+  Nothing -> case parent of
+    Just p -> Just p
+    Nothing -> Nothing
+
+@label "surface: merge read display"
+@description "Fenel-owned right-biased Maybe-aware ReadDisplay merge. Child Just slots win, child Nothing falls through to parent, both absent yields Nothing."
+@tags "engine" "surface" "display" "registry" "ux-parity" "phase-12"
+surfaceMergeRead : (parent: Maybe a) -> (child: Maybe a) -> Maybe a
+surfaceMergeRead parent child = case child of
+  Nothing -> parent
+  Just c -> case parent of
+    Nothing -> Just c
+    Just p -> Just {
+      format = surfaceMergeMaybe p.format c.format,
+      transform = surfaceMergeMaybe p.transform c.transform,
+      colorMap = surfaceMergeMaybe p.colorMap c.colorMap,
+      labelMap = surfaceMergeMaybe p.labelMap c.labelMap,
+      icon = surfaceMergeMaybe p.icon c.icon,
+      emptyText = surfaceMergeMaybe p.emptyText c.emptyText,
+      prefix = surfaceMergeMaybe p.prefix c.prefix,
+      suffix = surfaceMergeMaybe p.suffix c.suffix,
+      refTemplate = surfaceMergeMaybe p.refTemplate c.refTemplate
+    }
+
+@label "surface: merge edit display"
+@description "Fenel-owned right-biased Maybe-aware EditDisplay merge. Child Just slots win, child Nothing falls through to parent, both absent yields Nothing."
+@tags "engine" "surface" "display" "registry" "ux-parity" "phase-12"
+surfaceMergeEdit : (parent: Maybe a) -> (child: Maybe a) -> Maybe a
+surfaceMergeEdit parent child = case child of
+  Nothing -> parent
+  Just c -> case parent of
+    Nothing -> Just c
+    Just p -> Just {
+      widget = surfaceMergeMaybe p.widget c.widget,
+      placeholder = surfaceMergeMaybe p.placeholder c.placeholder,
+      helpText = surfaceMergeMaybe p.helpText c.helpText,
+      options = surfaceMergeMaybe p.options c.options,
+      columns = surfaceMergeMaybe p.columns c.columns,
+      refFilter = surfaceMergeMaybe p.refFilter c.refFilter,
+      prefix = surfaceMergeMaybe p.prefix c.prefix,
+      suffix = surfaceMergeMaybe p.suffix c.suffix,
+      format = surfaceMergeMaybe p.format c.format
+    }
+
+@category "engine-internal"
+surfaceHasMaybe : (value: Maybe a) -> Bool
+surfaceHasMaybe value = case value of
+  Just v -> true
+  Nothing -> false
+
+@category "engine-internal"
+surfaceDisplayHasRead : (display: Maybe a) -> Bool
+surfaceDisplayHasRead display = case display of
+  Nothing -> false
+  Just d -> surfaceHasMaybe d.read
+
+@category "engine-internal"
+surfaceDisplayHasEdit : (display: Maybe a) -> Bool
+surfaceDisplayHasEdit display = case display of
+  Nothing -> false
+  Just d -> surfaceHasMaybe d.edit
+
+@label "surface: merge display"
+@description "Fenel-owned right-biased Maybe-aware TypeView display merge. Merges read/edit facets with the same child-Just / parent-fallback semantics as the inner displays."
+@tags "engine" "surface" "display" "registry" "ux-parity" "phase-12"
+surfaceMergeDisplay : (parent: Maybe a) -> (child: Maybe a) -> Maybe a
+surfaceMergeDisplay parent child = case child of
+  Nothing -> parent
+  Just c -> case parent of
+    Nothing -> Just c
+    Just p -> Just {
+      read = surfaceMergeRead p.read c.read,
+      edit = surfaceMergeEdit p.edit c.edit
+    }
+
+@category "engine-internal"
+surfaceGroupForCategory : (category: String) -> String
+surfaceGroupForCategory category =
+  if eq category "atom" then "Scalar"
+  else if eq category "foundation" then "Scalar"
+  else if eq category "primitive" then "Scalar"
+  else if eq category "higher-order" then "Scalar"
+  else if eq category "format" then "Format"
+  else if eq category "entity" then "Entity"
+  else if eq category "domain" then "Domain"
+  else "Other"
+
+@category "engine-internal"
+surfaceOptionSeen : (value: String) -> (seen: List String) -> Bool
+surfaceOptionSeen value seen =
+  contains seen value
+
+@category "engine-internal"
+surfaceTargetTypeOptionsGo : (entries: List a) -> (seen: List String) -> (acc: List a) -> List a
+surfaceTargetTypeOptionsGo entries seen acc = case head entries of
+  Nothing -> acc
+  Just e ->
+    let value = e.value
+    let next =
+          if eq value ""
+          then { seen = seen, acc = acc }
+          else if surfaceOptionSeen value seen
+          then { seen = seen, acc = acc }
+          else {
+            seen = appendItem value seen,
+            acc = appendItem {
+              value = value,
+              label = e.label,
+              group = surfaceGroupForCategory e.category,
+              description = e.description,
+              type = e.type,
+              entityId = e.entityId
+            } acc
+          }
+    case tail entries of
+      Nothing -> next.acc
+      Just rest -> surfaceTargetTypeOptionsGo rest next.seen next.acc
+
+@label "surface: targetTypeOptions"
+@description "Fenel-native target-type option classification for the view editor. Dedupes catalog entries and maps catalog categories to surface option groups."
+@tags "engine" "surface" "catalog" "authoring" "ux-parity" "phase-10"
+surfaceTargetTypeOptions : (entries: List a) -> List a
+surfaceTargetTypeOptions entries =
+  surfaceTargetTypeOptionsGo entries [] []
+
+@category "engine-internal"
+surfaceMaybeName : (name: String) -> Bool
+surfaceMaybeName name =
+  not (eq name "")
+
+@category "engine-internal"
+surfaceTargetMatches : (view: a) -> (typeName: String) -> (typeKey: String) -> Bool
+surfaceTargetMatches view typeName typeKey =
+  if not view.hasTarget
+  then true
+  else if and (surfaceMaybeName view.targetName) (surfaceMaybeName typeName)
+  then eq view.targetName typeName
+  else if and (not (surfaceMaybeName view.targetName)) (not (surfaceMaybeName typeName))
+  then eq view.targetKey typeKey
+  else true
+
+@category "engine-internal"
+surfaceViewFacetMatches : (view: a) -> (typeName: String) -> (typeKey: String) -> (mode: String) -> Bool
+surfaceViewFacetMatches view typeName typeKey mode =
+  if not (surfaceTargetMatches view typeName typeKey)
+  then false
+  else if eq mode "list"
+  then view.hasListDisplay
+  else if eq mode "read"
+  then or view.hasLayout (or (not (eq view.component "")) (or (not (eq view.readComponent "")) view.hasReadDisplay))
+  else or view.hasLayout (or (not (eq view.component "")) (or (not (eq view.editComponent "")) view.hasEditDisplay))
+
+@category "engine-internal"
+surfaceFindViewByName : (views: List a) -> (name: String) -> Maybe a
+surfaceFindViewByName views name =
+  if eq name ""
+  then Nothing
+  else case head views of
+    Nothing -> Nothing
+    Just v ->
+      if eq v.name name
+      then Just v
+      else case tail views of
+        Nothing -> Nothing
+        Just rest -> surfaceFindViewByName rest name
+
+@category "engine-internal"
+surfaceViewDescription : (parent: a) -> (child: a) -> a
+surfaceViewDescription parent child =
+  if child.hasDescription then child.description else parent.description
+
+@category "engine-internal"
+surfaceViewHasDescription : (parent: a) -> (child: a) -> Bool
+surfaceViewHasDescription parent child =
+  if child.hasDescription then true else parent.hasDescription
+
+@category "engine-internal"
+surfaceViewTargetType : (parent: a) -> (child: a) -> a
+surfaceViewTargetType parent child =
+  if child.hasTarget then child.targetType else parent.targetType
+
+@category "engine-internal"
+surfaceViewTargetName : (parent: a) -> (child: a) -> String
+surfaceViewTargetName parent child =
+  if child.hasTarget then child.targetName else parent.targetName
+
+@category "engine-internal"
+surfaceViewTargetKey : (parent: a) -> (child: a) -> String
+surfaceViewTargetKey parent child =
+  if child.hasTarget then child.targetKey else parent.targetKey
+
+@category "engine-internal"
+surfaceViewLayout : (parent: a) -> (child: a) -> a
+surfaceViewLayout parent child =
+  if child.hasLayout then child.layout else parent.layout
+
+@category "engine-internal"
+surfaceViewListDisplay : (parent: a) -> (child: a) -> a
+surfaceViewListDisplay parent child =
+  if child.hasListDisplay then child.listDisplay else parent.listDisplay
+
+@category "engine-internal"
+surfaceMergeComponentName : (parentName: String) -> (childName: String) -> String
+surfaceMergeComponentName parentName childName =
+  if eq childName "" then parentName else childName
+
+@category "engine-internal"
+surfaceMergeViewWire : (parent: a) -> (child: a) -> a
+surfaceMergeViewWire parent child =
+  let display = surfaceMergeDisplay parent.display child.display
+  let readDisplay = case display of
+    Nothing -> Nothing
+    Just d -> d.read
+  let editDisplay = case display of
+    Nothing -> Nothing
+    Just d -> d.edit
+  {
+    name = child.name,
+    hasDescription = surfaceViewHasDescription parent child,
+    description = surfaceViewDescription parent child,
+    hasExtends = child.hasExtends,
+    extendsName = child.extendsName,
+    hasTarget = if child.hasTarget then true else parent.hasTarget,
+    targetName = surfaceViewTargetName parent child,
+    targetKey = surfaceViewTargetKey parent child,
+    targetType = surfaceViewTargetType parent child,
+    display = display,
+    hasLayout = if child.hasLayout then true else parent.hasLayout,
+    hasListDisplay = if child.hasListDisplay then true else parent.hasListDisplay,
+    hasReadDisplay = surfaceDisplayHasRead display,
+    hasEditDisplay = surfaceDisplayHasEdit display,
+    component = surfaceMergeComponentName parent.component child.component,
+    readComponent = surfaceMergeComponentName parent.readComponent child.readComponent,
+    editComponent = surfaceMergeComponentName parent.editComponent child.editComponent,
+    layout = surfaceViewLayout parent child,
+    listDisplay = surfaceViewListDisplay parent child,
+    readDisplay = readDisplay,
+    editDisplay = editDisplay,
+    raw = child.raw
+  }
+
+@category "engine-internal"
+surfaceResolveViewWire : (views: List a) -> (view: a) -> (seen: List String) -> a
+surfaceResolveViewWire views view seen =
+  if contains seen view.name
+  then view
+  else if not view.hasExtends
+  then view
+  else case surfaceFindViewByName views view.extendsName of
+    Nothing -> view
+    Just parent ->
+      let resolvedParent = surfaceResolveViewWire views parent (appendItem view.name seen)
+      surfaceMergeViewWire resolvedParent view
+
+@label "surface: resolve TypeView"
+@description "Fenel-owned TypeView inheritance resolver. Resolves an extends chain with a cycle guard and applies the registry display/facet merge semantics."
+@tags "engine" "surface" "typeview" "registry" "ux-parity" "phase-12"
+surfaceResolveTypeView : (views: List a) -> (name: String) -> Maybe a
+surfaceResolveTypeView views name = case surfaceFindViewByName views name of
+  Nothing -> Nothing
+  Just view -> Just (surfaceResolveViewWire views view [])
+
+@category "engine-internal"
+surfaceFindDefaultRuleGroup : (groups: List a) -> (schemaType: String) -> Maybe a
+surfaceFindDefaultRuleGroup groups schemaType = case head groups of
+  Nothing -> Nothing
+  Just group ->
+    if eq group.schemaType schemaType
+    then Just group
+    else case tail groups of
+      Nothing -> Nothing
+      Just rest -> surfaceFindDefaultRuleGroup rest schemaType
+
+@category "engine-internal"
+surfaceFirstMatchingRule : (rules: List a) -> Maybe String
+surfaceFirstMatchingRule rules = case head rules of
+  Nothing -> Nothing
+  Just rule ->
+    if rule.matched
+    then Just rule.template
+    else case tail rules of
+      Nothing -> Nothing
+      Just rest -> surfaceFirstMatchingRule rest
+
+@category "engine-internal"
+surfaceFindFallbackDefault : (defaults: List a) -> (schemaType: String) -> Maybe String
+surfaceFindFallbackDefault defaults schemaType = case head defaults of
+  Nothing -> Nothing
+  Just entry ->
+    if eq entry.schemaType schemaType
+    then Just entry.templateName
+    else case tail defaults of
+      Nothing -> Nothing
+      Just rest -> surfaceFindFallbackDefault rest schemaType
+
+@label "surface: default template name"
+@description "Fenel-owned schema-type default selection. Conditional rules are checked in order, then the fallback default is used."
+@tags "engine" "surface" "typeview" "registry" "ux-parity" "phase-12"
+surfaceDefaultTemplateName : (defaults: List a) -> (ruleGroups: List a) -> (schemaType: String) -> Maybe String
+surfaceDefaultTemplateName defaults ruleGroups schemaType =
+  case surfaceFindDefaultRuleGroup ruleGroups schemaType of
+    Just group -> case surfaceFirstMatchingRule group.rules of
+      Just name -> Just name
+      Nothing -> surfaceFindFallbackDefault defaults schemaType
+    Nothing -> surfaceFindFallbackDefault defaults schemaType
+
+@label "surface: resolve default template"
+@description "Fenel-owned default/rule template resolver. Selects the default template name for a schema type and resolves TypeView inheritance before returning it."
+@tags "engine" "surface" "typeview" "registry" "ux-parity" "phase-12"
+surfaceResolveDefaultTemplate : (views: List a) -> (defaults: List a) -> (ruleGroups: List a) -> (schemaType: String) -> Maybe a
+surfaceResolveDefaultTemplate views defaults ruleGroups schemaType =
+  case surfaceDefaultTemplateName defaults ruleGroups schemaType of
+    Nothing -> Nothing
+    Just name -> surfaceResolveTypeView views name
+
+@category "engine-internal"
+surfaceFindTargetedMatchingView : (views: List a) -> (typeName: String) -> (typeKey: String) -> (mode: String) -> Maybe a
+surfaceFindTargetedMatchingView views typeName typeKey mode = case head views of
+  Nothing -> Nothing
+  Just v ->
+    if and v.hasTarget (surfaceViewFacetMatches v typeName typeKey mode)
+    then Just v
+    else case tail views of
+      Nothing -> Nothing
+      Just rest -> surfaceFindTargetedMatchingView rest typeName typeKey mode
+
+@category "engine-internal"
+surfaceFindGenericMatchingView : (views: List a) -> (typeName: String) -> (typeKey: String) -> (mode: String) -> Maybe a
+surfaceFindGenericMatchingView views typeName typeKey mode = case head views of
+  Nothing -> Nothing
+  Just v ->
+    if and (not v.hasTarget) (surfaceViewFacetMatches v typeName typeKey mode)
+    then Just v
+    else case tail views of
+      Nothing -> Nothing
+      Just rest -> surfaceFindGenericMatchingView rest typeName typeKey mode
+
+@category "engine-internal"
+surfaceFindMatchingView : (views: List a) -> (typeName: String) -> (typeKey: String) -> (mode: String) -> Maybe a
+surfaceFindMatchingView views typeName typeKey mode =
+  case surfaceFindTargetedMatchingView views typeName typeKey mode of
+    Just v -> Just v
+    Nothing -> surfaceFindGenericMatchingView views typeName typeKey mode
+
+@label "surface: typeViewsForSurface"
+@description "Fenel-native TypeView facet matching for a target type and surface mode. Returns the raw TypeView rows whose target/facet applies."
+@tags "engine" "surface" "typeview" "authoring" "ux-parity" "phase-10"
+surfaceTypeViewsForSurface : (views: List a) -> (typeName: String) -> (typeKey: String) -> (mode: String) -> List a
+surfaceTypeViewsForSurface views typeName typeKey mode =
+  surfaceTypeViewsForSurfaceGo views typeName typeKey mode []
+
+@category "engine-internal"
+surfaceTypeViewsForSurfaceGo : (views: List a) -> (typeName: String) -> (typeKey: String) -> (mode: String) -> (acc: List a) -> List a
+surfaceTypeViewsForSurfaceGo views typeName typeKey mode acc = case head views of
+  Nothing -> acc
+  Just v ->
+    let acc2 = if surfaceViewFacetMatches v typeName typeKey mode then appendItem v.raw acc else acc
+    case tail views of
+      Nothing -> acc2
+      Just rest -> surfaceTypeViewsForSurfaceGo rest typeName typeKey mode acc2
+
+@category "engine-internal"
+surfaceSelectedViewFromCascade : (views: List a) -> (typeName: String) -> (typeKey: String) -> (mode: String) -> (options: a) -> a
+surfaceSelectedViewFromCascade views typeName typeKey mode options =
+  case surfaceFindViewByName views options.explicitViewName of
+    Just v -> { source = "explicit", view = Just v }
+    Nothing -> case surfaceFindViewByName views options.accountOverrideViewName of
+      Just v -> { source = "account-override", view = Just v }
+      Nothing -> case surfaceFindViewByName views options.userOverrideViewName of
+        Just v -> { source = "user-override", view = Just v }
+        Nothing -> case surfaceFindViewByName views options.entityDefaultViewName of
+          Just v -> { source = "entity-default", view = Just v }
+          Nothing -> case surfaceFindViewByName views options.catalogDefaultViewName of
+            Just v -> { source = "entity-default", view = Just v }
+            Nothing -> case surfaceFindMatchingView views typeName typeKey mode of
+              Just v -> { source = "matching-view", view = Just v }
+              Nothing -> { source = "inferred-structural", view = Nothing }
+
+@category "engine-internal"
+surfacePlanLayout : (view: Maybe a) -> (inferred: Maybe a) -> Maybe a
+surfacePlanLayout view inferred = case view of
+  Nothing -> inferred
+  Just v -> if v.hasLayout then Just v.layout else inferred
+
+@category "engine-internal"
+surfacePlanListDisplay : (view: Maybe a) -> (inferred: Maybe a) -> Maybe a
+surfacePlanListDisplay view inferred = case view of
+  Nothing -> inferred
+  Just v -> if v.hasListDisplay then Just v.listDisplay else inferred
+
+@category "engine-internal"
+surfacePlanReadDisplay : (view: Maybe a) -> Maybe a
+surfacePlanReadDisplay view = case view of
+  Nothing -> Nothing
+  Just v -> if v.hasReadDisplay then Just v.readDisplay else Nothing
+
+@category "engine-internal"
+surfacePlanEditDisplay : (view: Maybe a) -> Maybe a
+surfacePlanEditDisplay view = case view of
+  Nothing -> Nothing
+  Just v -> if v.hasEditDisplay then Just v.editDisplay else Nothing
+
+@category "engine-internal"
+surfacePlanComponentName : (view: Maybe a) -> (mode: String) -> Maybe String
+surfacePlanComponentName view mode = case view of
+  Nothing -> Nothing
+  Just v ->
+    let name =
+          if eq mode "edit"
+          then (if eq v.editComponent "" then v.component else v.editComponent)
+          else (if eq v.readComponent "" then v.component else v.readComponent)
+    if eq name "" then Nothing else Just name
+
+@category "engine-internal"
+surfaceInferredSource : (inferredLayout: Maybe a) -> (inferredList: Maybe a) -> String
+surfaceInferredSource inferredLayout inferredList = case inferredLayout of
+  Just layout -> if gt (length layout.sections) 0 then "inferred-structural" else case inferredList of
+    Just listDisplay -> "inferred-structural"
+    Nothing -> "universal"
+  Nothing -> case inferredList of
+    Just listDisplay -> "inferred-structural"
+    Nothing -> "universal"
+
+@label "surface: planForType"
+@description "Fenel-native specialized-surface planner. Owns TypeView cascade, view facet matching, default layout/list fallback, component-name selection, field candidates, and condition scope. TS supplies available views and override names as explicit IO leaves."
+@tags "engine" "surface" "typeview" "planner" "authoring" "ux-parity" "phase-10"
+surfacePlanForType : (t: SurfaceType) -> (rawType: a) -> (views: List a) -> (typeName: String) -> (typeKey: String) -> (mode: String) -> (options: a) -> (channel: String) -> a
+surfacePlanForType t rawType views typeName typeKey mode options channel =
+  let selected = surfaceSelectedViewFromCascade views typeName typeKey mode options
+  let inferredLayout = if or (eq mode "read") (eq mode "edit") then Just (surfaceDefaultLayoutForType t) else Nothing
+  let inferredList = if eq mode "list" then Just (surfaceDefaultListDisplayForType t) else Nothing
+  let source = case selected.view of
+    Just selectedView -> selected.source
+    Nothing -> surfaceInferredSource inferredLayout inferredList
+  { source = source
+  , view = case selected.view of
+      Just v -> Just v.raw
+      Nothing -> Nothing
+  , layout = surfacePlanLayout selected.view inferredLayout
+  , listDisplay = surfacePlanListDisplay selected.view inferredList
+  , readDisplay = surfacePlanReadDisplay selected.view
+  , editDisplay = surfacePlanEditDisplay selected.view
+  , componentName = surfacePlanComponentName selected.view mode
+  , fieldCandidates = surfaceFieldCandidates t 1
+  , conditionScope = surfaceConditionScopeForType t mode channel
+  }
+
+-- Universal value-read orchestration. Unlike SurfaceType's specialized layout
+-- carrier, these presentation projections retain the full TraversalType and
+-- every original raw type. They provide no membership or checking evidence.
+@category "engine-internal"
+surfaceReaderTypeFact : String -> List Anything -> Maybe Anything
+surfaceReaderTypeFact name facts = find (\fact -> fact.name == name) facts
+
+@category "engine-internal"
+surfaceReaderNativeStop : TraversalType -> Bool
+surfaceReaderNativeStop type = case fieldNativeAtomNamePlan type of
+  Just _ -> true
+  Nothing -> case type of
+    TtNamed { name = name } -> elem name ["Any", "Value", "Bytes", "Unit"]
+    TtOpaque { name = name } -> name == "Unit"
+    _ -> false
+
+@category "engine-internal"
+surfaceReaderTypeQueries : TraversalType -> List Anything -> List String -> List String
+surfaceReaderTypeQueries type facts seen = case type of
+  TtNamed { name = name } ->
+    if elem name seen then []
+    else case surfaceReaderTypeFact name facts of
+      Nothing -> [name]
+      Just fact -> if surfaceReaderNativeStop type then [] else case fact.type of
+        Nothing -> []
+        Just resolved -> surfaceReaderTypeQueries resolved facts (appendItem name seen)
+  TtRefined { base = base } -> surfaceReaderTypeQueries base facts seen
+  TtTagged { value = value } -> surfaceReaderTypeQueries value facts seen
+  TtOpaque { name = name, pure = pure } ->
+    let own = if name == "" then [] else case surfaceReaderTypeFact name facts of Nothing -> [name]; Just _ -> []
+    if surfaceReaderNativeStop type then own else concat own (surfaceReaderTypeQueries pure facts seen)
+  _ -> []
+
+@category "engine-internal"
+surfaceReaderMaybeQueries : Maybe TraversalType -> List Anything -> List String
+surfaceReaderMaybeQueries type facts = case type of Nothing -> []; Just node -> surfaceReaderTypeQueries node facts []
+
+@category "engine-internal"
+surfaceReaderResolveValueType : TraversalType -> List Anything -> List String -> TraversalType
+surfaceReaderResolveValueType type facts seen =
+  if surfaceReaderNativeStop type then type
+  else case type of
+    TtRefined { base = base } -> surfaceReaderResolveValueType base facts seen
+    TtTagged { value = value } -> surfaceReaderResolveValueType value facts seen
+    TtNamed { name = name } ->
+      if elem name seen then type
+      else case surfaceReaderTypeFact name facts of
+        Nothing -> type
+        Just fact -> case fact.type of
+          Nothing -> type
+          Just resolved -> surfaceReaderResolveValueType resolved facts (appendItem name seen)
+    _ -> type
+
+@category "engine-internal"
+surfaceReaderGenericType : TraversalType -> List Anything -> Bool
+surfaceReaderGenericType type facts = case type of
+  TtVar {} -> true
+  TtRefined {} -> false
+  TtTagged {} -> false
+  _ ->
+    let projected = case type of
+          TtNamed { name = name } -> case surfaceReaderTypeFact name facts of
+            Just fact -> fromMaybe type fact.type
+            Nothing -> type
+          _ -> type
+    case projected of
+      TtNamed {} -> false
+      TtRefined {} -> false
+      TtTagged {} -> false
+      _ -> case surfaceReaderResolveValueType projected facts [] of
+        TtComplement { inner = inner } -> case inner of TtVoid {} -> true; _ -> false
+        _ -> false
+
+@category "engine-internal"
+surfaceReaderKnownNominal : Maybe TraversalType -> List Anything -> Maybe String
+surfaceReaderKnownNominal type facts = case type of
+  Nothing -> Nothing
+  Just node -> case node of
+    TtNamed { name = name } -> case surfaceReaderTypeFact name facts of
+      Just fact -> case fact.type of Just _ -> Just name; Nothing -> Nothing
+      Nothing -> Nothing
+    TtOpaque { name = name } -> if name == "" then Nothing else Just name
+    _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderReflectedType : Maybe String -> List Anything -> Maybe TraversalType
+surfaceReaderReflectedType reflected facts = case reflected of
+  Nothing -> Nothing
+  Just name -> case surfaceReaderTypeFact name facts of
+    Just fact -> case fact.type of Just _ -> Just fact.reference; Nothing -> Nothing
+    Nothing -> Nothing
+
+@category "engine-internal"
+surfaceReaderDisplayType : Maybe TraversalType -> Maybe TraversalType -> Maybe String -> List Anything -> Maybe TraversalType
+surfaceReaderDisplayType declared observed reflected facts =
+  let fallback = case surfaceReaderReflectedType reflected facts of
+        Just type -> Just type
+        Nothing -> case declared of Just type -> Just type; Nothing -> observed
+  let afterObserved = case observed of
+        Just type -> if surfaceReaderGenericType type facts then fallback else Just type
+        Nothing -> fallback
+  case declared of
+    Just type -> if surfaceReaderGenericType type facts then afterObserved else Just type
+    Nothing -> afterObserved
+
+@category "engine-internal"
+surfaceReaderValueType : Maybe TraversalType -> Maybe String -> List Anything -> Maybe TraversalType
+surfaceReaderValueType declared nominal facts =
+  let inferred = case nominal of
+        Nothing -> declared
+        Just name -> case surfaceReaderTypeFact name facts of Just fact -> Just fact.reference; Nothing -> declared
+  case declared of
+    Nothing -> inferred
+    Just type -> case type of TtVar {} -> inferred; _ -> Just type
+
+@category "engine-internal"
+surfaceReaderMaybeInner : TraversalType -> Maybe TraversalType
+surfaceReaderMaybeInner type = case type of
+  TtRefined { base = base } -> surfaceReaderMaybeInner base
+  TtVariant { cases = cases } ->
+    if length cases != 2 then Nothing
+    else case setAlgebraFindCaseByName cases "Nothing" of
+      Nothing -> Nothing
+      Just absent -> if length absent.fields != 0 then Nothing else case setAlgebraFindCaseByName cases "Just" of
+        Nothing -> Nothing
+        Just present -> if length present.fields != 1 then Nothing else case head present.fields of
+          Nothing -> Nothing
+          Just field -> case field.key of
+            PositionalFieldInput { index = index } -> if index == 0 then Just field.type else Nothing
+            NoFieldKey -> if field.wireName == "_0" then Just field.type else Nothing
+            _ -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderRecordNode : TraversalType -> List Anything -> List String -> Maybe TraversalType
+surfaceReaderRecordNode type facts seen = case type of
+  TtRecord {} -> Just type
+  TtRefined { base = base } -> surfaceReaderRecordNode base facts seen
+  TtOpaque { pure = pure } -> surfaceReaderRecordNode pure facts seen
+  TtNamed { name = name } ->
+    if elem name seen then Nothing else case surfaceReaderTypeFact name facts of
+      Just fact -> case fact.type of Just next -> surfaceReaderRecordNode next facts (appendItem name seen); Nothing -> Nothing
+      Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderEntityFields : TraversalType -> List String
+surfaceReaderEntityFields type = case type of
+  TtOpaque { pure = pure } -> surfaceReaderEntityFields pure
+  TtRecord { fields = fields } -> map (\field -> field.token) fields
+  _ -> []
+
+-- A non-opaque type with one constructor has declared fields in every reader.
+-- Keep the existing record selectors and their opaque behavior unchanged.
+@category "engine-internal"
+surfaceReaderSingleCaseFields : TraversalType -> List Anything -> List String -> Maybe (List String)
+surfaceReaderSingleCaseFields type facts seen = case type of
+  TtVariant { cases = cases } ->
+    if length cases != 1 then Nothing else case head cases of
+      Just entry -> Just (map (\field -> field.token) entry.fields)
+      Nothing -> Nothing
+  TtRefined { base = base } -> surfaceReaderSingleCaseFields base facts seen
+  TtNamed { name = name } ->
+    if elem name seen then Nothing else case surfaceReaderTypeFact name facts of
+      Just fact -> case fact.type of Just next -> surfaceReaderSingleCaseFields next facts (appendItem name seen); Nothing -> Nothing
+      Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderFields : Maybe String -> Maybe TraversalType -> List Anything -> Maybe (List String)
+surfaceReaderFields nominal valueType facts = case nominal of
+  Just name -> case surfaceReaderTypeFact name facts of
+    Just fact -> case fact.type of
+      Just type -> Just (fromMaybe (surfaceReaderEntityFields type) (surfaceReaderSingleCaseFields type facts []))
+      Nothing -> surfaceReaderFields Nothing valueType facts
+    Nothing -> surfaceReaderFields Nothing valueType facts
+  Nothing -> case valueType of
+    Nothing -> Nothing
+    Just type -> case surfaceReaderRecordNode type facts [] of
+      Just (TtRecord { fields = fields }) -> Just (map (\field -> field.token) fields)
+      _ -> surfaceReaderSingleCaseFields type facts []
+
+@category "engine-internal"
+surfaceReaderValueTypesPlan : Maybe TraversalType -> Maybe TraversalType -> Maybe String -> List Anything -> Anything
+surfaceReaderValueTypesPlan declared observed reflected facts =
+  let reflectedQueries = case reflected of Nothing -> []; Just name -> case surfaceReaderTypeFact name facts of Nothing -> [name]; Just _ -> []
+  let queries = unique (concat (concat (surfaceReaderMaybeQueries declared facts) (surfaceReaderMaybeQueries observed facts)) reflectedQueries)
+  let nominal = case surfaceReaderKnownNominal declared facts of
+        Just name -> Just name
+        Nothing -> case surfaceReaderReflectedType reflected facts of Just (TtNamed { name = name }) -> Just name; _ -> Nothing
+  let valueType = surfaceReaderValueType declared nominal facts
+  let resolved = case valueType of Nothing -> Nothing; Just type -> Just (surfaceReaderResolveValueType type facts [])
+  let optional = case resolved of Nothing -> Nothing; Just type -> surfaceReaderMaybeInner type
+  let callable = case resolved of Just (TtArrow { raw = raw }) -> Just raw; _ -> Nothing
+  let universe = case resolved of Just (TtTypeUniverse {}) -> true; _ -> false
+  let numeric = case resolved of Nothing -> false; Just type -> case fieldNativeAtomNamePlan type of
+        Nothing -> false
+        Just name -> case fieldNumericTextCodecPlan name of Nothing -> false; Just _ -> true
+  { queries = queries, nominal = nominal, valueType = valueType
+  , displayType = surfaceReaderDisplayType declared observed reflected facts
+  , resolved = resolved, optional = optional, callable = callable, universe = universe, numeric = numeric
+  , fieldTokens = surfaceReaderFields nominal valueType facts
+  }
+
+@category "engine-internal"
+surfaceReaderVariantNode : TraversalType -> List Anything -> List String -> Maybe TraversalType
+surfaceReaderVariantNode type facts seen = case type of
+  TtVariant {} -> Just type
+  TtRefined { base = base } -> surfaceReaderVariantNode base facts seen
+  TtOpaque { pure = pure } -> surfaceReaderVariantNode pure facts seen
+  TtNamed { name = name } -> if elem name seen then Nothing else case surfaceReaderTypeFact name facts of
+    Just fact -> case fact.type of Just next -> surfaceReaderVariantNode next facts (appendItem name seen); Nothing -> Nothing
+    Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderChildTypePlan : Maybe TraversalType -> Maybe Anything -> Anything -> Maybe String -> List Anything -> Maybe Anything
+surfaceReaderChildTypePlan shape listElement key tag facts =
+  if isNumber key then listElement
+  else case shape of
+    Nothing -> Nothing
+    Just type ->
+      let fields = case surfaceReaderRecordNode type facts [] of
+            Just (TtRecord { fields = fields }) -> fields
+            _ -> case tag of
+              Just name -> case surfaceReaderVariantNode type facts [] of
+                Just (TtVariant { cases = cases }) -> case find (\entry -> entry.name == name) cases of Just entry -> entry.fields; Nothing -> []
+                _ -> []
+              Nothing -> []
+      case find (\field -> field.wireName == key) fields of Just field -> Just field.type.raw; Nothing -> Nothing
+
+@category "engine-internal"
+surfaceReaderOwnString : Anything -> String -> Maybe String
+surfaceReaderOwnString value name = case representationSnapshotField (representationValueSnapshot value) name of
+  Just text -> if isString text then Just text else Nothing
+  Nothing -> Nothing
+
+@category "engine-internal"
+surfaceReaderReference : Anything -> Maybe String
+surfaceReaderReference value = case representationValueSnapshot value of
+  SnapshotRecord fields ->
+    let direct = surfaceReaderOwnString value "$ref"
+    case direct of
+      Just name -> if name != "" && length fields == 1 then Just name else Nothing
+      Nothing -> if std.some fields (\field -> field.name == "$ref") then Nothing else case surfaceReaderOwnString value "$pin" of
+        Just kind -> if kind == "" then Nothing else case surfaceReaderOwnString value "id" of Just name -> if name == "" then Nothing else Just name; Nothing -> Nothing
+        Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderGlyphKeys : Anything -> Maybe String -> Maybe String -> List String
+surfaceReaderGlyphKeys value reflected nominal =
+  let own = concat (surfaceReaderMaybeNames (surfaceReaderOwnString value "$tag")) (surfaceReaderMaybeNames (surfaceReaderReference value))
+  let owners = concat (surfaceReaderMaybeNames reflected) (surfaceReaderMaybeNames nominal)
+  unique (filter (\name -> name != "") (concat own owners))
+
+@category "engine-internal"
+surfaceReaderMaybeNames : Maybe String -> List String
+surfaceReaderMaybeNames value = case value of Just name -> [name]; Nothing -> []
+
+@category "engine-internal"
+surfaceReaderDemandedGlyphKeys : Bool -> Anything -> Maybe String -> Maybe String -> List String
+surfaceReaderDemandedGlyphKeys enabled value reflected nominal = if enabled then surfaceReaderGlyphKeys value reflected nominal else []
+
+@category "engine-internal"
+surfaceReaderTypeLike : Anything -> Bool
+surfaceReaderTypeLike value = case representationValueSnapshot value of
+  SnapshotRecord fields -> std.some fields (\field -> elem field.name ["$void", "$unit", "$var", "$type", "$record", "$variant", "$tuple", "$map", "$union", "$intersect", "$complement", "$refined", "$mu", "$tagged", "$opaque", "$arrow", "$el"] || (field.name == "$ref" && isString field.value))
+  _ -> false
+
+@category "engine-internal"
+@label "Picture glyph"
+@fieldLabel "GlyphPictureReference.handle" "Picture reference"
+@fieldLabel "GlyphPictureInline.image" "Picture"
+SurfaceGlyphPicture = GlyphPictureReference handle: String | GlyphPictureInline image: Image
+
+-- References stay inert until the current reader asks to draw the picture.
+-- Inline images use the same physical Image recognition as the media reader,
+-- with a bounded thumbnail payload. This is presentation, never membership.
+@category "engine-internal"
+surfaceReaderGlyphPicture : Anything -> Maybe SurfaceGlyphPicture
+surfaceReaderGlyphPicture value = case surfaceReaderOwnString value "$ref" of
+  Just handle -> if surfaceReaderReference value == Just handle then Just (GlyphPictureReference { handle = handle }) else Nothing
+  Nothing ->
+    let snapshot = representationValueSnapshot value
+    case surfaceReaderMediaNaturalField snapshot "width" of
+      Nothing -> Nothing
+      Just width -> case surfaceReaderMediaNaturalField snapshot "height" of
+        Nothing -> Nothing
+        Just height ->
+          if width > 0 && height > 0 && width * height <= 16384 then
+            if surfaceReaderMediaInlineImage value then Just (GlyphPictureInline { image = value }) else Nothing
+          else Nothing
+
+@category "engine-internal"
+surfaceReaderGlyphPlan : List Anything -> List String -> Anything
+surfaceReaderGlyphPlan facts icons = case head facts of
+  Nothing -> { picture = Nothing, icon = Nothing, emoji = Nothing }
+  Just fact ->
+    let snapshot = representationValueSnapshot fact
+    let rawPicture = fromMaybe Nothing (representationSnapshotField snapshot "picture")
+    let picture = case rawPicture of Just value -> surfaceReaderGlyphPicture value; _ -> Nothing
+    case picture of
+      Just selected -> { picture = Just selected, icon = surfaceReaderKnownIcon fact.icon icons, emoji = surfaceReaderGlyphEmoji fact.emoji }
+      Nothing -> case fact.icon of
+        Just icon -> if isString icon && icon != "" && elem icon icons then { picture = Nothing, icon = Just icon, emoji = Nothing } else surfaceReaderEmojiPlan fact facts icons
+        Nothing -> surfaceReaderEmojiPlan fact facts icons
+
+@category "engine-internal"
+surfaceReaderGlyphEmoji : Maybe Anything -> Maybe String
+surfaceReaderGlyphEmoji value = case value of
+  Just text -> if isString text && trim text != "" then Just (trim text) else Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderEmojiPlan : Anything -> List Anything -> List String -> Anything
+surfaceReaderEmojiPlan fact facts icons = case fact.emoji of
+  Just text -> if isString text && trim text != "" then { picture = Nothing, icon = Nothing, emoji = Just (trim text) } else surfaceReaderGlyphPlan (fromMaybe [] (tail facts)) icons
+  Nothing -> surfaceReaderGlyphPlan (fromMaybe [] (tail facts)) icons
+
+@category "engine-internal"
+surfaceReaderIconTarget : Maybe TraversalType -> Maybe String -> Anything
+surfaceReaderIconTarget type reflected =
+  let declared = case type of Just (TtNamed { name = name }) -> Just name; Just (TtOpaque { name = name }) -> Just name; _ -> Nothing
+  let identity = case declared of Just name -> Just name; Nothing -> reflected
+  let target = case declared of Just name -> Just name; Nothing -> case type of Just node -> Just node.raw; Nothing -> identity
+  let kind = case type of Just (TtRecord {}) -> Just "Record"; Just (TtArrow {}) -> Just "Function"; _ -> Nothing
+  { declared = declared, identity = identity, target = target, kind = kind }
+
+@category "engine-internal"
+surfaceReaderIconPlan : Anything -> Maybe Anything -> Maybe Anything -> Maybe String -> List String -> Anything -> String
+surfaceReaderIconPlan request scoped reflected canonical icons fallbacks =
+  let selected = case scoped of Just icon -> Just icon; Nothing -> case request.declared of Just _ -> Nothing; Nothing -> reflected
+  let fallback = fromMaybe "type" (mapGet fallbacks "Type")
+  let byKind = case request.kind of Just kind -> fromMaybe fallback (mapGet fallbacks kind); Nothing -> fallback
+  let byIdentity = case request.identity of Just identity -> fromMaybe byKind (mapGet fallbacks identity); Nothing -> byKind
+  let byName = case canonical of Just name -> fromMaybe byIdentity (mapGet fallbacks name); Nothing -> byIdentity
+  case selected of Just icon -> if isString icon && icon != "" && elem icon icons then icon else byName; Nothing -> byName
+
+@category "engine-internal"
+surfaceReaderKnownIcon : Maybe Anything -> List String -> Maybe String
+surfaceReaderKnownIcon value icons = case value of Just icon -> if isString icon && icon != "" && elem icon icons then Just icon else Nothing; Nothing -> Nothing
+
+@category "engine-internal"
+surfaceReaderReflection : Anything -> Anything -> Maybe String
+surfaceReaderReflection value owners = case representationValueSnapshot value of
+  SnapshotNumber _ -> Just "Number"
+  SnapshotString _ -> Just "String"
+  SnapshotBoolean _ -> Just "Boolean"
+  SnapshotArray _ -> Just "List"
+  SnapshotRecord _ -> case surfaceReaderOwnString value "$tag" of
+    Just name -> Just (fromMaybe name (representationSnapshotField (representationValueSnapshot owners) name))
+    Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderIconFallbackTarget : Anything -> Maybe Anything -> Maybe String
+surfaceReaderIconFallbackTarget request scoped = case scoped of
+  Just _ -> Nothing
+  Nothing -> case request.declared of
+    Just _ -> Nothing
+    Nothing -> case request.identity of
+      Nothing -> Nothing
+      Just identity -> case request.target of
+        Just target -> if isString target && target == identity then Nothing else Just identity
+        Nothing -> Nothing
+
+@category "engine-internal"
+surfaceReaderRepresentationTarget : Maybe String -> Maybe TraversalType -> Maybe Anything
+surfaceReaderRepresentationTarget nominal type = case nominal of
+  Just name -> Just name
+  Nothing -> case type of Just node -> Just node.raw; Nothing -> Nothing
+
+@category "engine-internal"
+surfaceReaderFieldType : Maybe TraversalType -> Anything -> Anything
+surfaceReaderFieldType type fallback = case type of Just node -> node.raw; Nothing -> fallback
+
+@category "engine-internal"
+surfaceReaderThumbnailIcon : Maybe TraversalType -> Maybe String -> String -> Maybe String
+surfaceReaderThumbnailIcon type nominal icon = case type of Just _ -> Just icon; Nothing -> case nominal of Just _ -> Just icon; Nothing -> Nothing
+
+@category "engine-internal"
+surfaceReaderLocaleText : Anything -> Maybe String
+surfaceReaderLocaleText value = if isString value then Just value else case representationValueSnapshot value of
+  SnapshotRecord fields -> case surfaceReaderOwnString value "en" of
+    Just text -> Just text
+    Nothing -> case find (\field -> isString field.value) fields of Just field -> Just field.value; Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderCaption : Maybe Anything -> Maybe String -> Maybe Anything
+surfaceReaderCaption label code =
+  let human = case label of Just value -> surfaceReaderLocaleText value; Nothing -> Nothing
+  let codeText = case code of Just text -> trim text; Nothing -> ""
+  case human of
+    Just text -> if trim text != "" && trim text != codeText then Just { text = text, code = false }
+      else if codeText != "" then Just { text = fromMaybe "" code, code = true } else Nothing
+    Nothing -> if codeText != "" then Just { text = fromMaybe "" code, code = true } else Nothing
+
+@category "engine-internal"
+surfaceReaderViewName : Anything -> Maybe String
+surfaceReaderViewName value = if isString value then Just value else case representationValueSnapshot value of
+  SnapshotRecord _ ->
+    if surfaceReaderOwnString value "$tag" != Just "Just" then Nothing
+    else case representationSnapshotField (representationValueSnapshot value) "_0" of
+      Just name -> if isString name then Just name else Nothing
+      Nothing -> Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderViewCandidates : List Anything -> List Anything -> List String -> Maybe Anything
+surfaceReaderViewCandidates names views components = case head names of
+  Nothing -> Nothing
+  Just name -> case surfaceReaderViewName name of
+    Nothing -> surfaceReaderViewCandidates (fromMaybe [] (tail names)) views components
+    Just text -> case surfaceResolveTypeView views text of
+      Nothing -> surfaceReaderViewCandidates (fromMaybe [] (tail names)) views components
+      Just view ->
+        let component = if view.readComponent != "" then view.readComponent else view.component
+        if (component != "" && elem component components) || view.hasLayout || view.hasReadDisplay then Just view else surfaceReaderViewCandidates (fromMaybe [] (tail names)) views components
+
+@category "engine-internal"
+surfaceReaderViewPlan : List Anything -> List String -> Anything -> Bool -> Bool -> Bool -> Anything
+surfaceReaderViewPlan views components methods compact hasFields record =
+  let observed = representationValueSnapshot methods
+  let names = concat (if compact then [fromMaybe "" (representationSnapshotField observed "defaultInlineView")] else []) [fromMaybe "" (representationSnapshotField observed "defaultView")]
+  let selected = surfaceReaderViewCandidates names views components
+  let useLayout = case selected of
+        Nothing -> false
+        Just view ->
+          let component = if view.readComponent != "" then view.readComponent else view.component
+          view.hasLayout && not (component != "" && elem component components) && hasFields && record
+  { view = selected, useLayout = useLayout }
+
+@category "engine-internal"
+surfaceReaderTransferStep : TraversalType -> List Anything -> List String -> Anything
+surfaceReaderTransferStep type facts seen = case type of
+  TtRefined { base = base } -> surfaceReaderTransferStep base facts seen
+  TtEl { raw = raw } -> { type = type, dependent = Just raw }
+  TtApp { raw = raw } -> { type = type, dependent = Just raw }
+  TtNamed { name = name } -> if elem name ["String", "Char"] || elem name seen then { type = type, dependent = Nothing }
+    else case surfaceReaderTypeFact name facts of
+      Just fact -> case fact.type of
+        Just node -> surfaceReaderTransferStep node facts (appendItem name seen)
+        Nothing -> { type = type, dependent = Nothing }
+      Nothing -> { type = type, dependent = Nothing }
+  _ -> { type = type, dependent = Nothing }
+
+@category "engine-internal"
+surfaceReaderBodyPlan : Anything -> Anything -> Bool -> Bool -> Anything
+surfaceReaderBodyPlan value types typeLike preview =
+  let snapshot = representationValueSnapshot value
+  let held = types.universe && typeLike
+  let body = if held then "held-type" else case types.callable of Just _ -> "callable-type"; Nothing -> case types.optional of
+        Just _ -> "optional"
+        Nothing -> if preview then "preview" else case snapshot of SnapshotArray _ -> "collection"; SnapshotString _ -> "string"; SnapshotRecord _ -> "structural"; SnapshotUnreadable -> "structural"; _ -> "scalar"
+  let structure = if preview then "leaf" else case snapshot of SnapshotArray _ -> "array"; SnapshotRecord _ -> "record"; _ -> "leaf"
+  { body = body, structure = structure, recordLabel = fromMaybe "Record" (surfaceReaderOwnString value "$tag")
+  , recordCarrier = case snapshot of SnapshotRecord _ -> true; SnapshotUnreadable -> true; _ -> false
+  , held = held, present = surfaceReaderOwnString value "$tag" == Just "Just" }
+
+-- Source port of data-preview-shape.ts and image-canvas-data.ts predicates.
+-- The existing descriptor snapshot boundary supplies physical carrier facts.
+-- Binary is the host's ArrayBuffer/ArrayBuffer.isView observation. All other
+-- classification is source-owned. This is presentation, never membership.
+
+@category "engine-internal"
+surfaceReaderMediaString : Anything -> Maybe String
+surfaceReaderMediaString value = case representationValueSnapshot value of
+  SnapshotString text -> Just text
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderMediaStringField : RepresentationValueSnapshot -> String -> Bool
+surfaceReaderMediaStringField snapshot name = case representationSnapshotField snapshot name of
+  Nothing -> false
+  Just value -> case surfaceReaderMediaString value of Just _ -> true; Nothing -> false
+
+@category "engine-internal"
+surfaceReaderMediaArrayField : RepresentationValueSnapshot -> String -> Maybe (List Anything)
+surfaceReaderMediaArrayField snapshot name = case representationSnapshotField snapshot name of
+  Nothing -> Nothing
+  Just value -> case representationValueSnapshot value of SnapshotArray items -> Just items; _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderMediaImageLike : Anything -> Bool
+surfaceReaderMediaImageLike value = case surfaceReaderMediaString value of
+  Nothing -> false
+  Just text ->
+    let lowered = lower text
+    startsWith text "data:image/" || std.some ["png", "jpg", "jpeg", "gif", "webp", "svg"] (\extension -> endsWith lowered (concat "." extension) || std.contains lowered (concat (concat "." extension) "?"))
+
+@category "engine-internal"
+surfaceReaderMediaFileUrl : String -> Bool
+surfaceReaderMediaFileUrl text =
+  let lowered = lower text
+  if startsWith lowered "http://" || startsWith lowered "https://" then true
+  else if not (startsWith lowered "data:") then false
+  else
+    let parts = split (join (drop 5 (chars lowered)) "") ";"
+    case head parts of
+      Nothing -> false
+      Just mime -> if mime == "" || contains mime "," then false else case head (fromMaybe [] (tail parts)) of
+        Nothing -> false
+        Just encoded -> startsWith encoded "base64,"
+
+@category "engine-internal"
+surfaceReaderMediaFile : Anything -> Bool
+surfaceReaderMediaFile value =
+  let snapshot = representationValueSnapshot value
+  case snapshot of
+    SnapshotRecord _ ->
+      let url = case representationSnapshotField snapshot "url" of Nothing -> Nothing; Just raw -> surfaceReaderMediaString raw
+      let size = case representationSnapshotField snapshot "size" of Nothing -> false; Just raw -> case representationValueSnapshot raw of SnapshotNumber _ -> true; _ -> false
+      case url of
+        Nothing -> false
+        Just text -> surfaceReaderMediaFileUrl text && surfaceReaderMediaStringField snapshot "name" && surfaceReaderMediaStringField snapshot "mimeType" && size
+    _ -> false
+
+-- surfaceReaderMediaPixel writes this test out for each channel; keep the two in step.
+@category "engine-internal"
+surfaceReaderMediaSafeNatural : Anything -> Maybe Number
+surfaceReaderMediaSafeNatural value = case representationValueSnapshot value of
+  SnapshotNumber number -> if numberIsFinite number && number >= 0 && number <= 9007199254740991 && floor number == number then Just number else Nothing
+  _ -> Nothing
+
+@category "engine-internal"
+surfaceReaderMediaNaturalField : RepresentationValueSnapshot -> String -> Maybe Number
+surfaceReaderMediaNaturalField snapshot name = case representationSnapshotField snapshot name of
+  Nothing -> Nothing
+  Just value -> surfaceReaderMediaSafeNatural value
+
+-- A pixel is a record whose fields r, g, b and a are each a safe natural;
+-- other fields are allowed. One std fold over its own fields reads each field
+-- once (Nov 12; it was four find walks, each channel then snapshotted again):
+-- a channel field adds 1 when it is a safe natural and 1000 when it is not.
+-- Own field names are unique (the snapshot lists getOwnPropertyNames), so the
+-- total is 4 exactly when each channel is present once and every one is a
+-- safe natural. The channel test is surfaceReaderMediaSafeNatural's, written
+-- out: isNumber is its SnapshotNumber case (typeof "number"); keep the two
+-- in step. About 19 times faster per picture than the snapshot per channel.
+@category "engine-internal"
+surfaceReaderMediaPixel : Anything -> Bool
+surfaceReaderMediaPixel value = case representationValueSnapshot value of
+  SnapshotRecord fields ->
+    let score = fold (\total field -> if field.name != "r" && field.name != "g" && field.name != "b" && field.name != "a" then total else if isNumber field.value && numberIsFinite field.value && field.value >= 0 && field.value <= 9007199254740991 && floor field.value == field.value then total + 1 else total + 1000) 0 fields
+    score == 4
+  _ -> false
+
+@category "engine-internal"
+surfaceReaderMediaInlineImage : Anything -> Bool
+surfaceReaderMediaInlineImage value =
+  let snapshot = representationValueSnapshot value
+  case surfaceReaderMediaNaturalField snapshot "width" of
+    Nothing -> false
+    Just width -> case surfaceReaderMediaNaturalField snapshot "height" of
+      Nothing -> false
+      Just height -> case surfaceReaderMediaArrayField snapshot "pixels" of
+        Nothing -> false
+        Just pixels -> width * height == length pixels && all pixels surfaceReaderMediaPixel
+
+-- The siblings of a markup level are walked by the host (std fold), not by one
+-- nested self-call per sibling (no tail calls: a worker's stack holds under 200
+-- nestings on a first read, Nov 11). Same verdict and budget: the walk stops
+-- checking at the first invalid sibling and returns its state unchanged.
+@category "engine-internal"
+surfaceReaderMediaMarkupChildren : List Anything -> Number -> Number -> { valid: Bool, remaining: Number }
+surfaceReaderMediaMarkupChildren children depth remaining =
+  let walked = fold (\state child -> if state.valid then surfaceReaderMediaMarkupState child depth state.remaining else state) { valid = true, remaining = remaining } children
+  if walked.valid then { valid = true, remaining = walked.remaining } else walked
+
+@category "engine-internal"
+surfaceReaderMediaMarkupField : RepresentationValueSnapshot -> String -> Number -> Number -> { valid: Bool, remaining: Number }
+surfaceReaderMediaMarkupField snapshot name depth remaining = case surfaceReaderMediaArrayField snapshot name of
+  Nothing -> { valid = false, remaining = remaining }
+  Just children -> surfaceReaderMediaMarkupChildren (take 100 children) depth remaining
+
+@category "engine-internal"
+surfaceReaderMediaMarkupState : Anything -> Number -> Number -> { valid: Bool, remaining: Number }
+surfaceReaderMediaMarkupState value depth remaining =
+  let next = remaining - 1
+  if next < 0 then { valid = true, remaining = next }
+  else
+    let snapshot = representationValueSnapshot value
+    case snapshot of
+      SnapshotRecord _ ->
+        if depth > 64 then { valid = false, remaining = next }
+        else
+          let tag = case representationSnapshotField snapshot "$tag" of Nothing -> Nothing; Just raw -> surfaceReaderMediaString raw
+          case tag of
+            Nothing -> { valid = false, remaining = next }
+            Just name ->
+              if name == "Text" then { valid = surfaceReaderMediaStringField snapshot "content", remaining = next }
+              else if name == "Image" then { valid = surfaceReaderMediaStringField snapshot "src" && surfaceReaderMediaStringField snapshot "alt", remaining = next }
+              else if elem name ["Bold", "Italic", "Heading", "Link"] then
+                case representationSnapshotField snapshot "child" of
+                  Just child -> surfaceReaderMediaMarkupState child (depth + 1) next
+                  Nothing -> { valid = next - 1 < 0, remaining = next - 1 }
+              else if name == "Paragraph" || name == "Fragment" then surfaceReaderMediaMarkupField snapshot "children" (depth + 1) next
+              else if name == "List" then surfaceReaderMediaMarkupField snapshot "items" (depth + 1) next
+              else { valid = false, remaining = next }
+      _ -> { valid = false, remaining = next }
+
+@category "engine-internal"
+surfaceReaderHasPreview : Anything -> Bool -> Bool
+surfaceReaderHasPreview value binary =
+  if binary then true
+  else if surfaceReaderMediaFile value then true
+  else if surfaceReaderMediaImageLike value then true
+  else if surfaceReaderMediaInlineImage value then true
+  else
+    let checked = surfaceReaderMediaMarkupState value 0 300
+    checked.valid
+
+-- Immediate physical children retain their actual JSON key. References are
+-- ordinary records here; their navigation/meaning belongs to the caller.
+-- The strict worker transport admits enumerable own data before this snapshot.
+@category "engine-internal"
+surfaceReaderPhysicalChildren : Anything -> List ({ key: Anything, label: String })
+surfaceReaderPhysicalChildren value = case representationValueSnapshot value of
+  SnapshotArray items -> map (\row -> { key = row.index, label = concat "Item " (toString (row.index + 1)) }) (asbIndexed items)
+  SnapshotRecord fields -> map (\field -> { key = field.name, label = field.name }) (filter (\field -> field.name != "$tag") fields)
+  _ -> []

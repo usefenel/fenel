@@ -1,0 +1,211 @@
+-- =========================================================================
+-- Time — wall-clock instants and spans.
+--
+-- module-substrate Phase 3b (2026-05-30) — the FIRST native-carrying
+-- `FenelModule` → `module … where` migration, and the proof of the `ffi/`
+-- split. This file is now the SOURCE OF TRUTH for the module's signatures,
+-- identity, entities, and Fenel bodies. The FOREIGN-IO half — the irreducible
+-- host-time calls (`now` / `hostDateParse` / `formatIsoTimestamp` / `nowIso`)
+-- — lives in `fenel/modules/time/ffi/time-ffi.ts`; here they are `@native`
+-- FOREIGN DECLARATIONS (sig + identity facets, NO body). The seam
+-- (`engine/src/modules/time.ts`) loads this file, imports the ffi leaf, and
+-- reassembles the `FenelModule`.
+--
+-- Consolidation note: this file unions the four pre-migration `.fenel` files
+-- (`types.fenel` + `timestamp.fenel` + `duration.fenel` +
+-- `parse-iso-timestamp.fenel`) into ONE `module time where` file. That is
+-- authoring a single file — NOT the cross-file header-UNION (multiple files
+-- sharing one header), which is a separate pending frontier (roadmap 3d). The
+-- header keeps the LEGACY lowercase `time:` id-prefix + `time` category
+-- byte-identical (PascalCase canonicalisation is a deferred coordinated sweep).
+--
+-- `Timestamp` is a point in time (ms since the Unix epoch); `Duration` is a
+-- span between two points (also in ms). Both are records (single constructor,
+-- all named fields) — the constructor functions `timestamp` and `duration`
+-- build them. Their compact one-line spelling remains a parser compatibility
+-- control; indented named-field continuations are also supported.
+-- =========================================================================
+
+module time where
+
+using std (isNumber, isString, numberIsFinite, floor, mod, not, contains, chars, all, length, slice, join, padStart, toString, tryParseInt)
+
+Timestamp = Timestamp epochMs: Number
+
+Duration = Duration ms: Number
+
+-- ----- Foreign declarations (native-backed; impl in ffi/time-ffi.ts) -------
+-- Each is a single irreducible host call (`Date.*`) — wall-clock and ISO 8601
+-- parsing/formatting the JS runtime forces on us. No Fenel body: the registry
+-- resolves the call to the `nativeImpls` leaf keyed by codeName.
+
+@native
+@label "Now"
+@description "Current wall-clock time as a Timestamp (ms since epoch). Effectful — successive calls return different values."
+@requires "HasTime"
+@tags "time" "primitive" "effect"
+now : Timestamp
+
+@native
+@label "Host Date.parse"
+@description "Irreducible IO leaf — ask the host runtime to parse an ISO 8601 string into epoch milliseconds. Nothing if the input isn't a recognised date format. Prefer `parseIsoTimestamp` which wraps the result in a Timestamp record."
+@tags "time" "primitive" "io"
+hostDateParse : (iso: String) -> Maybe Number
+
+@native
+@label "Format ISO timestamp"
+@description "Format a Timestamp as an ISO 8601 string in UTC."
+@tags "time" "format"
+formatIsoTimestamp : (t: Timestamp) -> String
+
+@native
+@label "Now (ISO 8601)"
+@description "Phase 12d sub-step 3 — current wall-clock as an ISO 8601 string in UTC, in one call. Equivalent to `formatIsoTimestamp now` but a single sync native — `new Date().toISOString()`. Effectful; successive calls return different values."
+@requires "HasTime"
+@tags "time" "primitive" "effect"
+nowIso : String
+
+-- ----- Constructors (pure Fenel bodies) ------------------------------------
+-- timestamp / duration are pure record construction. The pre-Phase-5b2 TS
+-- natives carried a `Number(x) || 0` defensive coercion against JS
+-- null/undefined/NaN; the Fenel ports omit it — the typed spec (`Number`)
+-- guarantees the caller passes a Number. The constructed value carries
+-- `$tag: "Timestamp"` / `"Duration"` so downstream consumers identify it.
+
+timestamp : Number -> Timestamp
+@label "Timestamp"
+@description "Build a Timestamp from milliseconds since the Unix epoch."
+@tags "time" "constructor"
+timestamp epochMs = Timestamp { epochMs = epochMs }
+
+duration : Number -> Duration
+@label "Duration"
+@description "Build a Duration from a number of milliseconds."
+@tags "time" "constructor"
+duration ms = Duration { ms = ms }
+
+-- parseIsoTimestamp — wrap the host's ISO 8601 parser into a Timestamp record.
+-- The irreducible IO is `hostDateParse` (Date.parse), which returns Maybe
+-- Number (epoch ms); Fenel does the record construction. Uses the named-
+-- constructor form `Timestamp { epochMs = ms }` (an anonymous `{ epochMs = ms }`
+-- literal triggered a parser ambiguity that lowered to an `epochMs ms` call on
+-- the JS/WASM self-host targets).
+parseIsoTimestamp : String -> Maybe Timestamp
+@label "Parse ISO timestamp"
+@description "Parse an ISO 8601 string into a Timestamp. Nothing on parse failure."
+@tags "time" "parser"
+parseIsoTimestamp iso =
+  case hostDateParse iso of
+    Nothing -> Nothing
+    Just ms -> Just (Timestamp { epochMs = ms })
+
+-- ----- Span arithmetic + comparisons (pure; auto-derived identity) ---------
+-- These 8 helpers carry no `@facet` directives: the `module time where` header
+-- supplies the `time` category and the humanized codeName is the Labelable
+-- default ("addDuration" → "Add Duration"), exactly the auto-identity the
+-- pre-migration `loadFenelModule(TIME_SRC, "time")` produced. Parity is
+-- preserved without directives.
+
+addDuration : Timestamp -> Duration -> Timestamp
+addDuration t d = timestamp (t.epochMs + d.ms)
+
+diffTimestamps : Timestamp -> Timestamp -> Duration
+diffTimestamps a b = duration (a.epochMs - b.epochMs)
+
+before : Timestamp -> Timestamp -> Boolean
+before a b = a.epochMs < b.epochMs
+
+after : Timestamp -> Timestamp -> Boolean
+after a b = a.epochMs > b.epochMs
+
+seconds : Number -> Duration
+seconds n = duration (n * 1000)
+
+minutes : Number -> Duration
+minutes n = duration (n * 60000)
+
+hours : Number -> Duration
+hours n = duration (n * 3600000)
+
+days : Number -> Duration
+days n = duration (n * 86400000)
+
+-- ----- Calendar days: ordinary source type and checked text codec ----------
+-- CalendarDate keeps its source identity and carries no Date alias.
+-- Its presentation label is Date; this does not rename the legacy Date type.
+-- Existing bare Date schemas keep their legacy date-text contract.
+-- The runtime value is the exact year/month/day record, without a host clock,
+-- offset or timezone. ISO text is an explicit codec, not a runtime coercion.
+-- A record with extra data is not an inhabitant: encoding may not drop fields.
+
+@entity
+@label "Date"
+@icon "calendar"
+@description "A valid Gregorian calendar day from 0001-01-01 through 9999-12-31, without a time or timezone. The explicit text codec uses exactly YYYY-MM-DD."
+CalendarDate = { year: Int, month: Int, day: Int } | calendarDateValid value
+
+calendarDateWholeWithin : (minimum: Number) -> (maximum: Number) -> (value: Number) -> Boolean
+calendarDateWholeWithin minimum maximum value =
+  if not (isNumber value) then false
+  else if not (numberIsFinite value) then false
+  else floor value == value && value >= minimum && value <= maximum
+
+calendarDateLeapYear : Int -> Boolean
+calendarDateLeapYear year = mod year 400 == 0 || (mod year 4 == 0 && mod year 100 != 0)
+
+calendarDateMonthLength : Int -> Int -> Int
+calendarDateMonthLength year month =
+  if month == 2 then if calendarDateLeapYear year then 29 else 28
+  else if month == 4 || month == 6 || month == 9 || month == 11 then 30
+  else 31
+
+calendarDateValid : { year: Int, month: Int, day: Int } -> Boolean
+calendarDateValid value =
+  if not (calendarDateWholeWithin 1 9999 value.year) then false
+  else if not (calendarDateWholeWithin 1 12 value.month) then false
+  else if not (calendarDateWholeWithin 1 (calendarDateMonthLength value.year value.month) value.day) then false
+  else value == { year = value.year, month = value.month, day = value.day }
+
+calendarDate : (year: Int) -> (month: Int) -> (day: Int) -> Result String CalendarDate
+calendarDate year month day =
+  let value = { year = year, month = month, day = day }
+  if calendarDateValid value then Ok value
+  else Err "Calendar Date requires a valid Gregorian day in years 0001 through 9999."
+
+calendarDateDigit : String -> Boolean
+calendarDateDigit character = contains "0123456789" character
+
+calendarDateTextShape : String -> Boolean
+calendarDateTextShape input =
+  if not (isString input) then false
+  else if length input != 10 then false
+  else if slice input 4 5 != "-" || slice input 7 8 != "-" then false
+  else all (chars (join [slice input 0 4, slice input 5 7, slice input 8 10] "")) calendarDateDigit
+
+decodeCalendarDate : String -> Result String CalendarDate
+decodeCalendarDate input =
+  if not (calendarDateTextShape input) then Err "Calendar Date text must be exactly YYYY-MM-DD."
+  else case tryParseInt (slice input 0 4) of
+    Nothing -> Err "Calendar Date year is not an integer."
+    Just year -> case tryParseInt (slice input 5 7) of
+      Nothing -> Err "Calendar Date month is not an integer."
+      Just month -> case tryParseInt (slice input 8 10) of
+        Nothing -> Err "Calendar Date day is not an integer."
+        Just day -> calendarDate year month day
+
+encodeCalendarDate : CalendarDate -> Result String String
+encodeCalendarDate value =
+  if not (calendarDateValid value) then Err "Cannot encode an invalid Calendar Date."
+  else Ok (join [padStart (toString value.year) 4 "0", padStart (toString value.month) 2 "0", padStart (toString value.day) 2 "0"] "-")
+
+-- Existing Iso's serialized-side law is conditional on successful decode.
+-- It does not assert that every String is a CalendarDate. The decoder's
+-- successful domain is canonical valid YYYY-MM-DD text; failures stay Err.
+calendarDateIso : Iso String CalendarDate
+calendarDateIso = Iso { encode = time.encodeCalendarDate, decode = time.decodeCalendarDate }
+
+-- A CalendarDate reads as one date ("3 Nov 2026" in the reader's locale), in
+-- cards and table cells, through the shared built-in "calendar-date" view.
+-- Entry remains the universal record editor (year, month, day).
+calendarDateViewable : Viewable CalendarDate
+calendarDateViewable = Viewable { defaultView = "calendar-date", defaultInlineView = "calendar-date" }

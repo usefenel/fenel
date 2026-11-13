@@ -1,0 +1,469 @@
+module engine where
+
+-- =========================================================================
+-- declaration-names — what `_` may be, and when two declarations clash.
+-- modules-as-values Phase 3a (design/module-system.md §3 and §4).
+--
+-- `_` means "no name". An unnamed declaration is an instance: it is found by
+-- its type and parameters, never by name, so it needs a signature. Each `_`
+-- signature pairs with the `_` definition immediately after it, and several
+-- pairs may share a file.
+--
+-- A file-top selection (`using std (map)`) opens a name in every file of the
+-- module; two selections of one name from two different sources are an error
+-- naming both (§4: an ambiguous name is an error, never last-wins).
+--
+-- A name declared twice is an error, never a silent overwrite: two
+-- definitions, two signatures or two type declarations of one name, or two
+-- functions registered under one effective code name (the `@codeName`, or the
+-- name when there is none). `_` never clashes, and neither do the type and
+-- parameters of two instances: `Infixable "std:and"` is declared once per
+-- spelling.
+--
+-- THIS FILE IS THE SOURCE OF TRUTH. The loader runs before any Fenel code can,
+-- so `fenel-module.ts` carries a mechanical mirror of these rules, and
+-- `fenel-module-declaration-names-parity.test.ts` runs both over the same
+-- declaration lists and asserts equal results, messages included. Edit this
+-- file first; the mirror follows in the same commit.
+--
+-- Keep each declaration small: one over 120 tokens (PVF_DECL_CAP) fences the
+-- whole file out of the Fenel parser.
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- The declaration list and the errors.
+-- -------------------------------------------------------------------------
+
+-- The form of a top-level declaration. OtherForm (a module header, an import,
+-- a fixity) takes no part in the rules; it is listed so that "immediately
+-- after" means the next declaration in the file.
+DeclarationForm = SignatureForm | DefinitionForm | TypeForm | OtherForm
+
+-- One top-level declaration, in source order (`index` counts from 0). `name`
+-- is Nothing for `_`. `codeName` is the effective code name of the function
+-- the declaration registers, and Nothing when it registers none: a type, a
+-- signature whose definition registers the function, a value in an instance
+-- file, `_`. `typeHead` is the type a signature names; `bodyHead` is the
+-- constructor a definition's body applies to a record, or to nothing.
+DeclarationHead = DeclarationHead form: DeclarationForm name: Maybe String codeName: Maybe String file: String index: Nat hasParams: Boolean hasDirectives: Boolean typeHead: Maybe String bodyHead: Maybe String
+
+-- One name a file-top selection opens: `using source (name)`, or the legacy
+-- `import source (name)`, written at declaration `index` (from 0) of `file`.
+-- modules-as-values Phase 5c-1a.
+ImportSelection = ImportSelection name: String source: String file: String index: Nat
+
+-- Why an unnamed declaration is refused.
+UnnamedDeclarationFault = UnpairedSignature | UnpairedDefinition | UnnamedWithParameters | UnnamedNotInstance | UnnamedWithDirectives
+
+-- One refusal. The message is ready to display: the loader adds only the
+-- module name. `number` counts the file's unnamed declarations from 1.
+DeclarationNameError =
+  UnnamedDeclarationError fault: UnnamedDeclarationFault number: Nat declaration: DeclarationHead message: String
+  | DuplicateDeclaration name: String first: DeclarationHead second: DeclarationHead message: String
+  | CodeNameClash codeName: String first: DeclarationHead second: DeclarationHead message: String
+  | SelectionConflict name: String first: ImportSelection second: ImportSelection message: String
+
+
+-- -------------------------------------------------------------------------
+-- Shared readings of a declaration.
+-- -------------------------------------------------------------------------
+
+@label "Declaration site"
+@description "Where a declaration sits, for an error message: `declaration N in FILE`, with N counting from 1 in source order."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationSiteText : (decl: DeclarationHead) -> String
+declarationSiteText decl = concat "declaration " (concat (toString (add decl.index 1)) (concat " in " decl.file))
+
+@label "Declaration namespace"
+@description "The namespace a declaration's name lives in: signatures, definitions and type declarations each have their own. Nothing for a module header, an import or a fixity, which name nothing there."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationNamespace : (form: DeclarationForm) -> Maybe String
+declarationNamespace form =
+  case form of
+    SignatureForm -> Just "signature"
+    DefinitionForm -> Just "definition"
+    TypeForm -> Just "type declaration"
+    _ -> Nothing
+
+@label "Is unnamed signature"
+@description "True for a `_ : T` signature."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationIsUnnamedSignature : (decl: DeclarationHead) -> Boolean
+declarationIsUnnamedSignature decl =
+  case decl of
+    DeclarationHead { form = SignatureForm, name = Nothing } -> True
+    _ -> False
+
+@label "Is unnamed definition"
+@description "True for a `_ = …` definition."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationIsUnnamedDefinition : (decl: DeclarationHead) -> Boolean
+declarationIsUnnamedDefinition decl =
+  case decl of
+    DeclarationHead { form = DefinitionForm, name = Nothing } -> True
+    _ -> False
+
+@label "Has name"
+@description "True when the declaration is named, and named declName."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationHasName : (decl: DeclarationHead) -> (declName: String) -> Boolean
+declarationHasName decl declName =
+  case decl.name of
+    Just other -> eq other declName
+    Nothing -> False
+
+
+-- -------------------------------------------------------------------------
+-- Unnamed declarations. One walk in source order; the state is the count of
+-- unnamed declarations so far, the `_` signature still waiting for its
+-- definition, and the errors found.
+-- -------------------------------------------------------------------------
+
+@label "Unnamed declaration errors"
+@description "Every refusal of a `_` declaration in one file, in source order: a `_` signature not immediately followed by a `_` definition, a `_` definition not immediately preceded by a `_` signature, a `_` definition with parameters, a `_` definition that is not a constructor application of its signature's type, and a `_` declaration that carries directives. An empty list means every `_` pair is exactly one instance. The source of truth for fenel-module.ts's mirror of the same name."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+declarationUnnamedErrors : (heads: List DeclarationHead) -> List DeclarationNameError
+declarationUnnamedErrors heads =
+  let walked = fold declarationUnnamedStep { count = 0, pending = Nothing, errors = [] } heads
+  case walked.pending of
+    Just sig -> appendItem (declarationUnpairedSignatureError walked.count sig) walked.errors
+    Nothing -> walked.errors
+
+@label "Unnamed walk step"
+@description "One declaration of the unnamed walk: a `_` definition right after a waiting `_` signature pairs with it; anything else leaves that signature unpaired, then is visited on its own."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedStep : (state: a) -> (decl: DeclarationHead) -> a
+declarationUnnamedStep state decl =
+  case state.pending of
+    Just sig ->
+      if declarationIsUnnamedDefinition decl
+      then declarationUnnamedPair state sig decl
+      else declarationUnnamedVisit (declarationUnnamedUnpaired state sig) decl
+    Nothing -> declarationUnnamedVisit state decl
+
+@label "Unnamed visit"
+@description "Visit a declaration no `_` signature is waiting for: a `_` signature opens the next unnamed declaration, a `_` definition is an orphan, anything else passes."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedVisit : (state: a) -> (decl: DeclarationHead) -> a
+declarationUnnamedVisit state decl =
+  if declarationIsUnnamedSignature decl
+  then declarationUnnamedOpen state decl
+  else if declarationIsUnnamedDefinition decl
+  then declarationUnnamedOrphan state decl
+  else state
+
+@label "Unnamed open"
+@description "A `_` signature: number it, and wait for its definition. Its own directives are refused now."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedOpen : (state: a) -> (decl: DeclarationHead) -> a
+declarationUnnamedOpen state decl =
+  let ordinal = add state.count 1
+  { count = ordinal, pending = Just decl, errors = concat state.errors (declarationUnnamedDirectiveErrors ordinal decl) }
+
+@label "Unnamed pair"
+@description "A `_` definition right after its `_` signature: check its parameters, that its body constructs the signature's type, and its directives."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedPair : (state: a) -> (sig: DeclarationHead) -> (decl: DeclarationHead) -> a
+declarationUnnamedPair state sig decl =
+  let bodyErrors = concat (declarationUnnamedBodyErrors state.count sig decl) (declarationUnnamedDirectiveErrors state.count decl)
+  let found = concat (declarationUnnamedParameterErrors state.count decl) bodyErrors
+  { count = state.count, pending = Nothing, errors = concat state.errors found }
+
+@label "Unnamed orphan"
+@description "A `_` definition with no `_` signature right before it: number it and refuse it, then check its parameters and directives too."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedOrphan : (state: a) -> (decl: DeclarationHead) -> a
+declarationUnnamedOrphan state decl =
+  let ordinal = add state.count 1
+  let unpaired = declarationUnnamedError UnpairedDefinition ordinal decl " has no \"_\" signature immediately before it. An unnamed instance is found by its type and parameters, so it needs a signature."
+  let others = concat (declarationUnnamedParameterErrors ordinal decl) (declarationUnnamedDirectiveErrors ordinal decl)
+  { count = ordinal, pending = Nothing, errors = concat state.errors (concat (appendItem unpaired []) others) }
+
+@label "Unnamed unpaired"
+@description "The waiting `_` signature was not followed by its definition: refuse it and stop waiting."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedUnpaired : (state: a) -> (sig: DeclarationHead) -> a
+declarationUnnamedUnpaired state sig =
+  { count = state.count, pending = Nothing, errors = appendItem (declarationUnpairedSignatureError state.count sig) state.errors }
+
+@label "Unpaired signature error"
+@description "The refusal of a `_` signature that is not immediately followed by a `_` definition."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnpairedSignatureError : (ordinal: Nat) -> (sig: DeclarationHead) -> DeclarationNameError
+declarationUnpairedSignatureError ordinal sig =
+  declarationUnnamedError UnpairedSignature ordinal sig " is not immediately followed by a \"_\" definition. Each \"_\" signature pairs with the \"_\" definition right after it."
+
+@label "Unnamed parameter errors"
+@description "A `_` definition takes no parameters: it is an instance value, not a function."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedParameterErrors : (ordinal: Nat) -> (decl: DeclarationHead) -> List DeclarationNameError
+declarationUnnamedParameterErrors ordinal decl =
+  if decl.hasParams
+  then appendItem (declarationUnnamedError UnnamedWithParameters ordinal decl " takes parameters. An unnamed declaration is an instance value, not a function.") []
+  else []
+
+@label "Unnamed directive errors"
+@description "A `_` declaration carries no directives: it has no name for them to attach to, so they would be silently discarded."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedDirectiveErrors : (ordinal: Nat) -> (decl: DeclarationHead) -> List DeclarationNameError
+declarationUnnamedDirectiveErrors ordinal decl =
+  if decl.hasDirectives
+  then appendItem (declarationUnnamedError UnnamedWithDirectives ordinal decl " carries directives. An unnamed declaration has no name for them to attach to, so they would be silently discarded.") []
+  else []
+
+@label "Unnamed body errors"
+@description "A `_` definition must be a constructor application of the type its signature names, so that it is exactly one instance of that type."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedBodyErrors : (ordinal: Nat) -> (sig: DeclarationHead) -> (decl: DeclarationHead) -> List DeclarationNameError
+declarationUnnamedBodyErrors ordinal sig decl =
+  if declarationConstructsSignatureType sig decl
+  then []
+  else appendItem (declarationUnnamedError UnnamedNotInstance ordinal decl (declarationUnnamedBodyText sig)) []
+
+@label "Constructs signature type"
+@description "True when the definition's body applies the constructor its signature's type names."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationConstructsSignatureType : (sig: DeclarationHead) -> (decl: DeclarationHead) -> Boolean
+declarationConstructsSignatureType sig decl =
+  case sig.typeHead of
+    Just typeName -> declarationBodyApplies decl typeName
+    Nothing -> False
+
+@label "Body applies"
+@description "True when the definition's body applies the constructor named typeName."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationBodyApplies : (decl: DeclarationHead) -> (typeName: String) -> Boolean
+declarationBodyApplies decl typeName =
+  case decl.bodyHead of
+    Just ctor -> eq ctor typeName
+    Nothing -> False
+
+@label "Unnamed body text"
+@description "The end of the message refusing a `_` body: name the type to construct, or say the signature names none."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedBodyText : (sig: DeclarationHead) -> String
+declarationUnnamedBodyText sig =
+  case sig.typeHead of
+    Just typeName -> concat " must be a constructor application of its signature's type \"" (concat typeName (concat "\", as in _ = " (concat typeName " { ... }.")))
+    Nothing -> " cannot be an instance: its signature does not name a type."
+
+@label "Unnamed error"
+@description "Build one refusal of a `_` declaration; the message starts `unnamed declaration #N: the \"_\" signature at declaration I in FILE` and continues with text."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedError : (faultKind: UnnamedDeclarationFault) -> (ordinal: Nat) -> (decl: DeclarationHead) -> (text: String) -> DeclarationNameError
+declarationUnnamedError faultKind ordinal decl text =
+  UnnamedDeclarationError { fault = faultKind, number = ordinal, declaration = decl, message = concat (declarationUnnamedPrefix ordinal decl) text }
+
+@label "Unnamed prefix"
+@description "The start of every unnamed-declaration message: `unnamed declaration #N: the \"_\" signature at declaration I in FILE` (or definition)."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationUnnamedPrefix : (ordinal: Nat) -> (decl: DeclarationHead) -> String
+declarationUnnamedPrefix ordinal decl =
+  let noun = fromMaybe "declaration" (declarationNamespace decl.form)
+  concat "unnamed declaration #" (concat (toString ordinal) (concat ": the \"_\" " (concat noun (concat " at " (declarationSiteText decl)))))
+
+
+-- -------------------------------------------------------------------------
+-- Name clashes. One walk in source order, remembering the first declaration
+-- of each name in each namespace and the first function of each effective
+-- code name. The two indexes are separate: `foo @codeName "bar"` beside a
+-- function named `bar @codeName "foo"` is legal, since names {foo, bar} and
+-- code names {bar, foo} are each unique.
+-- -------------------------------------------------------------------------
+
+@label "Declaration name clashes"
+@description "Every name clash among declarations, in source order: a second definition, signature or type declaration of one name, and a second function registered under one effective code name (the @codeName, or the name when there is none). `_` never clashes, and neither do the type and parameters of two instances. A code-name clash between two declarations of the same name is left to the duplicate it already is. The source of truth for fenel-module.ts's mirror of the same name."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+declarationNameClashes : (heads: List DeclarationHead) -> List DeclarationNameError
+declarationNameClashes heads =
+  let walked = fold declarationClashStep { byName = {}, byCodeName = {}, errors = [] } heads
+  walked.errors
+
+@label "Declaration group clashes"
+@description "The name clashes among the files of one module (a union group), given the declarations of all of them. Each file has already passed declarationNameClashes alone; across files the rule sees every named definition (functions and named instances share one namespace, and an instance-file value has no function id) and every declaration that registers a function, for its code name. The source of truth for fenel-module.ts's mirror of the same name."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+declarationGroupClashes : (heads: List DeclarationHead) -> List DeclarationNameError
+declarationGroupClashes heads = declarationNameClashes (filter declarationSharedAcrossFiles heads)
+
+@label "Shared across files"
+@description "True for the declarations the cross-file rule sees: a named definition, or any declaration that registers a function."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationSharedAcrossFiles : (decl: DeclarationHead) -> Boolean
+declarationSharedAcrossFiles decl =
+  case decl of
+    DeclarationHead { form = DefinitionForm, name = Just n } -> True
+    DeclarationHead { codeName = Just c } -> True
+    _ -> False
+
+@label "Clash walk step"
+@description "One declaration of the clash walk: a named one is checked against its namespace, then, when it registers a function, against the code names seen so far. `_` passes."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationClashStep : (state: a) -> (decl: DeclarationHead) -> a
+declarationClashStep state decl =
+  case decl.name of
+    Just declName -> declarationCodeNameStep (declarationRawNameStep state decl declName) decl declName
+    Nothing -> state
+
+@label "Raw name step"
+@description "Check a named declaration against the first declaration of its name in its namespace."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationRawNameStep : (state: a) -> (decl: DeclarationHead) -> (declName: String) -> a
+declarationRawNameStep state decl declName =
+  case declarationNamespace decl.form of
+    Just space -> declarationRawNameCheck state decl declName (concat space (concat " " declName))
+    Nothing -> state
+
+@label "Raw name check"
+@description "A second declaration of a name in one namespace is a duplicate; the first one seen stays the one later duplicates are reported against."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationRawNameCheck : (state: a) -> (decl: DeclarationHead) -> (declName: String) -> (key: String) -> a
+declarationRawNameCheck state decl declName key =
+  case mapGet state.byName key of
+    Just earlier -> { byName = state.byName, byCodeName = state.byCodeName, errors = appendItem (declarationDuplicateError declName earlier decl) state.errors }
+    Nothing -> { byName = mapSet state.byName key decl, byCodeName = state.byCodeName, errors = state.errors }
+
+@label "Code name step"
+@description "Check a declaration that registers a function against the first function of its effective code name."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationCodeNameStep : (state: a) -> (decl: DeclarationHead) -> (declName: String) -> a
+declarationCodeNameStep state decl declName =
+  case decl.codeName of
+    Just code -> declarationCodeNameCheck state decl declName code
+    Nothing -> state
+
+@label "Code name check"
+@description "A second function of one effective code name clashes with the first, unless both are declarations of one name, which the duplicate check already reports."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationCodeNameCheck : (state: a) -> (decl: DeclarationHead) -> (declName: String) -> (code: String) -> a
+declarationCodeNameCheck state decl declName code =
+  case mapGet state.byCodeName code of
+    Just earlier ->
+      if declarationHasName earlier declName
+      then state
+      else { byName = state.byName, byCodeName = state.byCodeName, errors = appendItem (declarationCodeNameError code earlier decl) state.errors }
+    Nothing -> { byName = state.byName, byCodeName = mapSet state.byCodeName code decl, errors = state.errors }
+
+@label "Duplicate error"
+@description "Build the error for a second declaration of one name in one namespace."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationDuplicateError : (declName: String) -> (earlier: DeclarationHead) -> (later: DeclarationHead) -> DeclarationNameError
+declarationDuplicateError declName earlier later =
+  DuplicateDeclaration { name = declName, first = earlier, second = later, message = declarationDuplicateText declName earlier later }
+
+@label "Duplicate text"
+@description "The message for a duplicate: `duplicate definition \"foo\": declaration 1 in FILE and declaration 5 in FILE.` and what to do."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationDuplicateText : (declName: String) -> (earlier: DeclarationHead) -> (later: DeclarationHead) -> String
+declarationDuplicateText declName earlier later =
+  let noun = fromMaybe "declaration" (declarationNamespace later.form)
+  let sites = concat (declarationSiteText earlier) (concat " and " (declarationSiteText later))
+  concat "duplicate " (concat noun (concat " \"" (concat declName (concat "\": " (concat sites ". A name is declared once in a module; rename or remove one of them.")))))
+
+@label "Code name clash error"
+@description "Build the error for two functions registered under one effective code name."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationCodeNameError : (code: String) -> (earlier: DeclarationHead) -> (later: DeclarationHead) -> DeclarationNameError
+declarationCodeNameError code earlier later =
+  CodeNameClash { codeName = code, first = earlier, second = later, message = declarationCodeNameText code earlier later }
+
+@label "Code name clash text"
+@description "The message for a code-name clash: which code name, and which two functions register it."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationCodeNameText : (code: String) -> (earlier: DeclarationHead) -> (later: DeclarationHead) -> String
+declarationCodeNameText code earlier later =
+  let pair = concat (declarationNamedSiteText earlier) (concat " and " (declarationNamedSiteText later))
+  concat "code name \"" (concat code (concat "\" is registered by two functions, " (concat pair ". A function's @codeName, or its name when it has none, must be unique in its module.")))
+
+@label "Named site"
+@description "A declaration's name and site for a message: `\"foo\" (declaration 1 in FILE)`."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationNamedSiteText : (decl: DeclarationHead) -> String
+declarationNamedSiteText decl = concat "\"" (concat (fromMaybe "_" decl.name) (concat "\" (" (concat (declarationSiteText decl) ")")))
+
+
+-- -------------------------------------------------------------------------
+-- File-top selections (modules-as-values Phase 5c-1a). `using std (map)`
+-- opens `map` in every file of the module, so two selections of one name from
+-- two different sources are ambiguous: an error naming both, each later one
+-- reported against the first selection of the name. The same name selected
+-- twice from one source is fine. A module's own member is not a selection, so
+-- it never clashes here; it wins over any import when names are resolved.
+-- -------------------------------------------------------------------------
+
+@label "Selection conflicts"
+@description "Every conflict among file-top selections, in source order: a name selected from a source other than the one its first selection named. One name selected twice from one source is fine; own members are not selections. Run on one file's selections and on all the files of a module together. The source of truth for fenel-module.ts's mirror of the same name. modules-as-values Phase 5c-1a."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+declarationSelectionConflicts : (selections: List ImportSelection) -> List DeclarationNameError
+declarationSelectionConflicts selections =
+  let walked = fold declarationSelectionStep { bySelected = {}, errors = [] } selections
+  walked.errors
+
+@label "Selection walk step"
+@description "One selection of the conflict walk: the first selection of a name is remembered; a later one from another source is a conflict, one from the same source passes."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationSelectionStep : (state: a) -> (sel: ImportSelection) -> a
+declarationSelectionStep state sel =
+  case mapGet state.bySelected sel.name of
+    Just earlier ->
+      if eq earlier.source sel.source
+      then state
+      else { bySelected = state.bySelected, errors = appendItem (declarationSelectionError earlier sel) state.errors }
+    Nothing -> { bySelected = mapSet state.bySelected sel.name sel, errors = state.errors }
+
+@label "Selection conflict error"
+@description "Build the error for a name selected from two sources."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationSelectionError : (earlier: ImportSelection) -> (later: ImportSelection) -> DeclarationNameError
+declarationSelectionError earlier later =
+  SelectionConflict { name = later.name, first = earlier, second = later, message = declarationSelectionText earlier later }
+
+@label "Selection conflict text"
+@description "The message for a selection conflict: `\"map\" is selected from two sources: std (declaration 2 in FILE) and picture (declaration 3 in FILE).` and what to do."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationSelectionText : (earlier: ImportSelection) -> (later: ImportSelection) -> String
+declarationSelectionText earlier later =
+  let sites = concat (declarationSelectionSiteText earlier) (concat " and " (declarationSelectionSiteText later))
+  let advice = concat ". A module opens a name from one source; keep one selection and write the other as " (concat later.source (concat "." (concat later.name ".")))
+  concat "\"" (concat later.name (concat "\" is selected from two sources: " (concat sites advice)))
+
+@label "Selection site"
+@description "Where a selection sits, for an error message: `SOURCE (declaration N in FILE)`, with N counting from 1."
+@tags "engine" "loader" "declaration-names" "modules-as-values"
+@category "engine-internal"
+declarationSelectionSiteText : (sel: ImportSelection) -> String
+declarationSelectionSiteText sel = concat sel.source (concat " (declaration " (concat (toString (add sel.index 1)) (concat " in " (concat sel.file ")"))))

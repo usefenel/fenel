@@ -1,0 +1,722 @@
+module engine where
+
+-- =========================================================================
+-- The regex front-end in Fenel — the port of regex-derivative.ts's
+-- `parseRegex` (the recursive-descent regex parser) + `normalizePattern`
+-- (the `.*`-anchor wrapping) + `rNodeToPattern`/`rangesToSetExpr` (RNode →
+-- generic `Pattern` lowering). regex-derivative-to-fenel Phase 2 (Slice B).
+--
+-- WHAT THIS IS. `regexToPatternMarker toks` converts a regex (pre-tokenized
+-- by the TS shim into `[{ ch, code }]` — `ch` = the source char string,
+-- `code` = its code POINT) into a generic-`Pattern` MARKER tree: it
+-- normalises anchors (`.*` wrapping per JS `RegExp.test()` semantics), runs
+-- the recursive-descent parser to an `RxNode` AST, and lowers that to a
+-- Result-wrapped plain-record marker tree the TS shim authors into a real
+-- `Pattern` only after complete admission.
+--
+-- WHY TOKENS (NOT A STRING). This established shim uses the workstream's
+-- 1a-cont char-as-codepoint convention: chars↔codepoints happen TS-side.
+-- The later `std.charCode` leaf also exposes this bridge to Fenel bodies;
+-- retaining this token boundary does not introduce another tokenizer.
+-- Char-class range endpoints (`[a-z]`) + the `±1` boundary arithmetic in
+-- `rxMergeRanges`/`rxComplementRanges` need numeric code points, so the TS
+-- shim pre-renders each char as `{ ch, code }`. Literal char NODES keep their
+-- `ch` string (the lowering emits `{ $enum: [ch] }` directly); only char-CLASS
+-- ranges carry `code`. Digit quantifier bounds (`{n,m}`) use `code - 48`
+-- arithmetic — no string→number native needed.
+--
+-- THE $-KEY BARRIER (B3, the AUTHORING direction). The lowering CANNOT author
+-- `$`-prefixed-key objects (`$enum`/`$none`/`$interval`/`$union`/`$complement`/
+-- `$diff` + the `Pattern` `{t:…}` nodes), so `rxNodeToPattern` emits a
+-- plain-record MARKER tree (`{ tag = "RPMatch", pred = { tag = "RSEnum", … } }`)
+-- and the TS shim's marshal arm authors the `$`-keys + lifts through pattern.ts's
+-- smart constructors (`match`/`seq`/`alt`/`rep`/`eps`/`empty`). This is the
+-- INVERSE of 1a-cont's `setExprToWs` *reading* arm — same B3 boundary, authoring
+-- mode. (1a surprise: marshallers render char values as code points; here the
+-- interval markers carry codes, the shim `String.fromCodePoint`s them.)
+--
+-- FAITHFUL PORT. The RD parser is the mutable-`pos` `parseRegex` re-expressed
+-- as pure STATE-THREADING: every `parse…` returns `{ node, rest }` (the RxNode
+-- + the unconsumed token tail) — NO simulated mutable ref (the 1a idiom). The
+-- smart constructors (`rxMkSeq`/`rxMkAlt`/`rxMkGroup`), the char-class range
+-- merge/complement, the escape classes (`\d\w\s` + negations), the named/
+-- non-capturing group handling, the lazy-quantifier `?` swallow, and the
+-- `{n,m}` bound parsing are all faithful to regex-derivative.ts. `RxGroup` is
+-- transparent in the lowering (generic Pattern is a set-of-strings, not a
+-- parser — captures are dropped), matching `rNodeToPattern`.
+--
+-- ADMISSION DIVERGENCE (2026-10-07). Group closes are required and complete
+-- entry points refuse any unconsumed tail. Recursive parse results carry
+-- `error: Maybe String`; complete admission returns `Result String RxNode`
+-- before lowering or hint matching. Other inherited escape/class/quantifier
+-- meanings remain unchanged: this is not a full JavaScript Regex validator.
+-- SCALAR/ANCHOR DIVERGENCE (2026-10-08). Complements cover Unicode scalars,
+-- excluding UTF-16 surrogates; trailing-dollar anchors use escape parity.
+-- Lowered intervals split BMP and supplementary spans because their host
+-- String endpoints use UTF-16 ordering, which differs across that boundary.
+--
+-- FENCED (the 1a surprise): the Fenel-bodied parser does not yet cover the
+-- substrate-grade deep nested `case`/`let` recursion over `RxNode`, so this
+-- file is TS-parsed (in `generate-parse-cache.ts`'s `FENCE_FALLBACK`) — the
+-- SAME class as pattern-algebra.fenel / regex-containment.fenel. Closing the
+-- fence is parser-substrate's job.
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- The regex AST. Recursive sub-nodes are typed `RxNode`; opaque slots
+-- (`ch`/`code`/`ranges`/`neg`/`name`/`min`/`max`) are `a`: `ch` a char
+-- string, `code` its code POINT (carried alongside `ch` so the Slice-C hint
+-- engine's `firstSet`/`deriv` over `RxChar` have a numeric code without a
+-- char→code native — the lowering `rxNodeToPattern` ignores it and keeps
+-- emitting `{ $enum: [ch] }`), `ranges` a `[{ lo, hi }]` of code POINTS,
+-- `neg` a Bool, `name` a String, min/max numbers (`max = -1` is the
+-- unbounded sentinel, mirroring pattern.ts's `Infinity` arithmetic).
+-- -------------------------------------------------------------------------
+
+RxNode =
+  RxEmpty
+  | RxEps
+  | RxChar ch: a code: a
+  | RxCls ranges: a neg: a
+  | RxDot
+  | RxSeq left: RxNode right: RxNode
+  | RxAlt left: RxNode right: RxNode
+  | RxRep child: RxNode min: a max: a
+  | RxGroup name: a child: RxNode
+
+
+-- -------------------------------------------------------------------------
+-- Token-list primitives (front-consumption: peek = head, advance = tail).
+-- -------------------------------------------------------------------------
+
+@label "regex: rest of token list"
+@description "The tail of a token list, or [] when empty. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxRest : (xs: a) -> a
+rxRest xs =
+  case tail xs of
+    Nothing -> []
+    Just r -> r
+
+@label "regex: token list empty"
+@description "True when a token list has no head. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxIsEmpty : (xs: a) -> Bool
+rxIsEmpty xs =
+  case head xs of
+    Nothing -> true
+    Just t -> false
+
+@label "regex: peek char"
+@description "The `.ch` of the head token, or \"\" past the end (mirrors the RD parser's `peek()` returning \"\" beyond `end`). Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxPeek : (xs: a) -> String
+rxPeek xs =
+  case head xs of
+    Nothing -> ""
+    Just t -> t.ch
+
+@label "regex: head token"
+@description "The head token, or a `{ ch = \"\", code = 0 }` placeholder when empty (defensive — callers guard non-emptiness). Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxHeadTok : (xs: a) -> a
+rxHeadTok xs =
+  case head xs of
+    Nothing -> { ch = "", code = 0 }
+    Just t -> t
+
+@label "regex: head range"
+@description "The first `{ lo, hi }` of a range list, or `{ lo = 0, hi = 0 }` when empty. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxHeadRange : (xs: a) -> a
+rxHeadRange xs =
+  case head xs of
+    Nothing -> { lo = 0, hi = 0 }
+    Just r -> r
+
+@label "regex: last token char"
+@description "The `.ch` of the last token, or \"\" when empty. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxLastCh : (xs: a) -> String
+rxLastCh xs =
+  case last xs of
+    Nothing -> ""
+    Just t -> t.ch
+
+@label "regex: second-last token char"
+@description "The `.ch` of the second-to-last token (`pattern.charAt(len-2)`), or \"\" when too short. Used by the trailing-`$`-anchor escape check. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxSecondLastCh : (xs: a) -> String
+rxSecondLastCh xs =
+  case init xs of
+    Nothing -> ""
+    Just ys -> rxLastCh ys
+
+@label "regex: drop last token"
+@description "All tokens but the last, or [] when empty. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxInit : (xs: a) -> a
+rxInit xs =
+  case init xs of
+    Nothing -> []
+    Just r -> r
+
+@label "regex: numeric max"
+@description "Numeric max of two numbers (range-merge upper-bound widening). Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxMax : (a: a) -> (b: a) -> a
+rxMax a b = if gt a b then a else b
+
+
+-- -------------------------------------------------------------------------
+-- Predefined character classes (`\d` / `\w` / `\s`) are inlined at their use
+-- sites (rxEscapeToNode / rxEscapeToRanges) via `let`: a nullary `.fenel`
+-- function referenced bare yields the CLOSURE, not its value (no `f()` apply),
+-- so a constant must be a `let` binding, not a zero-arg function.
+-- -------------------------------------------------------------------------
+
+
+-- -------------------------------------------------------------------------
+-- Range utilities — sort + merge-adjacent (`±1`) + scalar complement.
+-- Numeric code-point domain (the same integer ±1 assumption distinctRanges
+-- makes; the consumers only produce code-point bounds).
+-- -------------------------------------------------------------------------
+
+@label "regex: merge ranges"
+@description "Sort code-point ranges by lo and merge overlapping/adjacent ones (`cur.lo <= last.hi + 1` ⇒ extend), mirroring regex-derivative.ts `mergeRanges`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxMergeRanges : (ranges: a) -> a
+rxMergeRanges ranges =
+  let sorted = sort (\r -> r.lo) ranges
+  case head sorted of
+    Nothing -> []
+    Just first -> rxMergeGo (rxRest sorted) [] { lo = first.lo, hi = first.hi }
+
+@label "regex: merge ranges go"
+@description "The merge fold: `cur` is the in-progress range, `acc` the flushed ones; an overlapping/adjacent next range widens `cur`, else `cur` flushes and the next becomes current. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxMergeGo : (toks: a) -> (acc: a) -> (cur: a) -> a
+rxMergeGo toks acc cur =
+  case head toks of
+    Nothing -> appendItem cur acc
+    Just r ->
+      if lte r.lo (add cur.hi 1)
+      then rxMergeGo (rxRest toks) acc { lo = cur.lo, hi = rxMax cur.hi r.hi }
+      else rxMergeGo (rxRest toks) (appendItem cur acc) { lo = r.lo, hi = r.hi }
+
+@label "regex: complement ranges"
+@description "Complement code-point ranges within Unicode scalar values: [0, 0xD7FF] and [0xE000, 0x10FFFF]. Merge the excluded ranges with the surrogate gap before emitting uncovered spans. Used by `\\D` / `\\W` / `\\S` inside char classes and by hints. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxComplementRanges : (ranges: a) -> a
+rxComplementRanges ranges =
+  let sorted = rxMergeRanges (concat ranges [{ lo = 55296, hi = 57343 }])
+  rxComplGo sorted 0 []
+
+@label "regex: complement ranges go"
+@description "The complement fold over merged excluded ranges, including surrogates: `prev` is the next uncovered code point, `acc` the emitted gaps. Each range emits the gap `[prev, r.lo-1]` (if any) and advances `prev` to `r.hi+1`; the tail emits `[prev, 0x10FFFF]`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxComplGo : (toks: a) -> (prev: a) -> (acc: a) -> a
+rxComplGo toks prev acc =
+  case head toks of
+    Nothing -> if lte prev 1114111 then appendItem { lo = prev, hi = 1114111 } acc else acc
+    Just r ->
+      let gapHi = if gt r.lo 1114111 then 1114111 else sub r.lo 1
+      let acc2 = if lte prev gapHi then appendItem { lo = prev, hi = gapHi } acc else acc
+      rxComplGo (rxRest toks) (rxMax prev (add r.hi 1)) acc2
+
+
+-- -------------------------------------------------------------------------
+-- Escapes. `rxEscapeToNode` (atom context — keeps the `neg` flag);
+-- `rxEscapeToRanges` (char-class context — pre-complements `\D\W\S`).
+-- -------------------------------------------------------------------------
+
+@label "regex: escape to node"
+@description "Convert an escaped char (token) in ATOM context to an RxNode: `\\d\\D\\w\\W\\s\\S` → a class node carrying the predefined ranges + the negation flag; any other escape → the literal char (carrying both `tok.ch` and `tok.code`). Mirrors regex-derivative.ts `escapeToNode`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxEscapeToNode : (tok: a) -> RxNode
+rxEscapeToNode tok =
+  let digit = [ { lo = 48, hi = 57 } ]
+  let word = [ { lo = 48, hi = 57 }, { lo = 65, hi = 90 }, { lo = 95, hi = 95 }, { lo = 97, hi = 122 } ]
+  let space = [ { lo = 9, hi = 13 }, { lo = 32, hi = 32 } ]
+  if eq tok.ch "d" then RxCls digit false
+  else if eq tok.ch "D" then RxCls digit true
+  else if eq tok.ch "w" then RxCls word false
+  else if eq tok.ch "W" then RxCls word true
+  else if eq tok.ch "s" then RxCls space false
+  else if eq tok.ch "S" then RxCls space true
+  else RxChar tok.ch tok.code
+
+@label "regex: escape to ranges"
+@description "Convert an escaped char in CHAR-CLASS context to code-point ranges: `\\d\\w\\s` → the predefined ranges; `\\D\\W\\S` → their complement; any other escape → the literal char's single-point range (`tok.code`). Mirrors regex-derivative.ts `escapeToRanges` (note `\\D` PRE-complements here, unlike the atom `escapeToNode` which keeps a neg flag). Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxEscapeToRanges : (tok: a) -> a
+rxEscapeToRanges tok =
+  let digit = [ { lo = 48, hi = 57 } ]
+  let word = [ { lo = 48, hi = 57 }, { lo = 65, hi = 90 }, { lo = 95, hi = 95 }, { lo = 97, hi = 122 } ]
+  let space = [ { lo = 9, hi = 13 }, { lo = 32, hi = 32 } ]
+  if eq tok.ch "d" then digit
+  else if eq tok.ch "D" then rxComplementRanges digit
+  else if eq tok.ch "w" then word
+  else if eq tok.ch "W" then rxComplementRanges word
+  else if eq tok.ch "s" then space
+  else if eq tok.ch "S" then rxComplementRanges space
+  else [ { lo = tok.code, hi = tok.code } ]
+
+
+-- -------------------------------------------------------------------------
+-- Smart constructors (regex-derivative.ts `mkSeq`/`mkAlt`/`mkGroup`):
+-- simplify the RxNode on the fly so the AST stays small.
+-- -------------------------------------------------------------------------
+
+@label "regex: is empty node"
+@description "True when an RxNode is the empty-language RxEmpty. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxIsRxEmpty : (n: RxNode) -> Bool
+rxIsRxEmpty n =
+  case n of
+    RxEmpty -> true
+    other -> false
+
+@label "regex: is eps node"
+@description "True when an RxNode is the empty-string RxEps. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxIsRxEps : (n: RxNode) -> Bool
+rxIsRxEps n =
+  case n of
+    RxEps -> true
+    other -> false
+
+@label "regex: mkSeq"
+@description "Sequencing smart constructor: RxEmpty on either side annihilates; RxEps on the left drops to the right, on the right drops to the left; else RxSeq. Mirrors regex-derivative.ts `mkSeq`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxMkSeq : (a: RxNode) -> (b: RxNode) -> RxNode
+rxMkSeq a b =
+  if or (rxIsRxEmpty a) (rxIsRxEmpty b) then RxEmpty
+  else if rxIsRxEps a then b
+  else if rxIsRxEps b then a
+  else RxSeq a b
+
+@label "regex: mkAlt"
+@description "Alternation smart constructor: a RxEmpty branch drops out; eps OR eps collapses to eps; else RxAlt. Mirrors regex-derivative.ts `mkAlt`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxMkAlt : (a: RxNode) -> (b: RxNode) -> RxNode
+rxMkAlt a b =
+  if rxIsRxEmpty a then b
+  else if rxIsRxEmpty b then a
+  else if and (rxIsRxEps a) (rxIsRxEps b) then RxEps
+  else RxAlt a b
+
+@label "regex: mkGroup"
+@description "Group smart constructor: an RxEmpty child annihilates; else a named RxGroup. Mirrors regex-derivative.ts `mkGroup`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxMkGroup : (name: a) -> (child: RxNode) -> RxNode
+rxMkGroup name child =
+  if rxIsRxEmpty child then RxEmpty else RxGroup name child
+
+
+-- -------------------------------------------------------------------------
+-- Anchor handling — `rxNormalize` (the `.*` wrapping per JS RegExp.test
+-- semantics) + `rxStripAnchors` (the parser's leading-`^` / trailing-`$`
+-- boundary stripping). Both faithful to regex-derivative.ts.
+-- -------------------------------------------------------------------------
+
+@label "regex: ends with $ anchor"
+@description "The final `$` is an end anchor when its immediately preceding run of backslashes has even length. Odd runs escape the dollar; escaped backslash pairs leave the anchor active. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxEndAnchor : (toks: a) -> (n: a) -> Bool
+rxEndAnchor toks n =
+  if eq n 0 then false
+  else if neq (rxLastCh toks) "$" then false
+  else
+    let escaped = fold (\odd tok -> if eq tok.ch "\\" then not odd else false) false (rxInit toks)
+    not escaped
+
+@label "regex: normalize tokens"
+@description "Wrap an unanchored regex's token list in `.*` to match JS `RegExp.test()` semantics (mirrors regex-derivative.ts `normalizePattern`): both anchors ⇒ unchanged; `^`-only ⇒ append `.*`; `$`-only ⇒ prepend `.*`; neither ⇒ wrap both sides. Anchors are KEPT (rxStripAnchors removes them at parse time). Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxNormalize : (toks: a) -> a
+rxNormalize toks =
+  let ds = [ { ch = ".", code = 46 }, { ch = "*", code = 42 } ]
+  let n = length toks
+  let startA = and (gt n 0) (eq (rxPeek toks) "^")
+  let endA = rxEndAnchor toks n
+  if and startA endA then toks
+  else if startA then concat toks ds
+  else if endA then concat ds toks
+  else concat ds (concat toks ds)
+
+@label "regex: strip anchors"
+@description "Strip the leading `^` and trailing (unescaped) `$` boundary anchors from the normalized token list, leaving the parse body — mirrors regex-derivative.ts `parseRegex`'s `pos`/`end` initialisation (hasDollar computed on the full list). Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxStripAnchors : (toks: a) -> a
+rxStripAnchors toks =
+  let n = length toks
+  let startA = and (gt n 0) (eq (rxPeek toks) "^")
+  let afterStart = if startA then rxRest toks else toks
+  let endA = rxEndAnchor toks n
+  if endA then rxInit afterStart else afterStart
+
+
+-- -------------------------------------------------------------------------
+-- The recursive-descent parser — pure STATE THREADING. Each `parse…`
+-- returns `{ node, rest, error }` (the RxNode, unconsumed token tail and a
+-- Maybe String failure propagated by the same recursive-descent owner). The
+-- grammar: alternation > sequence > quantifier > atom (groups recurse to
+-- alternation). Faithful to regex-derivative.ts's mutable-`pos` parser.
+-- -------------------------------------------------------------------------
+
+@label "regex: read digits"
+@description "Read a run of ASCII-digit tokens (code 48..57), accumulating their value `acc*10 + (code-48)` — pure code arithmetic (no string→number native). Returns `{ value, count, rest }` (count distinguishes `parseInt(\"\")||0` from a real 0). Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxReadDigits : (toks: a) -> a
+rxReadDigits toks = rxReadDigitsGo toks 0 0
+
+@label "regex: read digits go"
+@description "The digit-accumulation fold for rxReadDigits. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxReadDigitsGo : (toks: a) -> (acc: a) -> (count: a) -> a
+rxReadDigitsGo toks acc count =
+  case head toks of
+    Nothing -> { value = acc, count = count, rest = toks }
+    Just t ->
+      if and (gte t.code 48) (lte t.code 57)
+      then rxReadDigitsGo (rxRest toks) (add (mul acc 10) (sub t.code 48)) (add count 1)
+      else { value = acc, count = count, rest = toks }
+
+@label "regex: read group name"
+@description "Read a named-group name (`(?<name>…)`) — the chars up to `>` (or end). Returns `{ name, rest }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxReadName : (toks: a) -> a
+rxReadName toks =
+  if or (rxIsEmpty toks) (eq (rxPeek toks) ">") then { name = "", rest = toks }
+  else
+    let sub = rxReadName (rxRest toks)
+    { name = concat (rxPeek toks) sub.name, rest = sub.rest }
+
+@label "regex: consume close paren"
+@description "Require and consume a leading `)` in a group parse result; preserve an inner failure, or report a missing close through the same result's error field. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxCloseParen : (parsed: a) -> a
+rxCloseParen parsed =
+  case parsed.error of
+    Just reason -> parsed
+    Nothing ->
+      if eq (rxPeek parsed.rest) ")"
+      then { node = parsed.node, rest = rxRest parsed.rest, error = Nothing }
+      else { node = parsed.node, rest = parsed.rest, error = Just "Missing closing parenthesis" }
+
+@label "regex: read class atom"
+@description "Read one char-class element (an escape via `rxEscapeToRanges`, else a literal single-point range from `tok.code`). Returns `{ ranges, rest }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxClassAtom : (toks: a) -> a
+rxClassAtom toks =
+  if eq (rxPeek toks) "\\"
+  then
+    let escTok = rxHeadTok (rxRest toks)
+    { ranges = rxEscapeToRanges escTok, rest = rxRest (rxRest toks) }
+  else
+    let t = rxHeadTok toks
+    { ranges = [ { lo = t.code, hi = t.code } ], rest = rxRest toks }
+
+@label "regex: read class range hi"
+@description "Read the upper bound of a char-class `a-z` range — a single code point (`tok.code`, even when escaped: `[a-\\d]`'s hi is literal 'd', matching regex-derivative.ts). Returns `{ code, rest }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxClassHi : (toks: a) -> a
+rxClassHi toks =
+  if eq (rxPeek toks) "\\"
+  then
+    let t = rxHeadTok (rxRest toks)
+    { code = t.code, rest = rxRest (rxRest toks) }
+  else
+    let t = rxHeadTok toks
+    { code = t.code, rest = rxRest toks }
+
+@label "regex: parse char class"
+@description "Parse a `[...]` char class (toks AFTER the `[`): optional `^` negation, then class items (literals / escapes / `a-z` ranges) until `]`, merged via rxMergeRanges. Retains inherited class-close tolerance. Returns `{ node, rest, error }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseCharClass : (toks: a) -> a
+rxParseCharClass toks =
+  let neg = eq (rxPeek toks) "^"
+  let afterNeg = if neg then rxRest toks else toks
+  let acc = rxClassItems afterNeg []
+  let afterClose = if eq (rxPeek acc.rest) "]" then rxRest acc.rest else acc.rest
+  { node = RxCls (rxMergeRanges acc.ranges) neg, rest = afterClose, error = Nothing }
+
+@label "regex: parse class items"
+@description "The char-class item loop: accumulate ranges until `]` or end. A lo-element followed by `-` and a non-`]` forms a range (`[lo, hi]` when lo is a single point, else the lo-ranges plus a singleton hi); otherwise the lo-ranges append directly. Mirrors regex-derivative.ts's inner `while`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxClassItems : (toks: a) -> (ranges: a) -> a
+rxClassItems toks ranges =
+  if or (rxIsEmpty toks) (eq (rxPeek toks) "]") then { ranges = ranges, rest = toks }
+  else
+    let lo = rxClassAtom toks
+    if and (eq (rxPeek lo.rest) "-") (and (not (rxIsEmpty (rxRest lo.rest))) (neq (rxPeek (rxRest lo.rest)) "]"))
+    then
+      let afterDash = rxRest lo.rest
+      let hi = rxClassHi afterDash
+      let lo0 = rxHeadRange lo.ranges
+      let single = and (eq (length lo.ranges) 1) (eq lo0.lo lo0.hi)
+      let newRanges = if single then appendItem { lo = lo0.lo, hi = hi.code } ranges else appendItem { lo = hi.code, hi = hi.code } (concat ranges lo.ranges)
+      rxClassItems hi.rest newRanges
+    else
+      rxClassItems lo.rest (concat ranges lo.ranges)
+
+@label "regex: parse atom"
+@description "Parse one regex atom (toks non-empty): `(` ⇒ group; `[` ⇒ char class; `.` ⇒ dot; `\\x` ⇒ escape; else a literal char. Returns `{ node, rest, error }`, propagating group-close failures. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseAtom : (toks: a) -> a
+rxParseAtom toks =
+  let c = rxPeek toks
+  if eq c "(" then rxParseGroup (rxRest toks)
+  else if eq c "[" then rxParseCharClass (rxRest toks)
+  else if eq c "." then { node = RxDot, rest = rxRest toks, error = Nothing }
+  else if eq c "\\" then
+    let escTok = rxHeadTok (rxRest toks)
+    { node = rxEscapeToNode escTok, rest = rxRest (rxRest toks), error = Nothing }
+  else
+    let t = rxHeadTok toks
+    { node = RxChar t.ch t.code, rest = rxRest toks, error = Nothing }
+
+@label "regex: parse group"
+@description "Parse a group body (toks AFTER the `(`): `(?:…)` non-capturing, `(?<name>…)` named, else a plain group; require its closing `)` and propagate an inner failure. Returns `{ node, rest, error }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseGroup : (toks: a) -> a
+rxParseGroup toks =
+  if and (eq (rxPeek toks) "?") (not (rxIsEmpty (rxRest toks)))
+  then
+    let n2 = rxPeek (rxRest toks)
+    if eq n2 ":" then
+      let inner = rxParseAlt (rxRest (rxRest toks))
+      rxCloseParen inner
+    else if eq n2 "<" then
+      let afterLt = rxRest (rxRest toks)
+      let nm = rxReadName afterLt
+      let afterGt = if eq (rxPeek nm.rest) ">" then rxRest nm.rest else nm.rest
+      let inner = rxParseAlt afterGt
+      rxCloseParen { node = rxMkGroup nm.name inner.node, rest = inner.rest, error = inner.error }
+    else
+      let inner = rxParseAlt toks
+      rxCloseParen inner
+  else
+    let inner = rxParseAlt toks
+    rxCloseParen inner
+
+@label "regex: parse braced quantifier"
+@description "Parse a `{n}` / `{n,}` / `{n,m}` quantifier (toks AFTER the `{`): min digits, optional `,` then `}` (unbounded, -1 sentinel) or max digits (defaulting to min when absent), then the closing `}`. Always wraps in RxRep, retaining inherited malformed-bound meanings. Returns `{ node, rest, error }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseBraced : (node: RxNode) -> (toks: a) -> a
+rxParseBraced node toks =
+  let mn = rxReadDigits toks
+  let afterMin = mn.rest
+  let mm = if eq (rxPeek afterMin) "," then rxBracedMax mn (rxRest afterMin) else { max = mn.value, rest = afterMin }
+  let afterBrace = if eq (rxPeek mm.rest) "}" then rxRest mm.rest else mm.rest
+  { node = RxRep node mn.value mm.max, rest = afterBrace, error = Nothing }
+
+@label "regex: parse braced max"
+@description "The `{n,…}` upper-bound half: a `}` immediately after the comma ⇒ unbounded (-1); else read max digits (defaulting to min when none). Returns `{ max, rest }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxBracedMax : (mn: a) -> (toks: a) -> a
+rxBracedMax mn toks =
+  if eq (rxPeek toks) "}" then { max = negate 1, rest = toks }
+  else
+    let mx = rxReadDigits toks
+    { max = if eq mx.count 0 then mn.value else mx.value, rest = mx.rest }
+
+@label "regex: parse quantifier"
+@description "Parse an atom then an optional postfix quantifier (`* + ? {n,m}`), swallowing a trailing lazy `?`; propagate an atom failure before reading its suffix. Returns `{ node, rest, error }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseQuant : (toks: a) -> a
+rxParseQuant toks =
+  let atom = rxParseAtom toks
+  case atom.error of
+    Just reason -> atom
+    Nothing -> rxParseQuantSuffix atom.node atom.rest
+
+@label "regex: parse quantifier suffix"
+@description "Apply a postfix quantifier to `node`: `*` ⇒ rep 0..∞, `+` ⇒ 1..∞, `?` ⇒ 0..1, `{` ⇒ braced; then swallow one trailing lazy `?`. Returns `{ node, rest, error }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseQuantSuffix : (node: RxNode) -> (toks: a) -> a
+rxParseQuantSuffix node toks =
+  if rxIsEmpty toks then { node = node, rest = toks, error = Nothing }
+  else
+    let c = rxPeek toks
+    let applied = if eq c "*" then { node = RxRep node 0 (negate 1), rest = rxRest toks, error = Nothing } else if eq c "+" then { node = RxRep node 1 (negate 1), rest = rxRest toks, error = Nothing } else if eq c "?" then { node = RxRep node 0 1, rest = rxRest toks, error = Nothing } else if eq c "{" then rxParseBraced node (rxRest toks) else { node = node, rest = toks, error = Nothing }
+    if eq (rxPeek applied.rest) "?" then { node = applied.node, rest = rxRest applied.rest, error = applied.error } else applied
+
+@label "regex: parse sequence"
+@description "Parse a concatenation of quantified atoms until `)`, `|`, or end, propagating a child failure. Returns `{ node, rest, error }`. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseSeq : (toks: a) -> a
+rxParseSeq toks =
+  let seed = RxEps
+  rxParseSeqLoop seed toks
+
+@label "regex: parse sequence loop"
+@description "The sequence fold: while not at `)`/`|`/end, parse a quantifier and rxMkSeq it on. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseSeqLoop : (node: RxNode) -> (toks: a) -> a
+rxParseSeqLoop node toks =
+  if and (not (rxIsEmpty toks)) (and (neq (rxPeek toks) ")") (neq (rxPeek toks) "|"))
+  then
+    let q = rxParseQuant toks
+    case q.error of
+      Just reason -> q
+      Nothing -> rxParseSeqLoop (rxMkSeq node q.node) q.rest
+  else { node = node, rest = toks, error = Nothing }
+
+@label "regex: parse alternation"
+@description "Parse `seq (| seq)*` alternation, propagating a child failure. Returns `{ node, rest, error }`. The recursive-descent entry; complete callers use rxParseWhole. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseAlt : (toks: a) -> a
+rxParseAlt toks =
+  let first = rxParseSeq toks
+  case first.error of
+    Just reason -> first
+    Nothing -> rxParseAltLoop first.node first.rest
+
+@label "regex: parse alternation loop"
+@description "The alternation fold: while the next token is `|`, consume it, parse a sequence, and rxMkAlt it on. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxParseAltLoop : (node: RxNode) -> (toks: a) -> a
+rxParseAltLoop node toks =
+  if eq (rxPeek toks) "|"
+  then
+    let s = rxParseSeq (rxRest toks)
+    case s.error of
+      Just reason -> s
+      Nothing -> rxParseAltLoop (rxMkAlt node s.node) s.rest
+  else { node = node, rest = toks, error = Nothing }
+
+@label "regex: complete token parse"
+@description "Admit a complete regex token body through the existing recursive-descent parser: require group closes and no unconsumed tail, returning Result String RxNode. Boundary anchors are stripped; other inherited syntax meanings are retained. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse"
+@category "engine-internal"
+rxParseWhole : (toks: a) -> Result String RxNode
+rxParseWhole toks =
+  let parsed = rxParseAlt (rxStripAnchors toks)
+  case parsed.error of
+    Just reason -> Err reason
+    Nothing ->
+      if rxIsEmpty parsed.rest then Ok parsed.node
+      else Err (concat "Unexpected unconsumed token: " (rxPeek parsed.rest))
+
+
+-- -------------------------------------------------------------------------
+-- RxNode → generic-Pattern MARKER lowering. Emits plain-record markers
+-- (`{ tag = … }`) the TS shim authors into `$`-keyed SetExpr + Pattern.
+-- Mirrors regex-derivative.ts `rNodeToPattern` + `rangesToSetExpr`. RxGroup
+-- is transparent (captures dropped — generic Pattern is a set of strings).
+-- -------------------------------------------------------------------------
+
+@label "regex: ranges to marker"
+@description "Lower scalar code-point ranges to a SetExpr predicate MARKER: [] ⇒ RSNone; one span ⇒ RSInterval; many ⇒ RSUnion. Exclude the surrogate gap and split BMP/supplementary spans so the existing String endpoint marshaller retains each numeric interval under UTF-16 ordering. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxRangesToMarker : (ranges: a) -> a
+rxRangesToMarker ranges =
+  let parts = fold rxAppendRangeMarkers [] ranges
+  if eq (length parts) 0 then { tag = "RSNone" }
+  else if eq (length parts) 1 then rxHeadMarker parts else { tag = "RSUnion", parts = parts }
+
+@label "regex: append scalar interval markers"
+@description "Append the intersections of one numeric range with the lower BMP, upper BMP and supplementary scalar spans. The split keeps the existing String endpoint lowering faithful to code-point order. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse"
+@category "engine-internal"
+rxAppendRangeMarkers : (parts: a) -> (r: a) -> a
+rxAppendRangeMarkers parts r =
+  let lowerLo = rxMax r.lo 0
+  let lowerHi = if lt r.hi 55295 then r.hi else 55295
+  let lower = if lte lowerLo lowerHi then appendItem { tag = "RSInterval", lo = lowerLo, hi = lowerHi } parts else parts
+  let upperLo = rxMax r.lo 57344
+  let upperHi = if lt r.hi 65535 then r.hi else 65535
+  let upper = if lte upperLo upperHi then appendItem { tag = "RSInterval", lo = upperLo, hi = upperHi } lower else lower
+  let supplementaryLo = rxMax r.lo 65536
+  let supplementaryHi = if lt r.hi 1114111 then r.hi else 1114111
+  if lte supplementaryLo supplementaryHi then appendItem { tag = "RSInterval", lo = supplementaryLo, hi = supplementaryHi } upper else upper
+
+@label "regex: head marker"
+@description "The first marker of a list, or RSNone when empty. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxHeadMarker : (xs: a) -> a
+rxHeadMarker xs =
+  case head xs of
+    Nothing -> { tag = "RSNone" }
+    Just m -> m
+
+@label "regex: node to pattern marker"
+@description "Lower an RxNode to a generic-Pattern MARKER tree (mirrors regex-derivative.ts `rNodeToPattern`): RxChar ⇒ a single-char RSEnum match; RxCls ⇒ the ranges marker (RSComplement-wrapped when negated); RxDot ⇒ RSDot (any-char-except-newline); RxSeq/RxAlt/RxRep map structurally; RxGroup is TRANSPARENT (captures dropped). The TS shim authors the `$`-keys + lifts through pattern.ts's smart constructors. Internal helper (regex-parse)."
+@tags "engine" "internal" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+@category "engine-internal"
+rxNodeToPattern : (node: RxNode) -> a
+rxNodeToPattern node =
+  case node of
+    RxEmpty -> { tag = "RPEmpty" }
+    RxEps -> { tag = "RPEps" }
+    RxChar ch code -> { tag = "RPMatch", pred = { tag = "RSEnum", chars = [ch] } }
+    RxCls ranges neg ->
+      let pos = rxRangesToMarker ranges
+      let pred = if neg then { tag = "RSComplement", inner = pos } else pos
+      { tag = "RPMatch", pred = pred }
+    RxDot -> { tag = "RPMatch", pred = { tag = "RSDot" } }
+    RxSeq l r -> { tag = "RPSeq", a = rxNodeToPattern l, b = rxNodeToPattern r }
+    RxAlt l r -> { tag = "RPAlt", a = rxNodeToPattern l, b = rxNodeToPattern r }
+    RxRep c mn mx -> { tag = "RPRep", child = rxNodeToPattern c, min = mn, max = mx }
+    RxGroup name c -> rxNodeToPattern c
+
+
+-- -------------------------------------------------------------------------
+-- The entry — the dispatch shim calls this with the pre-tokenized regex.
+-- -------------------------------------------------------------------------
+
+@label "regex: regex tokens to Pattern marker"
+@description "Convert pre-tokenized regex char/code-point pairs to Result String Pattern-marker: normalize anchors, require complete recursive-descent admission with group closes, then lower to the marker tree the shim authors into a Pattern. Other inherited regex-fragment meanings remain unchanged; this is not a full JavaScript Regex validator."
+@tags "engine" "regex" "parse" "regex-derivative-to-fenel" "phase-2"
+regexToPatternMarker : (toks: a) -> Result String Any
+regexToPatternMarker toks =
+  let nt = rxNormalize toks
+  case rxParseWhole nt of
+    Err reason -> Err reason
+    Ok node -> Ok (rxNodeToPattern node)

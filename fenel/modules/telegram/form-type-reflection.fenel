@@ -1,0 +1,241 @@
+module telegram where
+
+-- ============================================================================
+-- form-type-reflection — the Tier-0 raw-FenelType peelers for the Telegram
+-- conversational read(T) / form-fill UX.
+--
+-- ts-elimination-completion Phase 7 (2026-06-02). These five public bodies
+-- (`innerType` / `isOptionalField` / `typeHint` / `enumValues` /
+-- `isBooleanType`) were inline JSON-Logic `body: {` literals in
+-- engine/src/modules/telegram.ts that pattern-matched RAW FenelType reflection
+-- shapes (`{$variant}` / `{$refined}` / `{$opaque}` / `{$named}`).
+--
+-- THE STEP-0 A/B/C DESIGN DECISION (resolved empirically — see
+-- workstreams/ts-elimination-completion/notes/phase-7-telegram-reflection-cluster.md):
+--
+--   (A) Direct `$`-headed `case` patterns in `.fenel` — REJECTED. The parser
+--       has no `$`-headed pattern path (`parsePattern` only handles literals /
+--       records / parens / idents); `case t of $variant {...} ->` fails with
+--       "Expected pattern". `$` is a reserved op token, never an ident/field
+--       head (the Phase-2b `assocRecord {} "$record"` finding).
+--   (B) Marshalling boundary-adapter (the `type-traversal.fenel` /
+--       `marshalTraversalType` precedent) — VIABLE but unnecessary here. Its
+--       marshalling lives in a TS dispatch WRAPPER; telegram's peelers are
+--       invoked by codeName through the generic evaluator AND called by-id from
+--       sibling Fenel bodies (Tier-2 `keyboardForField`/`parseFieldInput`/… call
+--       these passing raw `field.type`), so a TS-wrapper marshaller can't sit in
+--       that path. It would also need a telegram-specific ADT (TraversalType
+--       drops the `$refined` set + Maybe fingerprint these peelers need).
+--   (C) Read the `$`-keyed type fields via `std:lookup` in pure Fenel — CHOSEN.
+--       `std:lookup record key -> Maybe a` reads ANY key (incl. `$refined` /
+--       `$variant` / `$opaque` / `$named`), returning `Just <value>` / `Nothing`
+--       (the sanctioned `$`-keyed-FenelType idiom, sister of Phase-2b's
+--       `std:assocRecord`/`std:lookup` for building the `$record` envelope). NO
+--       marshaller native, NO new ADT, fully Fenel-first, and reachable from
+--       both TS-codeName and Fenel-by-id call sites. Each peeler does ONE level
+--       of `lookup`-driven unwrapping and recurses on the raw child.
+--
+-- Two authoring gotchas this file works around (catalogued in the Step-0 note):
+--   * `and`/`or` are infix-only — `and a b` (prefix) fails to parse; use the
+--     `if … then … else` cascade or infix `a and b`.
+--   * `(expr).field` parses `.` as the COMPOSE operator, not field access —
+--     field access only works on a var-path token (`v.cases`, `r.base`). So
+--     `(at cs i).name` must be `let c = at cs i  /  c.name`.
+--
+-- Helpers are prefixed `formRefl…` to avoid colliding with like-named std /
+-- engine / sibling-telegram helpers (the `typeTraversal…` convention).
+-- ============================================================================
+
+-- innerType — peel Maybe / $refined / $opaque wrappers off a FenelType to
+-- expose the named primitive underneath. Self-recursive; returns the type
+-- unchanged once no wrapper matches. Mirrors the retired inline body
+-- (telegram.ts:464) which matched `{$variant Maybe}` / `{$refined}` /
+-- `{$opaque}` directly. Order is irrelevant (a type is at most one of these
+-- at top level).
+@label "Inner type"
+@description "Peel Maybe / $refined / $opaque wrappers off a FenelType to expose the named primitive underneath. Used by form-rendering helpers that decide hints based on the underlying type."
+@tags "type" "introspection" "form"
+@category "telegram"
+@codeName "innerType"
+innerType : (t: a) -> a
+innerType t =
+  case lookup t "$refined" of
+    Just r -> innerType r.base
+    Nothing ->
+      case lookup t "$opaque" of
+        Just o -> innerType o.pure
+        Nothing ->
+          case formReflMaybePayload t of
+            Just inner -> innerType inner
+            Nothing -> t
+
+-- isOptionalField — true when the field's type is wrapped in Maybe (the
+-- `Nothing | Just` fingerprint). Mirrors telegram.ts:503, which matched the
+-- two-case `$variant` shape only (no payload requirement).
+@label "Field is optional"
+@description "True when the field's type is wrapped in Maybe — the user can answer with `skip` to leave it empty."
+@tags "type" "form"
+@category "telegram"
+@codeName "isOptionalField"
+isOptionalField : (field: a) -> a
+isOptionalField field =
+  case lookup field.type "$variant" of
+    Nothing -> false
+    Just v -> formReflMaybeShape v.cases
+
+-- typeHint — type-driven suffix appended to a field prompt. Format-refined
+-- primitives match before peeling (only the OUTER $refined carries the format
+-- set); then fall through to the named-primitive hints on the peeled inner.
+-- Mirrors telegram.ts:529.
+@label "Type hint suffix"
+@description "Type-driven suffix appended to a field prompt (e.g. \" (yes/no)\" for Boolean, \" (date — YYYY-MM-DD)\" for Date, \" (your email)\" for format:email). Empty string when no hint applies."
+@tags "type" "form" "render"
+@category "telegram"
+@codeName "typeHint"
+typeHint : (t: a) -> a
+typeHint t =
+  let fmt = formReflFormatName t
+  if eq fmt "format:email"
+  then " (your email)"
+  else if eq fmt "format:url"
+  then " (a URL)"
+  else if eq fmt "format:handle"
+  then " (your @handle)"
+  else formReflNamedHint (innerType t)
+
+-- enumValues — extract the enum value list constraining a FenelType. Peels
+-- through Maybe / $refined wrappers; empty list when no enum set is present.
+-- Mirrors telegram.ts:583 (enum arm first, then refined-base recurse, then
+-- Maybe recurse).
+-- set-algebra-to-fenel 3b-3a: DUAL-READ the refined `set` slot — the canonical
+-- `$tag` `SeEnum` ADT (what the 3b-2 producer flip + the `0085` at-rest flip now
+-- emit) FIRST, then the legacy `$enum` `$`-key form (the transition tolerance,
+-- mirroring the TS readers' `peelSetExpr` dual-read). The `$`-key arm drops in
+-- 3b-3 Step 1 when the codec + `peelSetExpr`'s `$`-key arm collapse.
+@label "Enum values"
+@description "Extract the enum value list constraining a FenelType. Peels through Maybe / $refined wrappers; returns the empty list when no enum set is present."
+@tags "type" "introspection" "form"
+@category "telegram"
+@codeName "enumValues"
+enumValues : (t: a) -> a
+enumValues t =
+  case lookup t "$refined" of
+    Just r ->
+      case r.set of
+        SeEnum { values = vs } -> vs
+        _ ->
+          case lookup r.set "$enum" of
+            Just vs -> vs
+            Nothing -> enumValues r.base
+    Nothing ->
+      case formReflMaybePayload t of
+        Just inner -> enumValues inner
+        Nothing -> []
+
+-- isBooleanType — true when the underlying primitive (after peeling) is the
+-- named Boolean. Mirrors telegram.ts:620 (`match innerType t: Boolean -> true`)
+-- via the ported `innerType` + a named-name read.
+@label "Type is Boolean"
+@description "True when the underlying primitive (after peeling Maybe / $refined / $opaque) is the named Boolean."
+@tags "type" "introspection" "form"
+@category "telegram"
+@codeName "isBooleanType"
+isBooleanType : (t: a) -> a
+isBooleanType t =
+  eq (formReflNamedName (innerType t)) "Boolean"
+
+-- ============================================================================
+-- Helpers — Codeable-ONLY (directive-free, the telegram-union 3j default), so
+-- they ride as resolvable codeName members WITHOUT adding Labelable /
+-- Describable / Taggable / Categorizable rows. This matches the sibling
+-- telegram helpers (flat*Inner / the Conversation helpers — guarded
+-- Codeable-only by module-migrate-telegram.test.ts) and keeps the law count
+-- flat (pure helpers contribute 0 spec-law rows). All pure; `formRefl…`-prefixed.
+-- ============================================================================
+
+-- formReflMaybePayload — if `t` is a Maybe variant (cases `[Nothing, Just]`),
+-- return `Just <the Just case's payload type>`, else `Nothing`. The payload
+-- type is the Just case's first field (`_0`) `type`.
+formReflMaybePayload : (t: a) -> a
+formReflMaybePayload t =
+  case lookup t "$variant" of
+    Nothing -> Nothing
+    Just v ->
+      if formReflMaybeShape v.cases
+      then Just (formReflFirstFieldType (at v.cases 1))
+      else Nothing
+
+-- formReflMaybeShape — true when a variant's cases are exactly
+-- `[Nothing, Just]` (the Maybe fingerprint).
+formReflMaybeShape : (cs: a) -> a
+formReflMaybeShape cs =
+  if eq (length cs) 2
+  then if eq (formReflCaseNameAt cs 0) "Nothing"
+       then eq (formReflCaseNameAt cs 1) "Just"
+       else false
+  else false
+
+-- formReflCaseNameAt — the `name` of the i-th variant case.
+formReflCaseNameAt : (cs: a) -> (i: a) -> a
+formReflCaseNameAt cs i =
+  let c = at cs i
+  c.name
+
+-- formReflFirstFieldType — the `type` of a variant case's first field.
+formReflFirstFieldType : (c: a) -> a
+formReflFirstFieldType c =
+  let f0 = at c.fields 0
+  f0.type
+
+-- formReflNamedName — the name-handle of a type, or "" when it isn't a bare
+-- name reference. 7g-retire-4c: reads `{$ref}` (the canonical name-ref) first,
+-- then legacy `{$named}` (the dual-read tolerance — the Fenel-body sibling of
+-- the TS `refHandle`).
+formReflNamedName : (t: a) -> a
+formReflNamedName t =
+  case lookup t "$ref" of
+    Just n -> n
+    Nothing ->
+      case lookup t "$named" of
+        Just n -> n
+        Nothing -> ""
+
+-- formReflFormatName — the format-set name of a directly-$refined type
+-- (`$refined {set: SeRef "format:..."}`), or "" otherwise. Only the OUTER
+-- $refined's name-set is read.
+-- set-algebra-to-fenel 3b-3a: DUAL-READ the refined `set` slot — the canonical
+-- `$tag` `SeRef` ADT (the 3b-2 producer flip emits `{$tag:"SeRef", handle}`)
+-- FIRST, then the legacy `$ref` / `$named` `$`-key handles (7g-retire-4c name-ref
+-- tolerance — these are the typed-fn-refs axis, kept verbatim, NOT entangled).
+-- The `$`-key arm drops in 3b-3 Step 1 with the codec collapse.
+formReflFormatName : (t: a) -> a
+formReflFormatName t =
+  case lookup t "$refined" of
+    Nothing -> ""
+    Just r ->
+      case r.set of
+        SeRef { handle = h } -> h
+        _ ->
+          case lookup r.set "$ref" of
+            Just n -> n
+            Nothing ->
+              case lookup r.set "$named" of
+                Just n -> n
+                Nothing -> ""
+
+-- formReflNamedHint — the named-primitive hint suffix for a peeled type.
+-- Mirrors the inner `match` of the inline typeHint body.
+formReflNamedHint : (t: a) -> a
+formReflNamedHint t =
+  let n = formReflNamedName t
+  if eq n "Boolean"
+  then " (yes/no)"
+  else if eq n "Int"
+  then " (a number)"
+  else if eq n "Number"
+  then " (a number)"
+  else if eq n "Nat"
+  then " (a number)"
+  else if eq n "Date"
+  then " (date — YYYY-MM-DD)"
+  else ""

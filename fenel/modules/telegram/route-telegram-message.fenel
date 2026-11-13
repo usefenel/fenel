@@ -1,0 +1,155 @@
+-- routeTelegramMessage — handle an inbound user reply on an active
+-- form-fill conversation.
+--
+-- Returns Boolean — true if a conversation matched and the reply
+-- was handled, false when no active conversation matched (the
+-- caller falls through to user-defined trigger matching instead).
+--
+-- This body covers the no-`onFieldFn`-hook path. Two routing modes:
+--
+--   1. Strict (default, asDraft = false): the decision is delegated
+--      to the pure `dispatchUserReply` Fenel function, which maps the
+--      reply to one of: cancel, back_invalid, back_edge, done_empty,
+--      next_field, confirm, reprompt. Parse / validation failures
+--      reprompt the same field.
+--
+--   2. Draft (asDraft = true, capture-first): the body handles
+--      /cancel and /back inline, then for any other reply parses +
+--      validates the input and wraps the outcome as
+--      Either<String, T_field> (Left for failures, Right for
+--      validated values). The conversation ALWAYS advances — invalid
+--      input never reprompts; it's preserved as a Left for later
+--      reconciliation in the review UX. The conversation eventually
+--      materialises as a Draft<typeName> entity at confirm.
+--
+-- Stale-message gate: if the user's message timestamp predates the
+-- bot's most-recent field-prompt send, the message couldn't have
+-- been authored as a reply to the current question — drop it with
+-- a friendly note. Applies to both modes.
+--
+-- Conversations that carry an `onFieldFn` hook are still routed
+-- via the legacy TS path until that branch is ported — the TS
+-- wrapper checks `conv.hooks.onFieldFn` and only dispatches here
+-- when no hook is set.
+--
+-- module-substrate Phase 3o (2026-05-31) — migrated to `module telegram where`.
+-- The defineFunction spec + ROUTE_TELEGRAM_MESSAGE_BODY extraction RETIRED;
+-- identity rides @facet directives. The two helpers (routeStrictReply /
+-- routeDraftReply) stay directive-free → Codeable-only (3j default), resolved by
+-- codeName from the entry body. Def name === codeName. `requires` INFERRED.
+-- Bodies UNCHANGED.
+
+module telegram where
+
+@label "Route Telegram message reply"
+@description "Handle a user reply on an active form-fill conversation that has no onFieldFn hook. Calls the pure dispatchUserReply decision function and runs the side effects for each kind: cancel / back_invalid / back_edge / done_empty / next_field / confirm / reprompt. Conversations carrying an onFieldFn hook are routed by routeTelegramMessageWithHook."
+@tags "telegram" "collector" "io" "form" "routing"
+@ioAction "telegram_form.route_message"
+routeTelegramMessage : (botId: String) -> (chatId: Int) -> (userId: Int) -> (text: String) -> (messageDate: Maybe Int) -> Boolean
+routeTelegramMessage botId chatId userId text messageDate =
+  let convMaybe = findActiveConversation botId chatId userId
+  case convMaybe of
+    Nothing -> false
+    Just conv ->
+      let botMaybe = findBotById botId
+      case botMaybe of
+        Nothing -> false
+        Just bot ->
+          if not bot.enabled
+          then false
+          else if isStaleMessage conv messageDate
+          then
+            sendMessageText bot.token chatId "I got your message but it was sent before my last question — please reply to the most recent prompt above."
+            true
+          else if conv.hooks.asDraft
+          then routeDraftReply conv bot chatId text
+          else routeStrictReply conv bot chatId text
+
+-- Strict mode — defer the decision to dispatchUserReply and run the
+-- side effect per kind. Validation failures reprompt the same field.
+-- Conversation, bot, and decision values cross legacy dynamic `{}` IO
+-- carriers; exact-record inference cannot manufacture their open rows.
+routeStrictReply : ({}) -> ({}) -> Int -> String -> Boolean
+routeStrictReply conv bot chatId text =
+  let decision = dispatchUserReply text conv.fields conv.currentFieldIndex conv.partialValue
+  case decision.kind of
+    "cancel" ->
+      markConversationCancelled conv.id
+      sendMessageText bot.token chatId "Cancelled. Send /start to begin again."
+      true
+    "back_invalid" ->
+      sendMessageText bot.token chatId "Already on the first question."
+      true
+    "back_edge" ->
+      updateConversationProgress conv.id decision.newPartial decision.prevIndex
+      sendFieldPrompt bot.token chatId decision.prevField
+      stampPromptSentAt conv.id
+      true
+    "done_empty" ->
+      markConversationCompleted conv.id
+      true
+    "next_field" ->
+      updateConversationProgress conv.id decision.newPartial decision.nextIndex
+      sendFieldPrompt bot.token chatId decision.nextField
+      stampPromptSentAt conv.id
+      true
+    "confirm" ->
+      updateConversationProgress conv.id decision.newPartial (length conv.fields)
+      markConversationConfirming conv.id
+      sendConfirmationSummary bot.token chatId conv.fields decision.newPartial
+      true
+    "reprompt" ->
+      sendMessageText bot.token chatId `${decision.error}\n\nField: ${decision.label}\nReply with a corrected value, or send /back to revisit a previous question.`
+      true
+    _ -> false
+
+-- Draft mode — capture-first. Handles /cancel and /back inline (same
+-- semantics as strict mode) then for any other reply parses+wraps
+-- and unconditionally advances. The wrapped value is stored as
+-- Either<String, T_field> in partialValue; finalize materialises the
+-- whole thing as a Draft<typeName> entity.
+routeDraftReply : ({}) -> ({}) -> Int -> String -> Boolean
+routeDraftReply conv bot chatId text =
+  let trimmed = lower (trim text)
+  if trimmed == "/cancel"
+  then
+    markConversationCancelled conv.id
+    sendMessageText bot.token chatId "Cancelled. Send /start to begin again."
+    true
+  else if trimmed == "/back"
+  then
+    if (conv.currentFieldIndex <= 0) or (conv.currentFieldIndex > (length conv.fields))
+    then
+      sendMessageText bot.token chatId "Already on the first question."
+      true
+    else
+      let prevIdx = conv.currentFieldIndex - 1
+      let prevField = at conv.fields prevIdx
+      let newPartial = mapDelete conv.partialValue prevField.name
+      updateConversationProgress conv.id newPartial prevIdx
+      sendFieldPrompt bot.token chatId prevField
+      stampPromptSentAt conv.id
+      true
+  else
+    if (conv.currentFieldIndex < 0) or (conv.currentFieldIndex >= (length conv.fields))
+    then
+      markConversationCompleted conv.id
+      true
+    else
+      let currentField = at conv.fields conv.currentFieldIndex
+      let parseResult = parseFieldInput text currentField
+      let wrapped = wrapDraftField parseResult text
+      let nextValue = mapSet conv.partialValue currentField.name wrapped
+      let nextIdx = conv.currentFieldIndex + 1
+      if nextIdx >= length conv.fields
+      then
+        updateConversationProgress conv.id nextValue (length conv.fields)
+        markConversationConfirming conv.id
+        sendConfirmationSummary bot.token chatId conv.fields nextValue
+        true
+      else
+        let nextField = at conv.fields nextIdx
+        updateConversationProgress conv.id nextValue nextIdx
+        sendFieldPrompt bot.token chatId nextField
+        stampPromptSentAt conv.id
+        true

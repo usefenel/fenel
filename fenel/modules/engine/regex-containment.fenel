@@ -1,0 +1,854 @@
+module engine where
+
+-- =========================================================================
+-- Generic Pattern-language CONTAINMENT deciders in Fenel — the port of
+-- pattern.ts's patternSubset / patternDisjoint (the generic 2^N atom-
+-- enumeration Brzozowski-derivative walk). regex-derivative-to-fenel Phase 1
+-- (Slice A), shape (B): faithful-2^N-port-first.
+--
+-- WHAT THIS IS. Decide language inclusion (L(a) subset of L(b)) and
+-- disjointness (L(a) intersect L(b) empty) for two patterns over an abstract
+-- element domain whose match nodes carry arbitrary predicates. The algorithm
+-- is the coinductive product-automaton walk: at each (a, b) state collect the
+-- distinct predicates, enumerate the satisfiable ATOMS (boolean combinations
+-- of which predicates fire), derive both sides under each atom, recurse;
+-- co-inductive cycle detection via a threaded visited set (Phase-0 proved a
+-- threaded accumulator reproduces the TS mutable Set exactly, bounded). This
+-- is the UNORDERED / opaque-predicate path that the structured interval-
+-- endpoint partition (a later sub-phase) does NOT subsume: pattern.ts's tests
+-- pin patternSubset over $where event predicates decided purely by OPAQUE-atom
+-- structural inclusion, so the 2^N is load-bearing, not replaceable by
+-- conservative-false (see notes/phase-1-step0.md Finding 1).
+--
+-- THE $-KEY BARRIER + THE PRE-COMPUTE PRECEDENT. A .fenel body cannot read
+-- $-prefixed-key objects (SetExpr predicates). So the TS dispatch shim
+-- (engine-bodies-dispatch.ts) does the marshalling the marshalSetExprFor*
+-- functions already do: it collects the distinct predicates, assigns each a
+-- short opaque string KEY, and pre-computes — TS-side, via the already-Fenel
+-- isSubset — the only predicate facts this walk needs:
+--   * isAll  : does the predicate accept every element ($all)?
+--   * subsetOf: the keys j such that pred_i is a proven subset of pred_j.
+-- The body then treats predicates as OPAQUE string keys: PMatch carries a
+-- key, atoms are sets of keys, and atom satisfiability reads the pre-computed
+-- isAll / subsetOf table (no isSubset call from Fenel, no $-key access, no bit
+-- arithmetic — atoms are key LISTS). This mirrors marshalSetExprForDecideEmpty
+-- pre-computing anyPairDisjoint / aSubsetB for its body.
+--
+-- REUSE. The pattern ADT is pattern-algebra.fenel's `Pat` (PMatch carries the
+-- opaque key in its `ws` slot; PSeq/PAlt/PRep/PEmpty/PEps reused verbatim —
+-- containment carries no parse value, so PEpsV/PRed/PRef are unused). The
+-- recognizer smart constructors here (cSeq / cAlt) DELIBERATELY DIVERGE from
+-- pattern-algebra's value-preserving mkSeq/mkAlt: containment is a recognizer,
+-- so it collapses `seq eps b = b` (pattern.ts mkSeq), which the parser's
+-- value-carrying mkSeq must NOT do. Same divergence pattern-algebra documents
+-- for its own mkSeq. nullablePat is env-free (no PRef grammar env). maxNum /
+-- decMax (the PRep min-floor + the -1 unbounded sentinel) ARE reused from
+-- pattern-algebra.
+--
+-- PARITY. Verbatim port of pattern.ts: the per-state distinct-pred collection,
+-- the 16-pred cap (conservative-false beyond), the atom satisfiability filter
+-- ($all-not-fired and the subset-implication contradiction), the derivAtom
+-- mask semantics (pred not in this state OR bit unset => empty), the subset vs
+-- disjoint terminal predicates AND their distinct check ORDER (subset:
+-- memo-then-terminal; disjoint: empty-precheck + terminal-then-memo), and the
+-- disjoint dead-branch (db empty) skip. The two go-walks share every helper;
+-- only the ~10-line orchestration differs (the check order genuinely differs
+-- between the two, so this is two walks over shared machinery, not one forced
+-- combinator).
+-- =========================================================================
+
+
+-- -------------------------------------------------------------------------
+-- Pat recognizers + the recognizer smart constructors (collapse eps).
+-- -------------------------------------------------------------------------
+
+@label "Is PEmpty"
+@description "True when a Pat is the empty-language PEmpty. Internal helper (regex-containment)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+isPEmpty : (p: (Pat Any)) -> Boolean
+isPEmpty p =
+  case p of
+    PEmpty -> true
+    other -> false
+
+@label "Is PEps"
+@description "True when a Pat is the empty-string PEps. Internal helper (regex-containment)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+isPEps : (p: (Pat Any)) -> Boolean
+isPEps p =
+  case p of
+    PEps -> true
+    other -> false
+
+@label "Containment seq"
+@description "Recognizer sequencing smart constructor (pattern.ts mkSeq): PEmpty on either side annihilates; PEps on the left drops to the right, on the right drops to the left; else PSeq. DELIBERATELY collapses eps (recognizer-only) unlike pattern-algebra's value-preserving mkSeq. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+cSeq : (pa: (Pat Any)) -> (pb: (Pat Any)) -> (Pat Any)
+cSeq pa pb =
+  if or (isPEmpty pa) (isPEmpty pb) then PEmpty
+  else if isPEps pa then pb
+  else if isPEps pb then pa
+  else PSeq pa pb
+
+@label "Containment alt"
+@description "Recognizer alternation smart constructor (pattern.ts mkAlt): a PEmpty branch drops out; eps OR eps collapses to eps; else PAlt. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+cAlt : (pa: (Pat Any)) -> (pb: (Pat Any)) -> (Pat Any)
+cAlt pa pb =
+  if isPEmpty pa then pb
+  else if isPEmpty pb then pa
+  else if and (isPEps pa) (isPEps pb) then PEps
+  else PAlt pa pb
+
+
+-- -------------------------------------------------------------------------
+-- Nullability (env-free recognizer) + the structural memo key.
+-- -------------------------------------------------------------------------
+
+@label "Nullable pattern"
+@description "Does the Pat match the empty input? PEps true; PEmpty/PMatch false; PSeq and; PAlt or; PRep min==0 or nullable child. Env-free (containment patterns carry no PRef grammar refs). Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+nullablePat : (pat: (Pat Any)) -> Boolean
+nullablePat pat =
+  case pat of
+    PEmpty -> false
+    PEps -> true
+    PMatch k -> false
+    PSeq l r -> and (nullablePat l) (nullablePat r)
+    PAlt l r -> or (nullablePat l) (nullablePat r)
+    PRep c mn mx -> or (eq mn 0) (nullablePat c)
+    other -> false
+
+@label "Show pattern"
+@description "A total, deterministic structural string rendering of a Pat (PMatch carries an opaque pred key) — the coinductive memo key. Distinct Brzozowski states render to distinct strings. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+showPat : (pat: (Pat Any)) -> String
+showPat pat =
+  case pat of
+    PEmpty -> "E;"
+    PEps -> "e;"
+    PMatch k -> concat "m" (concat k ";")
+    PSeq l r -> concat "S" (concat (showPat l) (concat "." (showPat r)))
+    PAlt l r -> concat "A" (concat (showPat l) (concat "." (showPat r)))
+    PRep c mn mx -> concat "R" (concat (showPat c) (concat "." (concat (toString mn) (concat "." (toString mx)))))
+    other -> "?;"
+
+
+-- -------------------------------------------------------------------------
+-- Per-state distinct predicate keys + the atom (key-set) enumeration.
+-- -------------------------------------------------------------------------
+
+@label "Collect pattern keys"
+@description "Accumulate the distinct PMatch predicate keys reachable in a Pat (the per-state predicate set, order-preserving, deduped). Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+collectKeys : (pat: (Pat Any)) -> (acc: a) -> a
+collectKeys pat acc =
+  case pat of
+    PMatch k -> if elem k acc then acc else appendItem k acc
+    PSeq l r -> collectKeys r (collectKeys l acc)
+    PAlt l r -> collectKeys r (collectKeys l acc)
+    PRep c mn mx -> collectKeys c acc
+    other -> acc
+
+@label "All atoms"
+@description "All 2^n atoms over a key list: each atom is the SUBSET of keys that fire (a key list). Built recursively: atoms of the tail, plus each of those with the head added. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+allAtoms : (keys: a) -> a
+allAtoms keys =
+  case head keys of
+    Nothing -> [ [] ]
+    Just k ->
+      let sub = allAtoms (restOf keys)
+      concat sub (map (\s -> appendItem k s) sub)
+
+@label "Rest of list"
+@description "The tail of a list, or [] when empty. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+restOf : (xs: a) -> a
+restOf xs =
+  case tail xs of
+    Nothing -> []
+    Just r -> r
+
+
+-- -------------------------------------------------------------------------
+-- Atom satisfiability — from the TS-precomputed isAll / subsetOf table.
+-- -------------------------------------------------------------------------
+
+@label "Is-all key"
+@description "Does the predicate keyed `k` accept every element (the $all flag, pre-computed TS-side)? Reads the name->info index. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+isAllK : (infoIdx: a) -> (k: a) -> Boolean
+isAllK infoIdx k =
+  case mapGet infoIdx k of
+    Nothing -> false
+    Just e -> e.isAll
+
+@label "Subset-of key"
+@description "Is the predicate keyed `i` a proven subset of the one keyed `j` (pre-computed TS-side via isSubset)? Reads the name->info index. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+subsetOfK : (infoIdx: a) -> (i: a) -> (j: a) -> Boolean
+subsetOfK infoIdx i j =
+  case mapGet infoIdx i of
+    Nothing -> false
+    Just e -> elem j e.subsetOf
+
+@label "Atom impl pair ok"
+@description "The subset-implication contradiction check for one ordered key pair (i fires, j tested): ok unless i and j differ, j does NOT fire, and i is a subset of j (then every element satisfying i satisfies j, so the atom is unsatisfiable). Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+implPairOk : (infoIdx: a) -> (atom: a) -> (i: a) -> (j: a) -> Boolean
+implPairOk infoIdx atom i j =
+  if eq i j then true
+  else if elem j atom then true
+  else not (subsetOfK infoIdx i j)
+
+@label "All-fired ok"
+@description "The $all half of atomSat: every $all predicate in localKeys must fire in atom. Explicit head/tail recursion (mirrors pattern-algebra's allMember idiom — no all/some-with-lambda). Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+allFiredOk : (infoIdx: a) -> (localKeys: a) -> (atom: a) -> Boolean
+allFiredOk infoIdx localKeys atom =
+  case head localKeys of
+    Nothing -> true
+    Just k ->
+      if or (not (isAllK infoIdx k)) (elem k atom)
+      then
+        case tail localKeys of
+          Nothing -> true
+          Just rest -> allFiredOk infoIdx rest atom
+      else false
+
+@label "Impl row ok"
+@description "The subset-implication check for ONE firing key i against every j in localKeys (explicit recursion). Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+implRowOk : (infoIdx: a) -> (localKeys: a) -> (atom: a) -> (i: a) -> Boolean
+implRowOk infoIdx localKeys atom i =
+  case head localKeys of
+    Nothing -> true
+    Just j ->
+      if implPairOk infoIdx atom i j
+      then
+        case tail localKeys of
+          Nothing -> true
+          Just rest -> implRowOk infoIdx rest atom i
+      else false
+
+@label "Impl all ok"
+@description "The subset-implication half of atomSat: every firing key passes implRowOk against every localKey (explicit recursion over the firing set). Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+implAllOk : (infoIdx: a) -> (localKeys: a) -> (firing: a) -> Boolean
+implAllOk infoIdx localKeys firing =
+  case head firing of
+    Nothing -> true
+    Just i ->
+      if implRowOk infoIdx localKeys firing i
+      then
+        case tail firing of
+          Nothing -> true
+          Just rest -> implAllOk infoIdx localKeys rest
+      else false
+
+@label "Atom satisfiable"
+@description "Conservative atom satisfiability (pattern.ts isAtomSatisfiable): reject when some $all predicate does NOT fire, and when a firing predicate is a proven subset of a non-firing one. Only proven-unsatisfiable atoms are filtered; uncertain atoms pass. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+atomSat : (infoIdx: a) -> (localKeys: a) -> (atom: a) -> Boolean
+atomSat infoIdx localKeys atom =
+  let allFired = allFiredOk infoIdx localKeys atom
+  let implOk = implAllOk infoIdx localKeys atom
+  and allFired implOk
+
+
+-- -------------------------------------------------------------------------
+-- The atom derivative — Pat remaining after consuming the abstract element
+-- class defined by `atom` (the set of firing keys), within this state's keys.
+-- -------------------------------------------------------------------------
+
+@label "Derive under atom"
+@description "The Brzozowski derivative of a Pat under an atom (the set of firing predicate keys), at this state's localKeys. PMatch: empty when its key is outside the state OR not firing, else eps. PSeq captures the nullable-left tail via cAlt. PRep mirrors pattern.ts (max 0 dead; min floors at 0; the -1 unbounded sentinel preserved by decMax). Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+derivAtom : (atom: a) -> (localKeys: a) -> (pat: (Pat Any)) -> (Pat Any)
+derivAtom atom localKeys pat =
+  case pat of
+    PEmpty -> PEmpty
+    PEps -> PEmpty
+    PMatch k ->
+      if not (elem k localKeys) then PEmpty
+      else if elem k atom then PEps
+      else PEmpty
+    PSeq l r ->
+      let da = cSeq (derivAtom atom localKeys l) r
+      if nullablePat l then cAlt da (derivAtom atom localKeys r) else da
+    PAlt l r -> cAlt (derivAtom atom localKeys l) (derivAtom atom localKeys r)
+    PRep c mn mx ->
+      if eq mx 0 then PEmpty
+      else cSeq (derivAtom atom localKeys c) (PRep c (maxNum 0 (sub mn 1)) (decMax mx))
+    other -> PEmpty
+
+
+-- -------------------------------------------------------------------------
+-- The subset walk (L(a) subset of L(b)). Threads visited; returns
+-- { ok, visited }. Check order: memo-has, memo-add, terminal, cap, atoms.
+-- -------------------------------------------------------------------------
+
+@label "Subset go"
+@description "One coinductive step of the subset walk over (pa, pb), threading the visited memo. Memo cycle => true; nullable a and not nullable b => false; no preds => true; over 16 preds => conservative false; else fold the satisfiable atoms. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+subsetGo : (infoIdx: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> (visited: a) -> a
+subsetGo infoIdx pa pb visited =
+  let key = concat (concat (showPat pa) "~") (showPat pb)
+  if elem key visited then { ok = true, visited = visited }
+  else
+    let visited2 = appendItem key visited
+    if and (nullablePat pa) (not (nullablePat pb)) then { ok = false, visited = visited2 }
+    else
+      let localKeys = collectKeys pb (collectKeys pa [])
+      if eq (length localKeys) 0 then { ok = true, visited = visited2 }
+      else if gt (length localKeys) 16 then { ok = false, visited = visited2 }
+      else
+        let atoms = filter (\atom -> atomSat infoIdx localKeys atom) (allAtoms localKeys)
+        subsetFold infoIdx localKeys pa pb atoms visited2
+
+@label "Subset fold"
+@description "Fold the satisfiable atoms of a subset state: skip atoms where a derives empty; recurse on (da, db); short-circuit false; thread visited. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+subsetFold : (infoIdx: a) -> (localKeys: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> (atoms: a) -> (visited: a) -> a
+subsetFold infoIdx localKeys pa pb atoms visited =
+  case head atoms of
+    Nothing -> { ok = true, visited = visited }
+    Just atom ->
+      let da = derivAtom atom localKeys pa
+      if isPEmpty da then subsetFold infoIdx localKeys pa pb (restOf atoms) visited
+      else
+        let db = derivAtom atom localKeys pb
+        let res = subsetGo infoIdx da db visited
+        if res.ok then subsetFold infoIdx localKeys pa pb (restOf atoms) res.visited
+        else { ok = false, visited = res.visited }
+
+
+-- -------------------------------------------------------------------------
+-- The disjoint walk (L(a) intersect L(b) empty). Mirror of the subset walk;
+-- the terminal predicate is both-nullable, plus an empty-precheck BEFORE the
+-- memo (pattern.ts order) and the dead-branch (db empty) skip.
+-- -------------------------------------------------------------------------
+
+@label "Disjoint go"
+@description "One coinductive step of the disjointness walk over (pa, pb), threading the visited memo. Either side empty => true (disjoint); both nullable => false (empty string shared); memo cycle => true; no preds => true; over 16 preds => conservative false; else fold the satisfiable atoms skipping dead branches. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+disjointGo : (infoIdx: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> (visited: a) -> a
+disjointGo infoIdx pa pb visited =
+  if or (isPEmpty pa) (isPEmpty pb) then { ok = true, visited = visited }
+  else if and (nullablePat pa) (nullablePat pb) then { ok = false, visited = visited }
+  else
+    let key = concat (concat (showPat pa) "~") (showPat pb)
+    if elem key visited then { ok = true, visited = visited }
+    else
+      let visited2 = appendItem key visited
+      let localKeys = collectKeys pb (collectKeys pa [])
+      if eq (length localKeys) 0 then { ok = true, visited = visited2 }
+      else if gt (length localKeys) 16 then { ok = false, visited = visited2 }
+      else
+        let atoms = filter (\atom -> atomSat infoIdx localKeys atom) (allAtoms localKeys)
+        disjointFold infoIdx localKeys pa pb atoms visited2
+
+@label "Disjoint fold"
+@description "Fold the satisfiable atoms of a disjoint state: skip atoms where a OR b derives empty (the dead-branch skip); recurse on (da, db); short-circuit false; thread visited. Internal helper."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+disjointFold : (infoIdx: a) -> (localKeys: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> (atoms: a) -> (visited: a) -> a
+disjointFold infoIdx localKeys pa pb atoms visited =
+  case head atoms of
+    Nothing -> { ok = true, visited = visited }
+    Just atom ->
+      let da = derivAtom atom localKeys pa
+      if isPEmpty da then disjointFold infoIdx localKeys pa pb (restOf atoms) visited
+      else
+        let db = derivAtom atom localKeys pb
+        if isPEmpty db then disjointFold infoIdx localKeys pa pb (restOf atoms) visited
+        else
+          let res = disjointGo infoIdx da db visited
+          if res.ok then disjointFold infoIdx localKeys pa pb (restOf atoms) res.visited
+          else { ok = false, visited = res.visited }
+
+
+-- =========================================================================
+-- The STRUCTURED interval-endpoint partition (regex-derivative-to-fenel
+-- Phase 1a-cont) — the Fenel port + generalisation of regex-derivative.ts's
+-- `distinctRanges` (char-codes) over the `Ws` marker vocabulary. This is the
+-- ORDERED fragment's linear, exact decider: instead of enumerating 2^N atoms
+-- over the predicate set (the fallback above), it partitions the ordered
+-- domain into the maximal cells the markers induce and derives ONCE per cell.
+--
+-- THE TWO VIEWS UNIFY VIA THE PRED KEY. Each distinct predicate already has an
+-- opaque string key (p0/p1/…) that PMatch carries and the memo/2^N path reads.
+-- The dispatch shim now ALSO precomputes, per key, the predicate's `Ws` marker
+-- structure (the B3 ledgered marshal arm — char values rendered as code-point
+-- NUMBERS so the ±1 boundary step is plain numeric arithmetic, matching
+-- `distinctRanges`' code-point domain) and carries it on the SAME predInfo
+-- entry (`e.ws`). So the 2^N path reads `e.isAll`/`e.subsetOf` (unchanged); the
+-- structured path reads `e.ws` + `wsMember`. PMatch is untouched — the marker
+-- lives in predInfo keyed by the opaque key, NOT inlined on PMatch (lower churn
+-- than the brief's PMatch-carries-Ws sketch; same information, the 2^N path
+-- stays byte-identical). See notes/phase-1-step0-partition.md §"the two views
+-- unify".
+--
+-- DISPATCH (whole-pattern pre-scan). `decidePattern{Subset,Disjoint}` scans
+-- every distinct marker reachable in (pa ∪ pb): if ALL are Ws-ordered
+-- (WsAll/WsNone/WsEnum/WsInterval and boolean combinations) ⇒ the STRUCTURED
+-- walk; if ANY is opaque (WsWhere — $where/$named/$pattern/non-single-char) ⇒
+-- the 2^N atom-enum fallback (which decides those via opaque-atom structural
+-- inclusion — Finding 1, load-bearing). Whole-pattern (not per-state) keeps the
+-- split simple AND sound: char `$pattern`s are wholly ordered ⇒ structured (no
+-- deep-`.*` blowup); `$where` event patterns are wholly opaque ⇒ 2^N.
+--
+-- SOUNDNESS (the load-bearing argument — notes/phase-1-step0-partition.md
+-- §coverage). `wsBoundaries` emits every marker's membership TRANSITION points
+-- (an inclusive lo at `lo`, exclusive lo at `lo+1`; inclusive hi just-past at
+-- `hi+1`, exclusive hi at `hi`; each enum value `v` as `v` and `v+1`), unioned
+-- across ALL reachable markers — so no interval/enum/boolean-combination can
+-- change membership strictly inside a cell `[b_i, b_{i+1})`. One representative
+-- per cell (`b_i`) + one below-everything representative (`min(bounds) - 1`,
+-- witnessing the complement / WsAll / WsComplement region) therefore decide the
+-- whole partition for ANY boolean combination (the refine-to-the-common-
+-- partition argument); `wsMember` is the per-representative oracle. INTEGER-
+-- domain assumption (the ±1 step) — same as `distinctRanges`; the consumers
+-- (char code points + the integer-bounded generic-pattern tests) only produce
+-- integer/code-point bounds. Reproduces `distinctRanges` on the char fragment
+-- (the set-algebra.test.ts:527 corpus is the differential check).
+-- =========================================================================
+
+@label "Ws of key"
+@description "The Ws marker structure precomputed for predicate key `k` (read from the predInfo index `e.ws`); WsWhere when absent. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+wsOf : (infoIdx: a) -> (k: a) -> a
+wsOf infoIdx k =
+  case mapGet infoIdx k of
+    Nothing -> { tag = "WsWhere" }
+    Just e -> e.ws
+
+@label "Marker ordered"
+@description "Is a Ws marker in the structured-partition-able (ordered) fragment? WsAll/WsNone/WsEnum/WsInterval ⇒ yes; WsUnion/WsIntersect ⇒ all branches ordered; WsComplement ⇒ inner ordered; WsWhere / anything else ⇒ no (route the whole decision to the 2^N fallback). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+markerOrdered : (ws: a) -> Boolean
+markerOrdered ws =
+  if eq ws.tag "WsAll" then true
+  else if eq ws.tag "WsNone" then true
+  else if eq ws.tag "WsEnum" then true
+  else if eq ws.tag "WsInterval" then true
+  else if eq ws.tag "WsUnion" then allOrderedBranches ws.branches
+  else if eq ws.tag "WsIntersect" then allOrderedBranches ws.branches
+  else if eq ws.tag "WsComplement" then markerOrdered ws.inner
+  else false
+
+@label "All branches ordered"
+@description "True when every Ws marker in `branches` is markerOrdered (explicit recursion). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+allOrderedBranches : (branches: a) -> Boolean
+allOrderedBranches branches =
+  case head branches of
+    Nothing -> true
+    Just b ->
+      if markerOrdered b then allOrderedBranches (restOf branches) else false
+
+@label "All keys ordered"
+@description "True when every predicate key's Ws marker is markerOrdered — the whole-pattern dispatch test selecting the structured partition over the 2^N fallback. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+allOrderedKeys : (infoIdx: a) -> (keys: a) -> Boolean
+allOrderedKeys infoIdx keys =
+  case head keys of
+    Nothing -> true
+    Just k ->
+      if markerOrdered (wsOf infoIdx k) then allOrderedKeys infoIdx (restOf keys) else false
+
+@label "Lower boundary"
+@description "The membership-transition point a WsInterval lower bound induces: an inclusive `lo` enters AT `lo.value`, an exclusive `lo` enters at `lo.value + 1` (integer domain); a Nothing (unbounded) bound induces no boundary. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+loBound : (lo: a) -> a
+loBound lo =
+  case lo of
+    Nothing -> []
+    Just b -> [if b.inclusive then b.value else add b.value 1]
+
+@label "Upper boundary"
+@description "The membership-transition point a WsInterval upper bound induces: an inclusive `hi` exits JUST PAST at `hi.value + 1`, an exclusive `hi` exits AT `hi.value`; a Nothing (unbounded) bound induces no boundary. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+hiBound : (hi: a) -> a
+hiBound hi =
+  case hi of
+    Nothing -> []
+    Just b -> [if b.inclusive then add b.value 1 else b.value]
+
+@label "Enum boundaries"
+@description "The transition points a WsEnum induces: each value `v` enters at `v` and exits at `v + 1` (a singleton cell). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+enumBounds : (vs: a) -> a
+enumBounds vs =
+  case head vs of
+    Nothing -> []
+    Just v -> concat [v, add v 1] (enumBounds (restOf vs))
+
+@label "Branch boundaries"
+@description "The union of every branch marker's boundaries (WsUnion/WsIntersect). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+branchBounds : (branches: a) -> a
+branchBounds branches =
+  case head branches of
+    Nothing -> []
+    Just b -> concat (wsBoundaries b) (branchBounds (restOf branches))
+
+@label "Ws boundaries"
+@description "The membership-transition points a Ws marker induces on the ordered domain (the partition's boundary points): WsInterval ⇒ its lo + hi boundaries; WsEnum ⇒ each value as a singleton; WsUnion/WsIntersect ⇒ union of branch boundaries; WsComplement ⇒ its inner's boundaries (complementing flips membership but not transition points); WsAll/WsNone/opaque ⇒ none. Generalises distinctRanges' `{lo, hi+1}` point collection over the Ws vocabulary. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+wsBoundaries : (ws: a) -> a
+wsBoundaries ws =
+  if eq ws.tag "WsInterval" then concat (loBound ws.lo) (hiBound ws.hi)
+  else if eq ws.tag "WsEnum" then enumBounds ws.values
+  else if eq ws.tag "WsUnion" then branchBounds ws.branches
+  else if eq ws.tag "WsIntersect" then branchBounds ws.branches
+  else if eq ws.tag "WsComplement" then wsBoundaries ws.inner
+  else []
+
+@label "Boundaries of keys"
+@description "All boundary points induced by every predicate key's Ws marker (concatenated; deduped + min-extended by partitionReps). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+boundsOfKeys : (infoIdx: a) -> (keys: a) -> a
+boundsOfKeys infoIdx keys =
+  case head keys of
+    Nothing -> []
+    Just k -> concat (wsBoundaries (wsOf infoIdx k)) (boundsOfKeys infoIdx (restOf keys))
+
+@label "Dedup numbers"
+@description "Order-preserving de-duplication of a number list (eq-based). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+dedupNums : (xs: a) -> a
+dedupNums xs = dedupNumsInto xs []
+
+@label "Dedup numbers into"
+@description "dedupNums' accumulator pass: append each unseen number. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+dedupNumsInto : (xs: a) -> (acc: a) -> a
+dedupNumsInto xs acc =
+  case head xs of
+    Nothing -> acc
+    Just h ->
+      let acc2 = if elem h acc then acc else appendItem h acc
+      case tail xs of
+        Nothing -> acc2
+        Just rest -> dedupNumsInto rest acc2
+
+@label "Minimum number"
+@description "The minimum of a non-empty number list (0 when empty — unobservable, partitionReps guards). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+minNum : (xs: a) -> a
+minNum xs =
+  case head xs of
+    Nothing -> 0
+    Just h -> minNumGo (restOf xs) h
+
+@label "Minimum number go"
+@description "minNum's tail fold: keep the smaller of the accumulator and the head. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+minNumGo : (xs: a) -> (acc: a) -> a
+minNumGo xs acc =
+  case head xs of
+    Nothing -> acc
+    Just h -> minNumGo (restOf xs) (if lt h acc then h else acc)
+
+@label "Partition representatives"
+@description "The representative values to derive under, from the boundary points: one per cell `[b_i, b_{i+1})` (its left endpoint `b_i`, a boundary value) PLUS one below-everything representative `min(bounds) - 1` (witnessing the leftmost / complement / WsAll cell). Empty boundaries (all-WsAll/None markers) ⇒ a single arbitrary representative (every value is equivalent). One deriv per representative ⇒ LINEAR in the boundary count. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+partitionReps : (bounds: a) -> a
+partitionReps bounds =
+  let ded = dedupNums bounds
+  case head ded of
+    Nothing -> [0]
+    Just first -> appendItem (sub (minNum ded) 1) ded
+
+-- -------------------------------------------------------------------------
+-- ACI-canonical alternation (the Brzozowski-finiteness lever). Without
+-- normalising alternations up to Associativity + Idempotence, the derivative
+-- of a deep-`.*` pattern grows an ever-deeper nested `PAlt` that never
+-- structurally repeats — so the showPat memo never fires and the (interpreted)
+-- walk recurses unboundedly (a JS-stack overflow where the native-TS regex
+-- engine's higher limits + small examples masked it). `cAltC` flattens both
+-- operands' alt-branches, DEDUPS by showPat, and rebuilds a right-nested PAlt.
+-- Order is preserved (no sort): `deriv` is deterministic, so the deduped
+-- flattened branch list reaches a structural fixpoint — the standard ACI
+-- argument that makes the derivative set FINITE (and the trees small, so the
+-- interpreted showPat / deriv recursion stays shallow). Language-preserving ⇒
+-- verdicts unchanged. Used ONLY by the structured derivative (the 2^N path's
+-- cAlt is untouched — it never runs on the deep-`.*` char fragment).
+-- -------------------------------------------------------------------------
+
+@label "Alt branches"
+@description "Flatten a Pat into its alternation branches: PEmpty ⇒ [] (drops out); PAlt ⇒ the concatenation of both sides' branches (associativity); any other Pat ⇒ a singleton. Internal helper (structured partition, ACI-canonical alt)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+altBranches : (pat: (Pat Any)) -> a
+altBranches pat =
+  case pat of
+    PEmpty -> []
+    PAlt l r -> concat (altBranches l) (altBranches r)
+    other -> [pat]
+
+@label "Elem by show"
+@description "True when some Pat in `xs` renders to the same showPat key as `key` (structural membership for the alt dedup). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+elemByShow : (key: a) -> (xs: a) -> Boolean
+elemByShow key xs =
+  case head xs of
+    Nothing -> false
+    Just h -> if eq (showPat h) key then true else elemByShow key (restOf xs)
+
+@label "Dedup pats"
+@description "Order-preserving de-duplication of an alt-branch list by showPat key (idempotence). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+dedupPats : (xs: a) -> (acc: a) -> a
+dedupPats xs acc =
+  case head xs of
+    Nothing -> acc
+    Just h ->
+      let acc2 = if elemByShow (showPat h) acc then acc else appendItem h acc
+      case tail xs of
+        Nothing -> acc2
+        Just rest -> dedupPats rest acc2
+
+@label "Rebuild alt"
+@description "Rebuild a right-nested PAlt from a (deduped, non-empty) branch list: [] ⇒ PEmpty; a singleton ⇒ itself; else PAlt head (rebuild tail). Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+rebuildAlt : (xs: a) -> (Pat Any)
+rebuildAlt xs =
+  case head xs of
+    Nothing -> PEmpty
+    Just h ->
+      case tail xs of
+        Nothing -> h
+        Just rest -> PAlt h (rebuildAlt rest)
+
+@label "Containment alt (canonical)"
+@description "ACI-canonical alternation: flatten both operands' branches, dedup by showPat, rebuild a right-nested PAlt — the Brzozowski-finiteness normaliser that keeps the structured walk's states bounded + the showPat memo effective. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+cAltC : (pa: (Pat Any)) -> (pb: (Pat Any)) -> (Pat Any)
+cAltC pa pb =
+  let bs = concat (altBranches pa) (altBranches pb)
+  let ded = dedupPats bs []
+  rebuildAlt ded
+
+@label "Derive under representative"
+@description "The Brzozowski derivative of a Pat under a CONCRETE representative element `rep` (the structured-partition counterpart of derivAtom): PMatch ⇒ eps when `wsMember (wsOf k) rep`, else empty; PSeq captures the nullable-left tail via cAltC; PRep mirrors pattern.ts (max 0 dead; min floors at 0; the -1 unbounded sentinel via decMax). Uses the ACI-canonical cAltC (not cAlt) so deep-`.*` derivative states stay finite + bounded. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+derivWsPat : (infoIdx: a) -> (rep: a) -> (pat: (Pat Any)) -> (Pat Any)
+derivWsPat infoIdx rep pat =
+  case pat of
+    PEmpty -> PEmpty
+    PEps -> PEmpty
+    PMatch k -> if wsMember (wsOf infoIdx k) rep then PEps else PEmpty
+    PSeq l r ->
+      let da = cSeq (derivWsPat infoIdx rep l) r
+      if nullablePat l then cAltC da (derivWsPat infoIdx rep r) else da
+    PAlt l r -> cAltC (derivWsPat infoIdx rep l) (derivWsPat infoIdx rep r)
+    PRep c mn mx ->
+      if eq mx 0 then PEmpty
+      else cSeq (derivWsPat infoIdx rep c) (PRep c (maxNum 0 (sub mn 1)) (decMax mx))
+    other -> PEmpty
+
+
+-- -------------------------------------------------------------------------
+-- The structured subset walk. Mirror of subsetGo: same terminal predicate +
+-- memo, but the next-element classes come from the interval-endpoint
+-- partition (one deriv per cell), not the 2^N atom enumeration. No 16-pred
+-- cap (the partition is linear, not exponential).
+-- -------------------------------------------------------------------------
+
+@label "Subset go (structured)"
+@description "One coinductive step of the structured subset walk over (pa, pb), threading the visited memo. Memo cycle ⇒ true; nullable a and not nullable b ⇒ false; no preds ⇒ true; else derive under each partition representative. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+subsetGoS : (infoIdx: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> (visited: a) -> a
+subsetGoS infoIdx pa pb visited =
+  let key = concat (concat (showPat pa) "~") (showPat pb)
+  if elem key visited then { ok = true, visited = visited }
+  else
+    let visited2 = appendItem key visited
+    if and (nullablePat pa) (not (nullablePat pb)) then { ok = false, visited = visited2 }
+    else
+      let localKeys = collectKeys pb (collectKeys pa [])
+      if eq (length localKeys) 0 then { ok = true, visited = visited2 }
+      else
+        let reps = partitionReps (boundsOfKeys infoIdx localKeys)
+        subsetFoldS infoIdx pa pb reps visited2
+
+@label "Subset fold (structured)"
+@description "Fold the partition representatives of a structured subset state: skip representatives where a derives empty; recurse on (da, db); short-circuit false; thread visited. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+subsetFoldS : (infoIdx: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> (reps: a) -> (visited: a) -> a
+subsetFoldS infoIdx pa pb reps visited =
+  case head reps of
+    Nothing -> { ok = true, visited = visited }
+    Just rep ->
+      let da = derivWsPat infoIdx rep pa
+      if isPEmpty da then subsetFoldS infoIdx pa pb (restOf reps) visited
+      else
+        let db = derivWsPat infoIdx rep pb
+        let res = subsetGoS infoIdx da db visited
+        if res.ok then subsetFoldS infoIdx pa pb (restOf reps) res.visited
+        else { ok = false, visited = res.visited }
+
+
+-- -------------------------------------------------------------------------
+-- The structured disjoint walk. Mirror of disjointGo over the partition.
+-- -------------------------------------------------------------------------
+
+@label "Disjoint go (structured)"
+@description "One coinductive step of the structured disjointness walk over (pa, pb), threading the visited memo. Either side empty ⇒ true; both nullable ⇒ false; memo cycle ⇒ true; no preds ⇒ true; else derive under each partition representative skipping dead branches. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+disjointGoS : (infoIdx: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> (visited: a) -> a
+disjointGoS infoIdx pa pb visited =
+  if or (isPEmpty pa) (isPEmpty pb) then { ok = true, visited = visited }
+  else if and (nullablePat pa) (nullablePat pb) then { ok = false, visited = visited }
+  else
+    let key = concat (concat (showPat pa) "~") (showPat pb)
+    if elem key visited then { ok = true, visited = visited }
+    else
+      let visited2 = appendItem key visited
+      let localKeys = collectKeys pb (collectKeys pa [])
+      if eq (length localKeys) 0 then { ok = true, visited = visited2 }
+      else
+        let reps = partitionReps (boundsOfKeys infoIdx localKeys)
+        disjointFoldS infoIdx pa pb reps visited2
+
+@label "Disjoint fold (structured)"
+@description "Fold the partition representatives of a structured disjoint state: skip representatives where a OR b derives empty (the dead-branch skip); recurse on (da, db); short-circuit false; thread visited. Internal helper (structured partition)."
+@tags "engine" "internal" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+@category "engine-internal"
+disjointFoldS : (infoIdx: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> (reps: a) -> (visited: a) -> a
+disjointFoldS infoIdx pa pb reps visited =
+  case head reps of
+    Nothing -> { ok = true, visited = visited }
+    Just rep ->
+      let da = derivWsPat infoIdx rep pa
+      if isPEmpty da then disjointFoldS infoIdx pa pb (restOf reps) visited
+      else
+        let db = derivWsPat infoIdx rep pb
+        if isPEmpty db then disjointFoldS infoIdx pa pb (restOf reps) visited
+        else
+          let res = disjointGoS infoIdx da db visited
+          if res.ok then disjointFoldS infoIdx pa pb (restOf reps) res.visited
+          else { ok = false, visited = res.visited }
+
+
+-- -------------------------------------------------------------------------
+-- Entry points — the dispatch shim calls these with the pre-computed
+-- predicate-info list + the two marshalled Pats.
+-- -------------------------------------------------------------------------
+
+@label "Decide pattern subset"
+@description "Decide L(pa) subset of L(pb). When every reachable predicate is Ws-ordered (intervals/enums/all and boolean combinations) ⇒ the STRUCTURED interval-endpoint partition (linear, exact — reproduces regex-derivative.ts distinctRanges on the char fragment); when any predicate is opaque ($where/$named/non-char) ⇒ the generic 2^N atom-enumeration Brzozowski walk (decides opaque preds via structural atom inclusion). predInfo is the TS-precomputed [{ key, isAll, subsetOf, ws }] table; pa/pb are Pats whose PMatch carry opaque predicate keys. The port of pattern.ts patternSubset + the structured partition (Phase 1a-cont). regex-derivative-to-fenel Phase 1."
+@tags "engine" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+decidePatternSubset : (predInfo: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> Boolean
+decidePatternSubset predInfo pa pb =
+  let infoIdx = fromEntries (map (\e -> { key = e.key, value = e }) predInfo)
+  let allKeys = collectKeys pb (collectKeys pa [])
+  let res = if allOrderedKeys infoIdx allKeys then subsetGoS infoIdx pa pb [] else subsetGo infoIdx pa pb []
+  res.ok
+
+@label "Decide pattern disjoint"
+@description "Decide L(pa) intersect L(pb) empty. When every reachable predicate is Ws-ordered ⇒ the STRUCTURED interval-endpoint partition (linear, exact — reproduces regex-derivative.ts distinctRanges on the char fragment); when any predicate is opaque ⇒ the generic 2^N atom-enumeration Brzozowski walk. predInfo is the TS-precomputed [{ key, isAll, subsetOf, ws }] table; pa/pb are Pats whose PMatch carry opaque predicate keys. The port of pattern.ts patternDisjoint + the structured partition (Phase 1a-cont). regex-derivative-to-fenel Phase 1."
+@tags "engine" "regex" "containment" "regex-derivative-to-fenel" "phase-1"
+decidePatternDisjoint : (predInfo: a) -> (pa: (Pat Any)) -> (pb: (Pat Any)) -> Boolean
+decidePatternDisjoint predInfo pa pb =
+  let infoIdx = fromEntries (map (\e -> { key = e.key, value = e }) predInfo)
+  let allKeys = collectKeys pb (collectKeys pa [])
+  let res = if allOrderedKeys infoIdx allKeys then disjointGoS infoIdx pa pb [] else disjointGo infoIdx pa pb []
+  res.ok
+
+
+-- -------------------------------------------------------------------------
+-- memberPat — the Pattern-membership decider (named-membership-to-fenel
+-- Phase 2). `value ∈ L(pat)` over a PRE-BUILT match-Pattern, the Phase-0-GO
+-- kill-2-birds payoff. The classic Brzozowski membership identity
+--   patternMatch p s  ≡  nullable (foldl deriv p (chars s))
+-- ported verbatim: fold the per-char derivative under each input CODE POINT
+-- (`derivWsPat infoIdx cp acc` — the SAME concrete-element derivative the
+-- structured containment walk uses; a partition representative and an actual
+-- input char are the same shape, a code point fed to `wsMember`), then ask
+-- `nullablePat` of the residual.
+--
+-- STRICTLY EASIER than the containment deciders above: the match-Pattern is
+-- purely INDUCTIVE (no PRef), and the input is FINITE — N chars = N derivative
+-- steps — so membership needs NONE of the coinductive machinery (the 2^N atom
+-- enumeration, the `visited` memo, the 16-pred cap, the `nullableFix` fuel). It
+-- terminates structurally.
+--
+-- The WsWhere fence lives in the TS shim (`dispatchedPatternMember`): a
+-- predicate that marshals to WsWhere (a non-char-orderable match pred) would
+-- make `wsMember` return false at that node ≠ TS `deriv`'s full
+-- `contains(pred, char)`, so the shim PRE-SCANS predInfo and falls back to the
+-- TS `patternMatch` leaf rather than letting this body silently mis-decide. The
+-- format/regex-format slice carries no such predicate (all single-char $enum /
+-- $interval / $union), so the fold below decides the whole Phase-2 target.
+--
+-- predInfo is the membership-only [{ key, ws }] marshal table from
+-- `buildPatternMemberPredInfo`. Containment keeps its separate isAll/subsetOf
+-- facts; membership does not compute or consume those relations. `codepoints`
+-- is the input string's
+-- per-char code points (`[...value].map predValueToCodePoint`, TS-marshalled).
+-- -------------------------------------------------------------------------
+
+@label "Member fold"
+@description "Fold the per-char Brzozowski derivative of a Pat under each input code point (`derivWsPat infoIdx cp pat`), left to right, until the code points run out — returning the residual Pat. The inductive membership walk (no memo, no atom enumeration; N chars = N steps). Internal helper. named-membership-to-fenel Phase 2."
+@tags "engine" "internal" "regex" "containment" "named" "membership" "named-membership-to-fenel" "phase-2"
+@category "engine-internal"
+memberFold : (infoIdx: a) -> (pat: (Pat Any)) -> (codepoints: a) -> (Pat Any)
+memberFold infoIdx pat codepoints =
+  case head codepoints of
+    Nothing -> pat
+    Just cp -> memberFold infoIdx (derivWsPat infoIdx cp pat) (restOf codepoints)
+
+@label "Member pattern"
+@description "Decide `value ∈ L(pat)` over a pre-built match-Pattern: nullablePat of the residual after folding the per-char derivative under every input code point (the Brzozowski `nullable (foldl deriv p (chars s))` identity). predInfo is the membership-only [{ key, ws }] marshal table; codepoints are the input string's per-char code points. Membership is purely inductive + finite — no visited memo / atom enumeration / fuel. The WsWhere fence is in the TS shim (dispatchedPatternMember pre-scans + falls back). The port of pattern.ts patternMatch over the structured Ws derivative. named-membership-to-fenel Phase 2."
+@tags "engine" "regex" "containment" "named" "membership" "named-membership-to-fenel" "phase-2"
+memberPat : (predInfo: a) -> (pat: (Pat Any)) -> (codepoints: a) -> Boolean
+memberPat predInfo pat codepoints =
+  let infoIdx = fromEntries (map (\e -> { key = e.key, value = e }) predInfo)
+  nullablePat (memberFold infoIdx pat codepoints)

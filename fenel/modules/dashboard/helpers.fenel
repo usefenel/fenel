@@ -1,0 +1,190 @@
+module dashboard where
+
+-- =========================================================================
+-- Dashboard helpers — pure Fenel-bodied shape transforms ported from
+-- api/src/routes/dashboard.ts.
+--
+-- Phase 12a sub-step 1 of the ts-elimination workstream. The 6 helpers
+-- below are the cross-route toolbox that 12a-2's Disposition-E DELETE
+-- batch (22 routes) will consume; this sub-step is substrate-only — the
+-- routes themselves are not yet refactored.
+--
+-- Each helper is byte-equivalent to its TS counterpart (smoke-tested in
+-- engine/src/modules/smoke-12a-1.ts pre-commit). Defensive `data ?? {}`
+-- and `data.field ?? null` shapes from the TS originals are preserved so
+-- callers see the same wire format — Fenel evaluator's `{var: "x.y"}` on
+-- a missing field already resolves to null, so the explicit-null fallback
+-- is handled by the record-literal path (each declared field gets
+-- evaluated, including null values), not per-field case-matches.
+--
+-- maskCredentials lives in engine/src/modules/dashboard.ts as a TS native
+-- impl rather than a Fenel body — record-key iteration has no std
+-- primitive yet (no std:keys / std:recordEntries) and adding one for a
+-- single helper would overshoot the 12a-1 substrate budget; flagged for
+-- a future std-primitives sub-step.
+-- =========================================================================
+
+-- defaultTo — single-arg null-coalesce. Returns `dflt` when `x` is null,
+-- otherwise `x`. Mirrors JS `x ?? dflt` for the row.data null-default
+-- and the data.type "person" default cases. Local to this module — not
+-- worth surfacing as a std primitive yet (only the dashboard helpers
+-- have a use for it today).
+--
+-- Implementation: composed via std:ifElse + std:isNull rather than a
+-- `case x of null -> ...` pattern. The Fenel parser sees a bare `null`
+-- in pattern position as an ordinary lowercase ident and lifts it to
+-- `{$bind: "null"}`, which would erroneously match every value (the
+-- pattern was the first arm encountered + always binds). ifElse/isNull
+-- is the safe shape today; a future parser rule recognising `null` as
+-- the JS-null literal in pattern position would let this read more
+-- naturally — flagged in the sub-step surprises.
+
+@label "Default to"
+@description "Null-coalesce. Returns `dflt` when `x` is null; `x` otherwise. Local utility for the dashboard helpers' row.data null-default and per-field defaults. Not surfaced as a std primitive — only the dashboard module uses it today."
+@tags "dashboard" "helper" "pure"
+defaultTo dflt x = ifElse (isNull x) dflt x
+
+-- flattenProfile — entity_instances row of entityType "profile" →
+-- legacy profile wire-shape. Ported from dashboard.ts:92-110.
+--
+-- Inputs: { id, accountId, data, createdAt } (drizzle row shape).
+-- Output: { id, accountId, type, gender, email, phone, dob, avatar,
+-- notes, firstName, lastName, nicknames, archivedAt, createdAt }.
+--
+-- Defaults: data.type ↦ "person" (only field with a non-null default);
+-- every other absent field ↦ null (via record-literal evaluation of
+-- `data.<field>` over a possibly-empty data record).
+
+@label "Flatten profile"
+@description "entity_instances row of entityType 'profile' → legacy profile wire-shape. Defaults data.type to 'person'; every other absent field projects to null via record-literal evaluation. Byte-equivalent to the TS dashboard.ts:flattenProfile helper."
+@tags "dashboard" "profile" "flatten" "pure"
+flattenProfile : (row: {}) -> {}
+flattenProfile row =
+  let data = defaultTo {} row.data
+  {
+    id = row.id,
+    accountId = row.accountId,
+    type = defaultTo "person" data.type,
+    gender = data.gender,
+    email = data.email,
+    phone = data.phone,
+    dob = data.dob,
+    avatar = data.avatar,
+    notes = data.notes,
+    firstName = data.firstName,
+    lastName = data.lastName,
+    nicknames = data.nicknames,
+    archivedAt = data.archivedAt,
+    createdAt = row.createdAt
+  }
+
+-- flattenInstance — generic entity_instances row → flattened wire shape
+-- (id + accountId + spread of data + createdAt + updatedAt). Ported
+-- from dashboard.ts:687-695.
+--
+-- Implementation: mergeRecords composition keeps each step
+-- right-biased — `data` overrides nothing in `base` (id/accountId aren't
+-- in JSONB data; they're row columns), and the trailing timestamps
+-- override nothing in `data` (data never carries those column names).
+
+@label "Flatten entity instance"
+@description "Generic entity_instances row → flattened wire shape (id + accountId + spread of data + createdAt + updatedAt). Used by every list/detail route over a non-profile entity (proxy_link, integration, page, …). Byte-equivalent to dashboard.ts:flattenInstance."
+@tags "dashboard" "flatten" "pure"
+flattenInstance : (row: {}) -> {}
+flattenInstance row =
+  let data = defaultTo {} row.data
+  let base = { id = row.id, accountId = row.accountId }
+  let withData = mergeRecords base data
+  mergeRecords withData { createdAt = row.createdAt, updatedAt = row.updatedAt }
+
+-- flattenRelation — alias of flattenInstance WITHOUT the updatedAt
+-- field. Ported from the inline closure at dashboard.ts:205-210
+-- (inside the /profiles/:id route). Five relation tables share this
+-- shape (handles / phones / tags / intents / purchases). Kept as a
+-- distinct fnId because the route consumers don't carry `updatedAt`
+-- in their response wire-shape and adding it would be a contract
+-- change (out-of-scope for 12a-1).
+
+@label "Flatten profile relation"
+@description "entity_instances relation row → flattened wire shape WITHOUT updatedAt (handles / phones / tags / intents / purchases inside /profiles/:id). Sibling of flattenInstance; kept separate because the relation routes' wire-shape contract omits updatedAt and adding it would be a contract change (out-of-scope for 12a-1)."
+@tags "dashboard" "profile" "relation" "flatten" "pure"
+flattenRelation : (row: {}) -> {}
+flattenRelation row =
+  let data = defaultTo {} row.data
+  let base = { id = row.id, accountId = row.accountId }
+  let withData = mergeRecords base data
+  mergeRecords withData { createdAt = row.createdAt }
+
+-- readMetadata — parse the subscription row's nullable metadata string
+-- to a Record. Ported from dashboard.ts:1676-1684. TS impl wraps
+-- JSON.parse in a try/catch and returns {} on parse failure or
+-- non-object result. The Fenel body uses codec:jsonDecode (which
+-- returns Result DecErr JsonValue), then unwraps via codec:unwrapJsonValue
+-- when the value is a JsonObject; non-object JSON values (number /
+-- string / array / null) collapse to {} — preserves the TS
+-- `parsed && typeof parsed === "object"` gate's behavior. The Err
+-- branch also collapses to {} mirroring the TS catch arm.
+
+@label "Read subscription metadata"
+@description "Parse the subscription row's nullable metadata string to a Record. Wraps codec:jsonDecode + codec:unwrapJsonValue with the TS try/catch semantics: parse failures and non-object JSON values both collapse to {}. Byte-equivalent to dashboard.ts:readMetadata."
+@tags "dashboard" "subscription" "json" "pure"
+readMetadata : (raw: String) -> {}
+readMetadata raw =
+  ifElse (isNull raw) {} (parseMetadataString raw)
+
+@label "Parse metadata string"
+@description "Private helper dispatched by readMetadata. Pattern-matches codec:jsonDecode's Result; on Ok JsonObject, calls codec:unwrapJsonValue to lower back to a plain Fenel record. Non-object JSON values (number / string / array / null) and Err results both collapse to {}. Split from readMetadata because the outer null-guard needs an ifElse + a multi-arm case can't compose inline with the ifElse arg position cleanly."
+@tags "dashboard" "subscription" "json" "pure"
+parseMetadataString : (s: String) -> {}
+parseMetadataString s =
+  case jsonDecode s of
+    Err _e -> {}
+    Ok jv ->
+      case jv of
+        JsonObject { pairs = _p } -> unwrapJsonValue jv
+        _ -> {}
+
+-- flattenSubscriptionToTrigger — subscription row → legacy trigger
+-- wire-shape. Ported from dashboard.ts:1686-1699. Reads metadata via
+-- readMetadata; pulls trigger / cancelWhen / args out with null
+-- defaults (record-literal evaluation of `meta.<field>` over the
+-- possibly-empty meta record gives null when the field is absent —
+-- byte-equivalent to TS `meta.trigger ?? null`); surfaces
+-- row.handlerFunctionId as functionId; surfaces row.enabled as active.
+
+@label "Flatten subscription → trigger"
+@description "Subscription row → legacy trigger wire-shape. Reads metadata via dashboard:readMetadata; surfaces trigger / cancelWhen / args from the parsed metadata (null when absent); maps row.handlerFunctionId to functionId and row.enabled to active. Byte-equivalent to dashboard.ts:flattenSubscriptionToTrigger."
+@tags "dashboard" "subscription" "trigger" "flatten" "pure"
+flattenSubscriptionToTrigger : (row: {}) -> {}
+flattenSubscriptionToTrigger row =
+  let meta = readMetadata row.metadata
+  {
+    id = row.id,
+    accountId = row.accountId,
+    functionId = row.handlerFunctionId,
+    trigger = meta.trigger,
+    cancelWhen = meta.cancelWhen,
+    args = meta.args,
+    active = row.enabled,
+    createdAt = row.createdAt,
+    updatedAt = row.updatedAt
+  }
+
+-- maskCredentials — Record<String, unknown> → Record<String, "configured">.
+-- Each non-null, non-empty-string entry collapses to "configured"; null and
+-- empty-string entries are dropped. module-substrate Phase 3t.2 — PORTED off
+-- the TS native (`maskCredentialsNative`) now that std carries the
+-- record-iteration primitives: `entries` (record → List {key, value}) folds via
+-- `mapSet` into the output record. The Fenel-first HARD rule: record-key
+-- iteration is pure, so once the primitives exist the body MUST be Fenel (the
+-- std:isMultipleOf reversion precedent — a TS native for composable-from-std
+-- logic is the documented anti-pattern). `eq v ""` is true ONLY for the empty
+-- STRING (for non-strings `eq` is false), reproducing the TS
+-- `typeof v === "string" && v.length === 0` guard exactly; the null/undefined
+-- case is the `isNull` arm.
+@label "Mask credentials"
+@description "Record<String, unknown> → Record<String, 'configured'>. Each entry whose value is non-null AND not the empty string becomes 'configured'; null and empty-string entries are dropped. Fenel-bodied via std:entries + std:fold + std:mapSet (Phase 3t.2 — the std record-iteration primitives exist, so the Fenel-first rule retired the TS native)."
+@tags "dashboard" "integration" "credentials" "pure"
+maskCredentials : (creds: {}) -> {}
+maskCredentials creds =
+  fold (\acc pair -> if (isNull pair.value) or (eq pair.value "") then acc else (mapSet acc pair.key "configured")) {} (entries creds)
